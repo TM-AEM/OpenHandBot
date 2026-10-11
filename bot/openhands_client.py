@@ -102,6 +102,26 @@ class OpenHandsClient:
                         return text
         return None
 
+    async def list_files(self, conversation_id: str, path: str = "") -> list[str]:
+        params: dict[str, Any] = {}
+        if path:
+            params["path"] = path
+        data = await self._get(f"/app-conversations/{conversation_id}/files", params=params or None)
+        items = data if isinstance(data, list) else data.get("items", [])
+        return [f for f in items if isinstance(f, str)]
+
+    async def read_file(self, conversation_id: str, file_path: str) -> str:
+        """محتوى ملف واحد. الباراميتر اسمه `file_path` (مش `path`)."""
+        data = await self._get(
+            f"/app-conversations/{conversation_id}/file", params={"file_path": file_path}
+        )
+        return data if isinstance(data, str) else ""
+
+    async def export_conversation(self, conversation_id: str) -> bytes:
+        """تصدير الشات كـ zip (events + meta)، مش ملفات الـ workspace."""
+        resp = await self._request("GET", f"/app-conversations/{conversation_id}/download")
+        return resp.content
+
     async def send_message(self, conversation_id: str, text: str) -> None:
         body = {"role": "user", "content": [{"type": "text", "text": text}], "run": True}
         await self._request("POST", f"/app-conversations/{conversation_id}/send-message", json=body)

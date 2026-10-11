@@ -39,15 +39,52 @@ def split_message(text: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
     return parts
 
 
+def pr_url(conv: dict) -> str | None:
+    """رابط الـ PR لو الشات مرتبط بواحد. pr_number ممكن يكون [1] مش رقم."""
+    repo = conv.get("selected_repository")
+    numbers = conv.get("pr_number")
+    if not repo or not numbers:
+        return None
+    number = numbers[0] if isinstance(numbers, (list, tuple)) and numbers else numbers
+    if number is None:
+        return None
+    return f"https://github.com/{repo}/pull/{number}"
+
+
 def format_conversation(conv: dict, reply: str | None) -> str:
     """نص خام (مش HTML). اللي بيعرضه لازم يهرّبه بـ escape_html."""
     title = conv.get("title") or "بدون عنوان"
     repo = conv.get("selected_repository") or "بدون مستودع"
     state = state_label(conv.get("execution_status"))
     lines = [title, f"المستودع: {repo}", f"الحالة: {state}"]
+    link = pr_url(conv)
+    if link:
+        lines.append(f"الـ PR: {link}")
     if reply:
         lines.append("")
         lines.append(reply)
+    return "\n".join(lines)
+
+
+def format_cost(metrics: dict | None) -> str:
+    """سطر التكلفة والتوكنز من حقل metrics على الشات."""
+    if not metrics:
+        return "مفيش بيانات تكلفة."
+    cost = metrics.get("accumulated_cost")
+    usage = metrics.get("accumulated_token_usage") or {}
+    model = metrics.get("model_name") or usage.get("model") or "غير معروف"
+    lines = [f"الموديل: {model}"]
+    if cost is not None:
+        try:
+            cost = f"{float(cost):.4f}"
+        except (TypeError, ValueError):
+            pass
+        lines.append(f"التكلفة التراكمية: ${cost}")
+    prompt = usage.get("prompt_tokens")
+    completion = usage.get("completion_tokens")
+    if prompt is not None or completion is not None:
+        lines.append(f"توكنز الإدخال: {prompt or 0}")
+        lines.append(f"توكنز الإخراج: {completion or 0}")
     return "\n".join(lines)
 
 

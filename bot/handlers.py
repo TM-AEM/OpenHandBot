@@ -2,21 +2,23 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 
-from telegram import Update
+from telegram import InputFile, Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
 from . import keyboards as kb
 from .errors import ApiError
-from .messages import escape_html, format_conversation
+from .messages import escape_html, format_conversation, format_cost, pr_url, state_label
 from .sender import send_long
 
 log = logging.getLogger(__name__)
 
 PAGE_SIZE = 10
 REPOS_PAGE_SIZE = 8
+FILES_PAGE_SIZE = 10
 
 
 def _allowed(update: Update, config) -> bool:
@@ -136,6 +138,125 @@ async def open_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     text = format_conversation(conv, reply)
     markup = kb.conversation_actions(conversation_id)
     await _edit_or_send(q, text, q.message.chat_id, context.bot, reply_markup=markup)
+
+
+async def show_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    if not _allowed(update, context.bot_data["config"]):
+        return
+    conversation_id = q.data.split(":", 1)[1]
+    client = context.bot_data["client"]
+    try:
+        conv = await _conversation(client, conversation_id)
+    except ApiError as exc:
+        await _safe_edit(q, str(exc))
+        return
+    if not conv:
+        await _safe_edit(q, "الشات مش موجود.")
+        return
+    lines = [
+        f"العنوان: {conv.get('title') or 'بدون عنوان'}",
+        f"الحالة: {state_label(conv.get('execution_status'))}",
+        f"الـ sandbox: {conv.get('sandbox_status') or 'غير معروف'}",
+    ]
+    link = pr_url(conv)
+    if link:
+        lines.append(f"الـ PR: {link}")
+    await _edit_or_send(
+        q, "\n".join(lines), q.message.chat_id, context.bot,
+        reply_markup=kb.conversation_actions(conversation_id),
+    )
+
+
+async def show_cost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    if not _allowed(update, context.bot_data["config"]):
+        return
+    conversation_id = q.data.split(":", 1)[1]
+    client = context.bot_data["client"]
+    try:
+        conv = await _conversation(client, conversation_id)
+    except ApiError as exc:
+        await _safe_edit(q, str(exc))
+        return
+    await _edit_or_send(
+        q, format_cost(conv.get("metrics")), q.message.chat_id, context.bot,
+        reply_markup=kb.conversation_actions(conversation_id),
+    )
+
+
+async def export_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    if not _allowed(update, context.bot_data["config"]):
+        return
+    conversation_id = q.data.split(":", 1)[1]
+    client = context.bot_data["client"]
+    try:
+        data = await client.export_conversation(conversation_id)
+    except ApiError as exc:
+        await _safe_edit(q, str(exc))
+        return
+    buffer = io.BytesIO(data)
+    await context.bot.send_document(
+        chat_id=q.message.chat_id,
+        document=InputFile(buffer, filename=f"conversation-{conversation_id[:8]}.zip"),
+    )
+
+
+async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    if not _allowed(update, context.bot_data["config"]):
+        return
+    _, conversation_id, page_raw = q.data.split(":", 2)
+    page = int(page_raw)
+    client = context.bot_data["client"]
+    try:
+        files = await client.list_files(conversation_id)
+    except ApiError as exc:
+        await _safe_edit(q, str(exc))
+        return
+    if not files:
+        await _safe_edit(q, "ما فيهاش ملفات.", reply_markup=kb.conversation_actions(conversation_id))
+        return
+    # نخزّن القايمة عشان الـ callback data (حد 64 بايت) ما يشيلش المسار الكامل.
+    context.bot_data.setdefault("file_cache", {})[conversation_id] = files
+    start = page * FILES_PAGE_SIZE
+    chunk = files[start : start + FILES_PAGE_SIZE]
+    has_more = len(files) > start + FILES_PAGE_SIZE
+    await _safe_edit(
+        q,
+        f"ملفات الشات (صفحة {page + 1}):",
+        reply_markup=kb.files_menu(conversation_id, chunk, start, page, has_more),
+    )
+
+
+async def show_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    if not _allowed(update, context.bot_data["config"]):
+        return
+    _, conversation_id, index_raw = q.data.split(":", 2)
+    files = context.bot_data.get("file_cache", {}).get(conversation_id) or []
+    index = int(index_raw)
+    if index >= len(files):
+        await _safe_edit(q, "الملف مش موجود، افتح قايمة الملفات تاني.")
+        return
+    path = files[index]
+    client = context.bot_data["client"]
+    try:
+        content = await client.read_file(conversation_id, path)
+    except ApiError as exc:
+        await _safe_edit(q, str(exc))
+        return
+    name = path.rsplit("/", 1)[-1] or "file.txt"
+    buffer = io.BytesIO(content.encode("utf-8"))
+    await context.bot.send_document(
+        chat_id=q.message.chat_id, document=InputFile(buffer, filename=name)
+    )
 
 
 async def reply_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

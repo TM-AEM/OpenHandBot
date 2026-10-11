@@ -127,6 +127,42 @@ def test_wait_for_start_returns_app_conversation_id():
     assert out == "conv-1"
 
 
+def test_list_files():
+    def handler(request):
+        assert request.url.path == "/api/v1/app-conversations/c1/files"
+        return httpx.Response(200, json=["a.py", "b/c.py", 5])
+
+    import asyncio
+
+    client = make_client(handler)
+    assert asyncio.run(client.list_files("c1")) == ["a.py", "b/c.py"]
+
+
+def test_read_file_uses_file_path_param():
+    seen = {}
+
+    def handler(request):
+        seen["file_path"] = request.url.params.get("file_path")
+        return httpx.Response(200, json="print('hi')\n")
+
+    import asyncio
+
+    client = make_client(handler)
+    assert asyncio.run(client.read_file("c1", "main.py")) == "print('hi')\n"
+    assert seen["file_path"] == "main.py"
+
+
+def test_export_conversation_returns_bytes():
+    def handler(request):
+        assert request.url.path == "/api/v1/app-conversations/c1/download"
+        return httpx.Response(200, content=b"PK\x03\x04zip")
+
+    import asyncio
+
+    client = make_client(handler)
+    assert asyncio.run(client.export_conversation("c1")) == b"PK\x03\x04zip"
+
+
 def test_search_repositories():
     def handler(request):
         assert request.url.params["provider"] == "github"

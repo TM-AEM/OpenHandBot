@@ -45,6 +45,17 @@
 - ترجّع `{"items":[...]}`، كل عنصر فيه `full_name`، `main_branch`، `is_public`.
 - 16 مستودع لـ `TM-AEM`.
 
+## ملفات الشات والتصدير (اتأكد live)
+- `GET /app-conversations/{id}/files?path=` → **مصفوفة نصية** بالمسارات النسبية (لاحظت 534 ملف
+  في شات Recovo، فيه `.gradle/` و`build/` كمان).
+- `GET /app-conversations/{id}/file?file_path=<path>` → **نص خام JSON** (string). الباراميتر
+  اسمه `file_path` **مش** `path` — لو بعتت `path` بترجّع `""` بـ 200 من غير أي خطأ.
+- `GET /app-conversations/{id}/download` → **zip** (`application/zip`، 6.4MB) لكنه
+  **تصدير الشات** (event_*.json + meta.json)، **مش** ملفات الـ workspace.
+- `metrics` على عنصر الشات فيه `accumulated_cost` و`accumulated_token_usage.{prompt,completion}_tokens`
+  و`model_name`. `pr_number` ممكن يكون **`[1]` (list)** أو scalar؛ رابط الـ PR يتكوّن من
+  `selected_repository` + الرقم.
+
 ## ترقيم الصفحات (اتأكد live)
 - الترتيب الخام لـ `app-conversations/search` **مش** بالـ `created_at` ولا الـ `updated_at`.
 - فالترقيم لازم يكون client-side: نجيب لحد 100 عنصر (أقصى `limit`) مرة واحدة، نرتّبهم إحنا، وبعدين نقسّمهم.
