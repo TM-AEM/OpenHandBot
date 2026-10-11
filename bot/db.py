@@ -70,6 +70,12 @@ class Database:
             Watched(r["conversation_id"], r["title"], r["last_state"], r["chat_id"]) for r in rows
         ]
 
+    def is_watched(self, conversation_id: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM watched WHERE conversation_id=?", (conversation_id,)
+        ).fetchone()
+        return row is not None
+
     def set_last_state(self, conversation_id: str, state: str) -> None:
         self._conn.execute(
             "UPDATE watched SET last_state=? WHERE conversation_id=?", (state, conversation_id)

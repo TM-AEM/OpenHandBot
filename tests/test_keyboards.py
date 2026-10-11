@@ -9,6 +9,29 @@ def test_main_menu_has_two_buttons():
     cbs = _callbacks(kb.main_menu())
     assert "list:0" in cbs
     assert "newchat" in cbs
+    assert "watched:0" in cbs
+
+
+def test_conversation_actions_shows_watch_toggle():
+    assert "watch:c1" in _callbacks(kb.conversation_actions("c1", watched=False))
+    assert "unwatch:c1" in _callbacks(kb.conversation_actions("c1", watched=True))
+
+
+def test_watches_menu_lists_open_and_unwatch():
+    from bot.db import Watched
+
+    items = [Watched("c1", "شات", "running")]
+    cbs = _callbacks(kb.watches_menu(items, 0, has_more=False))
+    assert "open:c1" in cbs
+    assert "unwatch:c1" in cbs
+
+
+def test_watches_menu_pagination():
+    from bot.db import Watched
+
+    cbs = _callbacks(kb.watches_menu([Watched("c1", "شات", "running")], 2, has_more=True))
+    assert "watched:1" in cbs
+    assert "watched:3" in cbs
 
 
 def test_conversations_menu_uses_page_number_for_more():

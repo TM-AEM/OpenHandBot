@@ -44,6 +44,15 @@ def test_add_watched_is_idempotent(tmp_path):
     assert db.list_watched()[0].title == "b"
 
 
+def test_is_watched(tmp_path):
+    db = make_db(tmp_path)
+    assert db.is_watched("c1") is False
+    db.add_watched("c1")
+    assert db.is_watched("c1") is True
+    db.remove_watched("c1")
+    assert db.is_watched("c1") is False
+
+
 def test_add_watched_stores_chat_id(tmp_path):
     db = make_db(tmp_path)
     db.add_watched("c1", "عنوان", chat_id=555)

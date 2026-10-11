@@ -15,12 +15,43 @@ STATUS = "الحالة"
 FILES = "الملفات"
 COST = "التكلفة"
 EXPORT = "تصدير"
+WATCHES = "متابعاتي"
+WATCH = "تابع"
+UNWATCH = "إلغاء"
 
 
 def main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(MY_CHATS, callback_data="list:0"), InlineKeyboardButton(NEW_CHAT, callback_data="newchat")]]
+        [
+            [
+                InlineKeyboardButton(MY_CHATS, callback_data="list:0"),
+                InlineKeyboardButton(NEW_CHAT, callback_data="newchat"),
+            ],
+            [InlineKeyboardButton(WATCHES, callback_data="watched:0")],
+        ]
     )
+
+
+def watches_menu(items: list, page: int, has_more: bool) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for w in items:
+        title = (w.title or "بدون عنوان")[:32]
+        label = f"{title} — {state_label(w.last_state)}"
+        rows.append(
+            [
+                InlineKeyboardButton(label, callback_data=f"open:{w.conversation_id}"),
+                InlineKeyboardButton(UNWATCH, callback_data=f"unwatch:{w.conversation_id}"),
+            ]
+        )
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("السابق", callback_data=f"watched:{page - 1}"))
+    if has_more:
+        nav.append(InlineKeyboardButton(MORE, callback_data=f"watched:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(BACK, callback_data="menu")])
+    return InlineKeyboardMarkup(rows)
 
 
 def conversations_menu(items: list[dict], page: int, has_more: bool) -> InlineKeyboardMarkup:
@@ -40,7 +71,12 @@ def conversations_menu(items: list[dict], page: int, has_more: bool) -> InlineKe
     return InlineKeyboardMarkup(rows)
 
 
-def conversation_actions(conversation_id: str) -> InlineKeyboardMarkup:
+def conversation_actions(conversation_id: str, watched: bool = False) -> InlineKeyboardMarkup:
+    toggle = (
+        InlineKeyboardButton("إلغاء المتابعة", callback_data=f"unwatch:{conversation_id}")
+        if watched
+        else InlineKeyboardButton(WATCH, callback_data=f"watch:{conversation_id}")
+    )
     return InlineKeyboardMarkup(
         [
             [
@@ -52,7 +88,7 @@ def conversation_actions(conversation_id: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(FILES, callback_data=f"files:{conversation_id}:0"),
                 InlineKeyboardButton(COST, callback_data=f"cost:{conversation_id}"),
             ],
-            [InlineKeyboardButton(EXPORT, callback_data=f"export:{conversation_id}")],
+            [InlineKeyboardButton(EXPORT, callback_data=f"export:{conversation_id}"), toggle],
             [InlineKeyboardButton(BACK, callback_data="list:0")],
         ]
     )

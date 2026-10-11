@@ -135,9 +135,66 @@ async def open_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     except ApiError as exc:
         await q.edit_message_text(str(exc))
         return
+    watched = context.bot_data["db"].is_watched(conversation_id)
     text = format_conversation(conv, reply)
-    markup = kb.conversation_actions(conversation_id)
+    markup = kb.conversation_actions(conversation_id, watched)
     await _edit_or_send(q, text, q.message.chat_id, context.bot, reply_markup=markup)
+
+
+async def list_watches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    if not _allowed(update, context.bot_data["config"]):
+        return
+    page = int(q.data.split(":", 1)[1])
+    items = context.bot_data["db"].list_watched()
+    if not items:
+        await _safe_edit(q, "مفيش شاتات متابَعة.", reply_markup=kb.main_menu())
+        return
+    start = page * PAGE_SIZE
+    chunk = items[start : start + PAGE_SIZE]
+    if not chunk:
+        page, start = 0, 0
+        chunk = items[:PAGE_SIZE]
+    has_more = len(items) > start + PAGE_SIZE
+    await _safe_edit(
+        q,
+        f"متابعاتي (صفحة {page + 1}) — {len(items)} شات:",
+        reply_markup=kb.watches_menu(chunk, page, has_more),
+    )
+
+
+async def watch_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    if not _allowed(update, context.bot_data["config"]):
+        return
+    conversation_id = q.data.split(":", 1)[1]
+    client = context.bot_data["client"]
+    db = context.bot_data["db"]
+    try:
+        conv = await _conversation(client, conversation_id)
+    except ApiError as exc:
+        await _safe_edit(q, str(exc))
+        return
+    if not conv:
+        await _safe_edit(q, "الشات مش موجود.")
+        return
+    db.add_watched(conversation_id, conv.get("title", ""), q.message.chat_id)
+    db.set_last_state(conversation_id, conv.get("execution_status") or "")
+    await _safe_edit(
+        q, "تمام، الشات اتضاف للمتابعة ✅", reply_markup=kb.conversation_actions(conversation_id, True)
+    )
+
+
+async def unwatch_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    if not _allowed(update, context.bot_data["config"]):
+        return
+    conversation_id = q.data.split(":", 1)[1]
+    context.bot_data["db"].remove_watched(conversation_id)
+    await _safe_edit(q, "تمام، اتشال من المتابعة.")
 
 
 async def show_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

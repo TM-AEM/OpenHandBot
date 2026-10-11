@@ -237,3 +237,34 @@ def test_export_sends_zip(tmp_path):
     update = _cb_update(1, "export:c1")
     asyncio.run(h.export_conversation(update, ctx))
     assert len(ctx.bot.documents) == 1
+
+
+def test_list_watches_empty(tmp_path):
+    ctx = _ctx_with(tmp_path, DetailClient(None))
+    update = _cb_update(1, "watched:0")
+    asyncio.run(h.list_watches(update, ctx))
+    assert "مفيش" in update.callback_query.edits[-1]
+
+
+def test_list_watches_shows_items(tmp_path):
+    ctx = _ctx_with(tmp_path, DetailClient(None))
+    ctx.bot_data["db"].add_watched("c1", "شات", chat_id=99)
+    update = _cb_update(1, "watched:0")
+    asyncio.run(h.list_watches(update, ctx))
+    assert "متابعاتي" in update.callback_query.edits[-1]
+
+
+def test_watch_conversation_adds_to_db(tmp_path):
+    ctx = _ctx_with(tmp_path, DetailClient({"id": "c1", "title": "شات", "execution_status": "running"}))
+    update = _cb_update(1, "watch:c1")
+    asyncio.run(h.watch_conversation(update, ctx))
+    assert ctx.bot_data["db"].is_watched("c1")
+    assert ctx.bot_data["db"].list_watched()[0].chat_id == 99
+
+
+def test_unwatch_conversation_removes(tmp_path):
+    ctx = _ctx_with(tmp_path, DetailClient(None))
+    ctx.bot_data["db"].add_watched("c1")
+    update = _cb_update(1, "unwatch:c1")
+    asyncio.run(h.unwatch_conversation(update, ctx))
+    assert not ctx.bot_data["db"].is_watched("c1")
