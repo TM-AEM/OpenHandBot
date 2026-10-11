@@ -19,9 +19,9 @@ PAGE_SIZE = 10
 REPOS_PAGE_SIZE = 8
 
 
-def _allowed(update: Update, allowed_id: int) -> bool:
+def _allowed(update: Update, config) -> bool:
     user = update.effective_user
-    return bool(user and user.id == allowed_id)
+    return bool(user and config.is_allowed(user.id))
 
 
 class _MessageAdapter:
@@ -45,7 +45,7 @@ async def _safe_edit(query, text: str, **kwargs) -> None:
 
 async def _guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     cfg = context.bot_data["config"]
-    if not _allowed(update, cfg.allowed_telegram_id):
+    if not _allowed(update, cfg):
         log.info("تجاهل رسالة من مستخدم غير مسموح: %s", update.effective_user and update.effective_user.id)
         return False
     return True
@@ -64,7 +64,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
-    if not _allowed(update, context.bot_data["config"].allowed_telegram_id):
+    if not _allowed(update, context.bot_data["config"]):
         return
     await q.edit_message_text("أهلاً 👋 اختار من الأزرار:", reply_markup=kb.main_menu())
 
@@ -72,7 +72,7 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def list_conversations(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
-    if not _allowed(update, context.bot_data["config"].allowed_telegram_id):
+    if not _allowed(update, context.bot_data["config"]):
         return
     cursor = q.data.split(":", 1)[1]
     page_id = None if cursor == "first" else cursor
@@ -99,7 +99,7 @@ async def list_conversations(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def open_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
-    if not _allowed(update, context.bot_data["config"].allowed_telegram_id):
+    if not _allowed(update, context.bot_data["config"]):
         return
     conversation_id = q.data.split(":", 1)[1]
     client = context.bot_data["client"]
@@ -125,7 +125,7 @@ async def open_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def reply_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
-    if not _allowed(update, context.bot_data["config"].allowed_telegram_id):
+    if not _allowed(update, context.bot_data["config"]):
         return
     conversation_id = q.data.split(":", 1)[1]
     db = context.bot_data["db"]
@@ -213,7 +213,7 @@ async def _wait_running(client, conversation_id: str, interval: float, timeout: 
 async def start_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
-    if not _allowed(update, context.bot_data["config"].allowed_telegram_id):
+    if not _allowed(update, context.bot_data["config"]):
         return
     await _show_repos(q, context, page=0, query="")
 
@@ -221,7 +221,7 @@ async def start_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def repos_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
-    if not _allowed(update, context.bot_data["config"].allowed_telegram_id):
+    if not _allowed(update, context.bot_data["config"]):
         return
     _, page, query = (q.data.split(":", 2) + [""])[:3]
     await _show_repos(q, context, page=int(page), query=query)
@@ -230,7 +230,7 @@ async def repos_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def repo_search_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
-    if not _allowed(update, context.bot_data["config"].allowed_telegram_id):
+    if not _allowed(update, context.bot_data["config"]):
         return
     context.bot_data["db"].set_awaiting(update.effective_user.id, "", "reposearch")
     await _safe_edit(q, "ابعت كلمة للبحث في المستودعات.")
@@ -256,7 +256,7 @@ async def _show_repos(q, context: ContextTypes.DEFAULT_TYPE, page: int, query: s
 async def pick_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
-    if not _allowed(update, context.bot_data["config"].allowed_telegram_id):
+    if not _allowed(update, context.bot_data["config"]):
         return
     repo = q.data.split(":", 1)[1]
     context.bot_data["db"].set_awaiting(update.effective_user.id, repo, "newchat")

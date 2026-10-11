@@ -28,7 +28,7 @@ python main.py
 | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | توكن البوت من @BotFather |
 | `OPENHANDS_API_KEY` | من Settings → API Keys → Create API Key |
-| `ALLOWED_TELEGRAM_ID` | الـ ID الرقمي بتاعك (البوت يرد عليك أنت بس) |
+| `ALLOWED_TELEGRAM_ID` | الـ ID الرقمي بتاعك، أو أكتر من ID مفصولين بفواصل (البوت يرد على دول بس). أول واحد بيستقبل إشعارات المراقب |
 | `OPENHANDS_BASE_URL` | اختياري، الافتراضي `https://app.all-hands.dev` |
 
 ## الاختبار

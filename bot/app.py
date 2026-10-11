@@ -46,7 +46,7 @@ def build_application(config: Config) -> Application:
             client,
             db,
             application.bot,
-            chat_id=config.allowed_telegram_id,
+            chat_id=config.owner_id,
             interval=config.watcher_interval,
         )
         application.bot_data["watcher"] = watcher

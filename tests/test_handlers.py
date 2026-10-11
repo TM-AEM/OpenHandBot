@@ -36,10 +36,20 @@ def make_update(user_id, text="hi"):
     )
 
 
+class FakeConfig:
+    def __init__(self, allowed_id):
+        self.allowed_telegram_ids = frozenset({allowed_id})
+        self.owner_id = allowed_id
+        self.openhands_base_url = "https://app.all-hands.dev"
+
+    def is_allowed(self, user_id):
+        return user_id in self.allowed_telegram_ids
+
+
 def make_context(allowed_id, tmp_path, client=None):
     ctx = SimpleNamespace()
     ctx.bot_data = {
-        "config": SimpleNamespace(allowed_telegram_id=allowed_id, openhands_base_url="https://app.all-hands.dev"),
+        "config": FakeConfig(allowed_id),
         "db": Database(str(tmp_path / "t.sqlite3")),
         "client": client,
     }
