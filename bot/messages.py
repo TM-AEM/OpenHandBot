@@ -40,21 +40,18 @@ def split_message(text: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
 
 
 def format_conversation(conv: dict, reply: str | None) -> str:
+    """نص خام (مش HTML). اللي بيعرضه لازم يهرّبه بـ escape_html."""
     title = conv.get("title") or "بدون عنوان"
     repo = conv.get("selected_repository") or "بدون مستودع"
     state = state_label(conv.get("execution_status"))
-    lines = [
-        f"<b>{_esc(title)}</b>",
-        f"المستودع: {_esc(repo)}",
-        f"الحالة: {state}",
-    ]
+    lines = [title, f"المستودع: {repo}", f"الحالة: {state}"]
     if reply:
         lines.append("")
-        lines.append(_esc(reply))
+        lines.append(reply)
     return "\n".join(lines)
 
 
-def _esc(text: str) -> str:
+def escape_html(text: str) -> str:
     return (
         str(text)
         .replace("&", "&amp;")

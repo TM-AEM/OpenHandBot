@@ -19,12 +19,15 @@ class FakeClient:
 class FakeBot:
     def __init__(self):
         self.sent = []
+        self.chat_ids = []
 
     async def send_message(self, chat_id=None, text=None, parse_mode=None, **kw):
         self.sent.append(text)
+        self.chat_ids.append(chat_id)
 
     async def send_document(self, chat_id=None, document=None, **kw):
         self.sent.append("DOC")
+        self.chat_ids.append(chat_id)
 
 
 def test_finished_triggers_notification_and_removes(tmp_path):
@@ -78,3 +81,28 @@ def test_waiting_for_confirmation_mentions_site(tmp_path):
     asyncio.run(w.tick())
 
     assert "تأكيد" in bot.sent[0]
+
+
+def test_missing_conversation_is_dropped(tmp_path):
+    db = Database(str(tmp_path / "t.sqlite3"))
+    db.add_watched("gone", "اتمسح")
+    client = FakeClient({})  # الشات مش موجود في الـ API
+    bot = FakeBot()
+    w = Watcher(client, db, bot, chat_id=1)
+
+    asyncio.run(w.tick())
+
+    assert bot.sent == []
+    assert db.list_watched() == []
+
+
+def test_notification_goes_to_chat_that_started_it(tmp_path):
+    db = Database(str(tmp_path / "t.sqlite3"))
+    db.add_watched("c1", "عنوان", chat_id=555)
+    client = FakeClient({"c1": {"id": "c1", "title": "عنوان", "execution_status": "finished"}}, reply="تم")
+    bot = FakeBot()
+    w = Watcher(client, db, bot, chat_id=1)  # الافتراضي 1، بس الشات بدأ من 555
+
+    asyncio.run(w.tick())
+
+    assert bot.chat_ids == [555]

@@ -22,9 +22,15 @@ def test_short_message_single_send():
     assert bot.documents == []
 
 
-def test_three_parts_still_messages():
+def test_short_message_is_html_escaped():
     bot = FakeBot()
-    text = "ب" * 5000  # partان
+    asyncio.run(send_long(1, "رد <b>&</b>", bot))
+    assert bot.messages == ["رد &lt;b&gt;&amp;&lt;/b&gt;"]
+
+
+def test_two_parts_still_messages():
+    bot = FakeBot()
+    text = "ب" * 5000  # جزئين
     asyncio.run(send_long(1, text, bot))
     assert bot.documents == []
     assert len(bot.messages) == 2

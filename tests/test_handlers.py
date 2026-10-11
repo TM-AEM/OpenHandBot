@@ -105,3 +105,45 @@ def test_start_owner_gets_menu(tmp_path):
     update = make_update(1)
     asyncio.run(h.start(update, ctx))
     assert len(update.message.replies) == 1
+
+
+class FakeClient:
+    def __init__(self, items):
+        self._items = items
+
+    async def search_conversations(self, limit=20, page_id=None):
+        return {"items": self._items[:limit], "next_page_id": None}
+
+
+def _list_update(user_id, page):
+    msg = FakeMessage()
+    q = FakeQuery()
+    q.data = f"list:{page}"
+    return SimpleNamespace(
+        effective_user=SimpleNamespace(id=user_id),
+        effective_chat=SimpleNamespace(id=99),
+        message=msg,
+        callback_query=q,
+    )
+
+
+def test_list_conversations_paginates_locally(tmp_path):
+    items = [{"id": f"c{i}", "title": f"شات {i}", "execution_status": "running"} for i in range(15)]
+    ctx = make_context(1, tmp_path, client=FakeClient(items))
+
+    update = _list_update(1, 0)
+    asyncio.run(h.list_conversations(update, ctx))
+    first = update.callback_query.edits[-1]
+    assert "صفحة 1" in first
+
+    update = _list_update(1, 1)
+    asyncio.run(h.list_conversations(update, ctx))
+    second = update.callback_query.edits[-1]
+    assert "صفحة 2" in second
+
+
+def test_list_conversations_ignores_non_owner(tmp_path):
+    ctx = make_context(1, tmp_path, client=FakeClient([]))
+    update = _list_update(999, 0)
+    asyncio.run(h.list_conversations(update, ctx))
+    assert update.callback_query.edits == []

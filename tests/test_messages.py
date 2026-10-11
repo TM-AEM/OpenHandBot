@@ -1,4 +1,4 @@
-from bot.messages import format_conversation, split_message, state_label
+from bot.messages import escape_html, format_conversation, split_message, state_label
 
 
 def test_state_labels_arabic():
@@ -25,9 +25,14 @@ def test_split_prefers_newline_boundary():
     assert parts[0] == "a" * 50
 
 
-def test_format_escapes_html():
+def test_format_conversation_is_raw_text():
     conv = {"title": "<b>hack</b>", "selected_repository": "x/y", "execution_status": "running"}
     out = format_conversation(conv, "رد <س>")
-    assert "&lt;b&gt;hack&lt;/b&gt;" in out
+    assert "<b>hack</b>" in out
     assert "شغال" in out
-    assert "&lt;س&gt;" in out
+    assert "رد <س>" in out
+
+
+def test_escape_html_neutralizes_markup():
+    assert escape_html("<b>&</b>") == "&lt;b&gt;&amp;&lt;/b&gt;"
+    assert escape_html("رد <س>") == "رد &lt;س&gt;"

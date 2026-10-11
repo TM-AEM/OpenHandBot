@@ -12,6 +12,7 @@ def test_loads_required_values():
         }
     )
     assert cfg.allowed_telegram_ids == frozenset({123})
+    assert cfg.owner_id == 123
     assert cfg.is_allowed(123)
     assert not cfg.is_allowed(456)
     assert cfg.openhands_base_url == "https://app.all-hands.dev"
@@ -29,6 +30,17 @@ def test_multiple_allowed_ids_and_owner():
     assert cfg.allowed_telegram_ids == frozenset({10, 20, 30})
     assert cfg.owner_id == 10
     assert cfg.is_allowed(20) and cfg.is_allowed(30)
+
+
+def test_owner_is_first_id_in_order_not_smallest():
+    cfg = load_config(
+        {
+            "TELEGRAM_BOT_TOKEN": "t",
+            "OPENHANDS_API_KEY": "k",
+            "ALLOWED_TELEGRAM_ID": "99,5,42",
+        }
+    )
+    assert cfg.owner_id == 99
 
 
 def test_custom_interval_and_db_path():

@@ -45,5 +45,11 @@
 - ترجّع `{"items":[...]}`، كل عنصر فيه `full_name`، `main_branch`، `is_public`.
 - 16 مستودع لـ `TM-AEM`.
 
+## ترقيم الصفحات (اتأكد live)
+- الترتيب الخام لـ `app-conversations/search` **مش** بالـ `created_at` ولا الـ `updated_at`.
+- فالترقيم لازم يكون client-side: نجيب لحد 100 عنصر (أقصى `limit`) مرة واحدة، نرتّبهم إحنا، وبعدين نقسّمهم.
+- ترتيب كل صفحة لوحدها مع الـ cursor من الـ API بيكسر التسلسل (تكرار/فقد عناصر).
+
 ## مرجع
 - https://docs.openhands.dev/openhands/usage/cloud/cloud-api.md
+- مواصفات OpenAPI: `GET https://app.all-hands.dev/openapi.json` (v1.68.1 وقت الفحص).

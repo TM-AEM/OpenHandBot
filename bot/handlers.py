@@ -10,7 +10,7 @@ from telegram.ext import ContextTypes
 
 from . import keyboards as kb
 from .errors import ApiError
-from .messages import format_conversation
+from .messages import escape_html, format_conversation
 from .sender import send_long
 
 log = logging.getLogger(__name__)
@@ -34,13 +34,29 @@ class _MessageAdapter:
         await self._message.edit_text(text, **kwargs)
 
 
-async def _safe_edit(query, text: str, **kwargs) -> None:
-    """يرجّع True لو اتعدّلت الرسالة، وFalse لو مفيش تغيير."""
+async def _safe_edit(query, text: str, **kwargs) -> bool:
+    """يرجّع True لو اتعدّلت الرسالة، وFalse لو مفيش تغيير (زر تحديث)."""
     try:
         await query.edit_message_text(text, **kwargs)
-    except Exception as exc:  # noqa: BLE001 - "Message is not modified" شائع مع زر تحديث
+        return True
+    except Exception as exc:  # noqa: BLE001
         if "not modified" not in str(exc).lower():
             raise
+        return False
+
+
+async def _edit_or_send(query, text: str, chat_id: int, bot, **kwargs) -> None:
+    """يعدّل الرسالة الحالية؛ ولو طويلة عليها يبعتها مقسّمة من جديد."""
+    try:
+        await query.edit_message_text(escape_html(text), parse_mode=ParseMode.HTML, **kwargs)
+    except Exception as exc:  # noqa: BLE001
+        message = str(exc).lower()
+        if "not modified" in message:
+            return
+        if "too long" in message:
+            await send_long(chat_id, text, bot)
+            return
+        raise
 
 
 async def _guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -74,25 +90,29 @@ async def list_conversations(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await q.answer()
     if not _allowed(update, context.bot_data["config"]):
         return
-    cursor = q.data.split(":", 1)[1]
-    page_id = None if cursor == "first" else cursor
+    page = int(q.data.split(":", 1)[1])
     client = context.bot_data["client"]
-    page = 0 if page_id is None else 1
+    # نجيب لحد 100 شات مرة واحدة ونرتّبهم إحنا، عشان الترتيب الخام من الـ API
+    # مش مضمون وبيكسر الترقيم لو رتّبنا كل صفحة لوحدها.
     try:
-        result = await client.search_conversations(limit=PAGE_SIZE + 1, page_id=page_id)
+        result = await client.search_conversations(limit=100)
     except ApiError as exc:
         await _safe_edit(q, str(exc))
         return
     items = result["items"]
-    has_more = len(items) > PAGE_SIZE
-    items = items[:PAGE_SIZE]
     if not items:
         await _safe_edit(q, "ما فيهاش شاتات.", reply_markup=kb.main_menu())
         return
+    start = page * PAGE_SIZE
+    chunk = items[start : start + PAGE_SIZE]
+    if not chunk:
+        page, start = 0, 0
+        chunk = items[:PAGE_SIZE]
+    has_more = len(items) > start + PAGE_SIZE
     await _safe_edit(
         q,
         f"آخر الشاتات (صفحة {page + 1}):",
-        reply_markup=kb.conversations_menu(items, result.get("next_page_id"), has_more),
+        reply_markup=kb.conversations_menu(chunk, page, has_more),
     )
 
 
@@ -114,12 +134,8 @@ async def open_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await q.edit_message_text(str(exc))
         return
     text = format_conversation(conv, reply)
-    try:
-        await q.edit_message_text(
-            text, parse_mode=ParseMode.HTML, reply_markup=kb.conversation_actions(conversation_id)
-        )
-    except Exception:  # noqa: BLE001 - التقسيم للرسايل الطويلة
-        await send_long(q.message.chat_id, text, context.bot)
+    markup = kb.conversation_actions(conversation_id)
+    await _edit_or_send(q, text, q.message.chat_id, context.bot, reply_markup=markup)
 
 
 async def reply_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -187,7 +203,7 @@ async def _deliver_prompt(context: ContextTypes.DEFAULT_TYPE, chat_id: int, conv
 
         await client.send_message(conversation_id, text)
         await bot.send_message(chat_id=chat_id, text="اتبعت ✅ الشات اتضاف للمتابعة.")
-        db.add_watched(conversation_id, conv.get("title", ""))
+        db.add_watched(conversation_id, conv.get("title", ""), chat_id)
         db.set_last_state(conversation_id, "running")
     except ApiError as exc:
         await bot.send_message(chat_id=chat_id, text=f"فشل الإرسال: {exc}")
@@ -281,7 +297,7 @@ async def _create_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int, repo: s
             chat_id=chat_id,
             text=f"بدأ الشات ✅\n{context.bot_data['config'].openhands_base_url}/canvas/conversations/{conversation_id}",
         )
-        db.add_watched(conversation_id, repo or "")
+        db.add_watched(conversation_id, repo or "", chat_id)
         db.set_last_state(conversation_id, "running")
     except ApiError as exc:
         await bot.send_message(chat_id=chat_id, text=f"فشل بدء الشات: {exc}")

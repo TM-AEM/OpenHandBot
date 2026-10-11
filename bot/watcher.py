@@ -16,7 +16,7 @@ class Watcher:
         self._client = client
         self._db = db
         self._bot = bot
-        self._chat_id = chat_id
+        self._default_chat_id = chat_id
         self._interval = interval
         self._task: asyncio.Task | None = None
 
@@ -55,22 +55,25 @@ class Watcher:
         for w in watched:
             conv = convs.get(w.conversation_id)
             if not conv:
+                # الشات اتمسح من OpenHands، مفيش فايدة نفضل نراقبه للأبد.
+                log.info("إزالة شات مش موجود من المتابعة: %s", w.conversation_id)
+                self._db.remove_watched(w.conversation_id)
                 continue
             state = conv.get("execution_status")
             if state in DONE_STATES and w.last_state not in DONE_STATES:
-                await self._notify(w.conversation_id, conv, state)
+                await self._notify(w, conv, state)
                 self._db.remove_watched(w.conversation_id)
             else:
                 self._db.set_last_state(w.conversation_id, state or "")
 
-    async def _notify(self, conversation_id: str, conv: dict, state: str) -> None:
+    async def _notify(self, w, conv: dict, state: str) -> None:
         title = conv.get("title") or "بدون عنوان"
         header = f"انتهى الشات: {title}\nالحالة: {state_label(state)}"
         if state == "waiting_for_confirmation":
             header += "\nالشات مستني تأكيدك، افتح الموقع للمتابعة."
         try:
-            reply = await self._client.get_last_reply(conversation_id)
+            reply = await self._client.get_last_reply(w.conversation_id)
         except ApiError:
             reply = None
         text = header + ("\n\n" + reply if reply else "")
-        await send_long(self._chat_id, text, self._bot)
+        await send_long(w.chat_id or self._default_chat_id, text, self._bot)
