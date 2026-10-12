@@ -81,6 +81,7 @@ class Watcher:
                 await self._handle_missing(w)
                 continue
             self._misses.pop(w.conversation_id, None)
+            self._refresh_title(w, conv)
             state = conv.get("execution_status")
             try:
                 if parse_timestamp(w.submitted_at) is not None:
@@ -95,6 +96,15 @@ class Watcher:
                 log.error(
                     "خطأ غير متوقع في متابعة الشات %s (%s)", w.conversation_id, type(exc).__name__
                 )
+
+    def _refresh_title(self, w, conv: dict) -> None:
+        """يخزّن العنوان الطازج للشات المتابَع (لو اتغيّر). معزول: أي خطأ ما يوقفش الدورة."""
+        try:
+            self._db.update_watched_title(w.conversation_id, conv.get("title") or "")
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "تعذّر تحديث عنوان الشات %s (%s)", w.conversation_id, type(exc).__name__
+            )
 
     async def _handle_missing(self, w) -> None:
         """شات مش ظاهر في الرد: ممكن يكون عطل مؤقت، فنستنى كذا دورة ثم نبلّغ صراحةً."""

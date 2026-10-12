@@ -11,6 +11,7 @@ from telegram.ext import ContextTypes
 from . import keyboards as kb
 from . import outbox
 from .errors import ApiError, error_text
+from .file_cache import FileCache
 from .messages import escape_html, format_conversation, format_cost, pr_url, state_label
 from .sender import send_long
 
@@ -71,6 +72,11 @@ async def _edit_or_send(query, text: str, chat_id: int, bot, **kwargs) -> None:
             return True
         log.warning("فشل عرض الشات (%s)", type(exc).__name__)
         return False
+
+
+def _file_cache(context: ContextTypes.DEFAULT_TYPE) -> FileCache:
+    """ذاكرة الملفات المؤقتة المحدودة (LRU) من bot_data (بتتعمل مرة واحدة)."""
+    return context.bot_data.setdefault("file_cache", FileCache())
 
 
 async def _guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -297,8 +303,17 @@ async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await q.answer()
     if not _allowed(update, context.bot_data["config"]):
         return
-    _, conversation_id, page_raw = q.data.split(":", 2)
-    page = int(page_raw)
+    parts = q.data.split(":")
+    if len(parts) < 2:
+        await _safe_edit(q, _FILES_EXPIRED)
+        return
+    conversation_id = parts[1]
+    # أزرار قديمة (بدون gen) أو صفحة مش رقم ⇒ نتجاهلها بأمان برسالة ودّية.
+    try:
+        page = int(parts[-1])
+    except ValueError:
+        await _safe_edit(q, _FILES_EXPIRED)
+        return
     client = context.bot_data["client"]
     try:
         files = await client.list_files(conversation_id)
@@ -309,14 +324,15 @@ async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await _safe_edit(q, "ما فيهاش ملفات.", reply_markup=kb.conversation_actions(conversation_id))
         return
     # نخزّن القايمة عشان الـ callback data (حد 64 بايت) ما يشيلش المسار الكامل.
-    context.bot_data.setdefault("file_cache", {})[conversation_id] = files
+    # ذاكرة مؤقتة محدودة (LRU) مع نسخة لكل شات: أي زر قديم (نسخة أقدم/اتشال) بيرجّع «مش موجود».
+    gen = _file_cache(context).put(conversation_id, files)
     start = page * FILES_PAGE_SIZE
     chunk = files[start : start + FILES_PAGE_SIZE]
     has_more = len(files) > start + FILES_PAGE_SIZE
     await _safe_edit(
         q,
         f"ملفات الشات (صفحة {page + 1}):",
-        reply_markup=kb.files_menu(conversation_id, chunk, start, page, has_more),
+        reply_markup=kb.files_menu(conversation_id, chunk, start, page, has_more, gen),
     )
 
 
@@ -325,11 +341,21 @@ async def show_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await q.answer()
     if not _allowed(update, context.bot_data["config"]):
         return
-    _, conversation_id, index_raw = q.data.split(":", 2)
-    files = context.bot_data.get("file_cache", {}).get(conversation_id) or []
-    index = int(index_raw)
+    try:
+        _, conversation_id, gen_raw, index_raw = q.data.split(":", 3)
+        gen, index = int(gen_raw), int(index_raw)
+    except ValueError:
+        await _safe_edit(q, _FILES_EXPIRED)
+        return
+    # النسخة والاتشاف لازم يطابقوا الحالة الحالية للذاكرة: أي زر قديم (نسخة أقدم)، أو
+    # ملف اتشال/اتغير، أو شات مش موجود ⇒ «مش موجود» من غير أي كشف لمحتوى الشات.
+    found = _file_cache(context).get(conversation_id, gen)
+    if found is None:
+        await _safe_edit(q, _FILE_MISSING)
+        return
+    files, _ = found
     if index >= len(files):
-        await _safe_edit(q, "الملف مش موجود، افتح قايمة الملفات تاني.")
+        await _safe_edit(q, _FILE_MISSING)
         return
     path = files[index]
     client = context.bot_data["client"]
@@ -414,7 +440,8 @@ async def _send_prompt(
     db = context.bot_data["db"]
     chat_id = update.effective_chat.id
     # نسجّل 'pending' قبل ما نبدأ أي إرسال، عشان البرومت مايضيعش لو العملية اتقطعت.
-    db.add_outbox(conversation_id, chat_id, text, outbox.now_iso())
+    # القرار 2: لو فيه برومت لنفس الوجهة اتسجّل خلال 1.5 ثانية، بيتجمّع معاه في سجل واحد.
+    db.add_or_group_outbox(conversation_id, chat_id, text, outbox.now_iso())
     # تأكيد الحفظ بيذكر الشات المستهدف (القرار 1) عشان رسالة ماتروحش لشات غلط من غير ما تلاحظ.
     ack = "وصل ✅" if not title else f"وصل ✅ ← «{title[:40]}»"
     await update.message.reply_text(ack)
@@ -451,6 +478,8 @@ async def start_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 _NAV_EXPIRED = "القايمة دي انتهت، افتح «شات جديد» من القائمة تاني."
+_FILES_EXPIRED = "قايمة الملفات دي قديمة، افتح «الملفات» من الشات تاني."
+_FILE_MISSING = "الملف مش موجود، افتح قايمة الملفات تاني."
 
 
 def _repo_nav(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> dict:

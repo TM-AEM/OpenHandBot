@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+from . import features
 from .messages import state_label
 
 CALLBACK_DATA_LIMIT = 64  # حد تيليجرام بالبايت
@@ -31,15 +32,16 @@ CANCEL_ROUTE = "إلغاء التوجيه"
 
 
 def main_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
+    rows: list[list[InlineKeyboardButton]] = [
         [
-            [
-                _btn(MY_CHATS, callback_data="list:0"),
-                _btn(NEW_CHAT, callback_data="newchat"),
-            ],
-            [_btn(WATCHES, callback_data="watched:0")],
+            _btn(MY_CHATS, callback_data="list:0"),
+            _btn(NEW_CHAT, callback_data="newchat"),
         ]
-    )
+    ]
+    # القرار 4: زر «متابعاتي» (إدارة يدوية للمتابعات) مخفي مؤقتًا مع باقي الميزات المؤجّلة.
+    if not features.is_hidden("followups"):
+        rows.append([_btn(WATCHES, callback_data="watched:0")])
+    return InlineKeyboardMarkup(rows)
 
 
 def watches_menu(items: list, page: int, has_more: bool) -> InlineKeyboardMarkup:
@@ -82,41 +84,57 @@ def conversations_menu(items: list[dict], page: int, has_more: bool) -> InlineKe
 
 
 def conversation_actions(conversation_id: str, watched: bool = False) -> InlineKeyboardMarkup:
+    # الميزات المؤجّلة (القرار 4): الملفات/التكلفة/التصدير مخفية، وزر المتابعة اليدوية
+    # (تابع/إلغاء المتابعة) مخفي مع «متابعاتي». الأزرار الأساسية (رد/تحديث/رجوع/إلغاء
+    # التوجيه) بتفضل ظاهرة.
     toggle = (
         _btn("إلغاء المتابعة", callback_data=f"unwatch:{conversation_id}")
         if watched
         else _btn(WATCH, callback_data=f"watch:{conversation_id}")
     )
-    return InlineKeyboardMarkup(
+    rows: list[list[InlineKeyboardButton]] = [
         [
-            [
-                _btn(REPLY, callback_data=f"reply:{conversation_id}"),
-                _btn(REFRESH, callback_data=f"open:{conversation_id}"),
-            ],
-            [
-                _btn(STATUS, callback_data=f"status:{conversation_id}"),
-                _btn(FILES, callback_data=f"files:{conversation_id}:0"),
-                _btn(COST, callback_data=f"cost:{conversation_id}"),
-            ],
-            [_btn(EXPORT, callback_data=f"export:{conversation_id}"), toggle],
-            [
-                _btn(BACK, callback_data="list:0"),
-                _btn(CANCEL_ROUTE, callback_data="cancelroute"),
-            ],
+            _btn(REPLY, callback_data=f"reply:{conversation_id}"),
+            _btn(REFRESH, callback_data=f"open:{conversation_id}"),
+        ],
+    ]
+    extra: list[InlineKeyboardButton] = []
+    if not features.is_hidden("files"):
+        extra.append(_btn(FILES, callback_data=f"files:{conversation_id}:0"))
+    if not features.is_hidden("cost"):
+        extra.append(_btn(COST, callback_data=f"cost:{conversation_id}"))
+    if extra:
+        rows.append([_btn(STATUS, callback_data=f"status:{conversation_id}"), *extra])
+    else:
+        rows.append([_btn(STATUS, callback_data=f"status:{conversation_id}")])
+    if not features.is_hidden("export") and not features.is_hidden("followups"):
+        rows.append([_btn(EXPORT, callback_data=f"export:{conversation_id}"), toggle])
+    elif not features.is_hidden("export"):
+        rows.append([_btn(EXPORT, callback_data=f"export:{conversation_id}")])
+    elif not features.is_hidden("followups"):
+        rows.append([toggle])
+    rows.append(
+        [
+            _btn(BACK, callback_data="list:0"),
+            _btn(CANCEL_ROUTE, callback_data="cancelroute"),
         ]
     )
+    return InlineKeyboardMarkup(rows)
 
 
-def files_menu(conversation_id: str, files: list[str], start: int, page: int, has_more: bool) -> InlineKeyboardMarkup:
-    # callback data بحد 64 بايت، فبنستخدم رقم الملف مش مساره الكامل.
+def files_menu(
+    conversation_id: str, files: list[str], start: int, page: int, has_more: bool, gen: int
+) -> InlineKeyboardMarkup:
+    # callback data بحد 64 بايت، فبنستخدم رقم النسخة ورقم الملف مش مساره الكامل.
+    # gen بيربط الزرار بالنسخة الحالية للذاكرة، فزرار من تحديث أقدم بيتجاهل بأمان.
     rows: list[list[InlineKeyboardButton]] = []
     for offset, name in enumerate(files):
-        rows.append([_btn(name[:60], callback_data=f"file:{conversation_id}:{start + offset}")])
+        rows.append([_btn(name[:60], callback_data=f"file:{conversation_id}:{gen}:{start + offset}")])
     nav: list[InlineKeyboardButton] = []
     if page > 0:
-        nav.append(_btn("السابق", callback_data=f"files:{conversation_id}:{page - 1}"))
+        nav.append(_btn("السابق", callback_data=f"files:{conversation_id}:{gen}:{page - 1}"))
     if has_more:
-        nav.append(_btn(MORE, callback_data=f"files:{conversation_id}:{page + 1}"))
+        nav.append(_btn(MORE, callback_data=f"files:{conversation_id}:{gen}:{page + 1}"))
     if nav:
         rows.append(nav)
     rows.append([_btn(BACK, callback_data=f"open:{conversation_id}")])

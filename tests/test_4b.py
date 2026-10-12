@@ -259,7 +259,7 @@ def test_conversation_menus_stay_within_limit_for_uuid_ids():
     for markup in (
         kb.conversation_actions(cid, True),
         kb.conversation_actions(cid, False),
-        kb.files_menu(cid, ["a.py"] * 10, start=990, page=99, has_more=True),
+        kb.files_menu(cid, ["a.py"] * 10, start=990, page=99, has_more=True, gen=123456789),
     ):
         assert all(len(cb.encode("utf-8")) <= 64 for cb in callbacks(markup))
 
@@ -386,7 +386,11 @@ def test_route_is_sticky_refreshes_and_shows_chat_name(tmp_path):
     u2 = make_update(1, "تاني")
     asyncio.run(h.handle_text(u2, ctx))
 
-    assert [i.conversation_id for i in db.list_outbox_by_status("pending")] == ["conv-A", "conv-A"]
+    # القرار 2: الرسالتين خلال 1.5 ثانية بتتجمّعوا في سجل واحد لنفس الوجهة.
+    items = db.list_outbox_by_status("pending")
+    assert len(items) == 1
+    assert items[0].conversation_id == "conv-A"
+    assert items[0].text == "أول\nتاني"  # الترتيب والمحتوى محفوظين
     assert "مشروع الموقع" in u1.message.replies[0]  # اسم الشات المستهدف ظاهر
     assert db.get_awaiting(1) == ("conv-A", "route")  # لسه شغال (اتجدّد وقته)
 
@@ -491,8 +495,12 @@ def test_concurrent_messages_on_route_all_reach_the_same_chat(tmp_path):
         await asyncio.gather(*(h.handle_text(u, ctx) for u in updates))
 
     asyncio.run(go())
-    assert {i.conversation_id for i in db.list_outbox_by_status("pending")} == {"A"}
-    assert db.count_outbox("pending") == 10
+    items = db.list_outbox_by_status("pending")
+    # القرار 2 + القرار 1: كل الرسايل بتتجمّع في سجل واحد لنفس الوجهة (مفيش توجيه غلط).
+    assert {i.conversation_id for i in items} == {"A"}
+    assert len(items) == 1
+    # كل الرسايل موجودة بالترتيب (مفيش نص ضايع).
+    assert items[0].text.split("\n") == [f"m{i}" for i in range(10)]
 
 
 # =====================================================================

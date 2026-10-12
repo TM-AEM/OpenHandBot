@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import logging
 
-from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -12,7 +11,7 @@ from telegram.ext import (
     filters,
 )
 
-from . import handlers
+from . import features, handlers
 from .config import Config
 from .db import Database
 from .openhands_client import OpenHandsClient
@@ -43,23 +42,33 @@ def build_application(config: Config) -> Application:
     app.add_handler(CallbackQueryHandler(handlers.show_menu, pattern=r"^menu$"))
     app.add_handler(CallbackQueryHandler(handlers.cancel_route_button, pattern=r"^cancelroute$"))
     app.add_handler(CallbackQueryHandler(handlers.list_conversations, pattern=r"^list:"))
-    app.add_handler(CallbackQueryHandler(handlers.list_watches, pattern=r"^watched:"))
-    app.add_handler(CallbackQueryHandler(handlers.watch_conversation, pattern=r"^watch:"))
-    app.add_handler(CallbackQueryHandler(handlers.unwatch_conversation, pattern=r"^unwatch:"))
     app.add_handler(CallbackQueryHandler(handlers.open_conversation, pattern=r"^open:"))
     app.add_handler(CallbackQueryHandler(handlers.show_status, pattern=r"^status:"))
-    app.add_handler(CallbackQueryHandler(handlers.show_cost, pattern=r"^cost:"))
-    app.add_handler(CallbackQueryHandler(handlers.export_conversation, pattern=r"^export:"))
-    app.add_handler(CallbackQueryHandler(handlers.list_files, pattern=r"^files:"))
-    app.add_handler(CallbackQueryHandler(handlers.show_file, pattern=r"^file:"))
     app.add_handler(CallbackQueryHandler(handlers.reply_prompt, pattern=r"^reply:"))
     app.add_handler(CallbackQueryHandler(handlers.start_new_chat, pattern=r"^newchat$"))
     app.add_handler(CallbackQueryHandler(handlers.repos_page, pattern=r"^repos:"))
     app.add_handler(CallbackQueryHandler(handlers.repo_search_prompt, pattern=r"^reposearch$"))
     app.add_handler(CallbackQueryHandler(handlers.pick_repo, pattern=r"^pickrepo:"))
+    # القرار 4: الميزات المؤجّلة (الملفات/التصدير/التكلفة/إدارة المتابعات) مش بتتسجّل،
+    # فحتى أي callback قديم مستني مش هيوصل لأي handler (نقاط الدخول مخفية). الكود والبيانات
+    # لسه موجودين (مش بنحذف حاجة) — بس مش معروضين للمستخدم.
+    if not features.is_hidden("followups"):
+        app.add_handler(CallbackQueryHandler(handlers.list_watches, pattern=r"^watched:"))
+        app.add_handler(CallbackQueryHandler(handlers.watch_conversation, pattern=r"^watch:"))
+        app.add_handler(CallbackQueryHandler(handlers.unwatch_conversation, pattern=r"^unwatch:"))
+    if not features.is_hidden("cost"):
+        app.add_handler(CallbackQueryHandler(handlers.show_cost, pattern=r"^cost:"))
+    if not features.is_hidden("export"):
+        app.add_handler(CallbackQueryHandler(handlers.export_conversation, pattern=r"^export:"))
+    if not features.is_hidden("files"):
+        app.add_handler(CallbackQueryHandler(handlers.list_files, pattern=r"^files:"))
+        app.add_handler(CallbackQueryHandler(handlers.show_file, pattern=r"^file:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.handle_text))
 
     async def _post_init(application: Application) -> None:
+        # 0) صيانة تشغيل آمنة: فحص سريع للتكامل + تحسين + checkpoint للـ WAL.
+        #    لو القاعدة تالفة بنسجّل تحذير واضح بس البوت يفضل شغّال (ما بيرميش).
+        db.run_startup_maintenance()
         # 1) تعافي الصندوق (يحوّل 'sending'/'starting' المتروك لـ 'unknown') قبل أي معالجة.
         await handlers.outbox_recover(application)
         await handlers.creation_recover(application)
@@ -98,6 +107,11 @@ def build_application(config: Config) -> Application:
         if watcher:
             await watcher.stop()
         await client.aclose()
+        # إغلاق نظيف: نرجّع بيانات WAL للقاعدة الرئيسية ونقصّر الـ WAL.
+        try:
+            db.checkpoint()
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).warning("checkpoint عند الإغلاق اتخطّى (%s)", type(exc).__name__)
         db.close()
 
     app.post_init = _post_init

@@ -258,10 +258,14 @@ def _message_text(event: dict) -> str:
 
 
 def _detail(resp: httpx.Response) -> str:
+    """تفاصيل آمنة للخطأ: حقل `detail` من جسم JSON بس (موثّق ومحدود).
+
+    أي جسم مش JSON (HTML/proxy/غير متوقع) مايتعرضش خالص — ممكن يحتوي تفاصيل حساسة.
+    """
     try:
         data = resp.json()
     except ValueError:
-        return resp.text[:300]
-    if isinstance(data, dict):
-        return str(data.get("detail", data))[:300]
-    return str(data)[:300]
+        return ""
+    if isinstance(data, dict) and "detail" in data:
+        return str(data["detail"])[:300]
+    return ""

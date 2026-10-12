@@ -178,7 +178,7 @@ def test_cancellation_during_post_is_unknown(tmp_path):
 
 
 # ------------------------------------------------------------ retry policy
-def test_safe_pre_post_failure_is_retried_after_backoff(tmp_path):
+def test_safe_pre_post_failure_is_retried_after_backoff(tmp_path, monkeypatch):
     db = make_db(tmp_path)
     add_pending(db)
 
@@ -191,6 +191,9 @@ def test_safe_pre_post_failure_is_retried_after_backoff(tmp_path):
     assert db.get_outbox(1).status == "pending"  # آمن يتعاود
     assert worker._consecutive_failures == 1
     assert worker._next_delay() > worker._poll_interval  # backoff
+
+    # نعدّي نافذة التجميع (القرار 2): السجل بقى ناضج ⇒ الـ worker يحجزه فورًا.
+    monkeypatch.setattr("bot.outbox.grouping_mature_before", lambda *a, **k: "9999-12-31T23:59:59+00:00")
 
     # لما ينجح، الـ backoff يتصفّر.
     worker._client = Client()

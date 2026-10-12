@@ -1,9 +1,12 @@
 """قاعدة بيانات SQLite لحفظ الشاتات المتابَعة وحالة الحوار وصندوق الصادر."""
 from __future__ import annotations
 
+import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+
+log = logging.getLogger(__name__)
 
 # حالات صندوق الصادر (outbox) — كل انتقال مع سلوك التعافي بعد إعادة التشغيل:
 #   pending  : اتسجّل بثبات ولسه ماتحاولش الإرسال. آمن يتعاود بعد restart.
@@ -43,6 +46,11 @@ CREATION_DISCARDED = "discarded"
 
 # مهلة أي حالة توجيه (من آخر نشاط). القرار 1: توجيه 10 دقايق.
 AWAITING_TTL = timedelta(minutes=10)
+
+
+# نافذة تجميع الرسايل المتتالية (القرار 2): أي رسالة جاية خلال 1.5 ثانية من آخر تحديث
+# لبرومت لسه 'pending' لنفس الوجهة بتتجمّع معاه في سجل واحد (مش إرسال منفصل).
+GROUP_WINDOW = timedelta(seconds=1.5)
 
 
 def _parse_iso(value: str | None) -> datetime | None:
@@ -222,6 +230,30 @@ class Database:
         )
         self._conn.commit()
 
+    def update_watched_title(self, conversation_id: str, title: str) -> bool:
+        """يحدّث عنوان شات متابَع (القرار: المراقب بيخزّن العنوان الطازج).
+
+        - تحديث السجل المطابق بس.
+        - مفيش كتابة لو العنوان مش موجود/فاضي أو ما اتغيّرش (مفيش كتابات زيادة).
+        - مفيش كتابة لو السجل مش موجود (اتشال/اتمسح) — ما بنعملش صف جديد.
+        بيرجّع True لو فيه كتابة فعليّة، وFalse غير كده.
+        """
+        title = (title or "").strip()
+        if not title:
+            return False
+        row = self._conn.execute(
+            "SELECT title FROM watched WHERE conversation_id=?", (conversation_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        if (row["title"] or "").strip() == title:
+            return False
+        self._conn.execute(
+            "UPDATE watched SET title=? WHERE conversation_id=?", (title, conversation_id)
+        )
+        self._conn.commit()
+        return True
+
     # -------------------------------------------------------------- user state
     # حالة توجيه الرسالة الجاية. كل حالة ليها وقت (awaiting_at) وتنتهي بعد AWAITING_TTL.
     #   reply / newchat / reposearch : لمرة واحدة (بتتستهلك أول رسالة).
@@ -326,6 +358,58 @@ class Database:
         self._conn.commit()
         return int(cur.lastrowid)
 
+    def add_or_group_outbox(
+        self,
+        conversation_id: str,
+        chat_id: int,
+        text: str,
+        now: str,
+        window: timedelta | None = None,
+    ) -> int:
+        """تجميع (القرار 2): لو فيه برومت 'pending' لنفس الوجهة اتحدّث خلال `window`،
+
+        نضيف النص عليه بدل ما نعمل سجل جديد. غير كده نسجّل سجل 'pending' جديد.
+
+        الوجهة = (conversation_id, chat_id). العملية كلها جوه BEGIN IMMEDIATE عشان
+        رسالتين متزامنتين مايعملوش سجلين منفصلين لنفس الدفعة. بنرجّع id السجل.
+        """
+        window = window if window is not None else GROUP_WINDOW
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT id, text, updated_at FROM outbox "
+                "WHERE conversation_id=? AND chat_id=? AND status=? ORDER BY id DESC LIMIT 1",
+                (conversation_id, chat_id, OUTBOX_PENDING),
+            ).fetchone()
+            now_dt = _parse_iso(now)
+            row_dt = _parse_iso(row["updated_at"]) if row else None
+            within = (
+                row is not None
+                and now_dt is not None
+                and row_dt is not None
+                and now_dt - row_dt <= window
+            )
+            if within:
+                merged = row["text"] + "\n" + text
+                conn.execute(
+                    "UPDATE outbox SET text=?, updated_at=? WHERE id=?",
+                    (merged, now, row["id"]),
+                )
+                out_id = int(row["id"])
+            else:
+                cur = conn.execute(
+                    "INSERT INTO outbox(conversation_id, chat_id, text, status, created_at, updated_at) "
+                    "VALUES(?, ?, ?, ?, ?, ?)",
+                    (conversation_id, chat_id, text, OUTBOX_PENDING, now, now),
+                )
+                out_id = int(cur.lastrowid)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return out_id
+
     def set_outbox_status(
         self, outbox_id: int, status: str, now: str, error: str | None = None, bump: bool = False
     ) -> None:
@@ -341,7 +425,7 @@ class Database:
             )
         self._conn.commit()
 
-    def claim_outbox(self, now: str) -> OutboxItem | None:
+    def claim_outbox(self, now: str, mature_before: str | None = None) -> OutboxItem | None:
         """ياخد ذرّياً أقدم عنصر 'pending' ويحوّله 'claimed' (atomic claim).
 
         الـ SELECT والـ UPDATE في جملة واحدة، فمفيش سباق بين اتنين workers/iterations.
@@ -349,15 +433,55 @@ class Database:
         مؤهّل، فمستحيل ناخد نفس السجل مرتين. الـ 'claimed' معناه ملكية ولسه POST
         مابدأش ⇒ لو العملية اتقطعت هنا يتعافى 'pending' (آمن). الـ 'sending' بيتسجّل
         بثبات قبل الـ POST مباشرة (شوف outbox._post_claimed).
+
+        لو `mature_before` اتحدّد، بنحجز بس السجلات اللي updated_at <= mature_before
+        (نافذة تجميع القرار 2: نسيب الدفعة تستقر قبل الإرسال). القيمة None بتحافظ على
+        السلوك القديم (أي 'pending').
         """
-        row = self._conn.execute(
-            "UPDATE outbox SET status=?, updated_at=? "
-            "WHERE id=(SELECT id FROM outbox WHERE status=? ORDER BY id LIMIT 1) "
-            "RETURNING *",
-            (OUTBOX_CLAIMED, now, OUTBOX_PENDING),
-        ).fetchone()
+        if mature_before is None:
+            sql = (
+                "UPDATE outbox SET status=?, updated_at=? "
+                "WHERE id=(SELECT id FROM outbox WHERE status=? ORDER BY id LIMIT 1) "
+                "RETURNING *"
+            )
+            params = (OUTBOX_CLAIMED, now, OUTBOX_PENDING)
+        else:
+            sql = (
+                "UPDATE outbox SET status=?, updated_at=? "
+                "WHERE id=(SELECT id FROM outbox WHERE status=? AND updated_at<=? ORDER BY id LIMIT 1) "
+                "RETURNING *"
+            )
+            params = (OUTBOX_CLAIMED, now, OUTBOX_PENDING, mature_before)
+        row = self._conn.execute(sql, params).fetchone()
         self._conn.commit()
         return self._row_to_outbox(row) if row else None
+
+    def seconds_until_mature(self, now: str, window: timedelta) -> float | None:
+        """كم ثانية فاضلة لحد ما أقدم عنصر 'pending' يستوفي نافذة التجميع؟
+
+        None لو مفيش 'pending' خالص. 0.0 لو أقدم عنصر مستوفي بالفعل (جاهز للحجز).
+        """
+        return self._seconds_until_mature(_parse_iso(now), window)
+
+    def seconds_until_mature_at(self, now_dt: datetime, window: timedelta) -> float | None:
+        """زي `seconds_until_mature` بس بياخد datetime محسوب مقدماً (قراءة ساعة واحدة).
+
+        بنستخدمه في worker التجميع: نفس الطابع الزمني بيتحسب مرة واحدة وبيتمرّر هنا
+        وبيتحجز بيه، فمفيش قراءتين للساعة ممكن يخلّوا التأخير غير متّسق مع حدّ النضج.
+        """
+        return self._seconds_until_mature(now_dt, window)
+
+    def _seconds_until_mature(self, now_dt: datetime | None, window: timedelta) -> float | None:
+        row = self._conn.execute(
+            "SELECT updated_at FROM outbox WHERE status=? ORDER BY updated_at LIMIT 1",
+            (OUTBOX_PENDING,),
+        ).fetchone()
+        if row is None:
+            return None
+        row_dt = _parse_iso(row["updated_at"])
+        if now_dt is None or row_dt is None:
+            return 0.0
+        return max(0.0, (row_dt + window - now_dt).total_seconds())
 
     def oldest_pending_id(self) -> int | None:
         """أقدم عنصر 'pending' (للجدولة الفورية من الـ handlers) أو None."""
@@ -517,3 +641,54 @@ class Database:
 
     def close(self) -> None:
         self._conn.close()
+
+    # -------------------------------------------------------- integrity / upkeep
+    def quick_check(self) -> bool:
+        """فحص سريع للتكامل (PRAGMA quick_check). True = سليم.
+
+        بيرمي sqlite3.DatabaseError لو فيه تلف في القرص/الملف — ما بنسكتش عليه.
+        """
+        row = self._conn.execute("PRAGMA quick_check").fetchone()
+        return bool(row) and row[0] == "ok"
+
+    def integrity_check(self) -> bool:
+        """فحص تكامل كامل (PRAGMA integrity_check). True = سليم."""
+        row = self._conn.execute("PRAGMA integrity_check").fetchone()
+        return bool(row) and row[0] == "ok"
+
+    def optimize(self) -> None:
+        """تحسين دوري: ANALYZE + تفريغ مساحة (incremental vacuum لو مفعّل)."""
+        self._conn.execute("PRAGMA optimize")
+        try:
+            self._conn.execute("PRAGMA incremental_vacuum")
+        except sqlite3.OperationalError:
+            # incremental_vacuum بيتطلب auto_vacuum؛ لو مش مفعّل نتجاهله بهدوء.
+            pass
+        self._conn.commit()
+
+    def checkpoint(self, mode: str = "TRUNCATE") -> None:
+        """يرجّع بيانات WAL لقاعدة البيانات الرئيسية ويقصّر الـ WAL (upkeep آمن)."""
+        self._conn.execute(f"PRAGMA wal_checkpoint({mode})")
+        self._conn.commit()
+
+    def run_startup_maintenance(self) -> bool:
+        """صيانة تشغيل آمنة: فحص سريع ثم تحسين + checkpoint.
+
+        بيرجّع True لو الفحص السريع سليم، وFalse لو القاعدة تالفة (وبيسجّل تحذير).
+        ما بيرميش: أي خطأ فحص/صيانة بيتسجّل بس عشان البوت يشتغل لو القاعدة سليمة.
+        """
+        try:
+            healthy = self.quick_check()
+        except sqlite3.DatabaseError as exc:
+            log.error("فحص قاعدة البيانات فشل (%s)", type(exc).__name__)
+            return False
+        if not healthy:
+            log.error("قاعدة البيانات فحصها فشل (quick_check != ok)")
+            return False
+        try:
+            self.optimize()
+            self.checkpoint()
+        except sqlite3.Error as exc:
+            # الصيانة مش حرجة: القاعدة سليمة، فمنعطّلش البوت عشانها.
+            log.warning("صيانة قاعدة البيانات اتخطّت (%s)", type(exc).__name__)
+        return True

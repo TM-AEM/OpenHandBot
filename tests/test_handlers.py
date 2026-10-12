@@ -7,6 +7,7 @@ import bot.handlers as h
 from bot import outbox
 from bot.db import Database
 from bot.errors import ApiError
+from bot.file_cache import FileCache
 
 
 class FakeMessage:
@@ -293,14 +294,15 @@ def test_list_files_caches_and_paginates(tmp_path):
     ctx = _ctx_with(tmp_path, DetailClient({"id": "c1"}, files=files))
     update = _cb_update(1, "files:c1:0")
     asyncio.run(h.list_files(update, ctx))
-    assert ctx.bot_data["file_cache"]["c1"] == files
+    cached = ctx.bot_data["file_cache"].get("c1")
+    assert cached is not None and cached[0] == files
     assert "صفحة 1" in update.callback_query.edits[-1]
 
 
 def test_show_file_sends_document(tmp_path):
     ctx = _ctx_with(tmp_path, DetailClient({"id": "c1"}, files=["a/b/main.py"], content="hello"))
-    ctx.bot_data["file_cache"] = {"c1": ["a/b/main.py"]}
-    update = _cb_update(1, "file:c1:0")
+    cache = FileCache(); gen = cache.put("c1", ["a/b/main.py"]); ctx.bot_data["file_cache"] = cache
+    update = _cb_update(1, f"file:c1:{gen}:0")
     asyncio.run(h.show_file(update, ctx))
     assert len(ctx.bot.documents) == 1
 

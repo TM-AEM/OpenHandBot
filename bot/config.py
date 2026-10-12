@@ -54,7 +54,11 @@ def _clean(env, name: str, default: str = "") -> str:
 
 
 def _parse_ids(raw: str) -> list[int]:
-    """يرجّع الـ IDs بترتيبهم في النص مع إزالة التكرار."""
+    """يرجّع الـ IDs بترتيبهم في النص (بعد إزالة التكرار).
+
+    القرار 5: مستخدم واحد بس مسموح. لو النص فيه أكتر من ID مختلف، بنرفض بوضوح
+    (من غير ما نطبع القيم نفسها — ممكن تكون أسرار اتلزقت بالغلط).
+    """
     ids: list[int] = []
     for chunk in raw.replace(";", ",").split(","):
         chunk = chunk.strip()
@@ -69,6 +73,11 @@ def _parse_ids(raw: str) -> list[int]:
             raise ConfigError("ALLOWED_TELEGRAM_ID لازم يكون أرقام موجبة")
         if value not in ids:
             ids.append(value)
+    if len(ids) > 1:
+        raise ConfigError(
+            "ALLOWED_TELEGRAM_ID لازم يكون مستخدم واحد بس (القرار 5) — "
+            "شيل الزيادة وسيب ID واحد"
+        )
     return ids
 
 

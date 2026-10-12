@@ -22,28 +22,31 @@ def test_loads_required_values():
     assert cfg.api_base == "https://app.all-hands.dev/api/v1"
 
 
-def test_multiple_allowed_ids_and_owner():
+def test_multiple_allowed_ids_are_rejected():
+    # القرار 5: مستخدم واحد بس. أي أكتر من ID ⇒ رفض واضح (بدون طباعة القيم).
+    with pytest.raises(ConfigError) as exc:
+        load_config(
+            {
+                "TELEGRAM_BOT_TOKEN": TOKEN,
+                "OPENHANDS_API_KEY": KEY,
+                "ALLOWED_TELEGRAM_ID": "10, 20;30",
+            }
+        )
+    assert "مستخدم واحد" in str(exc.value)
+    assert "10" not in str(exc.value) and "20" not in str(exc.value)  # مفيش تسريب قيم
+
+
+def test_duplicate_same_id_is_not_multiple():
+    # تكرار نفس الـ ID (بفواصل/مسافات) مش "أكتر من مستخدم".
     cfg = load_config(
         {
             "TELEGRAM_BOT_TOKEN": TOKEN,
             "OPENHANDS_API_KEY": KEY,
-            "ALLOWED_TELEGRAM_ID": "10, 20;30",
+            "ALLOWED_TELEGRAM_ID": "7, 7;7",
         }
     )
-    assert cfg.allowed_telegram_ids == frozenset({10, 20, 30})
-    assert cfg.owner_id == 10
-    assert cfg.is_allowed(20) and cfg.is_allowed(30)
-
-
-def test_owner_is_first_id_in_order_not_smallest():
-    cfg = load_config(
-        {
-            "TELEGRAM_BOT_TOKEN": TOKEN,
-            "OPENHANDS_API_KEY": KEY,
-            "ALLOWED_TELEGRAM_ID": "99,5,42",
-        }
-    )
-    assert cfg.owner_id == 99
+    assert cfg.allowed_telegram_ids == frozenset({7})
+    assert cfg.owner_id == 7
 
 
 def test_custom_interval_and_db_path():

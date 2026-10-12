@@ -1,13 +1,11 @@
 """U04: استهلاك حالة التوجيه مرة واحدة، تأكيد الحفظ سريع، والتزامن مفعّل."""
 import asyncio
 import time
-from types import SimpleNamespace
 
 import bot.handlers as h
 from bot.app import build_application
 from bot.config import Config
 from bot.db import Database
-from bot.openhands_client import OpenHandsClient
 from bot import outbox
 
 from tests.test_handlers import make_context, make_update

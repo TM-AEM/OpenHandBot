@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from telegram.error import TelegramError
 
+from . import db as db_module
 from .db import (
     CREATION_CLAIMED,
     CREATION_FAILED,
@@ -42,6 +43,26 @@ _UNKNOWN_CREATION_NOTICE = (
 def now_iso() -> str:
     """طابع زمني UTC بترتيب ISO-8601 (بيترتّب نصيّاً صح)."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def _utcnow() -> datetime:
+    """ساعة UTC واحدة؛ بنقراها مرة واحدة في العملية اللي محتاجة طابع زمني متّسق."""
+    return datetime.now(timezone.utc)
+
+
+def _iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat()
+
+
+def grouping_mature_before(window: timedelta | None = None, now: datetime | None = None) -> str:
+    """حدّ النضج: أي برومت updated_at <= النتيجة دي بقى مستوفي نافذة التجميع.
+
+    بنستخدمه في الحجز عشان ما ناخدش دفعة لسه بتتجمع. لو `now` مابيتزوّدش، بنستخدم
+    الساعة الحقيقية. بنقرأ db_module.GROUP_WINDOW وقت النداء (مش كقيمة افتراضية متثبّتة) عشان
+    الاختبارات تقدر تصغّر النافذة بشكل حتمي.
+    """
+    current = now or datetime.now(timezone.utc)
+    return _iso(current - (window if window is not None else db_module.GROUP_WINDOW))
 
 
 async def safe_send(bot, chat_id: int, text: str) -> None:
@@ -238,7 +259,7 @@ class _BaseWorker:
                 did_work = True
             # خمول ⇒ نوم طويل (مفيش استعلامات متكرّرة على صندوق فاضي)؛ شغل ⇒ دورة
             # سريعة/backoff. wake() بيقطع النوم فوراً.
-            await self._sleep(self._next_delay() if did_work else self._max_idle)
+            await self._sleep(self._next_delay() if did_work else self._idle_delay())
 
     def _next_delay(self) -> float:
         # backoff أسّي محدود للفشل الآمن المؤقّت؛ وإلا دورة سريعة عشان نلتقط الجديد.
@@ -246,17 +267,34 @@ class _BaseWorker:
             return min(self._poll_interval * (2 ** self._consecutive_failures), self._max_idle)
         return self._poll_interval
 
+    def _idle_delay(self) -> float:
+        """مدة النوم لما الدورة ملقيتش عمل. الافتراضي: خمول طويل."""
+        return self._max_idle
+
+    def _reschedule_on_wake(self, delay: float) -> float | None:
+        """عند الاستيقاظ من wake() أثناء النوم: هل نعيد الجدولة بمدّة جديدة؟
+
+        الافتراضي None ⇒ ندخل الدورة فوراً. الـ workers اللي محتاجة نوم أدق (تجميع)
+        بترجّع مدّة، والـ loop هيكمل نوم بيها.
+        """
+        return None
+
     async def _sleep(self, delay: float) -> None:
         wake = self._wake
         if wake is None:
             await asyncio.sleep(delay)
             return
-        try:
-            await asyncio.wait_for(wake.wait(), timeout=delay)
-        except asyncio.TimeoutError:
-            pass
-        else:
+        while True:
+            try:
+                await asyncio.wait_for(wake.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                return
+            # اتوقّظنا (عمل جديد). الافتراضي: نرجع ندخل الدورة فوراً.
             wake.clear()
+            reschedule = self._reschedule_on_wake(delay)
+            if reschedule is None:
+                return
+            delay = reschedule
 
     async def _tick(self) -> bool:
         """دورة واحدة: تحجز عنصراً وتعالجه. ما بتنامش (النوم في _run)."""
@@ -287,10 +325,15 @@ class OutboxWorker(_BaseWorker):
 
     - الفشل الآمن المؤقّت (قبل الـ POST أو sandbox مش جاهز) بيدخل pending تاني، فالعنصر
       يفضل مؤهّل وتتطبق عليه الـ backoff. 'unknown'/'failed'/'sent' مش مؤهّلة أصلاً.
+    - القرار 2: ما بيحجزش سجل 'pending' غير لما يستوفي نافذة التجميع (db_module.GROUP_WINDOW)،
+      فكل الرسايل اللي وصلت خلال النافذة بتتجمّع في سجل واحد وبتتبعت مرة واحدة.
     """
 
     def _claim(self):
-        return self._db.claim_outbox(now_iso())  # حجز ذرّي: pending ⇒ claimed
+        # قراءة ساعة واحدة: نفس اللحظة بتحدّد حدّ النضج ووقت الحجز، فمفيش عدم اتّساق
+        # بين حساب التأخير واللحظة اللي بنحجز فيها. حجز ذرّي للناضج (استوفى النافذة).
+        now = _utcnow()
+        return self._db.claim_outbox(_iso(now), mature_before=grouping_mature_before(now=now))
 
     async def _process(self, item) -> None:
         await _post_claimed(self._client, self._db, self._bot, item)
@@ -298,6 +341,39 @@ class OutboxWorker(_BaseWorker):
     def _is_retry_pending(self, item) -> bool:
         after = self._db.get_outbox(item.id)
         return after is not None and after.status == OUTBOX_PENDING
+
+    def _next_delay(self) -> float:
+        # فيه 'pending' لسه في نافذة التجميع ⇒ ننام بالظبط لحد ما يستوفي (بدل لفّ فاضي).
+        # الحالات المؤقّتة (backoff) وأي حالة تانية زي ما هي.
+        if self._consecutive_failures:
+            return super()._next_delay()
+        remaining = self._remaining_until_mature()
+        if remaining is None:
+            return self._poll_interval
+        return min(remaining, self._max_idle)
+
+    def _idle_delay(self) -> float:
+        # مفيش حجز (الدفعة لسه بتتجمّع): ننام لحد ما تستوفي النافذة، مش خمول طويل،
+        # عشان الإرسال يحصل بعد ~1.5 ثانية من آخر رسالة (القرار 2).
+        remaining = self._remaining_until_mature()
+        if remaining is None:
+            return self._max_idle
+        return min(remaining, self._max_idle)
+
+    def _remaining_until_mature(self) -> float | None:
+        """ثواني النوم لحد نضج أقدم 'pending'. None لو مفيش 'pending'.
+
+        قراءة ساعة واحدة بتتمرّر للاستعلام، فمفيش قراءتين ممكن يخلّوا القيمة
+        غير متّسقة مع حدّ النضج اللي بنحجز بيه.
+        """
+        return self._db.seconds_until_mature_at(_utcnow(), db_module.GROUP_WINDOW)
+
+    def _reschedule_on_wake(self, delay: float) -> float | None:
+        # نوم تجميع دقيق: wake() من برومت جديد بتمنع الرجوع الفوري للدورة؛ بنعيد حساب
+        # المدة عشان نستنى آخر نافذة. لو مفيش 'pending' (اتحجز/اتصفّى) نرجع ندخل الدورة.
+        # حتى لو الـ loop اتأخّر، الـ claim بيفلتر بالنضج فالدفعة ما تتجزّاش.
+        fresh = self._remaining_until_mature()
+        return delay if fresh is None else fresh
 
 
 async def _start_conversation(client, db, bot, job, base_url: str) -> None:
