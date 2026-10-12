@@ -495,6 +495,313 @@ def test_concurrent_messages_on_route_all_reach_the_same_chat(tmp_path):
     assert db.count_outbox("pending") == 10
 
 
+# =====================================================================
+# TASK 04B-2 — U40: صمود فتح الشات ضد ردود غير صالحة/تعديل تيليجرام فاشل
+# =====================================================================
+from telegram.error import BadRequest, TelegramError  # noqa: E402
+
+
+class OpenFlowClient:
+    """عميل فتح شات: conversation + آخر رد، مع عدّادات نداءات ومسارات خطأ/تعليق."""
+
+    def __init__(self, conv, reply="رد", *, list_calls=None, open_error=None,
+                 reply_error=None, hang=False):
+        self._conv = conv
+        self._reply = reply
+        self._list_calls = list_calls if list_calls is not None else []
+        self._open_error = open_error
+        self._reply_error = reply_error
+        self._hang = hang
+
+    async def get_conversations(self, ids):
+        self._list_calls.append(list(ids))
+        if self._hang:
+            await asyncio.Event().wait()  # تعليق (اختبار المهلة)
+        if self._open_error:
+            raise self._open_error
+        return [self._conv] if self._conv else []
+
+    async def get_last_reply(self, conversation_id):
+        if self._reply_error:
+            raise self._reply_error
+        return self._reply
+
+
+class FailQuery:
+    """CallbackQuery بيحفظ نداءات التعديل ويرمي خطأ تيليجرام متوقّع."""
+
+    def __init__(self, data, edit_error):
+        self.data = data
+        self.edits = []
+        self.message = SimpleNamespace(chat_id=99)
+        self._edit_error = edit_error
+
+    async def answer(self):
+        pass
+
+    async def edit_message_text(self, text, **kw):
+        self.edits.append(text)
+        raise self._edit_error
+
+
+class RecordingBot:
+    def __init__(self):
+        self.sent = []
+
+    async def send_message(self, chat_id=None, text=None, **kw):
+        self.sent.append(text)
+
+
+def _open_update(q, user_id=1):
+    return SimpleNamespace(
+        effective_user=SimpleNamespace(id=user_id),
+        effective_chat=SimpleNamespace(id=99, type="private"),
+        callback_query=q,
+        message=None,
+    )
+
+
+CONV = {"id": "A", "title": "شات A", "execution_status": "finished", "selected_repository": "o/r"}
+
+
+# 1) فتح ناجح: عرض سليم + توجيه صحيح -----------------------------------------
+def test_open_success_renders_view_and_activates_route(tmp_path):
+    ctx = make_context(1, tmp_path, client=OpenFlowClient(CONV, reply="آخر رد"))
+    q = Q("open:A")
+    asyncio.run(h.open_conversation(cb_update(q), ctx))
+    assert q.edits and "شات A" in q.edits[0] and "آخر رد" in q.edits[0]
+    assert ctx.bot_data["db"].get_awaiting(1) == ("A", "route")
+
+
+# 2) شات مش موجود: رسالة متوقعة + الحفاظ على التوجيه القائم -------------------
+def test_open_missing_returns_message_and_preserves_route(tmp_path):
+    ctx = make_context(1, tmp_path, client=OpenFlowClient(None))
+    db = ctx.bot_data["db"]
+    db.set_awaiting(1, "prev", "route", title="t")
+    q = Q("open:missing")
+    asyncio.run(h.open_conversation(cb_update(q), ctx))
+    assert q.edits == ["الشات مش موجود."]
+    assert db.get_awaiting(1) == ("prev", "route")  # ما اتلمسش
+
+
+# 3) 401/403: فشل آمن بدون تفعيل توجيه غلط -----------------------------------
+@pytest.mark.parametrize("code", [401, 403])
+def test_open_auth_failures_do_not_activate_route(tmp_path, code):
+    err = ApiError(f"auth {code}", code)
+    ctx = make_context(1, tmp_path, client=OpenFlowClient(CONV, open_error=err))
+    db = ctx.bot_data["db"]
+    db.set_awaiting(1, "prev", "route", title="t")
+    q = Q("open:A")
+    asyncio.run(h.open_conversation(cb_update(q), ctx))
+    assert q.edits == [f"auth {code}"]        # رسالة خطأ آمنة واحدة
+    assert db.get_awaiting(1) == ("prev", "route")  # ما اتغيّرش لـ A
+
+
+# 4) 429/5xx/مهلة/انقطاع: بدون إعادة محاولة تلقائية --------------------------
+@pytest.mark.parametrize("exc", [
+    ApiError("too many", 429),
+    ApiError("server", 500),
+    ApiError("gateway", 503),
+    ApiError("انتهى الوقت"),          # مهلة: بدون status
+    ApiError("تعذّر الاتصال"),        # انقطاع: بدون status
+])
+def test_open_transient_errors_do_not_retry_and_preserve_state(tmp_path, exc):
+    calls = []
+    ctx = make_context(1, tmp_path, client=OpenFlowClient(CONV, open_error=exc, list_calls=calls))
+    db = ctx.bot_data["db"]
+    db.set_awaiting(1, "prev", "route", title="t")
+    q = Q("open:A")
+    asyncio.run(h.open_conversation(cb_update(q), ctx))
+    assert len(calls) == 1                     # نداء API واحد بالظبط — مفيش retry
+    assert db.get_awaiting(1) == ("prev", "route")
+    assert db.count_outbox() == 0 and db.list_open_creation_jobs() == []
+
+
+def test_open_timeout_does_not_retry(tmp_path):
+    calls = []
+    ctx = make_context(1, tmp_path, client=OpenFlowClient(CONV, hang=True, list_calls=calls))
+    db = ctx.bot_data["db"]
+    db.set_awaiting(1, "prev", "route", title="t")
+    q = Q("open:A")
+
+    async def go():
+        try:
+            await asyncio.wait_for(h.open_conversation(cb_update(q), ctx), timeout=0.2)
+        except asyncio.TimeoutError:
+            pass
+
+    asyncio.run(go())
+    assert len(calls) == 1                     # نداء واحد، مفيش محاولة تانية
+    assert db.get_awaiting(1) == ("prev", "route")
+
+
+# 5) JSON غير صالح / شكل غير متوقع: فشل مضبوط مش استثناء خام ------------------
+def test_client_invalid_json_raises_apierror():
+    def handler(request):
+        return httpx.Response(200, content=b"<html>not json</html>")
+
+    async def go():
+        client = OpenHandsClient("https://x.test", "k", transport=httpx.MockTransport(handler))
+        try:
+            return await client.get_conversations(["c1"])
+        finally:
+            await client.aclose()
+
+    with pytest.raises(ApiError):
+        asyncio.run(go())
+
+
+def test_client_unexpected_shape_raises_apierror():
+    def handler(request):
+        return httpx.Response(200, json={"unexpected": True})
+
+    async def go():
+        client = OpenHandsClient("https://x.test", "k", transport=httpx.MockTransport(handler))
+        try:
+            return await client.get_conversations(["c1"])
+        finally:
+            await client.aclose()
+
+    with pytest.raises(ApiError):
+        asyncio.run(go())
+
+
+def test_client_non_dict_entries_are_dropped():
+    def handler(request):
+        return httpx.Response(200, json=[None, {"id": "c1", "title": "t"}, "bad"])
+
+    async def go():
+        client = OpenHandsClient("https://x.test", "k", transport=httpx.MockTransport(handler))
+        try:
+            return await client.get_conversations(["c1"])
+        finally:
+            await client.aclose()
+
+    assert asyncio.run(go()) == [{"id": "c1", "title": "t"}]
+
+
+def test_open_malformed_response_shows_controlled_error_no_route(tmp_path):
+    ctx = make_context(1, tmp_path, client=OpenFlowClient(CONV, open_error=ApiError("رد غير متوقع من OpenHands")))
+    db = ctx.bot_data["db"]
+    db.set_awaiting(1, "prev", "route", title="t")
+    q = Q("open:A")
+    asyncio.run(h.open_conversation(cb_update(q), ctx))  # مايرميش JSONDecodeError
+    assert q.edits and "غير متوقع" in q.edits[0]
+    assert db.get_awaiting(1) == ("prev", "route")
+
+
+# 6) فشل تعديل تيليجرام متوقّع: مفيش انهيار في الـ callback --------------------
+def test_open_edit_failure_is_handled_without_crash(tmp_path):
+    ctx = make_context(1, tmp_path, client=OpenFlowClient(CONV))
+    ctx.bot = RecordingBot()
+    q = FailQuery("open:A", BadRequest("Message is not modified"))
+    asyncio.run(h.open_conversation(_open_update(q), ctx))  # مايرميش
+    assert ctx.bot_data["db"].get_awaiting(1) == ("A", "route")  # العرض موجود => التوجيه اتفعّل
+
+
+def test_open_edit_expired_message_is_handled_without_crash(tmp_path):
+    ctx = make_context(1, tmp_path, client=OpenFlowClient(CONV))
+    ctx.bot = RecordingBot()
+    db = ctx.bot_data["db"]
+    db.set_awaiting(1, "prev", "route", title="t")
+    q = FailQuery("open:A", BadRequest("message to edit not found"))
+    asyncio.run(h.open_conversation(_open_update(q), ctx))  # مايرميش
+    assert db.get_awaiting(1) == ("prev", "route")  # العرض فشل => مفيش توجيه جديد
+
+
+# 7) فشل العرض ما يسبش توجيه غير مقصود ---------------------------------------
+def test_open_render_failure_leaves_no_route(tmp_path):
+    ctx = make_context(1, tmp_path, client=OpenFlowClient(CONV))
+    ctx.bot = RecordingBot()
+    q = FailQuery("open:A", TelegramError("boom secret-token-xyz"))
+    asyncio.run(h.open_conversation(_open_update(q), ctx))
+    assert ctx.bot_data["db"].get_awaiting(1) == (None, None)  # مفيش توجيه جديد
+
+
+# 8) الفشل ما بيلمسش watched/outbox/creation ---------------------------------
+def test_open_failure_preserves_watched_and_does_not_touch_jobs(tmp_path):
+    ctx = make_context(1, tmp_path, client=OpenFlowClient(CONV, open_error=ApiError("server", 500)))
+    db = ctx.bot_data["db"]
+    db.add_watched("w1", "عنوان", chat_id=99)
+    db.set_last_state("w1", "running")
+    before = [(w.conversation_id, w.last_state, w.chat_id) for w in db.list_watched()]
+    oid = db.add_outbox("c1", 99, "نص", "2026-01-01T00:00:00+00:00")
+    job = db.add_creation_job(99, "o/r", "نص", "2026-01-01T00:00:00+00:00")
+
+    q = Q("open:A")
+    asyncio.run(h.open_conversation(cb_update(q), ctx))
+
+    after = [(w.conversation_id, w.last_state, w.chat_id) for w in db.list_watched()]
+    assert after == before                                   # المتابعة زي ما هي
+    assert db.get_outbox(oid).status == "pending"            # مفيش تغيير
+    assert db.get_creation_job(job).status == "pending"      # مفيش تغيير
+    assert db.get_awaiting(1) == (None, None)
+
+
+# =====================================================================
+# TASK 04B-2R — فروع open_conversation الطرفية: فشل تعديل تيليجرام المتوقّع
+# =====================================================================
+def test_open_missing_edit_failure_is_handled(tmp_path):
+    # شات مش موجود + تعديل الرسالة فشل (رسالة قديمة/مش قابلة للتعديل): مفيش انهيار.
+    ctx = make_context(1, tmp_path, client=OpenFlowClient(None))
+    db = ctx.bot_data["db"]
+    db.set_awaiting(1, "prev", "route", title="t")
+    q = FailQuery("open:missing", BadRequest("message to edit not found"))
+    asyncio.run(h.open_conversation(_open_update(q), ctx))  # مايرميش
+    assert q.edits == ["الشات مش موجود."]        # الرسالة اتجرّبت فعلاً
+    assert db.get_awaiting(1) == ("prev", "route")  # التوجيه القائم ما اتلمسش
+
+
+def test_open_api_error_edit_failure_is_handled(tmp_path):
+    # خطأ API (5xx) + تعديل رسالة الخطأ فشل: مفيش انهيار ولا توجيه جديد.
+    ctx = make_context(1, tmp_path, client=OpenFlowClient(CONV, open_error=ApiError("server", 500)))
+    db = ctx.bot_data["db"]
+    db.set_awaiting(1, "prev", "route", title="t")
+    q = FailQuery("open:A", BadRequest("message to edit not found"))
+    asyncio.run(h.open_conversation(_open_update(q), ctx))  # مايرميش
+    assert q.edits == ["server"]                 # رسالة الخطأ الآمنة اتجرّبت
+    assert db.get_awaiting(1) == ("prev", "route")  # ما اتغيّرش لـ A
+
+
+def test_open_missing_not_modified_is_handled(tmp_path):
+    # شات مش موجود + "message is not modified": نتيجة حميدة، مفيش توجيه.
+    ctx = make_context(1, tmp_path, client=OpenFlowClient(None))
+    db = ctx.bot_data["db"]
+    db.set_awaiting(1, "prev", "route", title="t")
+    q = FailQuery("open:missing", BadRequest("Message is not modified"))
+    asyncio.run(h.open_conversation(_open_update(q), ctx))  # مايرميش
+    assert db.get_awaiting(1) == ("prev", "route")
+
+
+def test_open_api_error_not_modified_is_handled(tmp_path):
+    ctx = make_context(1, tmp_path, client=OpenFlowClient(CONV, open_error=ApiError("x", 500)))
+    db = ctx.bot_data["db"]
+    db.set_awaiting(1, "prev", "route", title="t")
+    q = FailQuery("open:A", BadRequest("Message is not modified"))
+    asyncio.run(h.open_conversation(_open_update(q), ctx))  # مايرميش
+    assert db.get_awaiting(1) == ("prev", "route")
+
+
+def test_open_api_error_edit_failure_preserves_all_state(tmp_path):
+    # فشل تعديل على مسار خطأ الـ API: التوجيه + المتابعة + الصندوق + الإنشاء ما بيتغيّروش.
+    ctx = make_context(1, tmp_path, client=OpenFlowClient(CONV, open_error=ApiError("server", 500)))
+    db = ctx.bot_data["db"]
+    db.set_awaiting(1, "prev", "route", title="t")
+    db.add_watched("w1", "عنوان", chat_id=99)
+    db.set_last_state("w1", "running")
+    before = [(w.conversation_id, w.last_state, w.chat_id) for w in db.list_watched()]
+    oid = db.add_outbox("c1", 99, "نص", "2026-01-01T00:00:00+00:00")
+    job = db.add_creation_job(99, "o/r", "نص", "2026-01-01T00:00:00+00:00")
+
+    q = FailQuery("open:A", BadRequest("message to edit not found"))
+    asyncio.run(h.open_conversation(_open_update(q), ctx))  # مايرميش
+
+    assert db.get_awaiting(1) == ("prev", "route")
+    assert [(w.conversation_id, w.last_state, w.chat_id) for w in db.list_watched()] == before
+    assert db.get_outbox(oid).status == "pending"
+    assert db.get_creation_job(job).status == "pending"
+
+
 def test_conversation_actions_has_cancel_route_button():
     assert "cancelroute" in callbacks(kb.conversation_actions("c1"))
 

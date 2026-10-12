@@ -52,17 +52,25 @@ async def _safe_edit(query, text: str, **kwargs) -> bool:
 
 
 async def _edit_or_send(query, text: str, chat_id: int, bot, **kwargs) -> None:
-    """يعدّل الرسالة الحالية؛ ولو طويلة عليها يبعتها مقسّمة من جديد."""
+    """يعدّل الرسالة الحالية؛ ولو طويلة عليها يبعتها مقسّمة من جديد.
+
+    بيرجّع True لو اتعرض العرض فعلاً (اتعدّلت الرسالة أو اتبعتت من جديد)، وFalse لو
+    فشل العرض (خطأ تيليجرام زي رسالة قديمة/مش قابلة للتعديل). الفشل بيتسجّل بنوعه بس
+    (من غير نص الاستثناء، ممكن يحتوي أسرار) عشان ما يتخفيش — بس ما يوقّفش معالج الـ
+    callback. اللي بينده لازم ياخد باله من القيمة الراجعة قبل أي تغيير في الحالة.
+    """
     try:
         await query.edit_message_text(escape_html(text), parse_mode=ParseMode.HTML, **kwargs)
+        return True
     except Exception as exc:  # noqa: BLE001
         message = str(exc).lower()
         if "not modified" in message:
-            return
+            return True  # العرض نفسه موجود بالفعل — مش فشل
         if "too long" in message:
             await send_long(chat_id, text, bot)
-            return
-        raise
+            return True
+        log.warning("فشل عرض الشات (%s)", type(exc).__name__)
+        return False
 
 
 async def _guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -140,20 +148,25 @@ async def open_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     try:
         convs = await client.get_conversations([conversation_id])
         if not convs:
-            await q.edit_message_text("الشات مش موجود.")
+            # رسالة "مش موجود" بتتعدّل بالمسار المتسامح: فشل تعديل متوقّع (رسالة قديمة/
+            # مش قابلة للتعديل) ما يوقّفش الـ callback، وما بيفعّلش أي توجيه.
+            await _edit_or_send(q, "الشات مش موجود.", q.message.chat_id, context.bot)
             return
         conv = convs[0]
         reply = await client.get_last_reply(conversation_id)
     except ApiError as exc:
-        await q.edit_message_text(error_text(exc))
+        # نفس المسار المتسامح لرسالة الخطأ: مفيش توجيه جديد ولا انهيار في الـ callback.
+        await _edit_or_send(q, error_text(exc), q.message.chat_id, context.bot)
         return
     db = context.bot_data["db"]
     watched = db.is_watched(conversation_id)
-    # القرار 1: بعد فتح الشات، رسايلك الجاية بتتوجّه له 10 دقايق من آخر نشاط (مع زر إلغاء).
-    db.set_awaiting(update.effective_user.id, conversation_id, "route", title=conv.get("title") or "")
     text = format_conversation(conv, reply) + "\n\n✉️ رسايلك الجاية هتتبعت للشات ده (10 دقايق من آخر نشاط). للإلغاء: زر إلغاء التوجيه أو /cancel."
     markup = kb.conversation_actions(conversation_id, watched)
-    await _edit_or_send(q, text, q.message.chat_id, context.bot, reply_markup=markup)
+    # القرار 1: بعد فتح الشات، رسايلك الجاية بتتوجّه له 10 دقايق من آخر نشاط (مع زر إلغاء).
+    # بنفعّل التوجيه بس بعد ما العرض يظهر فعلاً، عشان فشل العرض ما يسبش توجيه مفعّل من غير
+    # ما تشوف الشات (وما نلمسش أي توجيه قائم لو الفتح فشل).
+    if await _edit_or_send(q, text, q.message.chat_id, context.bot, reply_markup=markup):
+        db.set_awaiting(update.effective_user.id, conversation_id, "route", title=conv.get("title") or "")
 
 
 async def list_watches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

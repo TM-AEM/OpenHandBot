@@ -51,7 +51,7 @@ class OpenHandsClient:
 
     async def _get(self, url: str, params: Any = None) -> Any:
         resp = await self._request("GET", url, params=params)
-        return resp.json()
+        return _decode_json(resp)
 
     # -------------------------------------------------------- conversations
     async def search_conversations(self, limit: int = SEARCH_LIMIT, page_id: str | None = None) -> dict:
@@ -70,8 +70,15 @@ class OpenHandsClient:
             return []
         params = [("ids", cid) for cid in ids]
         data = await self._get("/app-conversations", params=params)
-        items = data if isinstance(data, list) else data.get("items", [])
-        return [it for it in items if it]
+        # الموثّق: مصفوفة (عناصرها ممكن تكون null). لو الشكل غير متوقع ما نفسّرش قايمة
+        # فاضية كأن مفيش شات — نرمي خطأ API آمن عشان المستخدم مايتخدعش.
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict) and isinstance(data.get("items"), list):
+            items = data["items"]
+        else:
+            raise ApiError("رد غير متوقع من OpenHands")
+        return [it for it in items if isinstance(it, dict)]
 
     async def search_events(
         self,
@@ -194,6 +201,18 @@ class OpenHandsClient:
         data = await self._get("/git/repositories/search", params=params)
         items = data.get("items", data) if isinstance(data, dict) else data
         return [r for r in items if r]
+
+
+def _decode_json(resp: httpx.Response) -> Any:
+    """يفك جسم الرد كـ JSON، وأي جسم مش JSON يتحوّل لخطأ API آمن (مفيش JSONDecodeError خام).
+
+    بيعيد استخدام نفس قواعد الـ API: خطأ بدون status_code (غامض)، ورسالة ثابتة مفيهاش
+    أي جسم رد أو أسرار.
+    """
+    try:
+        return resp.json()
+    except ValueError as exc:
+        raise ApiError("رد غير متوقع من OpenHands") from exc
 
 
 def parse_timestamp(value: Any) -> datetime | None:
