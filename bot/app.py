@@ -16,6 +16,7 @@ from . import handlers
 from .config import Config
 from .db import Database
 from .openhands_client import OpenHandsClient
+from .outbox import CreationWorker, OutboxWorker
 from .watcher import Watcher
 
 log = logging.getLogger(__name__)
@@ -31,6 +32,10 @@ def build_application(config: Config) -> Application:
     app.bot_data["db"] = db
 
     app.add_handler(CommandHandler("start", handlers.start))
+    app.add_handler(CommandHandler("outbox", handlers.outbox_list))
+    app.add_handler(CommandHandler("outbox_status", handlers.outbox_status))
+    app.add_handler(CommandHandler("outbox_discard", handlers.outbox_discard))
+    app.add_handler(CommandHandler("outbox_mark_sent", handlers.outbox_mark_sent))
     app.add_handler(CallbackQueryHandler(handlers.show_menu, pattern=r"^menu$"))
     app.add_handler(CallbackQueryHandler(handlers.list_conversations, pattern=r"^list:"))
     app.add_handler(CallbackQueryHandler(handlers.list_watches, pattern=r"^watched:"))
@@ -50,6 +55,22 @@ def build_application(config: Config) -> Application:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.handle_text))
 
     async def _post_init(application: Application) -> None:
+        # 1) تعافي الصندوق (يحوّل 'sending'/'starting' المتروك لـ 'unknown') قبل أي معالجة.
+        await handlers.outbox_recover(application)
+        await handlers.creation_recover(application)
+        # 2) worker واحد مالك لكل جدول — يبدأوا بعد ما التعافي يخلص (عشان مايعالجوش
+        #    سجل 'sending'/'starting' قبل ما يتحوّل 'unknown'). الحرس ده يمنع worker
+        #    تاني لو اتنادت _post_init تاني (إعادة تهيئة مكرّرة).
+        if application.bot_data.get("outbox_worker") is None:
+            outbox_worker = OutboxWorker(client, db, application.bot)
+            application.bot_data["outbox_worker"] = outbox_worker
+            outbox_worker.start()
+        if application.bot_data.get("creation_worker") is None:
+            creation_worker = CreationWorker(
+                client, db, application.bot, config.openhands_base_url
+            )
+            application.bot_data["creation_worker"] = creation_worker
+            creation_worker.start()
         watcher = Watcher(
             client,
             db,
@@ -61,6 +82,12 @@ def build_application(config: Config) -> Application:
         watcher.start()
 
     async def _post_shutdown(application: Application) -> None:
+        outbox_worker: OutboxWorker | None = application.bot_data.get("outbox_worker")
+        if outbox_worker:
+            await outbox_worker.stop()
+        creation_worker: CreationWorker | None = application.bot_data.get("creation_worker")
+        if creation_worker:
+            await creation_worker.stop()
         watcher: Watcher | None = application.bot_data.get("watcher")
         if watcher:
             await watcher.stop()

@@ -1,7 +1,6 @@
 """أوامر تيليجرام وأزرارها. كل الرسايل عربي، والمستخدم المالك بس يترد عليه."""
 from __future__ import annotations
 
-import asyncio
 import io
 import logging
 
@@ -10,6 +9,7 @@ from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
 from . import keyboards as kb
+from . import outbox
 from .errors import ApiError
 from .messages import escape_html, format_conversation, format_cost, pr_url, state_label
 from .sender import send_long
@@ -353,55 +353,35 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def _send_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, conversation_id: str, text: str) -> None:
-    """يرد 'وصل' فوراً (أقل من ثانية) والإرسال الفعلي في الخلفية."""
+    """يسجّل البرومت في الصندوق (بثبات) قبل أي إرسال، ويرد 'وصل' فوراً."""
     if not text.strip():
         return
-    await update.message.reply_text("وصل ✅")
-    asyncio.create_task(
-        _deliver_prompt(context, update.effective_chat.id, conversation_id, text)
-    )
-
-
-async def _deliver_prompt(context: ContextTypes.DEFAULT_TYPE, chat_id: int, conversation_id: str, text: str) -> None:
-    client = context.bot_data["client"]
     db = context.bot_data["db"]
-    bot = context.bot
-    try:
-        conv = await _conversation(client, conversation_id)
-        sandbox_id = conv.get("sandbox_id")
-        status = str(conv.get("sandbox_status", "")).upper()
+    chat_id = update.effective_chat.id
+    # نسجّل 'pending' قبل ما نبدأ أي إرسال، عشان البرومت مايضيعش لو العملية اتقطعت.
+    db.add_outbox(conversation_id, chat_id, text, outbox.now_iso())
+    await update.message.reply_text("وصل ✅")
+    worker = context.bot_data.get("outbox_worker")
+    if worker is not None:
+        # worker واحد مالك؛ بنوقّظه بدل ما نعمل task جديد لكل برومت.
+        worker.wake()
 
-        if status != "RUNNING" and sandbox_id:
-            await client.resume_sandbox(sandbox_id)
-            status = await _wait_running(client, conversation_id, interval=3.0, timeout=120.0)
 
-        if status != "RUNNING":
-            await bot.send_message(chat_id=chat_id, text="الـ sandbox مش قادر يشتغل، جرّب تفتح الشات من الموقع.")
-            return
+async def _deliver_outbox(client, db, bot, outbox_id: int) -> None:
+    await outbox.deliver_outbox(client, db, bot, outbox_id)
 
-        await client.send_message(conversation_id, text)
-        await bot.send_message(chat_id=chat_id, text="اتبعت ✅ الشات اتضاف للمتابعة.")
-        db.add_watched(conversation_id, conv.get("title", ""), chat_id)
-        db.set_last_state(conversation_id, "running")
-    except ApiError as exc:
-        await bot.send_message(chat_id=chat_id, text=f"فشل الإرسال: {exc}")
+
+async def outbox_recover(app) -> None:
+    await outbox.outbox_recover(app)
+
+
+async def creation_recover(app) -> None:
+    await outbox.creation_recover(app)
 
 
 async def _conversation(client, conversation_id: str) -> dict:
     convs = await client.get_conversations([conversation_id])
     return convs[0] if convs else {}
-
-
-async def _wait_running(client, conversation_id: str, interval: float, timeout: float) -> str:
-    loop = asyncio.get_event_loop()
-    deadline = loop.time() + timeout
-    while loop.time() < deadline:
-        await asyncio.sleep(interval)
-        conv = await _conversation(client, conversation_id)
-        status = str(conv.get("sandbox_status", "")).upper()
-        if status == "RUNNING":
-            return status
-    return "UNKNOWN"
 
 
 async def start_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -460,22 +440,228 @@ async def pick_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def _start_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, repo: str | None, text: str) -> None:
     if not text.strip():
         return
+    db = context.bot_data["db"]
+    chat_id = update.effective_chat.id
+    # نسجّل طلب الشات الجديد (بثبات) قبل أي POST بدء، عشان مايضيعش لو العملية اتقطعت.
+    db.add_creation_job(chat_id, repo, text, outbox.now_iso())
     await update.message.reply_text("وصل ✅ جاري بدء شات جديد.")
-    asyncio.create_task(_create_chat(context, update.effective_chat.id, repo, text))
+    worker = context.bot_data.get("creation_worker")
+    if worker is not None:
+        worker.wake()
 
 
 async def _create_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int, repo: str | None, text: str) -> None:
+    """مسار متزامن مباشر (للاستخدام من الاختبارات): يسجّل job وينفّذه فوراً."""
     client = context.bot_data["client"]
     db = context.bot_data["db"]
     bot = context.bot
-    try:
-        task_id = await client.start_conversation(text, repo)
-        conversation_id = await client.wait_for_start(task_id)
-        await bot.send_message(
-            chat_id=chat_id,
-            text=f"بدأ الشات ✅\n{context.bot_data['config'].openhands_base_url}/canvas/conversations/{conversation_id}",
+    job_id = db.add_creation_job(chat_id, repo, text, outbox.now_iso())
+    job = db.get_creation_job(job_id)
+    await outbox._start_conversation(
+        client, db, bot, job, context.bot_data["config"].openhands_base_url
+    )
+
+
+# ------------------------------------------------ manual outbox reconciliation
+# أوامر المالك فقط لمراجعة/حل سجلات الصندوق الغامضة. كلها بتمر بـ _guard أولاً.
+#
+# مرجع السجل لازم يحدّد النوع صراحةً: "prompt:<id>" أو "creation:<id>". السبب إن
+# جدولي outbox و creation_jobs معرّفاتهم الرقمية ممكن تتقاطع (1 في الاتنين)، فمرجع
+# رقمي مجرّد كان يقدر يختار السجل الغلط. المرجع لازم يحل لجدول واحد وسجل واحد بس،
+# وأي مرجع ناقص/غير صالح/غامض بيفشل مقفول (fail closed) من غير أي تغيير في الحالة.
+_TERMINAL_OUTBOX = {"sent", "failed", "discarded"}
+_TERMINAL_CREATION = {"done", "failed", "discarded"}
+
+_REF_TYPES = {
+    "prompt": ("outbox", "برومت"),
+    "creation": ("creation", "طلب شات"),
+}
+
+
+def _safe_ts(value: str | None) -> str:
+    """طابع زمني آمن للعرض (تاريخ + ساعة بدون كسور، وبدون أي بيانات حساسة)."""
+    if not value:
+        return "?"
+    text = str(value).replace("T", " ")
+    return text[:16]
+
+
+def _parse_ref(token: str | None) -> tuple[str, int] | None:
+    """يحلّل مرجع "<type>:<id>" لـ (نوع، معرّف). None لو ناقص/غير صالح/غامض.
+
+    - النوع لازم يكون بالضبط "prompt" أو "creation" (بدون اختلاف حالة).
+    - المعرّف لازم صحيح موجب.
+    - أي مرجع رقمي مجرّد (بدون نوع) مرفوض عشان مايختارش جدول بالغلط.
+    """
+    if not token:
+        return None
+    raw = token.strip()
+    if ":" not in raw:
+        return None
+    type_raw, _, id_raw = raw.partition(":")
+    if type_raw not in _REF_TYPES:
+        return None
+    id_raw = id_raw.strip()
+    if not id_raw.isdigit():
+        return None
+    value = int(id_raw)
+    if value <= 0:
+        return None
+    return (type_raw, value)
+
+
+def _get_record(db, ref: tuple[str, int]):
+    """يرجّع السجل من الجدول اللي المرجع بيحدّده بالظبط (مش بحث في الاتنين)."""
+    kind, rid = ref
+    if kind == "prompt":
+        return db.get_outbox(rid)
+    return db.get_creation_job(rid)
+
+
+def _outbox_usage(name: str) -> str:
+    return f"استخدام: /{name} <prompt:id | creation:id> — مثال: /{name} prompt:3"
+
+
+async def outbox_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/outbox — عرض محدود للسجلات غير المنتهية (بدون نص البرومت أو أي أسرار)."""
+    if not await _guard(update, context):
+        return
+    db = context.bot_data["db"]
+    items = db.list_open_outbox()
+    jobs = db.list_open_creation_jobs()
+    lines = ["📤 صندوق الصادر (غير المنتهي):"]
+    if not items:
+        lines.append("• مفيش برومتات معلّقة.")
+    for item in items:
+        lines.append(
+            f"• prompt:{item.id} | الحالة: {item.status} | محاولات: {item.attempts} "
+            f"| آخر تحديث: {_safe_ts(item.updated_at)}"
         )
-        db.add_watched(conversation_id, repo or "", chat_id)
-        db.set_last_state(conversation_id, "running")
-    except ApiError as exc:
-        await bot.send_message(chat_id=chat_id, text=f"فشل بدء الشات: {exc}")
+    lines.append("🆕 طلبات شات جديد (غير المنتهية):")
+    if not jobs:
+        lines.append("• مفيش طلبات معلّقة.")
+    for job in jobs:
+        lines.append(
+            f"• creation:{job.id} | الحالة: {job.status} | محاولات: {job.attempts} "
+            f"| آخر تحديث: {_safe_ts(job.updated_at)}"
+        )
+    await update.message.reply_text("\n".join(lines))
+
+
+async def outbox_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/outbox_status <prompt:id|creation:id> — تفاصيل سجل واحد بدون نص/أسرار."""
+    if not await _guard(update, context):
+        return
+    db = context.bot_data["db"]
+    args = list(context.args or [])
+    ref = _parse_ref(args[0] if args else None)
+    if ref is None:
+        await update.message.reply_text(_outbox_usage("outbox_status"))
+        return
+    kind, rid = ref
+    record = _get_record(db, ref)  # الجدول محدد بالنوع — مفيش بحث في الاتنين
+    if record is None:
+        await update.message.reply_text(f"مفيش سجل بالمعرّف {kind}:{rid}.")
+        return
+    if kind == "prompt":
+        await update.message.reply_text(
+            f"برومت prompt:{record.id}\n"
+            f"الحالة: {record.status}\n"
+            f"المحادثة: {record.conversation_id}\n"
+            f"محاولات: {record.attempts}\n"
+            f"آخر خطأ: {record.error or '—'}\n"
+            f"آخر تحديث: {_safe_ts(record.updated_at)}"
+        )
+        return
+    await update.message.reply_text(
+        f"طلب شات creation:{record.id}\n"
+        f"الحالة: {record.status}\n"
+        f"المستودع: {record.repo or '—'}\n"
+        f"معرّف المهمة: {record.task_id or '—'}\n"
+        f"المحادثة: {record.conversation_id or '—'}\n"
+        f"محاولات: {record.attempts}\n"
+        f"آخر خطأ: {record.error or '—'}\n"
+        f"آخر تحديث: {_safe_ts(record.updated_at)}"
+    )
+
+
+async def outbox_discard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/outbox_discard <prompt:id|creation:id> confirm — يتخلّص من سجل (نهائي). idempotent."""
+    if not await _guard(update, context):
+        return
+    db = context.bot_data["db"]
+    args = list(context.args or [])
+    ref = _parse_ref(args[0] if args else None)
+    if ref is None:
+        await update.message.reply_text(_outbox_usage("outbox_discard"))
+        return
+    kind, rid = ref
+    label = _REF_TYPES[kind][1]
+    if len(args) < 2 or args[1].strip().lower() != "confirm":
+        await update.message.reply_text(
+            f"تأكيد مطلوب: /outbox_discard {kind}:{rid} confirm\n"
+            "ده هيعلّم السجل 'discarded' (نهائي) من غير أي إعادة إرسال."
+        )
+        return
+    record = _get_record(db, ref)  # الجدول محدد بالنوع — مفيش بحث في الاتنين
+    if record is None:
+        await update.message.reply_text(f"مفيش سجل بالمعرّف {kind}:{rid}.")
+        return
+    terminal = _TERMINAL_OUTBOX if kind == "prompt" else _TERMINAL_CREATION
+    if record.status in terminal:
+        await update.message.reply_text(
+            f"{label} {kind}:{rid} خلاص في حالة نهائية ({record.status}) — مفيش تغيير."
+        )
+        return
+    if kind == "prompt":
+        db.set_outbox_status(rid, "discarded", outbox.now_iso(), "اتشال يدوياً")
+    else:
+        db.set_creation_status(rid, "discarded", outbox.now_iso(), "اتشال يدوياً")
+    log.info("discard: ref=%s:%s status=discarded", kind, rid)
+    await update.message.reply_text(f"تم تعليم {label} {kind}:{rid} كـ 'discarded'.")
+
+
+async def outbox_mark_sent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/outbox_mark_sent <prompt:id|creation:id> confirm — تأكيد المالك إن العملية الغامضة نجحت."""
+    if not await _guard(update, context):
+        return
+    db = context.bot_data["db"]
+    args = list(context.args or [])
+    ref = _parse_ref(args[0] if args else None)
+    if ref is None:
+        await update.message.reply_text(_outbox_usage("outbox_mark_sent"))
+        return
+    kind, rid = ref
+    label = _REF_TYPES[kind][1]
+    if len(args) < 2 or args[1].strip().lower() != "confirm":
+        await update.message.reply_text(
+            f"تأكيد مطلوب: /outbox_mark_sent {kind}:{rid} confirm\n"
+            "ده تأكيد منك إن العملية نجحت فعلاً (مش إثبات من OpenHands). "
+            "مش هيعيد أي إرسال، بس بيقفل السجل."
+        )
+        return
+    record = _get_record(db, ref)  # الجدول محدد بالنوع — مفيش بحث في الاتنين
+    if record is None:
+        await update.message.reply_text(f"مفيش سجل بالمعرّف {kind}:{rid}.")
+        return
+    if record.status == "unknown":
+        # 'unknown' → حالة نهائية (sent/done): تفضل نهائية ومستحيل ترجع 'pending'،
+        # فمفيش إعادة إرسال أو إنشاء تلقائي (at-most-once محفوظ).
+        if kind == "prompt":
+            db.set_outbox_status(rid, "sent", outbox.now_iso(), "أكّده المالك")
+            final = "sent"
+        else:
+            db.set_creation_status(rid, "done", outbox.now_iso(), "أكّده المالك")
+            final = "done"
+        log.info("mark_sent: ref=%s:%s unknown->%s", kind, rid, final)
+        await update.message.reply_text(
+            f"تم تعليم {label} {kind}:{rid} كـ '{final}' (تأكيد منك — مش إثبات من OpenHands)."
+        )
+        return
+    already = "sent" if kind == "prompt" else "done"
+    if record.status == already:
+        await update.message.reply_text(f"{label} {kind}:{rid} معَلّم '{already}' بالفعل — مفيش تغيير.")
+        return
+    await update.message.reply_text(
+        f"{label} {kind}:{rid} حالته '{record.status}' — الأمر ده لـ 'unknown' بس."
+    )

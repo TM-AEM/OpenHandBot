@@ -146,13 +146,21 @@ class OpenHandsClient:
             raise ApiError("الـ API ما رجّعش معرّف مهمة البدء")
         return task_id
 
+    async def get_start_task(self, task_id: str) -> dict:
+        """يقرأ حالة مهمة البدء (GET آمن قابل للتكرار — مش بينشئ أي حاجة).
+
+        بترجّع dict المهمة (فاضي لو لسه مفيش بيانات). دي الطريقة الموثّقة الوحيدة
+        لمتابعة مهمة بدء موجودة، فالاستطلاع بيها آمن.
+        """
+        data = await self._get("/app-conversations/start-tasks", params={"ids": task_id})
+        tasks = data if isinstance(data, list) else data.get("items", [])
+        return next((t for t in tasks if t), {}) or {}
+
     async def wait_for_start(self, task_id: str, timeout: float = 180.0, interval: float = 3.0) -> str:
         loop = asyncio.get_event_loop()
         deadline = loop.time() + timeout
         while loop.time() < deadline:
-            data = await self._get("/app-conversations/start-tasks", params={"ids": task_id})
-            tasks = data if isinstance(data, list) else data.get("items", [])
-            task = next((t for t in tasks if t), None)
+            task = await self.get_start_task(task_id)
             if task:
                 status = str(task.get("status", "")).upper()
                 if status == "READY":
@@ -160,7 +168,10 @@ class OpenHandsClient:
                     if not app_id:
                         raise ApiError("المهمة جاهزة بس ما فيهاش app_conversation_id")
                     return app_id
-                if status in {"ERROR", "FAILED"}:
+                # "ERROR" هي القيمة الوحيدة الموثّقة للفشل في enum الـ API (مفيش "FAILED").
+                # بنعتبرها غامضة (زي timeout): الـ API مابيقولش إنه مافيش شات اتعمل، فممنوع
+                # نعيد POST تلقائياً. التصنيف النهائي بيحصل عند الـ caller (unknown مش failed).
+                if status == "ERROR":
                     raise ApiError("فشل بدء الشات على OpenHands")
             await asyncio.sleep(interval)
         raise ApiError("انتهى وقت انتظار بدء الشات")

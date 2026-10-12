@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from telegram.error import TelegramError
+
 from .errors import ApiError
 from .messages import DONE_STATES, state_label
 from .sender import send_long
@@ -61,7 +63,19 @@ class Watcher:
                 continue
             state = conv.get("execution_status")
             if state in DONE_STATES and w.last_state not in DONE_STATES:
-                await self._notify(w, conv, state)
+                # عزل الأخطاء لكل شات: فشل إرسال إشعار شات واحد (خطأ تيليجرام) ما
+                # يوقفش باقي الشاتات ولا دورة المراقب. الشات الفاشل يفضل متابَع
+                # عشان يتعاود في الدورة الجاية. مابنلتقطش غير أخطاء التسليم
+                # المتوقعة، فأي خطأ برمجي (غير متوقع) يطلع للـ loop الخارجي ويتسجّل.
+                try:
+                    await self._notify(w, conv, state)
+                except TelegramError as exc:
+                    log.warning(
+                        "فشل إشعار الشات %s (%s)، هيتعاود في الدورة الجاية",
+                        w.conversation_id,
+                        type(exc).__name__,
+                    )
+                    continue
                 self._db.remove_watched(w.conversation_id)
             else:
                 self._db.set_last_state(w.conversation_id, state or "")

@@ -127,6 +127,50 @@ def test_wait_for_start_returns_app_conversation_id():
     assert out == "conv-1"
 
 
+def test_wait_for_start_error_status_is_ambiguous():
+    # "ERROR" هو القيمة الموثّقة الوحيدة للفشل. لازم تبقى غامضة (ApiError بلا
+    # status_code) عشان الـ caller يصنّفها 'unknown' مش 'failed' ⇒ مفيش إعادة POST.
+    def handler(request):
+        return httpx.Response(200, json=[{"status": "ERROR", "detail": "boom"}])
+
+    import asyncio
+
+    client = make_client(handler)
+    with pytest.raises(ApiError) as exc:
+        asyncio.run(client.wait_for_start("task", timeout=5, interval=0))
+    assert exc.value.status_code is None
+
+
+def test_wait_for_start_failed_is_not_a_documented_enum_value():
+    # "FAILED" مش في enum الـ API ⇒ لازم يتجاهلها (يستمر في الاستطلاع) لحد ما يوصل
+    # READY، مش يعتبرها فشل. ده بيثبّت إزالة الفرع الميت.
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        if calls["n"] < 2:
+            return httpx.Response(200, json=[{"status": "FAILED"}])
+        return httpx.Response(200, json=[{"status": "READY", "app_conversation_id": "conv-9"}])
+
+    import asyncio
+
+    client = make_client(handler)
+    out = asyncio.run(client.wait_for_start("task", timeout=5, interval=0))
+    assert out == "conv-9"
+
+
+def test_wait_for_start_timeout_is_ambiguous():
+    def handler(request):
+        return httpx.Response(200, json=[{"status": "WAITING_FOR_SANDBOX"}])
+
+    import asyncio
+
+    client = make_client(handler)
+    with pytest.raises(ApiError) as exc:
+        asyncio.run(client.wait_for_start("task", timeout=0.05, interval=0.01))
+    assert exc.value.status_code is None  # مهلة ⇒ غامض ⇒ unknown
+
+
 def test_list_files():
     def handler(request):
         assert request.url.path == "/api/v1/app-conversations/c1/files"

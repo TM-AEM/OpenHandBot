@@ -23,6 +23,14 @@ def state_label(state: str | None) -> str:
 
 
 def split_message(text: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
+    """يقسّم نص خام (مش HTML) لأجزاء، كل جزء طوله ≤ limit.
+
+    حد تيليجرام (4096) بيتقاس "بعد فك كيانات HTML"، أي بطول النص الخام نفسه
+    (التهريب بيتحوّل لكيانات بترجع لنفس عدد الحروف بعد الفك). فالتقسيم بيحصل على
+    النص الخام قبل التهريب، وبُحافظ على النص كامل: "".join(parts) == text
+    (مفيش أي حرف—بما فيه السطور الجديدة—بيتفقد). التقسيم بيفضّل آخر سطر جديد جوه
+    الحد، ولو مفيش (نص متصل) بيقصّ عند الحد بالظبط.
+    """
     text = text or ""
     if len(text) <= limit:
         return [text]
@@ -35,7 +43,7 @@ def split_message(text: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
         if cut <= 0:
             cut = limit
         parts.append(text[:cut])
-        text = text[cut:].lstrip("\n")
+        text = text[cut:]
     return parts
 
 
