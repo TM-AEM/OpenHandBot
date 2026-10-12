@@ -80,6 +80,6 @@ def test_files_menu_pagination():
 
 def test_repositories_menu_has_search_and_pick():
     items = [{"full_name": "x/y"}]
-    cbs = _callbacks(kb.repositories_menu(items, 0, "", has_more=False))
-    assert "pickrepo:x/y" in cbs
+    cbs = _callbacks(kb.repositories_menu(items, 0, has_more=False, gen=7))
+    assert "pickrepo:7:0" in cbs
     assert "reposearch" in cbs

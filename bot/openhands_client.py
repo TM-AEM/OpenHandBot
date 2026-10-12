@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -43,7 +44,7 @@ class OpenHandsClient:
         try:
             resp = await self._client.request(method, url, **kwargs)
         except httpx.HTTPError as exc:
-            raise ApiError(f"تعذّر الاتصال بـ OpenHands: {exc}") from exc
+            raise ApiError(f"تعذّر الاتصال بـ OpenHands ({type(exc).__name__}).") from exc
         if resp.status_code >= 400:
             raise ApiError(describe_status(resp.status_code, _detail(resp)), resp.status_code)
         return resp
@@ -89,17 +90,27 @@ class OpenHandsClient:
         """يرجّع آخر رد للـ agent أو تقرير FinishAction."""
         events = await self.search_events(conversation_id, limit=50)
         for event in events:
-            kind = event.get("kind")
-            if kind == "MessageEvent" and event.get("source") == "agent":
-                text = _message_text(event)
-                if text:
-                    return text
-            if kind == "ActionEvent":
-                action = event.get("action") or {}
-                if action.get("kind") == "FinishAction":
-                    text = action.get("message")
-                    if isinstance(text, str) and text.strip():
-                        return text
+            text = _agent_report(event)
+            if text:
+                return text
+        return None
+
+    async def get_reply_since(self, conversation_id: str, since: datetime) -> str | None:
+        """آخر رد/تقرير للـ agent حدث *بعد* `since` بالظبط، أو None (U01).
+
+        الأحداث بترجع من الأحدث للأقدم. أي حدث من غير timestamp مفهوم مابيتحسبش
+        (fail closed): ما نقدرش نثبت إنه أحدث من البرومبت.
+        """
+        events = await self.search_events(conversation_id, limit=50)
+        for event in events:
+            ts = parse_timestamp(event.get("timestamp"))
+            if ts is None:
+                continue
+            if ts <= since:
+                break
+            text = _agent_report(event)
+            if text:
+                return text
         return None
 
     async def list_files(self, conversation_id: str, path: str = "") -> list[str]:
@@ -183,6 +194,41 @@ class OpenHandsClient:
         data = await self._get("/git/repositories/search", params=params)
         items = data.get("items", data) if isinstance(data, dict) else data
         return [r for r in items if r]
+
+
+def parse_timestamp(value: Any) -> datetime | None:
+    """يحوّل طابع ISO-8601 لـ datetime واعي بالتوقيت. القيم غير المفهومة ⇒ None.
+
+    الطوابع بدون منطقة زمنية بتتعامل كـ UTC.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _agent_report(event: dict) -> str | None:
+    """نص رد الـ agent (MessageEvent من agent) أو تقرير FinishAction، وإلا None."""
+    kind = event.get("kind")
+    if kind == "MessageEvent" and event.get("source") == "agent":
+        text = _message_text(event)
+        if text:
+            return text
+    if kind == "ActionEvent":
+        action = event.get("action") or {}
+        if action.get("kind") == "FinishAction":
+            text = action.get("message")
+            if isinstance(text, str) and text.strip():
+                return text
+    return None
 
 
 def _message_text(event: dict) -> str:

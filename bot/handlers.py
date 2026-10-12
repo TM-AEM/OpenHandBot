@@ -10,7 +10,7 @@ from telegram.ext import ContextTypes
 
 from . import keyboards as kb
 from . import outbox
-from .errors import ApiError
+from .errors import ApiError, error_text
 from .messages import escape_html, format_conversation, format_cost, pr_url, state_label
 from .sender import send_long
 
@@ -22,8 +22,12 @@ FILES_PAGE_SIZE = 10
 
 
 def _allowed(update: Update, config) -> bool:
+    """مستخدم مسموح *و* في محادثة خاصة. صلاحية المستخدم ما تعنيش صلاحية أي جروب."""
     user = update.effective_user
-    return bool(user and config.is_allowed(user.id))
+    if not (user and config.is_allowed(user.id)):
+        return False
+    chat = getattr(update, "effective_chat", None)
+    return chat is not None and getattr(chat, "type", None) == "private"
 
 
 class _MessageAdapter:
@@ -64,7 +68,12 @@ async def _edit_or_send(query, text: str, chat_id: int, bot, **kwargs) -> None:
 async def _guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     cfg = context.bot_data["config"]
     if not _allowed(update, cfg):
-        log.info("تجاهل رسالة من مستخدم غير مسموح: %s", update.effective_user and update.effective_user.id)
+        chat = getattr(update, "effective_chat", None)
+        log.info(
+            "تجاهل تحديث غير مسموح (مستخدم=%s، نوع الشات=%s)",
+            update.effective_user and update.effective_user.id,
+            getattr(chat, "type", None),
+        )
         return False
     return True
 
@@ -72,9 +81,10 @@ async def _guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _guard(update, context):
         return
+    context.bot_data["db"].clear_awaiting(update.effective_user.id)
     await update.message.reply_text(
         "أهلاً 👋\nأنا بوت تحكمك في OpenHands Cloud.\n"
-        "اختار من الأزرار تحت، أو ابعت برومت بعد ما تعمل رد على شات.",
+        "اختار من الأزرار تحت، أو افتح شات وابعتله برومت.",
         reply_markup=kb.main_menu(),
     )
 
@@ -84,6 +94,7 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await q.answer()
     if not _allowed(update, context.bot_data["config"]):
         return
+    context.bot_data["db"].clear_awaiting(update.effective_user.id)  # تنقّل = خروج من أي توجيه
     await q.edit_message_text("أهلاً 👋 اختار من الأزرار:", reply_markup=kb.main_menu())
 
 
@@ -92,6 +103,7 @@ async def list_conversations(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await q.answer()
     if not _allowed(update, context.bot_data["config"]):
         return
+    context.bot_data["db"].clear_awaiting(update.effective_user.id)  # تنقّل = خروج من أي توجيه
     page = int(q.data.split(":", 1)[1])
     client = context.bot_data["client"]
     # نجيب لحد 100 شات مرة واحدة ونرتّبهم إحنا، عشان الترتيب الخام من الـ API
@@ -99,7 +111,7 @@ async def list_conversations(update: Update, context: ContextTypes.DEFAULT_TYPE)
     try:
         result = await client.search_conversations(limit=100)
     except ApiError as exc:
-        await _safe_edit(q, str(exc))
+        await _safe_edit(q, error_text(exc))
         return
     items = result["items"]
     if not items:
@@ -133,10 +145,13 @@ async def open_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         conv = convs[0]
         reply = await client.get_last_reply(conversation_id)
     except ApiError as exc:
-        await q.edit_message_text(str(exc))
+        await q.edit_message_text(error_text(exc))
         return
-    watched = context.bot_data["db"].is_watched(conversation_id)
-    text = format_conversation(conv, reply)
+    db = context.bot_data["db"]
+    watched = db.is_watched(conversation_id)
+    # القرار 1: بعد فتح الشات، رسايلك الجاية بتتوجّه له 10 دقايق من آخر نشاط (مع زر إلغاء).
+    db.set_awaiting(update.effective_user.id, conversation_id, "route", title=conv.get("title") or "")
+    text = format_conversation(conv, reply) + "\n\n✉️ رسايلك الجاية هتتبعت للشات ده (10 دقايق من آخر نشاط). للإلغاء: زر إلغاء التوجيه أو /cancel."
     markup = kb.conversation_actions(conversation_id, watched)
     await _edit_or_send(q, text, q.message.chat_id, context.bot, reply_markup=markup)
 
@@ -146,6 +161,7 @@ async def list_watches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await q.answer()
     if not _allowed(update, context.bot_data["config"]):
         return
+    context.bot_data["db"].clear_awaiting(update.effective_user.id)  # تنقّل = خروج من أي توجيه
     page = int(q.data.split(":", 1)[1])
     items = context.bot_data["db"].list_watched()
     if not items:
@@ -175,7 +191,7 @@ async def watch_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE)
     try:
         conv = await _conversation(client, conversation_id)
     except ApiError as exc:
-        await _safe_edit(q, str(exc))
+        await _safe_edit(q, error_text(exc))
         return
     if not conv:
         await _safe_edit(q, "الشات مش موجود.")
@@ -207,7 +223,7 @@ async def show_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     try:
         conv = await _conversation(client, conversation_id)
     except ApiError as exc:
-        await _safe_edit(q, str(exc))
+        await _safe_edit(q, error_text(exc))
         return
     if not conv:
         await _safe_edit(q, "الشات مش موجود.")
@@ -236,7 +252,7 @@ async def show_cost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         conv = await _conversation(client, conversation_id)
     except ApiError as exc:
-        await _safe_edit(q, str(exc))
+        await _safe_edit(q, error_text(exc))
         return
     await _edit_or_send(
         q, format_cost(conv.get("metrics")), q.message.chat_id, context.bot,
@@ -254,7 +270,7 @@ async def export_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         data = await client.export_conversation(conversation_id)
     except ApiError as exc:
-        await _safe_edit(q, str(exc))
+        await _safe_edit(q, error_text(exc))
         return
     buffer = io.BytesIO(data)
     await context.bot.send_document(
@@ -274,7 +290,7 @@ async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     try:
         files = await client.list_files(conversation_id)
     except ApiError as exc:
-        await _safe_edit(q, str(exc))
+        await _safe_edit(q, error_text(exc))
         return
     if not files:
         await _safe_edit(q, "ما فيهاش ملفات.", reply_markup=kb.conversation_actions(conversation_id))
@@ -307,7 +323,7 @@ async def show_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         content = await client.read_file(conversation_id, path)
     except ApiError as exc:
-        await _safe_edit(q, str(exc))
+        await _safe_edit(q, error_text(exc))
         return
     name = path.rsplit("/", 1)[-1] or "file.txt"
     buffer = io.BytesIO(content.encode("utf-8"))
@@ -336,23 +352,49 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     db = context.bot_data["db"]
     telegram_id = update.effective_user.id
-    pending, kind = db.get_awaiting(telegram_id)
-    if kind == "reply" and pending:
-        db.clear_awaiting(telegram_id)
-        await _send_prompt(update, context, pending, update.message.text)
+    # U04: القراءة والاستهلاك (أو تجديد المهلة لو route) معاملة واحدة ذرّية، فرسالتين
+    # متزامنتين ما يقدروش يستهلكوا نفس حالة الانتظار ولا يتوجّهوا لشات غلط.
+    pending, kind, title = db.take_awaiting(telegram_id)
+    if kind in ("reply", "route") and pending:
+        await _send_prompt(update, context, pending, update.message.text, title if kind == "route" else None)
     elif kind == "newchat":
-        db.clear_awaiting(telegram_id)
         await _start_new_chat(update, context, pending, update.message.text)
     elif kind == "reposearch":
-        db.clear_awaiting(telegram_id)
         query = update.message.text.strip()
         sent = await update.message.reply_text("اختار مستودع للشات الجديد:\nبحث: " + query)
         await _show_repos(_MessageAdapter(sent), context, page=0, query=query)
+    elif kind == "expired":
+        await update.message.reply_text(
+            "انتهت مهلة التوجيه (10 دقايق من آخر نشاط). افتح الشات تاني وابعت برومتك."
+        )
     else:
-        await update.message.reply_text("ابعت /start للقائمة، أو اختار شات ورد عليه.")
+        await update.message.reply_text("ابعت /start للقائمة، أو افتح شات عشان تبعتله برومت.")
 
 
-async def _send_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, conversation_id: str, text: str) -> None:
+async def cancel_route(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/cancel: يلغي أي توجيه أو انتظار معلّق."""
+    if not await _guard(update, context):
+        return
+    context.bot_data["db"].clear_awaiting(update.effective_user.id)
+    await update.message.reply_text("اتلغى التوجيه. ابعت /start للقائمة.")
+
+
+async def cancel_route_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    if not _allowed(update, context.bot_data["config"]):
+        return
+    context.bot_data["db"].clear_awaiting(update.effective_user.id)
+    await _safe_edit(q, "اتلغى التوجيه ✅", reply_markup=kb.main_menu())
+
+
+async def _send_prompt(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    conversation_id: str,
+    text: str,
+    title: str | None = None,
+) -> None:
     """يسجّل البرومت في الصندوق (بثبات) قبل أي إرسال، ويرد 'وصل' فوراً."""
     if not text.strip():
         return
@@ -360,7 +402,9 @@ async def _send_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, conve
     chat_id = update.effective_chat.id
     # نسجّل 'pending' قبل ما نبدأ أي إرسال، عشان البرومت مايضيعش لو العملية اتقطعت.
     db.add_outbox(conversation_id, chat_id, text, outbox.now_iso())
-    await update.message.reply_text("وصل ✅")
+    # تأكيد الحفظ بيذكر الشات المستهدف (القرار 1) عشان رسالة ماتروحش لشات غلط من غير ما تلاحظ.
+    ack = "وصل ✅" if not title else f"وصل ✅ ← «{title[:40]}»"
+    await update.message.reply_text(ack)
     worker = context.bot_data.get("outbox_worker")
     if worker is not None:
         # worker واحد مالك؛ بنوقّظه بدل ما نعمل task جديد لكل برومت.
@@ -389,7 +433,15 @@ async def start_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await q.answer()
     if not _allowed(update, context.bot_data["config"]):
         return
-    await _show_repos(q, context, page=0, query="")
+    context.bot_data["db"].clear_awaiting(update.effective_user.id)  # تنقّل = خروج من أي توجيه
+    await _show_repos(q, context, page=0, query="", user_id=update.effective_user.id)
+
+
+_NAV_EXPIRED = "القايمة دي انتهت، افتح «شات جديد» من القائمة تاني."
+
+
+def _repo_nav(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> dict:
+    return context.bot_data.setdefault("repo_nav", {}).get(user_id) or {}
 
 
 async def repos_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -397,8 +449,17 @@ async def repos_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await q.answer()
     if not _allowed(update, context.bot_data["config"]):
         return
-    _, page, query = (q.data.split(":", 2) + [""])[:3]
-    await _show_repos(q, context, page=int(page), query=query)
+    try:
+        _, gen_raw, page_raw = q.data.split(":", 2)
+        gen, page = int(gen_raw), int(page_raw)
+    except ValueError:
+        await _safe_edit(q, _NAV_EXPIRED, reply_markup=kb.main_menu())
+        return
+    nav = _repo_nav(context, update.effective_user.id)
+    if nav.get("gen") != gen:  # زر من قايمة أقدم
+        await _safe_edit(q, _NAV_EXPIRED, reply_markup=kb.main_menu())
+        return
+    await _show_repos(q, context, page=page, query=nav.get("query", ""), user_id=update.effective_user.id)
 
 
 async def repo_search_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -410,21 +471,34 @@ async def repo_search_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await _safe_edit(q, "ابعت كلمة للبحث في المستودعات.")
 
 
-async def _show_repos(q, context: ContextTypes.DEFAULT_TYPE, page: int, query: str) -> None:
+async def _show_repos(
+    q, context: ContextTypes.DEFAULT_TYPE, page: int, query: str, user_id: int | None = None
+) -> None:
     client = context.bot_data["client"]
+    if user_id is None:
+        user_id = context.bot_data["config"].owner_id
     try:
         repos = await client.search_repositories(query=query)
     except ApiError as exc:
-        await _safe_edit(q, str(exc))
+        await _safe_edit(q, error_text(exc))
         return
     start = page * REPOS_PAGE_SIZE
     chunk = repos[start : start + REPOS_PAGE_SIZE]
     if not chunk:
         await _safe_edit(q, "ما لقيتش مستودعات.", reply_markup=kb.main_menu())
         return
+    # الأسماء الكاملة والبحث بيتخزّنوا هنا؛ الأزرار بتحمل رقم النسخة والفهرس بس (حد 64 بايت).
+    gen = context.bot_data["repo_gen"] = context.bot_data.get("repo_gen", 0) + 1
+    context.bot_data.setdefault("repo_nav", {})[user_id] = {
+        "gen": gen,
+        "query": query,
+        "names": [r.get("full_name") or "" for r in repos],
+    }
     has_more = len(repos) > start + REPOS_PAGE_SIZE
     title = "اختار مستودع للشات الجديد:" + (f"\nبحث: {query}" if query else "")
-    await _safe_edit(q, title, reply_markup=kb.repositories_menu(chunk, page, query, has_more))
+    await _safe_edit(
+        q, title, reply_markup=kb.repositories_menu(chunk, page, has_more, gen, start=start)
+    )
 
 
 async def pick_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -432,9 +506,20 @@ async def pick_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await q.answer()
     if not _allowed(update, context.bot_data["config"]):
         return
-    repo = q.data.split(":", 1)[1]
+    try:
+        _, gen_raw, idx_raw = q.data.split(":", 2)
+        gen, idx = int(gen_raw), int(idx_raw)
+    except ValueError:
+        await _safe_edit(q, _NAV_EXPIRED, reply_markup=kb.main_menu())
+        return
+    nav = _repo_nav(context, update.effective_user.id)
+    names = nav.get("names") or []
+    if nav.get("gen") != gen or not 0 <= idx < len(names) or not names[idx]:
+        await _safe_edit(q, _NAV_EXPIRED, reply_markup=kb.main_menu())
+        return
+    repo = names[idx]
     context.bot_data["db"].set_awaiting(update.effective_user.id, repo, "newchat")
-    await _safe_edit(q, f"المستودع: {repo}\nابعت البرومت اللي عايز تبدأ بيه الشات.")
+    await _safe_edit(q, f"المستودع: {repo}\nابعت البرومت اللي عايز تبدأ بيه الشات (بعد 10 دقايق من غير رد هتتلغي).")
 
 
 async def _start_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, repo: str | None, text: str) -> None:

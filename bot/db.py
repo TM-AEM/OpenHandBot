@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 # حالات صندوق الصادر (outbox) — كل انتقال مع سلوك التعافي بعد إعادة التشغيل:
 #   pending  : اتسجّل بثبات ولسه ماتحاولش الإرسال. آمن يتعاود بعد restart.
@@ -40,12 +41,30 @@ CREATION_FAILED = "failed"
 CREATION_DISCARDED = "discarded"
 
 
+# مهلة أي حالة توجيه (من آخر نشاط). القرار 1: توجيه 10 دقايق.
+AWAITING_TTL = timedelta(minutes=10)
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
 @dataclass
 class Watched:
     conversation_id: str
     title: str
     last_state: str | None
     chat_id: int | None = None
+    # وقت (UTC ISO) آخر برومبت اتبعت للشات ده. لو موجود، المراقب ما يعلنش الانتهاء
+    # غير لو لقى تقرير أحدث منه (U01). NULL = متابعة يدوية بدون برومبت.
+    submitted_at: str | None = None
+    added_at: str | None = None
 
 
 @dataclass
@@ -93,12 +112,16 @@ class Database:
                 conversation_id TEXT PRIMARY KEY,
                 title           TEXT NOT NULL DEFAULT '',
                 last_state      TEXT,
-                chat_id         INTEGER
+                chat_id         INTEGER,
+                submitted_at    TEXT,
+                added_at        TEXT
             );
             CREATE TABLE IF NOT EXISTS user_state (
                 telegram_id INTEGER PRIMARY KEY,
                 awaiting_conversation_id TEXT,
-                awaiting_kind            TEXT
+                awaiting_kind            TEXT,
+                awaiting_at              TEXT,
+                awaiting_title           TEXT
             );
             CREATE TABLE IF NOT EXISTS outbox (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -136,6 +159,15 @@ class Database:
         columns = {r["name"] for r in self._conn.execute("PRAGMA table_info(watched)")}
         if "chat_id" not in columns:
             self._conn.execute("ALTER TABLE watched ADD COLUMN chat_id INTEGER")
+        state_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(user_state)")}
+        if state_cols and "awaiting_at" not in state_cols:
+            self._conn.execute("ALTER TABLE user_state ADD COLUMN awaiting_at TEXT")
+        if state_cols and "awaiting_title" not in state_cols:
+            self._conn.execute("ALTER TABLE user_state ADD COLUMN awaiting_title TEXT")
+        if "submitted_at" not in columns:
+            self._conn.execute("ALTER TABLE watched ADD COLUMN submitted_at TEXT")
+        if "added_at" not in columns:
+            self._conn.execute("ALTER TABLE watched ADD COLUMN added_at TEXT")
         # outbox اتعمل في 04A-4 من غير attempts؛ نضيفه لقواعد موجودة.
         outbox_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(outbox)")}
         if outbox_cols and "attempts" not in outbox_cols:
@@ -146,10 +178,19 @@ class Database:
     # ----------------------------------------------------------------- watched
     def add_watched(self, conversation_id: str, title: str = "", chat_id: int | None = None) -> None:
         self._conn.execute(
-            "INSERT INTO watched(conversation_id, title, chat_id) VALUES(?, ?, ?) "
+            "INSERT INTO watched(conversation_id, title, chat_id, added_at) VALUES(?, ?, ?, ?) "
             "ON CONFLICT(conversation_id) DO UPDATE SET title=excluded.title, "
-            "chat_id=COALESCE(excluded.chat_id, watched.chat_id)",
-            (conversation_id, title, chat_id),
+            "chat_id=COALESCE(excluded.chat_id, watched.chat_id), "
+            "added_at=COALESCE(watched.added_at, excluded.added_at)",
+            (conversation_id, title, chat_id, datetime.now(timezone.utc).isoformat()),
+        )
+        self._conn.commit()
+
+    def mark_submitted(self, conversation_id: str, submitted_at: str) -> None:
+        """يسجّل وقت إرسال آخر برومبت للشات (بيتحدّث مع كل برومبت جديد)."""
+        self._conn.execute(
+            "UPDATE watched SET submitted_at=? WHERE conversation_id=?",
+            (submitted_at, conversation_id),
         )
         self._conn.commit()
 
@@ -159,10 +200,14 @@ class Database:
 
     def list_watched(self) -> list[Watched]:
         rows = self._conn.execute(
-            "SELECT conversation_id, title, last_state, chat_id FROM watched"
+            "SELECT conversation_id, title, last_state, chat_id, submitted_at, added_at FROM watched"
         ).fetchall()
         return [
-            Watched(r["conversation_id"], r["title"], r["last_state"], r["chat_id"]) for r in rows
+            Watched(
+                r["conversation_id"], r["title"], r["last_state"], r["chat_id"],
+                r["submitted_at"], r["added_at"],
+            )
+            for r in rows
         ]
 
     def is_watched(self, conversation_id: str) -> bool:
@@ -178,18 +223,88 @@ class Database:
         self._conn.commit()
 
     # -------------------------------------------------------------- user state
-    def set_awaiting(self, telegram_id: int, conversation_id: str | None, kind: str | None) -> None:
+    # حالة توجيه الرسالة الجاية. كل حالة ليها وقت (awaiting_at) وتنتهي بعد AWAITING_TTL.
+    #   reply / newchat / reposearch : لمرة واحدة (بتتستهلك أول رسالة).
+    #   route : توجيه مستمر لشات معيّن؛ كل رسالة بتجدّد المهلة، وبينتهي بعد AWAITING_TTL
+    #           من آخر نشاط أو بالإلغاء.
+    def set_awaiting(
+        self,
+        telegram_id: int,
+        conversation_id: str | None,
+        kind: str | None,
+        title: str | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        stamp = (now or datetime.now(timezone.utc)).isoformat() if kind else None
         self._conn.execute(
-            "INSERT INTO user_state(telegram_id, awaiting_conversation_id, awaiting_kind) "
-            "VALUES(?, ?, ?) ON CONFLICT(telegram_id) DO UPDATE SET "
+            "INSERT INTO user_state(telegram_id, awaiting_conversation_id, awaiting_kind, "
+            "awaiting_at, awaiting_title) VALUES(?, ?, ?, ?, ?) ON CONFLICT(telegram_id) DO UPDATE SET "
             "awaiting_conversation_id=excluded.awaiting_conversation_id, "
-            "awaiting_kind=excluded.awaiting_kind",
-            (telegram_id, conversation_id, kind),
+            "awaiting_kind=excluded.awaiting_kind, awaiting_at=excluded.awaiting_at, "
+            "awaiting_title=excluded.awaiting_title",
+            (telegram_id, conversation_id, kind, stamp, title),
         )
         self._conn.commit()
 
     def clear_awaiting(self, telegram_id: int) -> None:
         self.set_awaiting(telegram_id, None, None)
+
+    def take_awaiting(
+        self, telegram_id: int, now: datetime | None = None
+    ) -> tuple[str | None, str | None, str | None]:
+        """يقرأ حالة التوجيه ويستهلكها (أو يجدّدها لو route) في معاملة ذرّية واحدة.
+
+        بيرجّع (conversation_id, kind, title). لو الحالة انتهت مهلتها بيمسحها ويرجّع
+        kind="expired". الحالات اللي لمرة واحدة بتتمسح، وrouting المستمر بيتجدّد وقته.
+        BEGIN IMMEDIATE بياخد قفل الكتابة قبل القراءة، فرسالتين متزامنتين ما يقدروش
+        ياخدوا نفس الحالة المستهلكة.
+        """
+        now = now or datetime.now(timezone.utc)
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT awaiting_conversation_id, awaiting_kind, awaiting_at, awaiting_title "
+                "FROM user_state WHERE telegram_id=?",
+                (telegram_id,),
+            ).fetchone()
+            result: tuple[str | None, str | None, str | None] = (None, None, None)
+            if row and row["awaiting_kind"]:
+                kind = row["awaiting_kind"]
+                since = _parse_iso(row["awaiting_at"])
+                expired = since is None or now - since > AWAITING_TTL
+                if expired:
+                    conn.execute(
+                        "UPDATE user_state SET awaiting_conversation_id=NULL, awaiting_kind=NULL, "
+                        "awaiting_at=NULL, awaiting_title=NULL WHERE telegram_id=?",
+                        (telegram_id,),
+                    )
+                    result = (None, "expired", None)
+                elif kind == "route":
+                    conn.execute(
+                        "UPDATE user_state SET awaiting_at=? WHERE telegram_id=?",
+                        (now.isoformat(), telegram_id),
+                    )
+                    result = (row["awaiting_conversation_id"], kind, row["awaiting_title"])
+                else:
+                    conn.execute(
+                        "UPDATE user_state SET awaiting_conversation_id=NULL, awaiting_kind=NULL, "
+                        "awaiting_at=NULL, awaiting_title=NULL WHERE telegram_id=?",
+                        (telegram_id,),
+                    )
+                    result = (row["awaiting_conversation_id"], kind, row["awaiting_title"])
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return result
+
+    def pop_awaiting(self, telegram_id: int) -> tuple[str | None, str | None]:
+        """نفس take_awaiting من غير العنوان؛ المنتهي بيرجّع (None, None)."""
+        conv, kind, _title = self.take_awaiting(telegram_id)
+        if kind == "expired":
+            return None, None
+        return conv, kind
 
     def get_awaiting(self, telegram_id: int) -> tuple[str | None, str | None]:
         row = self._conn.execute(

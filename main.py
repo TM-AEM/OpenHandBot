@@ -6,13 +6,21 @@ import sys
 
 from bot.app import build_application
 from bot.config import ConfigError, load_config
+from bot.errors import RedactingFilter, register_secrets
 
 
-def _setup_logging(level: str) -> None:
+def _setup_logging(level: str, secrets: tuple[str, ...] = ()) -> None:
+    register_secrets(*secrets)
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # فلتر التنقيح على كل الـ handlers: أي سر يظهر في رسالة أو traceback يتخفّى.
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(RedactingFilter())
+    # httpx/httpcore بتسجّل URL كامل، وURL تيليجرام فيه التوكن.
+    for noisy in ("httpx", "httpcore", "telegram", "apscheduler"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 def main() -> int:
@@ -21,8 +29,7 @@ def main() -> int:
     except ConfigError as exc:
         print(f"خطأ في الإعداد: {exc}", file=sys.stderr)
         return 1
-    _setup_logging(config.log_level)
-    logging.getLogger("httpx").setLevel(logging.WARNING)
+    _setup_logging(config.log_level, config.secrets)
 
     app = build_application(config)
     app.run_polling(drop_pending_updates=True)

@@ -26,7 +26,7 @@ from .db import (
     OUTBOX_SENT,
     OUTBOX_UNKNOWN,
 )
-from .errors import ApiError, describe_status
+from .errors import ApiError, describe_status, error_text
 
 log = logging.getLogger(__name__)
 
@@ -122,7 +122,8 @@ async def _post_claimed(client, db, bot, item) -> None:
 
         # الإرسال هيبدأ حالاً: نسجّل 'sending' بثبات قبل الـ POST مباشرة (الـ commit
         # جوّه set_outbox_status). ده آخر حد آمن: بعده النتيجة غامضة.
-        db.set_outbox_status(outbox_id, OUTBOX_SENDING, now_iso())
+        submitted_at = now_iso()  # قبل الـ POST: أي حدث للـ run الجديد لازم يكون أحدث منه
+        db.set_outbox_status(outbox_id, OUTBOX_SENDING, submitted_at)
         try:
             await client.send_message(conversation_id, text)
         except ApiError as exc:
@@ -153,10 +154,12 @@ async def _post_claimed(client, db, bot, item) -> None:
         # (fail closed). التفاصيل في تقرير TASK 04A-3.
         db.add_watched(conversation_id, conv.get("title", ""), chat_id)
         db.set_last_state(conversation_id, conv.get("execution_status") or "")
+        # U01: المراقب مابيعلنش الانتهاء غير بتقرير أحدث من وقت الإرسال ده.
+        db.mark_submitted(conversation_id, submitted_at)
     except ApiError as exc:
         # فشل قبل الـ POST (قراءة الشات / تشغيل الـ sandbox): الإرسال مابدأش ⇒ آمن يتعاود.
         db.set_outbox_status(outbox_id, OUTBOX_PENDING, now_iso(), safe_error_label(exc), bump=True)
-        await safe_send(bot, chat_id, f"فشل الإرسال: {exc}")
+        await safe_send(bot, chat_id, f"فشل الإرسال: {error_text(exc)}")
 
 
 async def outbox_recover(app) -> None:

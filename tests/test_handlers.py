@@ -34,7 +34,7 @@ def make_update(user_id, text="hi"):
     msg.text = text
     return SimpleNamespace(
         effective_user=SimpleNamespace(id=user_id),
-        effective_chat=SimpleNamespace(id=99),
+        effective_chat=SimpleNamespace(id=99, type="private"),
         message=msg,
         callback_query=None,
     )
@@ -127,7 +127,7 @@ def _list_update(user_id, page):
     q.data = f"list:{page}"
     return SimpleNamespace(
         effective_user=SimpleNamespace(id=user_id),
-        effective_chat=SimpleNamespace(id=99),
+        effective_chat=SimpleNamespace(id=99, type="private"),
         message=msg,
         callback_query=q,
     )
@@ -192,7 +192,7 @@ def _cb_update(user_id, data):
     q.data = data
     return SimpleNamespace(
         effective_user=SimpleNamespace(id=user_id),
-        effective_chat=SimpleNamespace(id=99),
+        effective_chat=SimpleNamespace(id=99, type="private"),
         message=SimpleNamespace(),
         callback_query=q,
     )

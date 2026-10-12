@@ -2,12 +2,15 @@ import pytest
 
 from bot.config import ConfigError, load_config
 
+TOKEN = "123456:ABCdef-ghiJKL_mnoPQR"
+KEY = "sk-oh-test-key-123456"
+
 
 def test_loads_required_values():
     cfg = load_config(
         {
-            "TELEGRAM_BOT_TOKEN": "t",
-            "OPENHANDS_API_KEY": "k",
+            "TELEGRAM_BOT_TOKEN": TOKEN,
+            "OPENHANDS_API_KEY": KEY,
             "ALLOWED_TELEGRAM_ID": "123",
         }
     )
@@ -22,8 +25,8 @@ def test_loads_required_values():
 def test_multiple_allowed_ids_and_owner():
     cfg = load_config(
         {
-            "TELEGRAM_BOT_TOKEN": "t",
-            "OPENHANDS_API_KEY": "k",
+            "TELEGRAM_BOT_TOKEN": TOKEN,
+            "OPENHANDS_API_KEY": KEY,
             "ALLOWED_TELEGRAM_ID": "10, 20;30",
         }
     )
@@ -35,8 +38,8 @@ def test_multiple_allowed_ids_and_owner():
 def test_owner_is_first_id_in_order_not_smallest():
     cfg = load_config(
         {
-            "TELEGRAM_BOT_TOKEN": "t",
-            "OPENHANDS_API_KEY": "k",
+            "TELEGRAM_BOT_TOKEN": TOKEN,
+            "OPENHANDS_API_KEY": KEY,
             "ALLOWED_TELEGRAM_ID": "99,5,42",
         }
     )
@@ -46,8 +49,8 @@ def test_owner_is_first_id_in_order_not_smallest():
 def test_custom_interval_and_db_path():
     cfg = load_config(
         {
-            "TELEGRAM_BOT_TOKEN": "t",
-            "OPENHANDS_API_KEY": "k",
+            "TELEGRAM_BOT_TOKEN": TOKEN,
+            "OPENHANDS_API_KEY": KEY,
             "ALLOWED_TELEGRAM_ID": "1",
             "WATCHER_INTERVAL": "40",
             "DB_PATH": "/tmp/x.sqlite3",
@@ -59,15 +62,15 @@ def test_custom_interval_and_db_path():
 
 def test_missing_values_raises():
     with pytest.raises(ConfigError):
-        load_config({"TELEGRAM_BOT_TOKEN": "t"})
+        load_config({"TELEGRAM_BOT_TOKEN": TOKEN})
 
 
 def test_bad_allowed_id_raises():
     with pytest.raises(ConfigError):
         load_config(
             {
-                "TELEGRAM_BOT_TOKEN": "t",
-                "OPENHANDS_API_KEY": "k",
+                "TELEGRAM_BOT_TOKEN": TOKEN,
+                "OPENHANDS_API_KEY": KEY,
                 "ALLOWED_TELEGRAM_ID": "abc",
             }
         )
@@ -76,8 +79,8 @@ def test_bad_allowed_id_raises():
 def test_api_base_strips_trailing_slash():
     cfg = load_config(
         {
-            "TELEGRAM_BOT_TOKEN": "t",
-            "OPENHANDS_API_KEY": "k",
+            "TELEGRAM_BOT_TOKEN": TOKEN,
+            "OPENHANDS_API_KEY": KEY,
             "ALLOWED_TELEGRAM_ID": "1",
             "OPENHANDS_BASE_URL": "https://example.test/",
         }

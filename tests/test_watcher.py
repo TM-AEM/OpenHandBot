@@ -85,7 +85,8 @@ def test_waiting_for_confirmation_mentions_site(tmp_path):
     assert "تأكيد" in bot.sent[0]
 
 
-def test_missing_conversation_is_dropped(tmp_path):
+def test_missing_conversation_is_not_silently_dropped(tmp_path):
+    # اتبدّل سلوك الحذف الصامت: غياب شات دورة أو اتنين (عطل مؤقت محتمل) ما يشيلوش المتابعة.
     db = Database(str(tmp_path / "t.sqlite3"))
     db.add_watched("gone", "اتمسح")
     client = FakeClient({})  # الشات مش موجود في الـ API
@@ -93,9 +94,10 @@ def test_missing_conversation_is_dropped(tmp_path):
     w = Watcher(client, db, bot, chat_id=1)
 
     asyncio.run(w.tick())
+    asyncio.run(w.tick())
 
     assert bot.sent == []
-    assert db.list_watched() == []
+    assert db.is_watched("gone")
 
 
 def test_notification_goes_to_chat_that_started_it(tmp_path):
@@ -167,22 +169,35 @@ def test_watcher_failure_then_success_retries(tmp_path):
     assert not db.is_watched("c1")
 
 
-def test_watcher_unexpected_error_propagates(tmp_path):
-    # الأخطاء البرمجية غير المتوقعة (مش TelegramError) لازم متتخفيش — تطلع من tick
-    # عشان الـ loop الخارجي يسجّلها.
-    import pytest
-
-    class BoomBot(FakeBot):
+def test_watcher_unexpected_error_is_isolated_per_conversation(tmp_path, caplog):
+    # 4B: خطأ برمجي غير متوقع في شات واحد ما يوقفش الدورة؛ باقي الشاتات بتتعالج،
+    # والخطأ بيتسجّل بنوعه بس (من غير نص الاستثناء).
+    class PickyBot(FakeBot):
         async def send_message(self, chat_id=None, text=None, parse_mode=None, **kw):
-            raise RuntimeError("bug in code")
+            if "first" in (text or ""):
+                raise RuntimeError("bug with secret-token-xyz")
+            await super().send_message(chat_id=chat_id, text=text, parse_mode=parse_mode, **kw)
 
     db = Database(str(tmp_path / "t.sqlite3"))
     db.add_watched("c1", "first")
-    client = FakeClient({"c1": {"id": "c1", "title": "first", "execution_status": "finished"}}, reply="تم")
-    w = Watcher(client, db, BoomBot(), chat_id=1)
+    db.add_watched("c2", "second")
+    client = FakeClient(
+        {
+            "c1": {"id": "c1", "title": "first", "execution_status": "finished"},
+            "c2": {"id": "c2", "title": "second", "execution_status": "finished"},
+        },
+        reply="تم",
+    )
+    bot = PickyBot()
 
-    with pytest.raises(RuntimeError):
-        asyncio.run(w.tick())
+    with caplog.at_level("ERROR"):
+        asyncio.run(Watcher(client, db, bot, chat_id=1).tick())
+
+    assert any("second" in t for t in bot.sent)
+    assert not db.is_watched("c2")
+    assert db.is_watched("c1")  # فشل، فيتعاود
+    assert "RuntimeError" in caplog.text and "c1" in caplog.text
+    assert "secret-token-xyz" not in caplog.text
 
 
 # ------------------------------------------------ U01 stale-report prevention

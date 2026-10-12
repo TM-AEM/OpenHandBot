@@ -23,7 +23,10 @@ log = logging.getLogger(__name__)
 
 
 def build_application(config: Config) -> Application:
-    app = Application.builder().token(config.telegram_bot_token).build()
+    # U04: بدون concurrent_updates أي أمر بطيء (تصدير/قايمة ملفات) بيأخّر تأكيد
+    # "وصل ✅" لأن التحديثات بتتعالج واحد ورا التاني. التزامن آمن هنا لأن حالة
+    # التوجيه بتتستهلك ذرّياً (db.pop_awaiting) وكتابة الصندوق معاملة واحدة.
+    app = Application.builder().token(config.telegram_bot_token).concurrent_updates(True).build()
     client = OpenHandsClient(config.openhands_base_url, config.openhands_api_key)
     db = Database(config.db_path)
 
@@ -32,11 +35,13 @@ def build_application(config: Config) -> Application:
     app.bot_data["db"] = db
 
     app.add_handler(CommandHandler("start", handlers.start))
+    app.add_handler(CommandHandler("cancel", handlers.cancel_route))
     app.add_handler(CommandHandler("outbox", handlers.outbox_list))
     app.add_handler(CommandHandler("outbox_status", handlers.outbox_status))
     app.add_handler(CommandHandler("outbox_discard", handlers.outbox_discard))
     app.add_handler(CommandHandler("outbox_mark_sent", handlers.outbox_mark_sent))
     app.add_handler(CallbackQueryHandler(handlers.show_menu, pattern=r"^menu$"))
+    app.add_handler(CallbackQueryHandler(handlers.cancel_route_button, pattern=r"^cancelroute$"))
     app.add_handler(CallbackQueryHandler(handlers.list_conversations, pattern=r"^list:"))
     app.add_handler(CallbackQueryHandler(handlers.list_watches, pattern=r"^watched:"))
     app.add_handler(CallbackQueryHandler(handlers.watch_conversation, pattern=r"^watch:"))
@@ -77,6 +82,7 @@ def build_application(config: Config) -> Application:
             application.bot,
             chat_id=config.owner_id,
             interval=config.watcher_interval,
+            allowed_chats=config.allowed_telegram_ids,  # الشات الخاص id = id المستخدم
         )
         application.bot_data["watcher"] = watcher
         watcher.start()

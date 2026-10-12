@@ -38,7 +38,7 @@ def make_update(user_id, text=""):
     msg.text = text
     return SimpleNamespace(
         effective_user=SimpleNamespace(id=user_id),
-        effective_chat=SimpleNamespace(id=99),
+        effective_chat=SimpleNamespace(id=99, type="private"),
         message=msg,
         callback_query=None,
     )
