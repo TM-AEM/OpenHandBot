@@ -148,11 +148,16 @@ def commit_all() -> None:
     )
 
 
-def sync_remote(token: str | None) -> None:
-    """Fetch; fast-forward when behind, rebase when diverged."""
-    git("fetch", authed_url(remote_url(), token), BRANCH, check=False)
+def ahead_behind() -> tuple[int, int]:
     ahead = int(git("rev-list", "--count", f"{REMOTE}/{BRANCH}..HEAD", check=False).stdout.strip() or 0)
     behind = int(git("rev-list", "--count", f"HEAD..{REMOTE}/{BRANCH}", check=False).stdout.strip() or 0)
+    return ahead, behind
+
+
+def sync_remote() -> None:
+    """Fetch via the named remote (keeps origin/<branch> current); ff or rebase."""
+    git("fetch", REMOTE, BRANCH, check=False)
+    ahead, behind = ahead_behind()
     if behind and not ahead:
         git("merge", "--ff-only", f"{REMOTE}/{BRANCH}")
     elif behind and ahead:
@@ -163,11 +168,13 @@ def sync_remote(token: str | None) -> None:
 
 
 def push_if_ahead(token: str | None) -> bool:
-    ahead = int(git("rev-list", "--count", f"{REMOTE}/{BRANCH}..HEAD", check=False).stdout.strip() or 0)
+    ahead, _ = ahead_behind()
     if ahead == 0:
         print("Nothing to push (already up to date).")
         return False
     git("push", authed_url(remote_url(), token), f"HEAD:{BRANCH}")
+    # Push went to a URL, so the remote-tracking ref was not updated by git.
+    git("update-ref", f"refs/remotes/{REMOTE}/{BRANCH}", "HEAD")
     print("Pushed to remote.")
     return True
 
@@ -180,7 +187,7 @@ def run_cycle() -> dict:
         raise RuntimeError(f"on branch '{branch}', expected '{BRANCH}'")
 
     token = resolve_token()
-    sync_remote(token)
+    sync_remote()
 
     if has_changes():
         commit_all()
