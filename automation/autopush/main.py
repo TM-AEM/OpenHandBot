@@ -118,9 +118,9 @@ def git(*args: str, check: bool = True, cwd: str | None = None) -> subprocess.Co
         env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
     )
     if proc.stdout:
-        print(redact(proc.stdout.rstrip()))
+        print(redact(proc.stdout.rstrip()), flush=True)
     if proc.stderr:
-        print(redact(proc.stderr.rstrip()), file=sys.stderr)
+        print(redact(proc.stderr.rstrip()), file=sys.stderr, flush=True)
     if check and proc.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed ({proc.returncode})")
     return proc
