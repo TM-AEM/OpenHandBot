@@ -2,19 +2,22 @@
 
 Deterministic (no LLM). Two run modes:
 
-  * Cloud automation entrypoint: `python3 main.py` — runs one cycle, then fires
+  * Cloud automation entrypoint: `python3 main.py` -- runs one cycle, then fires
     the completion callback (if the automation service provided one).
-  * Local daemon: `python3 main.py --daemon` — loops every INTERVAL_SECONDS
+  * Local daemon: `python3 main.py --daemon` -- loops every INTERVAL seconds
     forever (used to run the automation inside a live session).
 
+When no git work tree is present the script clones the target repo itself, so it
+works both against a live workspace and from a fresh automation sandbox.
+
 Env:
-  AUTOPUSH_REPO_DIR        repo working tree (default: cwd)
-  AUTOPUSH_BRANCH          target branch (default: main)
-  AUTOPUSH_REMOTE          remote name (default: origin)
-  AUTOPUSH_INTERVAL        loop seconds in --daemon mode (default: 300)
-  AUTOPUSH_AUTHOR_NAME     commit author name
-  AUTOPUSH_AUTHOR_EMAIL    commit author email
-  GITHUB_TOKEN             push credential (falls back to a stored secret)
+  AUTOPUSH_REPO_DIR    repo working tree (default: cwd if a repo, else /tmp/autopush-repo)
+  AUTOPUSH_REPO_URL    clone URL when the work tree is absent (default: TM-AEM/OpenHandBot)
+  AUTOPUSH_BRANCH      target branch (default: main)
+  AUTOPUSH_REMOTE      remote name (default: origin)
+  AUTOPUSH_INTERVAL    loop seconds in --daemon mode (default: 300)
+  AUTOPUSH_AUTHOR_NAME / AUTOPUSH_AUTHOR_EMAIL
+  GITHUB_TOKEN         push credential (falls back to a stored secret)
 """
 
 from __future__ import annotations
@@ -27,7 +30,19 @@ import time
 import urllib.request
 from datetime import datetime, timezone
 
-REPO_DIR = os.environ.get("AUTOPUSH_REPO_DIR") or os.getcwd()
+DEFAULT_REPO_URL = "https://github.com/TM-AEM/OpenHandBot.git"
+DEFAULT_REPO_DIR = "/tmp/autopush-repo"
+
+
+def _default_repo_dir() -> str:
+    cwd = os.getcwd()
+    if os.path.isdir(os.path.join(cwd, ".git")):
+        return cwd
+    return DEFAULT_REPO_DIR
+
+
+REPO_DIR = os.environ.get("AUTOPUSH_REPO_DIR") or _default_repo_dir()
+REPO_URL = os.environ.get("AUTOPUSH_REPO_URL", DEFAULT_REPO_URL)
 BRANCH = os.environ.get("AUTOPUSH_BRANCH", "main")
 REMOTE = os.environ.get("AUTOPUSH_REMOTE", "origin")
 INTERVAL = int(os.environ.get("AUTOPUSH_INTERVAL", "300"))
@@ -91,15 +106,13 @@ def fire_callback(status: str = "COMPLETED", error: str | None = None) -> None:
 
 def redact(text: str) -> str:
     token = _token_cache
-    if token:
-        text = text.replace(token, "***")
-    return text
+    return text.replace(token, "***") if token else text
 
 
-def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+def git(*args: str, check: bool = True, cwd: str | None = None) -> subprocess.CompletedProcess:
     proc = subprocess.run(
         ["git", *args],
-        cwd=REPO_DIR,
+        cwd=cwd or REPO_DIR,
         capture_output=True,
         text=True,
         env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
@@ -113,6 +126,27 @@ def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
     return proc
 
 
+def authed_url(url: str, token: str | None) -> str:
+    """Embed a token in `url` for one-shot use. Never written to git config."""
+    if not token or "://" not in url:
+        return url
+    scheme, rest = url.split("://", 1)
+    bare = rest.split("@")[-1]
+    return f"{scheme}://x-access-token:{token}@{bare}"
+
+
+def ensure_repo(token: str | None) -> None:
+    if os.path.isdir(os.path.join(REPO_DIR, ".git")):
+        return
+    parent = os.path.dirname(REPO_DIR.rstrip("/")) or "/"
+    name = os.path.basename(REPO_DIR.rstrip("/"))
+    os.makedirs(parent, exist_ok=True)
+    print(f"Cloning {REPO_URL} -> {REPO_DIR}")
+    git("clone", "--branch", BRANCH, authed_url(REPO_URL, token), name, cwd=parent)
+    # Never leave the token in the clone's .git/config.
+    git("remote", "set-url", REMOTE, REPO_URL)
+
+
 def current_branch() -> str:
     return git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
 
@@ -123,15 +157,6 @@ def has_changes() -> bool:
 
 def remote_url() -> str:
     return git("remote", "get-url", REMOTE, check=False).stdout.strip()
-
-
-def authed_url(url: str, token: str | None) -> str:
-    """Return `url` with a token embedded for one-shot use. Never written to config."""
-    if not token or "://" not in url:
-        return url
-    scheme, rest = url.split("://", 1)
-    bare = rest.split("@")[-1]
-    return f"{scheme}://x-access-token:{token}@{bare}"
 
 
 def commit_all() -> None:
@@ -173,20 +198,19 @@ def push_if_ahead(token: str | None) -> bool:
         print("Nothing to push (already up to date).")
         return False
     git("push", authed_url(remote_url(), token), f"HEAD:{BRANCH}")
-    # Push went to a URL, so the remote-tracking ref was not updated by git.
+    # Push went to a URL, so git did not advance the remote-tracking ref.
     git("update-ref", f"refs/remotes/{REMOTE}/{BRANCH}", "HEAD")
     print("Pushed to remote.")
     return True
 
 
 def run_cycle() -> dict:
-    if not os.path.isdir(os.path.join(REPO_DIR, ".git")):
-        raise RuntimeError(f"not a git repository: {REPO_DIR}")
+    token = resolve_token()
+    ensure_repo(token)
     branch = current_branch()
     if branch != BRANCH:
         raise RuntimeError(f"on branch '{branch}', expected '{BRANCH}'")
 
-    token = resolve_token()
     sync_remote()
 
     if has_changes():
@@ -194,8 +218,7 @@ def run_cycle() -> dict:
     else:
         print("No local changes.")
 
-    pushed = push_if_ahead(token)
-    return {"pushed": pushed}
+    return {"pushed": push_if_ahead(token)}
 
 
 def main() -> int:
