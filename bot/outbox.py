@@ -34,9 +34,23 @@ log = logging.getLogger(__name__)
 # فشل مؤكّد (4xx) مش هينجح بإعادة المحاولة؛ غيره (شبكة/مهلة/5xx) ممكن يتعاود لو الإرسال مابدأش.
 PERMANENT_STATUS = 400
 
+# حد إعادة المحاولة الآمنة (TASK 53): كل مرة إرسال مابدأش فيها (sandbox مش جاهز أو فشل
+# قبل الـ POST) بتزوّد attempts. بعد ما attempts يوصل الحد ده، بنوقف المحاولات ونعلّم
+# السجل 'failed' — عشان السجل مايفضلش يتعاود للأبد، والإشعار مايتكرّرش كل دورة.
+# السجلات اللي الـ POST بتاعها بدأ (sending/unknown) خارج الحد ده تمامًا: عمرها ما
+# تتاخد تلقائيًا تاني (at-most-once). الحد ده مابيغيّرش أي حاجة في مسار النجاح.
+MAX_OUTBOX_ATTEMPTS = 5
+
 # إشعار موحّد للعمليات الغامضة (مايتعادش تلقائياً — محتاجة مراجعة يدوية).
 _UNKNOWN_CREATION_NOTICE = (
     "مش قادرين نتأكد إن الشات الجديد بدأ. راجعه من الموقع قبل ما تعيد المحاولة."
+)
+
+# إشعارات مسار الإرسال: إشعار واحد عند أول محاولة آمنة فاشلة (مؤقّت)، وإشعار واحد
+# عند استنفاد الحد (نهائي). ما بنكرّرش نفس الرسالة كل دورة.
+_SANDBOX_NOT_READY_NOTICE = "الـ sandbox مش قادر يشتغل، جرّب تفتح الشات من الموقع."
+_OUTBOX_EXHAUSTED_NOTICE = (
+    "تعذّر إرسال البرومت بعد عدة محاولات. جرّب تفتح الشات من الموقع وابعت البرومت من هناك."
 )
 
 
@@ -136,9 +150,17 @@ async def _post_claimed(client, db, bot, item) -> None:
             status = await wait_running(client, conversation_id, interval=3.0, timeout=120.0)
 
         if status != "RUNNING":
-            # البرومت ماتبعتش خالص ⇒ آمن يتعاود لاحقاً (مش فشل دائم).
-            db.set_outbox_status(outbox_id, OUTBOX_PENDING, now_iso(), "sandbox غير جاهز", bump=True)
-            await safe_send(bot, chat_id, "الـ sandbox مش قادر يشتغل، جرّب تفتح الشات من الموقع.")
+            # البرومت ماتبعتش خالص ⇒ آمن يتعاود — بس بحد (TASK 53). بنزوّد attempts
+            # ذرّياً؛ أول محاولة بتبلّغ (مؤقّت)، وبعد استنفاد الحد نعلّمه 'failed' مرة واحدة.
+            attempts = db.bump_outbox_attempt(outbox_id, now_iso(), "sandbox غير جاهز")
+            if attempts >= MAX_OUTBOX_ATTEMPTS:
+                db.set_outbox_status(
+                    outbox_id, OUTBOX_FAILED, now_iso(),
+                    f"استنفد {attempts} محاولات (sandbox غير جاهز)",
+                )
+                await safe_send(bot, chat_id, _OUTBOX_EXHAUSTED_NOTICE)
+            elif attempts == 1:
+                await safe_send(bot, chat_id, _SANDBOX_NOT_READY_NOTICE)
             return
 
         # الإرسال هيبدأ حالاً: نسجّل 'sending' بثبات قبل الـ POST مباشرة (الـ commit
@@ -178,9 +200,16 @@ async def _post_claimed(client, db, bot, item) -> None:
         # U01: المراقب مابيعلنش الانتهاء غير بتقرير أحدث من وقت الإرسال ده.
         db.mark_submitted(conversation_id, submitted_at)
     except ApiError as exc:
-        # فشل قبل الـ POST (قراءة الشات / تشغيل الـ sandbox): الإرسال مابدأش ⇒ آمن يتعاود.
-        db.set_outbox_status(outbox_id, OUTBOX_PENDING, now_iso(), safe_error_label(exc), bump=True)
-        await safe_send(bot, chat_id, f"فشل الإرسال: {error_text(exc)}")
+        # فشل قبل الـ POST (قراءة الشات / تشغيل الـ sandbox): الإرسال مابدأش ⇒ آمن يتعاود،
+        # بس بحد (TASK 53): أول محاولة بتبلّغ (مؤقّت)، وبعد استنفاد الحد نعلّمه 'failed' مرة واحدة.
+        attempts = db.bump_outbox_attempt(outbox_id, now_iso(), safe_error_label(exc))
+        if attempts >= MAX_OUTBOX_ATTEMPTS:
+            db.set_outbox_status(
+                outbox_id, OUTBOX_FAILED, now_iso(), f"استنفد {attempts} محاولات"
+            )
+            await safe_send(bot, chat_id, _OUTBOX_EXHAUSTED_NOTICE)
+        elif attempts == 1:
+            await safe_send(bot, chat_id, f"فشل الإرسال: {error_text(exc)}")
 
 
 async def outbox_recover(app) -> None:
@@ -324,7 +353,9 @@ class OutboxWorker(_BaseWorker):
     """worker واحد مالك لصندوق البرومتات: يعالج 'pending' ويراعي at-most-once.
 
     - الفشل الآمن المؤقّت (قبل الـ POST أو sandbox مش جاهز) بيدخل pending تاني، فالعنصر
-      يفضل مؤهّل وتتطبق عليه الـ backoff. 'unknown'/'failed'/'sent' مش مؤهّلة أصلاً.
+      يفضل مؤهّل وتتطبق عليه الـ backoff — لحد MAX_OUTBOX_ATTEMPTS محاولات، وبعدها
+      نعلّمه 'failed' (نهائي) بإشعار واحد (TASK 53). 'unknown'/'failed'/'sent' مش مؤهّلة
+      أصلاً، فمستحيل يتعاودوا تلقائياً.
     - القرار 2: ما بيحجزش سجل 'pending' غير لما يستوفي نافذة التجميع (db_module.GROUP_WINDOW)،
       فكل الرسايل اللي وصلت خلال النافذة بتتجمّع في سجل واحد وبتتبعت مرة واحدة.
     """

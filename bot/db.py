@@ -73,6 +73,10 @@ class Watched:
     # غير لو لقى تقرير أحدث منه (U01). NULL = متابعة يدوية بدون برومبت.
     submitted_at: str | None = None
     added_at: str | None = None
+    # TASK 54: عدد محاولات إشعار الانتهاء الفاشلة المتتالية. بيترجع 0 عند بداية دورة
+    # إشعار جديدة (حالة غير منتهية جديدة) أو عند إضافة/تحديث المتابعة، وبيمنع تكرار
+    # نفس الإشعار بلا حد بعد استنفاد ميزانية المحاولات.
+    retry_count: int = 0
 
 
 @dataclass
@@ -122,7 +126,8 @@ class Database:
                 last_state      TEXT,
                 chat_id         INTEGER,
                 submitted_at    TEXT,
-                added_at        TEXT
+                added_at        TEXT,
+                retry_count     INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS user_state (
                 telegram_id INTEGER PRIMARY KEY,
@@ -176,6 +181,12 @@ class Database:
             self._conn.execute("ALTER TABLE watched ADD COLUMN submitted_at TEXT")
         if "added_at" not in columns:
             self._conn.execute("ALTER TABLE watched ADD COLUMN added_at TEXT")
+        # TASK 54: عدّاد محاولات إشعار الانتهاء. عمود إضافي بقيمة افتراضية 0، فالصفوف
+        # القديمة بتاخد ميزانية محاولات كاملة من غير أي فقد بيانات.
+        if "retry_count" not in columns:
+            self._conn.execute(
+                "ALTER TABLE watched ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0"
+            )
         # outbox اتعمل في 04A-4 من غير attempts؛ نضيفه لقواعد موجودة.
         outbox_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(outbox)")}
         if outbox_cols and "attempts" not in outbox_cols:
@@ -185,11 +196,15 @@ class Database:
 
     # ----------------------------------------------------------------- watched
     def add_watched(self, conversation_id: str, title: str = "", chat_id: int | None = None) -> None:
+        # TASK 54: إضافة/تحديث المتابعة = بداية دورة إشعار جديدة ⇒ نصفّر عدّاد المحاولات
+        # عشان الإشعار الجديد ياخد ميزانية كاملة (مش ميزانية محاولات إشعار قديم).
         self._conn.execute(
-            "INSERT INTO watched(conversation_id, title, chat_id, added_at) VALUES(?, ?, ?, ?) "
+            "INSERT INTO watched(conversation_id, title, chat_id, added_at, retry_count) "
+            "VALUES(?, ?, ?, ?, 0) "
             "ON CONFLICT(conversation_id) DO UPDATE SET title=excluded.title, "
             "chat_id=COALESCE(excluded.chat_id, watched.chat_id), "
-            "added_at=COALESCE(watched.added_at, excluded.added_at)",
+            "added_at=COALESCE(watched.added_at, excluded.added_at), "
+            "retry_count=0",
             (conversation_id, title, chat_id, datetime.now(timezone.utc).isoformat()),
         )
         self._conn.commit()
@@ -208,15 +223,43 @@ class Database:
 
     def list_watched(self) -> list[Watched]:
         rows = self._conn.execute(
-            "SELECT conversation_id, title, last_state, chat_id, submitted_at, added_at FROM watched"
+            "SELECT conversation_id, title, last_state, chat_id, submitted_at, added_at, "
+            "retry_count FROM watched"
         ).fetchall()
         return [
             Watched(
                 r["conversation_id"], r["title"], r["last_state"], r["chat_id"],
-                r["submitted_at"], r["added_at"],
+                r["submitted_at"], r["added_at"], r["retry_count"],
             )
             for r in rows
         ]
+
+    def increment_watched_retry(self, conversation_id: str) -> int:
+        """يزوّد عدّاد محاولات إشعار الانتهاء ذرّياً ويرجّع القيمة الجديدة (TASK 54).
+
+        الـ UPDATE والقراءة في جملة واحدة (RETURNING)، فالقرار "استنفدنا الحد؟" مبني على
+        عدّاد حقيقي مش snapshot قديم — مستحيل يتخطّى الحد أو يتكرّر الإشعار النهائي.
+        """
+        row = self._conn.execute(
+            "UPDATE watched SET retry_count=retry_count+1 WHERE conversation_id=? "
+            "RETURNING retry_count",
+            (conversation_id,),
+        ).fetchone()
+        self._conn.commit()
+        return int(row["retry_count"]) if row else 0
+
+    def advance_watched_state(self, conversation_id: str, state: str) -> None:
+        """يسجّل الحالة المسجَّلة ويصفّر عدّاد المحاولات (TASK 54).
+
+        الحالة اللي بتوصل هنا دايمًا مش منتهية (المسار المنتهي بيخرج قبلها)، فتسجيلها
+        معناه إن إشعار الانتهاء القديم مات أو ما اتولدش ⇒ بداية دورة إشعار جديدة بميزانية
+        كاملة. التصفير والكتابة في جملة واحدة (ذرّية) عشان مفيش حالة وسطية.
+        """
+        self._conn.execute(
+            "UPDATE watched SET last_state=?, retry_count=0 WHERE conversation_id=?",
+            (state, conversation_id),
+        )
+        self._conn.commit()
 
     def is_watched(self, conversation_id: str) -> bool:
         row = self._conn.execute(
@@ -424,6 +467,22 @@ class Database:
                 (status, error, now, outbox_id),
             )
         self._conn.commit()
+
+    def bump_outbox_attempt(self, outbox_id: int, now: str, error: str | None = None) -> int:
+        """يزوّد attempts ذرّياً ويسيب الحالة 'pending' (محاولة إرسال مابدأتش ⇒ آمنة).
+
+        الـ UPDATE والقراءة في جملة واحدة (RETURNING)، فالقيمة الراجعة هي العدّاد الفعلي
+        بعد الزيادة — حتى لو أكتر من caller نادوها. ده بيخلّي قرار "وصلنا الحد؟" مبني على
+        عدّاد حقيقي مش على snapshot قديم، فمستحيل يتخطّى الحد أو يتكرّر الإشعار النهائي.
+        بترجّع العدّاد الجديد.
+        """
+        row = self._conn.execute(
+            "UPDATE outbox SET status=?, error=?, updated_at=?, attempts=attempts+1 "
+            "WHERE id=? RETURNING attempts",
+            (OUTBOX_PENDING, error, now, outbox_id),
+        ).fetchone()
+        self._conn.commit()
+        return int(row["attempts"]) if row else 0
 
     def claim_outbox(self, now: str, mature_before: str | None = None) -> OutboxItem | None:
         """ياخد ذرّياً أقدم عنصر 'pending' ويحوّله 'claimed' (atomic claim).

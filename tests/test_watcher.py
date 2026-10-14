@@ -283,3 +283,93 @@ def test_watcher_still_isolates_and_retries_with_new_baseline(tmp_path, caplog):
     assert not db.is_watched("c2")
     assert db.is_watched("c1")
     assert "TelegramError" in caplog.text
+
+
+# ------------------------------------ TASK 54: bounded persistent notify retries
+from bot.watcher import MAX_WATCH_NOTIFY_RETRIES
+
+
+def _finished_client():
+    return FakeClient({"c1": {"id": "c1", "title": "first", "execution_status": "finished"}}, reply="تم")
+
+
+def test_legacy_notify_failure_increments_persistent_counter(tmp_path):
+    db = Database(str(tmp_path / "t.sqlite3"))
+    db.add_watched("c1", "first")
+    w = Watcher(_finished_client(), db, FailFirstBot("first"), chat_id=1)
+
+    asyncio.run(w.tick())
+
+    assert db.is_watched("c1")  # لسه بيتعاود
+    assert db.list_watched()[0].retry_count == 1  # العدّاد اتخزّن
+
+
+def test_legacy_notify_retries_stop_at_limit_and_remove(tmp_path):
+    db = Database(str(tmp_path / "t.sqlite3"))
+    db.add_watched("c1", "first")
+    w = Watcher(_finished_client(), db, FailFirstBot("first"), chat_id=1)
+
+    for i in range(1, MAX_WATCH_NOTIFY_RETRIES):
+        asyncio.run(w.tick())
+        assert db.is_watched("c1")  # تحت الحد ⇒ لسه متابَع
+        assert db.list_watched()[0].retry_count == i
+
+    asyncio.run(w.tick())  # المحاولة رقم الحد
+    assert not db.is_watched("c1")  # استسلمنا ومسحنا المتابعة
+
+
+def test_legacy_no_repeat_after_exhaustion(tmp_path):
+    db = Database(str(tmp_path / "t.sqlite3"))
+    db.add_watched("c1", "first")
+    bot = FailFirstBot("first")
+    w = Watcher(_finished_client(), db, bot, chat_id=1)
+
+    for _ in range(MAX_WATCH_NOTIFY_RETRIES + 5):
+        asyncio.run(w.tick())
+
+    # بعد الاستنفاد مفيش أي محاولة إضافية (السجل اتشال).
+    assert db.list_watched() == []
+    assert len(bot.sent) == 0  # كل المحاولات فشلت فمفيش رسالة ناجحة
+
+
+def test_legacy_retry_count_survives_restart(tmp_path):
+    path = str(tmp_path / "t.sqlite3")
+    db = Database(path)
+    db.add_watched("c1", "first")
+    asyncio.run(Watcher(_finished_client(), db, FailFirstBot("first"), chat_id=1).tick())
+    assert db.list_watched()[0].retry_count == 1
+    db.close()
+
+    # "إعادة تشغيل": قاعدة جديدة من نفس الملف + Watcher جديد.
+    db2 = Database(path)
+    asyncio.run(Watcher(_finished_client(), db2, FailFirstBot("first"), chat_id=1).tick())
+    assert db2.list_watched()[0].retry_count == 2  # اتراكم، مارجعش صفر
+    db2.close()
+
+
+def test_legacy_new_lifecycle_resets_retry_budget(tmp_path):
+    db = Database(str(tmp_path / "t.sqlite3"))
+    db.add_watched("c1", "first")
+    fail_bot = FailFirstBot("first")
+
+    # فشل إشعار الانتهاء 3 مرات (تحت الحد).
+    for _ in range(3):
+        asyncio.run(Watcher(_finished_client(), db, fail_bot, chat_id=1).tick())
+    assert db.list_watched()[0].retry_count == 3
+
+    # الشات رجع لحالة غير منتهية (دورة إشعار جديدة) ⇒ العدّاد يتصفّر.
+    running = FakeClient({"c1": {"id": "c1", "execution_status": "running"}})
+    asyncio.run(Watcher(running, db, fail_bot, chat_id=1).tick())
+    w = db.list_watched()[0]
+    assert w.last_state == "running"
+    assert w.retry_count == 0
+
+
+def test_legacy_successful_notify_unchanged(tmp_path):
+    db = Database(str(tmp_path / "t.sqlite3"))
+    db.add_watched("c1", "first")
+    bot = FakeBot()
+    asyncio.run(Watcher(_finished_client(), db, bot, chat_id=1).tick())
+    assert len(bot.sent) == 1  # إشعار ناجح زي قبل
+    assert not db.is_watched("c1")  # اتشال
+

@@ -1,4 +1,10 @@
-"""المراقب: polling كل 20-30 ثانية وإشعار الانتهاء."""
+"""المراقب: polling كل 20-30 ثانية وإشعار الانتهاء.
+
+TASK 54: إشعارات الانتهاء ليها ميزانية محاولات مستمرة (MAX_WATCH_NOTIFY_RETRIES،
+العدّاد في watched.retry_count). **مش تسليم exactly-once**: لو العملية اتقطعت بين ما
+تيليجرام يقبل الرسالة وما نسجّل النجاح (remove_watched)، ممكن الرسالة تتبعت تاني بعد
+إعادة التشغيل — لأن مفيش آلية idempotency مثبَّتة بين تيليجرام وقاعدة البيانات.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -21,6 +27,10 @@ START_TIMEOUT = timedelta(minutes=10)
 FOLLOW_TIMEOUT = timedelta(hours=24)
 # عدد الدورات المتتالية اللي الشات فيها مش ظاهر قبل ما نعتبره اتمسح فعلاً.
 MISSING_LIMIT = 3
+# TASK 54: أقصى عدد محاولات فاشلة متتالية لإشعار انتهاء واحد قبل ما نستسلم.
+# العدّاد متخزّن في SQLite (watched.retry_count) فمابيتصفّرش بإعادة التشغيل، وبيرجع 0
+# لما تبدأ دورة إشعار جديدة (حالة غير منتهية جديدة / إضافة متابعة).
+MAX_WATCH_NOTIFY_RETRIES = 5
 # حالات منتهية ممكن ما يطلعش فيها رد للـ agent، فانتقال حقيقي ليها كافي.
 _NO_REPORT_STATES = {"error", "stuck", "waiting_for_confirmation"}
 
@@ -123,14 +133,14 @@ class Watcher:
             try:
                 await self._notify(w, conv, state)
             except TelegramError as exc:
-                self._log_delivery_failure(w, exc)
+                self._handle_notify_failure(w, exc)
                 return
             self._db.remove_watched(w.conversation_id)
             return
         if self._expired(w.added_at, FOLLOW_TIMEOUT) and state not in DONE_STATES:
             if await self._notify_timeout(w, conv, state):
                 return
-        self._db.set_last_state(w.conversation_id, state or "")
+        self._db.advance_watched_state(w.conversation_id, state or "")
 
     async def _process_submitted(self, w, conv: dict, state: str | None) -> None:
         """U01: الانتهاء لازم يتثبت بتقرير أحدث من وقت إرسال البرومبت."""
@@ -149,7 +159,7 @@ class Watcher:
                 try:
                     await self._notify(w, conv, state, report=report, fresh_only=True)
                 except TelegramError as exc:
-                    self._log_delivery_failure(w, exc)
+                    self._handle_notify_failure(w, exc)
                     return
                 self._db.remove_watched(w.conversation_id)
                 return
@@ -167,7 +177,7 @@ class Watcher:
         if self._expired(w.submitted_at, FOLLOW_TIMEOUT):
             if await self._notify_timeout(w, conv, state):
                 return
-        self._db.set_last_state(w.conversation_id, state or "")
+        self._db.advance_watched_state(w.conversation_id, state or "")
 
     async def _notify_timeout(self, w, conv: dict, state: str | None) -> bool:
         title = conv.get("title") or w.title or "بدون عنوان"
@@ -205,6 +215,22 @@ class Watcher:
             "فشل إشعار الشات %s (%s)، هيتعاود في الدورة الجاية",
             w.conversation_id, type(exc).__name__,
         )
+
+    def _handle_notify_failure(self, w, exc: Exception) -> None:
+        """فشل إشعار انتهاء: يزوّد العدّاد المستمر، وبعد الحد يستسلم ويسيب المتابعة.
+
+        العدّاد متخزّن في SQLite فمايتصفّرش بإعادة التشغيل. لما يوصل الحد بنشيل المتابعة
+        عشان نفس الإشعار مايتحاولش تاني كل دورة. بنسجّل النوع بس (ممكن يحوي أسرار).
+        """
+        count = self._db.increment_watched_retry(w.conversation_id)
+        if count >= MAX_WATCH_NOTIFY_RETRIES:
+            log.warning(
+                "استسلمنا من إشعار انتهاء الشات %s بعد %d محاولة فاشلة (%s)؛ هنوقف المتابعة",
+                w.conversation_id, count, type(exc).__name__,
+            )
+            self._db.remove_watched(w.conversation_id)
+        else:
+            self._log_delivery_failure(w, exc)
 
     async def _notify(
         self, w, conv: dict, state: str, report: str | None = None, fresh_only: bool = False

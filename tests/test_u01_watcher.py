@@ -294,3 +294,67 @@ def test_client_events_without_timestamp_never_count():
             await client.aclose()
 
     assert asyncio.run(go()) is None
+
+
+# ------------------------- TASK 54: bounded persistent notify retries (submitted)
+from bot.watcher import MAX_WATCH_NOTIFY_RETRIES
+
+
+def test_submitted_notify_failure_increments_persistent_counter(tmp_path):
+    db = setup(tmp_path, "finished", last_state="running")
+    client = Client(conv("finished"), reports=[(T0 + timedelta(seconds=40), "تقرير جديد")])
+    run(Watcher(client, db, Bot(fail=True), chat_id=1, clock=Clock(T0 + timedelta(minutes=1))))
+
+    assert db.is_watched("c1")
+    assert db.list_watched()[0].retry_count == 1
+
+
+def test_submitted_notify_retries_stop_at_limit(tmp_path):
+    db = setup(tmp_path, "finished", last_state="running")
+    client = Client(conv("finished"), reports=[(T0 + timedelta(seconds=40), "تقرير جديد")])
+    w = Watcher(client, db, Bot(fail=True), chat_id=1, clock=Clock(T0 + timedelta(minutes=1)))
+
+    for i in range(1, MAX_WATCH_NOTIFY_RETRIES):
+        run(w)
+        assert db.is_watched("c1")
+        assert db.list_watched()[0].retry_count == i
+
+    run(w)  # المحاولة رقم الحد
+    assert not db.is_watched("c1")  # استسلمنا
+
+
+def test_submitted_no_repeat_after_exhaustion(tmp_path):
+    db = setup(tmp_path, "finished", last_state="running")
+    client = Client(conv("finished"), reports=[(T0 + timedelta(seconds=40), "تقرير جديد")])
+    w = Watcher(client, db, Bot(fail=True), chat_id=1, clock=Clock(T0 + timedelta(minutes=1)))
+
+    for _ in range(MAX_WATCH_NOTIFY_RETRIES + 4):
+        run(w)
+    assert not db.is_watched("c1")
+
+
+def test_submitted_retry_count_survives_restart(tmp_path):
+    path = str(tmp_path / "t.sqlite3")
+    db = Database(path)
+    db.add_watched("c1", "شات", chat_id=5)
+    db.set_last_state("c1", "running")
+    db.mark_submitted("c1", T0.isoformat())
+    client = Client(conv("finished"), reports=[(T0 + timedelta(seconds=40), "تقرير جديد")])
+    run(Watcher(client, db, Bot(fail=True), chat_id=1, clock=Clock(T0 + timedelta(minutes=1))))
+    assert db.list_watched()[0].retry_count == 1
+    db.close()
+
+    db2 = Database(path)
+    run(Watcher(client, db2, Bot(fail=True), chat_id=1, clock=Clock(T0 + timedelta(minutes=1))))
+    assert db2.list_watched()[0].retry_count == 2  # اتراكم بعد "إعادة التشغيل"
+    db2.close()
+
+
+def test_submitted_successful_notify_unchanged(tmp_path):
+    db = setup(tmp_path, "finished", last_state="running")
+    client = Client(conv("finished"), reports=[(T0 + timedelta(seconds=40), "تقرير جديد")])
+    bot = Bot()
+    run(Watcher(client, db, bot, chat_id=1, clock=Clock(T0 + timedelta(minutes=1))))
+    assert len(bot.sent) == 1
+    assert "تقرير جديد" in bot.sent[0]
+    assert not db.is_watched("c1")

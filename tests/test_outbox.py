@@ -431,3 +431,157 @@ def test_app_and_recovery_tasks_do_not_double_submit(tmp_path):
     assert client.sent == []
     assert db.get_outbox(oid).status == "unknown"
 
+
+# ------------------------------------------------ TASK 53: bounded retry cap
+def _mature(monkeypatch):
+    """يعدّي نافذة التجميع فورًا عشان الـ worker يحجز السجل في نفس الدورة."""
+    monkeypatch.setattr(
+        "bot.outbox.grouping_mature_before", lambda *a, **k: "9999-12-31T23:59:59+00:00"
+    )
+
+
+class NeverReadyClient:
+    """الشات موجود بس الـ sandbox عمره ما بيبقى RUNNING (فشل آمن قبل الـ POST).
+
+    من غير sandbox_id عشان نتخطّى resume + wait_running (اللي بينتظر 120 ثانية)،
+    وندخل نفس مسار إعادة المحاولة الآمن مباشرةً.
+    """
+
+    def __init__(self):
+        self.sends = []
+
+    async def get_conversations(self, ids):
+        return [{"id": "c1", "title": "شات", "sandbox_status": "STOPPED"}]
+
+    async def send_message(self, conversation_id, text):
+        self.sends.append((conversation_id, text))
+
+
+def test_sandbox_not_ready_first_attempt_notifies_once_and_increments(tmp_path, monkeypatch):
+    _mature(monkeypatch)
+    db = make_db(tmp_path)
+    add_pending(db)
+    bot = Bot()
+    worker = make_worker(db, client=NeverReadyClient(), bot=bot)
+
+    asyncio.run(worker._tick())
+    item = db.get_outbox(1)
+    assert item.status == "pending"  # لسه تحت الحد ⇒ آمن يتعاود
+    assert item.attempts == 1
+    # إشعار واحد بس عند أول محاولة.
+    assert sum("sandbox" in t for t in bot.sent) == 1
+
+    # دورات تانية تحت الحد: attempts بيزيد، ومفيش تكرار للإشعار.
+    asyncio.run(worker._tick())
+    assert db.get_outbox(1).attempts == 2
+    assert sum("sandbox" in t for t in bot.sent) == 1  # مفيش تكرار
+
+
+def test_exhaustion_marks_failed_once_with_single_notification(tmp_path, monkeypatch):
+    from bot.outbox import MAX_OUTBOX_ATTEMPTS
+
+    _mature(monkeypatch)
+    db = make_db(tmp_path)
+    add_pending(db)
+    bot = Bot()
+    worker = make_worker(db, client=NeverReadyClient(), bot=bot)
+
+    # نستنفد الحد بالظبط.
+    for _ in range(MAX_OUTBOX_ATTEMPTS):
+        asyncio.run(worker._tick())
+
+    item = db.get_outbox(1)
+    assert item.status == "failed"  # الحد استُوفي ⇒ نهائي
+    assert item.attempts == MAX_OUTBOX_ATTEMPTS
+    # إشعار نهائي واحد بس (استنفاد)، + إشعار مؤقّت واحد عند أول محاولة = 2 إجمالًا.
+    assert sum("تعذّر إرسال البرومت" in t for t in bot.sent) == 1
+    assert len(bot.sent) == 2
+
+    # دورات إضافية: السجل 'failed' مش مؤهّل ⇒ مفيش إشعار ولا إعادة.
+    for _ in range(3):
+        asyncio.run(worker._tick())
+    assert db.get_outbox(1).status == "failed"
+    assert len(bot.sent) == 2  # مفيش تكرار
+
+
+def test_cap_boundary_exact_threshold(tmp_path, monkeypatch):
+    # حدود دقيقة: عند attempts = الحد-1 لسه pending، وعند الحد يبقى failed.
+    from bot.outbox import MAX_OUTBOX_ATTEMPTS
+
+    _mature(monkeypatch)
+    db = make_db(tmp_path)
+    add_pending(db)
+    worker = make_worker(db, client=NeverReadyClient(), bot=Bot())
+
+    for i in range(1, MAX_OUTBOX_ATTEMPTS):
+        asyncio.run(worker._tick())
+        assert db.get_outbox(1).status == "pending", i
+        assert db.get_outbox(1).attempts == i
+
+    asyncio.run(worker._tick())  # المحاولة رقم الحد
+    assert db.get_outbox(1).attempts == MAX_OUTBOX_ATTEMPTS
+    assert db.get_outbox(1).status == "failed"
+
+
+def test_exhaustion_transition_is_exactly_once_under_repeat(tmp_path, monkeypatch):
+    # الانتقال النهائي ('failed') بيحصل مرة واحدة بس، حتى مع دورات متكررة.
+    from bot.outbox import MAX_OUTBOX_ATTEMPTS
+
+    _mature(monkeypatch)
+    db = make_db(tmp_path)
+    add_pending(db)
+    worker = make_worker(db, client=NeverReadyClient(), bot=Bot())
+
+    for _ in range(MAX_OUTBOX_ATTEMPTS + 5):
+        asyncio.run(worker._tick())
+    assert db.get_outbox(1).status == "failed"
+    assert db.get_outbox(1).attempts == MAX_OUTBOX_ATTEMPTS  # مفيش زيادة بعد النهائي
+
+
+def test_unknown_is_never_resent_even_with_cap(tmp_path, monkeypatch):
+    # حماية at-most-once: 'unknown' (POST ممكن يكون اتقبل) مابيتاخدش أبداً، والحد مايأثرش.
+    _mature(monkeypatch)
+    db = make_db(tmp_path)
+    add_pending(db)
+    client = Client(send_error=ApiError("timeout", None))
+    worker = make_worker(db, client=client, bot=Bot())
+
+    asyncio.run(worker._tick())
+    assert db.get_outbox(1).status == "unknown"
+    for _ in range(10):
+        asyncio.run(worker._tick())
+    assert db.get_outbox(1).status == "unknown"  # ما اتعادش
+    assert client.sent == []  # مفيش POST ناجح مكرّر
+
+
+def test_sending_record_is_not_reclaimed_by_cap(tmp_path, monkeypatch):
+    # 'sending' (POST بدأ) مابيتاخدش تلقائياً ولا يتحوّل 'failed' بسبب الحد.
+    from bot.outbox import MAX_OUTBOX_ATTEMPTS
+
+    _mature(monkeypatch)
+    db = make_db(tmp_path)
+    oid = add_pending(db)
+    db.set_outbox_status(oid, "sending", "t0")
+    client = Client()
+    worker = make_worker(db, client=client, bot=Bot())
+
+    for _ in range(MAX_OUTBOX_ATTEMPTS + 3):
+        asyncio.run(worker._tick())
+    assert db.get_outbox(oid).status == "sending"  # مالَمتْش
+    assert client.sent == []
+
+
+def test_success_path_unaffected_by_cap(tmp_path, monkeypatch):
+    # مسار النجاح مااتغيرش: إرسال واحد + 'sent'، وattempts مش بتزيد.
+    _mature(monkeypatch)
+    db = make_db(tmp_path)
+    add_pending(db)
+    client = Client()
+    worker = make_worker(db, client=client, bot=Bot())
+
+    asyncio.run(worker._tick())
+    assert db.get_outbox(1).status == "sent"
+    assert db.get_outbox(1).attempts == 0
+    assert client.sent == [("c1", "برومت")]
+
+

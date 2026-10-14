@@ -173,6 +173,24 @@ def test_outbox_attempts_defaults_zero_and_bumps(tmp_path):
     assert db.get_outbox(oid).attempts == 1
 
 
+def test_bump_outbox_attempt_is_atomic_and_returns_new_count(tmp_path):
+    # TASK 53: bump_outbox_attempt بترجّع العدّاد الفعلي بعد الزيادة (RETURNING)،
+    # وبتسيب الحالة 'pending' (محاولة مابدأتش ⇒ آمنة)، وبتحفظ الخطأ.
+    db = make_db(tmp_path)
+    oid = db.add_outbox("c1", 9, "x", "t")
+    assert db.bump_outbox_attempt(oid, "t1", "سبب") == 1
+    assert db.bump_outbox_attempt(oid, "t2", "سبب") == 2
+    item = db.get_outbox(oid)
+    assert item.status == "pending"
+    assert item.attempts == 2
+    assert item.error == "سبب"
+
+
+def test_bump_outbox_attempt_missing_record_returns_zero(tmp_path):
+    db = make_db(tmp_path)
+    assert db.bump_outbox_attempt(999, "t", None) == 0
+
+
 def test_claim_sets_claimed_and_is_single_shot(tmp_path):
     db = make_db(tmp_path)
     a = db.add_outbox("c1", 9, "a", "t")
@@ -313,4 +331,83 @@ def test_list_open_outbox_excludes_terminal(tmp_path):
     b = db.add_outbox("c2", 99, "b", "t")
     db.set_outbox_status(b, "sent", "t")
     assert [i.id for i in db.list_open_outbox()] == [a]
+
+
+# ---------------------------------------------- TASK 54: watched retry_count
+def test_watched_retry_count_defaults_zero(tmp_path):
+    db = make_db(tmp_path)
+    db.add_watched("c1", "عنوان")
+    assert db.list_watched()[0].retry_count == 0
+
+
+def test_increment_watched_retry_is_atomic_and_returns_new_count(tmp_path):
+    db = make_db(tmp_path)
+    db.add_watched("c1")
+    assert db.increment_watched_retry("c1") == 1
+    assert db.increment_watched_retry("c1") == 2
+    assert db.list_watched()[0].retry_count == 2
+
+
+def test_increment_watched_retry_missing_record_returns_zero(tmp_path):
+    db = make_db(tmp_path)
+    assert db.increment_watched_retry("nope") == 0
+
+
+def test_advance_watched_state_resets_retry_count(tmp_path):
+    db = make_db(tmp_path)
+    db.add_watched("c1")
+    db.increment_watched_retry("c1")
+    db.increment_watched_retry("c1")
+    assert db.list_watched()[0].retry_count == 2
+    db.advance_watched_state("c1", "running")
+    w = db.list_watched()[0]
+    assert w.last_state == "running"
+    assert w.retry_count == 0  # بداية دورة إشعار جديدة ⇒ ميزانية كاملة
+
+
+def test_add_watched_resets_retry_count_new_lifecycle(tmp_path):
+    db = make_db(tmp_path)
+    db.add_watched("c1", "عنوان")
+    db.increment_watched_retry("c1")
+    db.increment_watched_retry("c1")
+    assert db.list_watched()[0].retry_count == 2
+    db.add_watched("c1", "عنوان محدّث")  # متابعة جديدة ⇒ تصفير
+    assert db.list_watched()[0].retry_count == 0
+
+
+def test_retry_count_persists_across_reopen(tmp_path):
+    path = str(tmp_path / "t.sqlite3")
+    db = make_db(tmp_path)
+    db.add_watched("c1")
+    db.increment_watched_retry("c1")
+    db.increment_watched_retry("c1")
+    db.increment_watched_retry("c1")
+    db.close()
+
+    reopened = Database(path)
+    assert reopened.list_watched()[0].retry_count == 3  # نجا من إعادة الفتح
+    reopened.close()
+
+
+def test_migration_adds_retry_count_to_existing_watched(tmp_path):
+    import sqlite3
+
+    path = str(tmp_path / "old.sqlite3")
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        "CREATE TABLE watched (conversation_id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '',"
+        " last_state TEXT, chat_id INTEGER);"
+        "CREATE TABLE user_state (telegram_id INTEGER PRIMARY KEY, awaiting_conversation_id TEXT,"
+        " awaiting_kind TEXT);"
+    )
+    conn.execute("INSERT INTO watched(conversation_id, title) VALUES('c1','قديم')")
+    conn.commit()
+    conn.close()
+
+    db = Database(path)  # الترحيل يضيف العمود من غير ما يفقد الصف
+    w = db.list_watched()[0]
+    assert w.conversation_id == "c1"
+    assert w.retry_count == 0  # الصف القديم ياخد ميزانية كاملة
+    assert db.increment_watched_retry("c1") == 1
+
 
