@@ -8,10 +8,13 @@ Katabump المجاني كفاية للبوت ده (308 MB رام، 716 MB تخ�
 1. من لوحة Katabump اعمل سيرفر جديد نوعه **Python**.
 2. ارفع ملفات المشروع (ZIP أو SFTP):
    - `main.py`, `bot/`, `requirements.txt`, `README.md`, `docs/`.
-   - ما ترفعش `.env` ولا `.venv/` ولا `*.sqlite3`.
+   - ما ترفعش `.env` ولا `.venv/` ولا `*.sqlite3` (ولا ملفات الـ WAL المصاحبة
+     `*.sqlite3-wal`/`*.sqlite3-shm`)، ولا `.git/`، ولا `automation*/` و`automations/`
+     (سكربتات تطوير محلية مش جزء من التشغيل)، ولا `__pycache__/`.
 3. اضبط متغيرات البيئة في لوحة السيرفر (Environment Variables):
    - `TELEGRAM_BOT_TOKEN`, `OPENHANDS_API_KEY`, `ALLOWED_TELEGRAM_ID`.
-   - اختياري: `OPENHANDS_BASE_URL`, `LOG_LEVEL`, `WATCHER_INTERVAL`.
+   - اختياري: `OPENHANDS_BASE_URL`, `LOG_LEVEL`, `WATCHER_INTERVAL`, `DB_PATH`
+     (الافتراضي `bot_state.sqlite3`).
 4. أمر التشغيل: `python main.py` (الحزم تتثبت تلقائيًا من `requirements.txt` أول تشغيل).
 5. اضغط **Start**، وتابع السجلات من اللوحة.
 
