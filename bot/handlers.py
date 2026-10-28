@@ -22,10 +22,11 @@ log = logging.getLogger(__name__)
 PAGE_SIZE = 10
 REPOS_PAGE_SIZE = 8
 FILES_PAGE_SIZE = 10
-# TASK 55 (المرحلة B): كاش قصير للتبادل الأخير (copy/full).
+# TASK 55 (المرحلة B/C): كاش قصير للتبادل الأخير (copy/full) وكاش قايمة الشاتات.
 # الرام محدود (308MB على Katabump) فبنحدّ عدد المداخل.
 EXCHANGE_TTL = 45.0
 EXCHANGE_CACHE_MAX = 20
+LIST_TTL = 45.0
 
 
 def _allowed(update: Update, config) -> bool:
@@ -150,12 +151,19 @@ async def list_conversations(update: Update, context: ContextTypes.DEFAULT_TYPE)
     client = context.bot_data["client"]
     # نجيب لحد 100 شات مرة واحدة ونرتّبهم إحنا، عشان الترتيب الخام من الـ API
     # مش مضمون وبيكسر الترقيم لو رتّبنا كل صفحة لوحدها.
-    try:
-        result = await client.search_conversations(limit=100)
-    except ApiError as exc:
-        await _safe_edit(q, error_text(exc))
-        return
-    items = result["items"]
+    # TASK 55 (G4): كاش قصير للقايمة عشان الضغط على «المزيد» ما يعملش طلب API كل مرة.
+    cache = context.bot_data.get("list_cache")
+    if cache and time.monotonic() - cache[0] < LIST_TTL:
+        items = cache[1]
+    else:
+        try:
+            result = await client.search_conversations(limit=100)
+        except ApiError as exc:
+            await _safe_edit(q, error_text(exc))
+            return
+        items = result["items"]
+        if items:
+            context.bot_data["list_cache"] = (time.monotonic(), items)
     if not items:
         await _safe_edit(q, "ما فيهاش شاتات.", reply_markup=kb.main_menu())
         return
@@ -523,6 +531,8 @@ async def _send_prompt(
     # نسجّل 'pending' قبل ما نبدأ أي إرسال، عشان البرومت مايضيعش لو العملية اتقطعت.
     # القرار 2: لو فيه برومت لنفس الوجهة اتسجّل خلال 1.5 ثانية، بيتجمّع معاه في سجل واحد.
     db.add_or_group_outbox(conversation_id, chat_id, text, outbox.now_iso())
+    # TASK 55 (C): ترتيب القايمة بيتغيّر بعد البرومت ⇒ نبطّل كاش القايمة.
+    context.bot_data.pop("list_cache", None)
     # تأكيد الحفظ بيذكر الشات المستهدف (القرار 1) عشان رسالة ماتروحش لشات غلط من غير ما تلاحظ.
     ack = "وصل ✅" if not title else f"وصل ✅ ← «{title[:40]}»"
     await update.message.reply_text(ack)
@@ -668,6 +678,8 @@ async def _create_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int, repo: s
     await outbox._start_conversation(
         client, db, bot, job, context.bot_data["config"].openhands_base_url
     )
+    # TASK 55 (C): بعد نجاح بدء الشات، ترتيب القايمة اتغيّر ⇒ نبطّل كاش القايمة.
+    context.bot_data.pop("list_cache", None)
 
 
 # ------------------------------------------------ manual outbox reconciliation

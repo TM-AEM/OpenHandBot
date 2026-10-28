@@ -695,7 +695,7 @@ def test_create_chat_direct_ambiguous_is_unknown(tmp_path):
 
 
 # =====================================================================
-# TASK 55 (المرحلة B): عرض التبادل + النسخ
+# TASK 55 (المرحلة B/C): عرض التبادل + النسخ + كاش القايمة
 # =====================================================================
 class ExchangeClient:
     """عميل موحّد للاختبارات: شات + تبادل + قايمة مع عدّادات نداءات."""
@@ -892,3 +892,94 @@ def test_full_reply_sends_long_reply(tmp_path):
     asyncio.run(h.full_reply(_t55_cb_update(q), ctx))
     assert len(ctx.bot.messages) == 2  # send_long يقسّم لقطعتين
     assert ctx.bot.documents == []
+
+
+# -------------------------------------------------- كاش القايمة (المرحلة C)
+def _list_items(n):
+    return [{"id": f"c{i}", "title": f"شات {i}", "execution_status": "running"} for i in range(n)]
+
+
+def test_list_cache_avoids_second_api_call(tmp_path):
+    client = ExchangeClient(None, list_items=_list_items(15))
+    ctx = make_context(1, tmp_path, client=client)
+    asyncio.run(h.list_conversations(_t55_cb_update(CQ("list:0")), ctx))
+    asyncio.run(h.list_conversations(_t55_cb_update(CQ("list:1")), ctx))
+    assert client.list_calls == 1  # الضغطة التانية من الكاش
+
+
+def test_list_cache_expires(tmp_path, monkeypatch):
+    client = ExchangeClient(None, list_items=_list_items(3))
+    ctx = make_context(1, tmp_path, client=client)
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(h.time, "monotonic", lambda: clock["t"])
+    asyncio.run(h.list_conversations(_t55_cb_update(CQ("list:0")), ctx))
+    clock["t"] += h.LIST_TTL + 1
+    asyncio.run(h.list_conversations(_t55_cb_update(CQ("list:0")), ctx))
+    assert client.list_calls == 2
+
+
+def test_list_empty_not_cached(tmp_path):
+    client = ExchangeClient(None, list_items=[])
+    ctx = make_context(1, tmp_path, client=client)
+    asyncio.run(h.list_conversations(_t55_cb_update(CQ("list:0")), ctx))
+    asyncio.run(h.list_conversations(_t55_cb_update(CQ("list:0")), ctx))
+    assert client.list_calls == 2
+    assert "list_cache" not in ctx.bot_data
+
+
+def test_send_prompt_invalidates_list_cache(tmp_path):
+    ctx = make_context(1, tmp_path)
+    ctx.bot_data["list_cache"] = (h.time.monotonic(), [{"id": "x"}])
+    ctx.bot_data["db"].set_awaiting(1, "conv-1", "reply")
+    asyncio.run(h.handle_text(make_update(1, "برومت"), ctx))
+    assert "list_cache" not in ctx.bot_data
+
+
+def test_create_chat_invalidates_list_cache(tmp_path):
+    ctx = make_context(1, tmp_path, client=CreationClient(conv="conv-9"))
+    ctx.bot = _SendBot()
+    ctx.bot_data["list_cache"] = (h.time.monotonic(), [{"id": "x"}])
+    asyncio.run(h._create_chat(ctx, 99, "o/r", "برومت"))
+    assert "list_cache" not in ctx.bot_data
+
+
+def test_open_ignores_exchange_cache(tmp_path):
+    client = ExchangeClient(CONV55, "ب", "ردي")
+    ctx = make_context(1, tmp_path, client=client)
+    ctx.bot = RecBot()
+    ctx.bot_data["exchange_cache"] = {"A": (h.time.monotonic(), "قديم", "قديم")}
+    asyncio.run(h.open_conversation(_t55_cb_update(CQ("open:A")), ctx))
+    assert client.exchange_calls == 1  # تحديث = قراءة طازة دايماً
+
+
+def test_copy_after_open_uses_cache(tmp_path):
+    client = ExchangeClient(CONV55, "ب", "ردي")
+    ctx = make_context(1, tmp_path, client=client)
+    ctx.bot = RecBot()
+    asyncio.run(h.open_conversation(_t55_cb_update(CQ("open:A")), ctx))
+    assert client.exchange_calls == 1
+    asyncio.run(h.copy_reply(_t55_cb_update(CQ("copy:A")), ctx))
+    assert client.exchange_calls == 1  # من الكاش، مفيش طلب تاني
+
+
+def test_copy_after_ttl_refetches(tmp_path, monkeypatch):
+    client = ExchangeClient(CONV55, "ب", "ردي")
+    ctx = make_context(1, tmp_path, client=client)
+    ctx.bot = RecBot()
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(h.time, "monotonic", lambda: clock["t"])
+    asyncio.run(h.open_conversation(_t55_cb_update(CQ("open:A")), ctx))
+    clock["t"] += h.EXCHANGE_TTL + 1
+    asyncio.run(h.copy_reply(_t55_cb_update(CQ("copy:A")), ctx))
+    assert client.exchange_calls == 2
+
+
+def test_exchange_cache_evicts_oldest(tmp_path):
+    ctx = make_context(1, tmp_path, client=ExchangeClient(CONV55))
+    for i in range(h.EXCHANGE_CACHE_MAX + 5):
+        h._store_exchange(ctx, f"c{i}", "ب", "ر")
+    cache = ctx.bot_data["exchange_cache"]
+    assert len(cache) == h.EXCHANGE_CACHE_MAX
+    assert "c0" not in cache  # الأقدم اتشال
+    assert f"c{h.EXCHANGE_CACHE_MAX + 4}" in cache
+
