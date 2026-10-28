@@ -467,6 +467,9 @@ class OpenClient:
     async def get_last_reply(self, cid):
         return "رد"
 
+    async def get_last_exchange(self, cid):
+        return ("برومت", "رد")
+
 
 def test_opening_a_chat_routes_following_messages_to_it_and_replaces_previous(tmp_path):
     client = OpenClient({"id": "A", "title": "شات A", "execution_status": "finished"})
@@ -533,6 +536,11 @@ class OpenFlowClient:
         if self._reply_error:
             raise self._reply_error
         return self._reply
+
+    async def get_last_exchange(self, conversation_id):
+        if self._reply_error:
+            raise self._reply_error
+        return ("برومت", self._reply)
 
 
 class FailQuery:

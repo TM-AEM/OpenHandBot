@@ -693,3 +693,202 @@ def test_create_chat_direct_ambiguous_is_unknown(tmp_path):
     assert db.count_creation_jobs("unknown") == 1
     assert client.start_calls == 1
 
+
+# =====================================================================
+# TASK 55 (المرحلة B): عرض التبادل + النسخ
+# =====================================================================
+class ExchangeClient:
+    """عميل موحّد للاختبارات: شات + تبادل + قايمة مع عدّادات نداءات."""
+
+    def __init__(self, conv, user_text="برومتي", reply="ردي", *, open_error=None,
+                 exchange_error=None, list_items=None):
+        self._conv = conv
+        self._user_text = user_text
+        self._reply = reply
+        self._open_error = open_error
+        self._exchange_error = exchange_error
+        self._list_items = list_items if list_items is not None else []
+        self.list_calls = 0
+        self.exchange_calls = 0
+
+    async def get_conversations(self, ids):
+        if self._open_error:
+            raise self._open_error
+        return [self._conv] if self._conv else []
+
+    async def get_last_exchange(self, cid):
+        self.exchange_calls += 1
+        if self._exchange_error:
+            raise self._exchange_error
+        return (self._user_text, self._reply)
+
+    async def search_conversations(self, limit=100, page_id=None):
+        self.list_calls += 1
+        return {"items": self._list_items[:limit], "next_page_id": None}
+
+
+class RecBot:
+    def __init__(self):
+        self.messages = []
+        self.documents = []
+
+    async def send_message(self, chat_id=None, text=None, **kw):
+        self.messages.append((text, kw.get("parse_mode")))
+
+    async def send_document(self, chat_id=None, document=None, **kw):
+        self.documents.append(document)
+
+
+class CQ:
+    def __init__(self, data):
+        self.data = data
+        self.edits = []
+        self.markups = []
+        self.message = SimpleNamespace(chat_id=99)
+        self.answered = 0
+
+    async def answer(self):
+        self.answered += 1
+
+    async def edit_message_text(self, text, **kw):
+        self.edits.append(text)
+        self.markups.append(kw.get("reply_markup"))
+
+
+def _t55_cb_update(q, user_id=1):
+    return SimpleNamespace(
+        effective_user=SimpleNamespace(id=user_id),
+        effective_chat=SimpleNamespace(id=99, type="private"),
+        callback_query=q,
+        message=None,
+    )
+
+
+def _markup_callbacks(markup):
+    return [b.callback_data for row in markup.inline_keyboard for b in row]
+
+
+CONV55 = {"id": "A", "title": "شات A", "execution_status": "finished", "selected_repository": "o/r"}
+
+
+def test_open_shows_last_prompt_and_agent_reply(tmp_path):
+    ctx = make_context(1, tmp_path, client=ExchangeClient(CONV55, "برومتي", "ردي"))
+    ctx.bot = RecBot()
+    q = CQ("open:A")
+    asyncio.run(h.open_conversation(_t55_cb_update(q), ctx))
+    assert q.edits and "آخر برومت منك:" in q.edits[0] and "برومتي" in q.edits[0]
+    assert "رد الـ agent:" in q.edits[0] and "ردي" in q.edits[0]
+    assert "10 دقايق" in q.edits[0]
+    assert ctx.bot_data["db"].get_awaiting(1) == ("A", "route")
+
+
+def test_open_long_reply_offers_full_button(tmp_path):
+    ctx = make_context(1, tmp_path, client=ExchangeClient(CONV55, "ب", "ر" * 5000))
+    ctx.bot = RecBot()
+    q = CQ("open:A")
+    asyncio.run(h.open_conversation(_t55_cb_update(q), ctx))
+    cbs = _markup_callbacks(q.markups[-1])
+    assert "copy:A" in cbs and "full:A" in cbs
+
+
+def test_open_short_reply_has_no_full_button(tmp_path):
+    ctx = make_context(1, tmp_path, client=ExchangeClient(CONV55, "ب", "رد قصير"))
+    ctx.bot = RecBot()
+    q = CQ("open:A")
+    asyncio.run(h.open_conversation(_t55_cb_update(q), ctx))
+    cbs = _markup_callbacks(q.markups[-1])
+    assert "copy:A" in cbs and "full:A" not in cbs
+
+
+def test_open_no_reply_has_no_copy_button(tmp_path):
+    ctx = make_context(1, tmp_path, client=ExchangeClient(CONV55, "ب", None))
+    ctx.bot = RecBot()
+    q = CQ("open:A")
+    asyncio.run(h.open_conversation(_t55_cb_update(q), ctx))
+    assert "لسه مفيش رد." in q.edits[0]
+    assert "copy:A" not in _markup_callbacks(q.markups[-1])
+
+
+def test_open_missing_chat_message(tmp_path):
+    ctx = make_context(1, tmp_path, client=ExchangeClient(None))
+    ctx.bot = RecBot()
+    q = CQ("open:missing")
+    asyncio.run(h.open_conversation(_t55_cb_update(q), ctx))
+    assert q.edits == ["الشات مش موجود."]
+
+
+def test_open_missing_priority_over_exchange_error(tmp_path):
+    # الشات مش موجود + طلب الأحداث فشل ⇒ الرسالة القديمة "مش موجود" (أولوية ثابتة).
+    client = ExchangeClient(None, exchange_error=ApiError("server", 500))
+    ctx = make_context(1, tmp_path, client=client)
+    ctx.bot = RecBot()
+    q = CQ("open:missing")
+    asyncio.run(h.open_conversation(_t55_cb_update(q), ctx))
+    assert q.edits == ["الشات مش موجود."]
+
+
+def test_open_exchange_error_shows_error_and_no_route(tmp_path):
+    client = ExchangeClient(CONV55, exchange_error=ApiError("server", 500))
+    ctx = make_context(1, tmp_path, client=client)
+    ctx.bot = RecBot()
+    q = CQ("open:A")
+    asyncio.run(h.open_conversation(_t55_cb_update(q), ctx))
+    assert q.edits and "server" in q.edits[0]
+    assert ctx.bot_data["db"].get_awaiting(1) == (None, None)
+
+
+def test_copy_reply_sends_pre_escaped(tmp_path):
+    ctx = make_context(1, tmp_path, client=ExchangeClient(CONV55, "ب", "رد <b> & </b>"))
+    ctx.bot = RecBot()
+    q = CQ("copy:A")
+    asyncio.run(h.copy_reply(_t55_cb_update(q), ctx))
+    assert ctx.bot.messages
+    text = ctx.bot.messages[0][0]
+    assert text.startswith("<pre>") and text.endswith("</pre>")
+    assert "<b>" not in text and "&lt;b&gt;" in text and "&amp;" in text
+
+
+def test_copy_reply_non_owner_ignored(tmp_path):
+    ctx = make_context(1, tmp_path, client=ExchangeClient(CONV55))
+    ctx.bot = RecBot()
+    q = CQ("copy:A")
+    asyncio.run(h.copy_reply(_t55_cb_update(q, user_id=999), ctx))
+    assert ctx.bot.messages == []
+    assert q.answered == 1
+
+
+def test_copy_reply_no_reply_message(tmp_path):
+    ctx = make_context(1, tmp_path, client=ExchangeClient(CONV55, "ب", None))
+    ctx.bot = RecBot()
+    q = CQ("copy:A")
+    asyncio.run(h.copy_reply(_t55_cb_update(q), ctx))
+    assert [m[0] for m in ctx.bot.messages] == ["لسه مفيش رد للشات ده."]
+
+
+def test_copy_reply_api_error_sends_new_message_only(tmp_path):
+    client = ExchangeClient(CONV55, exchange_error=ApiError("server", 500))
+    ctx = make_context(1, tmp_path, client=client)
+    ctx.bot = RecBot()
+    q = CQ("copy:A")
+    asyncio.run(h.copy_reply(_t55_cb_update(q), ctx))
+    assert ctx.bot.messages and "server" in ctx.bot.messages[0][0]
+    assert q.edits == []  # الشاشة ما اتغيّرتش
+
+
+def test_copy_reply_very_long_sends_document(tmp_path):
+    from bot.sender import COPY_PART_LIMIT
+
+    ctx = make_context(1, tmp_path, client=ExchangeClient(CONV55, "ب", "ب" * (COPY_PART_LIMIT * 4)))
+    ctx.bot = RecBot()
+    q = CQ("copy:A")
+    asyncio.run(h.copy_reply(_t55_cb_update(q), ctx))
+    assert ctx.bot.documents and ctx.bot.messages == []
+
+
+def test_full_reply_sends_long_reply(tmp_path):
+    ctx = make_context(1, tmp_path, client=ExchangeClient(CONV55, "ب", "ب" * 5000))
+    ctx.bot = RecBot()
+    q = CQ("full:A")
+    asyncio.run(h.full_reply(_t55_cb_update(q), ctx))
+    assert len(ctx.bot.messages) == 2  # send_long يقسّم لقطعتين
+    assert ctx.bot.documents == []

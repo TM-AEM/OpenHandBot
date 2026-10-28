@@ -1,5 +1,8 @@
 """اختبارات دورة حياة التطبيق: worker واحد مالك، ترتيب التعافي، إيقاف نظيف."""
 import asyncio
+import re
+
+from telegram.ext import CallbackQueryHandler
 
 from bot.app import build_application
 from bot.config import Config
@@ -24,6 +27,23 @@ def test_build_application_wires_lifecycle_and_state(tmp_path):
     assert isinstance(app.bot_data["db"], Database)
     assert "client" in app.bot_data and "config" in app.bot_data
     assert "outbox_worker" not in app.bot_data  # مايتعملش غير بعد post_init
+
+
+def test_copy_and_full_patterns_registered_without_clash(tmp_path):
+    # TASK 55 (المرحلة B): نمطا copy:/full: متسجّلين، وما بيتعارضوش مع cost:/files:.
+    app = build_application(make_config(tmp_path))
+    patterns = [
+        h.pattern.pattern
+        for group in app.handlers.values()
+        for h in group
+        if isinstance(h, CallbackQueryHandler) and h.pattern
+    ]
+    assert "^copy:" in patterns and "^full:" in patterns
+    copy_full = [p for p in patterns if p in ("^copy:", "^full:")]
+    for data in ("copy:abc", "full:abc"):
+        assert any(re.match(p, data) for p in copy_full)
+    for other in ("cost:abc", "files:abc:0", "file:abc:0:0", "open:abc"):
+        assert not any(re.match(p, other) for p in copy_full)
 
 
 def test_post_init_single_worker_after_recovery_and_clean_shutdown(tmp_path, monkeypatch):

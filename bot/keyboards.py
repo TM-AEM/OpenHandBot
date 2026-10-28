@@ -29,6 +29,8 @@ WATCHES = "متابعاتي"
 WATCH = "تابع"
 UNWATCH = "إلغاء"
 CANCEL_ROUTE = "إلغاء التوجيه"
+COPY_REPLY = "📋 نسخ الرد"
+FULL_REPLY = "عرض كامل"
 
 
 def main_menu() -> InlineKeyboardMarkup:
@@ -83,7 +85,13 @@ def conversations_menu(items: list[dict], page: int, has_more: bool) -> InlineKe
     return InlineKeyboardMarkup(rows)
 
 
-def conversation_actions(conversation_id: str, watched: bool = False) -> InlineKeyboardMarkup:
+def conversation_actions(
+    conversation_id: str,
+    watched: bool = False,
+    *,
+    has_reply: bool = False,
+    reply_cut: bool = False,
+) -> InlineKeyboardMarkup:
     # الميزات المؤجّلة (القرار 4): الملفات/التكلفة/التصدير مخفية، وزر المتابعة اليدوية
     # (تابع/إلغاء المتابعة) مخفي مع «متابعاتي». الأزرار الأساسية (رد/تحديث/رجوع/إلغاء
     # التوجيه) بتفضل ظاهرة.
@@ -92,12 +100,20 @@ def conversation_actions(conversation_id: str, watched: bool = False) -> InlineK
         if watched
         else _btn(WATCH, callback_data=f"watch:{conversation_id}")
     )
-    rows: list[list[InlineKeyboardButton]] = [
+    rows: list[list[InlineKeyboardButton]] = []
+    # TASK 55 (المرحلة B): صف النسخ فوق كل حاجة لو فيه رد. الافتراضي (has_reply=False)
+    # بيسيب الشكل القديم بالظبط عشان الاستدعاءات والاختبارات القديمة ما تتكسرش.
+    if has_reply:
+        copy_row = [_btn(COPY_REPLY, callback_data=f"copy:{conversation_id}")]
+        if reply_cut:
+            copy_row.append(_btn(FULL_REPLY, callback_data=f"full:{conversation_id}"))
+        rows.append(copy_row)
+    rows.append(
         [
             _btn(REPLY, callback_data=f"reply:{conversation_id}"),
             _btn(REFRESH, callback_data=f"open:{conversation_id}"),
         ],
-    ]
+    )
     extra: list[InlineKeyboardButton] = []
     if not features.is_hidden("files"):
         extra.append(_btn(FILES, callback_data=f"files:{conversation_id}:0"))

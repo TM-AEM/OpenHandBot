@@ -126,3 +126,105 @@ def test_format_cost():
     assert "claude" in out
     assert "100" in out and "20" in out
     assert format_cost(None) == "مفيش بيانات تكلفة."
+
+
+# =====================================================================
+# TASK 55 (المرحلة B): truncate + format_conversation_view
+# =====================================================================
+from bot.messages import (  # noqa: E402
+    FOOTER_RESERVE,
+    PROMPT_PREVIEW,
+    REPLY_PREVIEW,
+    TELEGRAM_LIMIT,
+    format_conversation_view,
+    truncate,
+)
+
+FOOTER = (
+    "\n\n✉️ رسايلك الجاية هتتبعت للشات ده (10 دقايق من آخر نشاط). "
+    "للإلغاء: زر إلغاء التوجيه أو /cancel."
+)
+
+
+def test_truncate_short_unchanged():
+    assert truncate("مرحبا", 10) == ("مرحبا", False)
+
+
+def test_truncate_long_marks_cut():
+    text, cut = truncate("x" * 50, 10)
+    assert cut is True
+    assert text.endswith("…")
+    assert text.startswith("x" * 10)
+
+
+def test_truncate_empty_and_whitespace():
+    assert truncate(None, 10) == ("", False)
+    assert truncate("", 10) == ("", False)
+    assert truncate("   \n ", 10) == ("", False)
+
+
+def test_view_without_user_text():
+    conv = {"title": "شات", "execution_status": "running"}
+    out, cut = format_conversation_view(conv, None, "رد")
+    assert "شات" in out and "شغال" in out
+    assert "رد الـ agent:" in out
+    assert "رد" in out
+    assert "آخر برومت" not in out  # مفيش برومت ⇒ مفيش بلوك
+    assert cut is False
+
+
+def test_view_with_user_text_and_short_reply():
+    conv = {"title": "شات", "execution_status": "finished"}
+    out, cut = format_conversation_view(conv, "برومتي", "ردي")
+    assert "آخر برومت منك:" in out and "برومتي" in out
+    assert "رد الـ agent:" in out and "ردي" in out
+    assert cut is False
+
+
+def test_view_reply_none_shows_placeholder():
+    conv = {"title": "شات", "execution_status": "running"}
+    out, cut = format_conversation_view(conv, "برومتي", None)
+    assert "لسه مفيش رد." in out
+    assert cut is False
+
+
+def test_view_long_reply_is_cut():
+    conv = {"title": "شات", "execution_status": "finished"}
+    out, cut = format_conversation_view(conv, None, "ر" * 5000)
+    assert cut is True
+    # المعاينة محصورة بحد الرد (REPLY_PREVIEW لما المساحة تسمح).
+    assert len(out) < 2000
+    assert "…" in out
+
+
+def test_view_long_prompt_is_truncated():
+    conv = {"title": "شات", "execution_status": "running"}
+    out, _ = format_conversation_view(conv, "ب" * 5000, None)
+    # معاينة البرومت عند PROMPT_PREVIEW (300) مش النص الكامل.
+    assert len(out) < PROMPT_PREVIEW + 400
+
+
+def test_view_very_long_title_stays_within_limit_with_footer():
+    # عنوان طويل جداً يفعّل تصغير حد الرد؛ الإجمالي + الذيل لازم ≤ 4096.
+    conv = {"title": "ع" * 3300, "execution_status": "running"}
+    out, _ = format_conversation_view(conv, None, "ر" * 5000)
+    assert len(out) + len(FOOTER) <= TELEGRAM_LIMIT
+
+
+def test_view_reply_limit_never_below_floor():
+    # الحد الأدنى 200 يمنع تقليص الرد لنص تافه لما الهيدر ياخد مساحة كبيرة.
+    conv = {"title": "ع" * 100, "execution_status": "running"}
+    out, _ = format_conversation_view(conv, None, "ر" * 5000)
+    # الرد المعروض أطول من 200 حرف (مفيش تقليص مفرط).
+    assert out.count("ر") >= 200
+    assert REPLY_PREVIEW <= 800  # ثابت موثّق
+    assert FOOTER_RESERVE == 250
+
+
+def test_view_long_title_and_prompt_stay_within_limit():
+    # انحراف مقصود: عنوان + برومت طويلين جداً ⇒ العنوان بيتقص عشان الضمان ≤4096
+    # والأرضية 200 يفضلوا مضمونين مع بعض.
+    conv = {"title": "ع" * 6000, "execution_status": "running", "selected_repository": "o/r"}
+    out, _ = format_conversation_view(conv, "ب" * 6000, "ر" * 6000)
+    assert len(out) + len(FOOTER) <= TELEGRAM_LIMIT
+    assert out.count("ر") >= 200

@@ -3,6 +3,14 @@ from __future__ import annotations
 
 TELEGRAM_LIMIT = 4096
 MAX_PARTS = 3
+# TASK 55 (المرحلة B): حدود معاينة العرض الخفيف + مساحة محجوزة لذيل التوجيه.
+PROMPT_PREVIEW = 300
+REPLY_PREVIEW = 800
+FOOTER_RESERVE = 250  # مساحة لذيل التوجيه اللي بيتضاف في handlers
+_REPLY_LABEL = "\n\nرد الـ agent:\n"
+_NO_REPLY = "لسه مفيش رد."
+_REPLY_MIN = 200
+_ELLIPSIS = " …"
 
 STATE_LABELS = {
     "running": "شغال",
@@ -72,6 +80,55 @@ def format_conversation(conv: dict, reply: str | None) -> str:
         lines.append("")
         lines.append(reply)
     return "\n".join(lines)
+
+
+def truncate(text: str | None, limit: int) -> tuple[str, bool]:
+    """يقصّ نص خام عند حد، ويرجّع (النص، هل اتقص). مسافات بس = نص فاضي."""
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text, False
+    return text[:limit].rstrip() + " …", True
+
+
+def format_conversation_view(conv: dict, user_text: str | None, reply: str | None) -> tuple[str, bool]:
+    """نص خام (يتهرّب عند العرض). بيرجّع (النص، هل الرد اتقص).
+
+    العرض خفيف (رؤوس + آخر برومت + معاينة الرد) عشان الجهاز يستلم نص صغير بس، والرد
+    الكامل بيتبعت عند الطلب من زر «عرض كامل». العنوان الطويل ما يخلّيش الرسالة تعدّي
+    حد تيليجرام مع الذيل: بنحجز FOOTER_RESERVE ونحسب حد الرد من المساحة الباقية.
+
+    انحراف عن البرومت (مقصود، ومغطّى باختبار): البرومت حدّد أرضية 200 للرد دايماً،
+    لكن ده بيكسر ضمان ≤4096 لما العنوان يبقى طويل جداً. فبنحصر مساحة الهيدر (العنوان
+    + بلوك البرومت) في `TELEGRAM_LIMIT - _REPLY_MIN - FOOTER_RESERVE`؛ العنوان اللي
+    أطول من كده بيتقص عشان الأرضية 200 والحد الكلي يفضلوا مضمونين مع بعض.
+    """
+    title = conv.get("title") or "بدون عنوان"
+    repo = conv.get("selected_repository") or "بدون مستودع"
+    state = state_label(conv.get("execution_status"))
+    base = "\n".join([f"المستودع: {repo}", f"الحالة: {state}"])
+    link = pr_url(conv)
+    if link:
+        base += f"\nالـ PR: {link}"
+    user_block = ""
+    if user_text:
+        preview, _ = truncate(user_text, PROMPT_PREVIEW)
+        user_block = "\n\nآخر برومت منك:\n" + preview
+    reply_block = _REPLY_LABEL
+    total_budget = TELEGRAM_LIMIT - FOOTER_RESERVE
+    header_budget = total_budget - len(user_block) - len(reply_block) - _REPLY_MIN
+    if len(title) + len(base) + 1 > header_budget:
+        room = header_budget - len(base) - 1
+        cut = title[: max(room - len(_ELLIPSIS), 1)].rstrip() + _ELLIPSIS
+        header = cut + "\n" + base
+    else:
+        header = title + "\n" + base
+    head_len = len(header) + len(user_block) + len(reply_block)
+    reply_limit = min(REPLY_PREVIEW, total_budget - head_len)
+    reply_limit = max(reply_limit, _REPLY_MIN)
+    if reply:
+        preview, cut = truncate(reply, reply_limit)
+        return header + user_block + reply_block + preview, cut
+    return header + user_block + reply_block + _NO_REPLY, False
 
 
 def format_cost(metrics: dict | None) -> str:

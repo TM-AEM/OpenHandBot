@@ -43,6 +43,8 @@ def build_application(config: Config) -> Application:
     app.add_handler(CallbackQueryHandler(handlers.cancel_route_button, pattern=r"^cancelroute$"))
     app.add_handler(CallbackQueryHandler(handlers.list_conversations, pattern=r"^list:"))
     app.add_handler(CallbackQueryHandler(handlers.open_conversation, pattern=r"^open:"))
+    app.add_handler(CallbackQueryHandler(handlers.copy_reply, pattern=r"^copy:"))
+    app.add_handler(CallbackQueryHandler(handlers.full_reply, pattern=r"^full:"))
     app.add_handler(CallbackQueryHandler(handlers.show_status, pattern=r"^status:"))
     app.add_handler(CallbackQueryHandler(handlers.reply_prompt, pattern=r"^reply:"))
     app.add_handler(CallbackQueryHandler(handlers.start_new_chat, pattern=r"^newchat$"))

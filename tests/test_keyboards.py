@@ -87,6 +87,35 @@ def test_conversation_actions_shows_deferred_when_unhidden(monkeypatch):
         assert expected in cbs
 
 
+# =====================================================================
+# TASK 55 (المرحلة B): صف النسخ (نسخ الرد / عرض كامل)
+# =====================================================================
+def test_conversation_actions_default_shape_unchanged():
+    # الافتراضي (has_reply=False) بيسيب الشكل القديم بالظبط: مفيش أي زر نسخ.
+    cbs = _callbacks(kb.conversation_actions("c1"))
+    assert "copy:c1" not in cbs and "full:c1" not in cbs
+
+
+def test_conversation_actions_has_reply_adds_copy_row():
+    markup = kb.conversation_actions("c1", has_reply=True)
+    cbs = _callbacks(markup)
+    assert "copy:c1" in cbs
+    assert "full:c1" not in cbs  # الرد مش مقصوص ⇒ مفيش "عرض كامل"
+    # صف النسخ أول صف.
+    assert markup.inline_keyboard[0][0].callback_data == "copy:c1"
+
+
+def test_conversation_actions_reply_cut_adds_full_reply():
+    markup = kb.conversation_actions("c1", has_reply=True, reply_cut=True)
+    cbs = _callbacks(markup)
+    assert "copy:c1" in cbs and "full:c1" in cbs
+
+
+def test_conversation_actions_copy_callback_within_limit():
+    cbs = _callbacks(kb.conversation_actions("a" * 36, has_reply=True, reply_cut=True))
+    assert all(len(cb.encode()) <= 64 for cb in cbs)
+
+
 def test_files_menu_uses_index_not_path():
     markup = kb.files_menu("c1", ["a/b/very_long_name.py", "x.py"], start=0, page=0, has_more=False, gen=3)
     cbs = _callbacks(markup)

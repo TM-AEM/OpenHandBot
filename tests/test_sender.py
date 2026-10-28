@@ -70,3 +70,41 @@ def test_send_long_uses_html_parse_mode():
     asyncio.run(send_long(1, text, bot))
     assert bot.messages
     assert all(mode == ParseMode.HTML for _, mode in bot.messages)
+
+
+# =====================================================================
+# TASK 55 (المرحلة B): send_copyable — الرد جوه <pre> قابل للنسخ
+# =====================================================================
+from bot.sender import COPY_PART_LIMIT, send_copyable  # noqa: E402
+
+
+def test_send_copyable_wraps_in_pre_and_escapes():
+    bot = FakeBot()
+    asyncio.run(send_copyable(1, "رد <b>&</b>", bot))
+    assert bot.documents == []
+    assert [m[0] for m in bot.messages] == ["<pre>رد &lt;b&gt;&amp;&lt;/b&gt;</pre>"]
+
+
+def test_send_copyable_uses_html_parse_mode():
+    from telegram.constants import ParseMode
+
+    bot = FakeBot()
+    asyncio.run(send_copyable(1, "نص", bot))
+    assert all(mode == ParseMode.HTML for _, mode in bot.messages)
+
+
+def test_send_copyable_long_splits_at_copy_limit():
+    bot = FakeBot()
+    text = "ب" * (COPY_PART_LIMIT * 2 + 50)  # 3 أجزاء بحد النسخ
+    asyncio.run(send_copyable(1, text, bot))
+    assert bot.documents == []
+    assert len(bot.messages) == 3
+    assert all(m[0].startswith("<pre>") and m[0].endswith("</pre>") for m in bot.messages)
+
+
+def test_send_copyable_too_long_sends_document():
+    bot = FakeBot()
+    text = "ب" * (COPY_PART_LIMIT * 4)  # أكثر من 3 أجزاء
+    asyncio.run(send_copyable(1, text, bot))
+    assert bot.messages == []
+    assert len(bot.documents) == 1

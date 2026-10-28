@@ -1,8 +1,10 @@
 """أوامر تيليجرام وأزرارها. كل الرسايل عربي، والمستخدم المالك بس يترد عليه."""
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
+import time
 
 from telegram import InputFile, Update
 from telegram.constants import ParseMode
@@ -12,14 +14,18 @@ from . import keyboards as kb
 from . import outbox
 from .errors import ApiError, error_text
 from .file_cache import FileCache
-from .messages import escape_html, format_conversation, format_cost, pr_url, state_label
-from .sender import send_long
+from .messages import escape_html, format_conversation_view, format_cost, pr_url, state_label
+from .sender import send_copyable, send_long
 
 log = logging.getLogger(__name__)
 
 PAGE_SIZE = 10
 REPOS_PAGE_SIZE = 8
 FILES_PAGE_SIZE = 10
+# TASK 55 (المرحلة B): كاش قصير للتبادل الأخير (copy/full).
+# الرام محدود (308MB على Katabump) فبنحدّ عدد المداخل.
+EXCHANGE_TTL = 45.0
+EXCHANGE_CACHE_MAX = 20
 
 
 def _allowed(update: Update, config) -> bool:
@@ -77,6 +83,28 @@ async def _edit_or_send(query, text: str, chat_id: int, bot, **kwargs) -> None:
 def _file_cache(context: ContextTypes.DEFAULT_TYPE) -> FileCache:
     """ذاكرة الملفات المؤقتة المحدودة (LRU) من bot_data (بتتعمل مرة واحدة)."""
     return context.bot_data.setdefault("file_cache", FileCache())
+
+
+def _store_exchange(context, conversation_id, user_text, reply):
+    """يخزّن آخر تبادل (برومت مستخدم + رد agent) لكاش قصير، ويحافظ على الحد الأقصى."""
+    cache = context.bot_data.setdefault("exchange_cache", {})
+    cache[conversation_id] = (time.monotonic(), user_text, reply)
+    while len(cache) > EXCHANGE_CACHE_MAX:
+        cache.pop(next(iter(cache)))  # الأقدم أولاً (ترتيب الإدخال)
+
+
+async def _get_exchange(context, conversation_id):
+    """آخر تبادل من الكاش لو لسه طازة، وإلا من الـ API (وبيخزّنه).
+
+    الكاش بيخدم أزرار copy/full بس — فتح الشات (open) بيقرا طازة دايماً.
+    """
+    cache = context.bot_data.setdefault("exchange_cache", {})
+    hit = cache.get(conversation_id)
+    if hit and time.monotonic() - hit[0] < EXCHANGE_TTL:
+        return hit[1], hit[2]
+    user_text, reply = await context.bot_data["client"].get_last_exchange(conversation_id)
+    _store_exchange(context, conversation_id, user_text, reply)
+    return user_text, reply
 
 
 async def _guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -151,28 +179,81 @@ async def open_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     conversation_id = q.data.split(":", 1)[1]
     client = context.bot_data["client"]
-    try:
-        convs = await client.get_conversations([conversation_id])
-        if not convs:
-            # رسالة "مش موجود" بتتعدّل بالمسار المتسامح: فشل تعديل متوقّع (رسالة قديمة/
-            # مش قابلة للتعديل) ما يوقّفش الـ callback، وما بيفعّلش أي توجيه.
-            await _edit_or_send(q, "الشات مش موجود.", q.message.chat_id, context.bot)
-            return
-        conv = convs[0]
-        reply = await client.get_last_reply(conversation_id)
-    except ApiError as exc:
+    # TASK 55 (G5): نجيب الشات + آخر تبادل مع بعض (طلبين متوازيين بدل متتاليين).
+    # return_exceptions=True عشان نطبّق أولويات الرسايل القديمة بنفسها بالظبط.
+    convs, exchange = await asyncio.gather(
+        client.get_conversations([conversation_id]),
+        client.get_last_exchange(conversation_id),
+        return_exceptions=True,
+    )
+    if isinstance(convs, ApiError):
         # نفس المسار المتسامح لرسالة الخطأ: مفيش توجيه جديد ولا انهيار في الـ callback.
-        await _edit_or_send(q, error_text(exc), q.message.chat_id, context.bot)
+        await _edit_or_send(q, error_text(convs), q.message.chat_id, context.bot)
         return
+    if isinstance(convs, BaseException):
+        raise convs
+    if not convs:
+        # "مش موجود" ليها الأولوية حتى لو طلب الأحداث فشل، عشان نحافظ على الرسالة القديمة.
+        await _edit_or_send(q, "الشات مش موجود.", q.message.chat_id, context.bot)
+        return
+    if isinstance(exchange, ApiError):
+        await _edit_or_send(q, error_text(exchange), q.message.chat_id, context.bot)
+        return
+    if isinstance(exchange, BaseException):
+        raise exchange
+    conv = convs[0]
+    user_text, reply = exchange
+    _store_exchange(context, conversation_id, user_text, reply)
     db = context.bot_data["db"]
     watched = db.is_watched(conversation_id)
-    text = format_conversation(conv, reply) + "\n\n✉️ رسايلك الجاية هتتبعت للشات ده (10 دقايق من آخر نشاط). للإلغاء: زر إلغاء التوجيه أو /cancel."
-    markup = kb.conversation_actions(conversation_id, watched)
+    text, reply_cut = format_conversation_view(conv, user_text, reply)
+    text += "\n\n✉️ رسايلك الجاية هتتبعت للشات ده (10 دقايق من آخر نشاط). للإلغاء: زر إلغاء التوجيه أو /cancel."
+    markup = kb.conversation_actions(
+        conversation_id, watched, has_reply=reply is not None, reply_cut=reply_cut
+    )
     # القرار 1: بعد فتح الشات، رسايلك الجاية بتتوجّه له 10 دقايق من آخر نشاط (مع زر إلغاء).
     # بنفعّل التوجيه بس بعد ما العرض يظهر فعلاً، عشان فشل العرض ما يسبش توجيه مفعّل من غير
     # ما تشوف الشات (وما نلمسش أي توجيه قائم لو الفتح فشل).
     if await _edit_or_send(q, text, q.message.chat_id, context.bot, reply_markup=markup):
         db.set_awaiting(update.effective_user.id, conversation_id, "route", title=conv.get("title") or "")
+
+
+async def copy_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """TASK 55 (المرحلة B): يبعت رد الـ agent جوه code block قابل للنسخ بضغطة."""
+    q = update.callback_query
+    await q.answer()
+    if not _allowed(update, context.bot_data["config"]):
+        return
+    conversation_id = q.data.split(":", 1)[1]
+    chat_id = q.message.chat_id
+    try:
+        _, reply = await _get_exchange(context, conversation_id)
+    except ApiError as exc:
+        await context.bot.send_message(chat_id, escape_html(error_text(exc)), parse_mode=ParseMode.HTML)
+        return
+    if not reply:
+        await context.bot.send_message(chat_id, "لسه مفيش رد للشات ده.")
+        return
+    await send_copyable(chat_id, reply, context.bot)
+
+
+async def full_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """TASK 55 (المرحلة B): يبعت الرد الكامل (نفس منطق send_long)."""
+    q = update.callback_query
+    await q.answer()
+    if not _allowed(update, context.bot_data["config"]):
+        return
+    conversation_id = q.data.split(":", 1)[1]
+    chat_id = q.message.chat_id
+    try:
+        _, reply = await _get_exchange(context, conversation_id)
+    except ApiError as exc:
+        await context.bot.send_message(chat_id, escape_html(error_text(exc)), parse_mode=ParseMode.HTML)
+        return
+    if not reply:
+        await context.bot.send_message(chat_id, "لسه مفيش رد للشات ده.")
+        return
+    await send_long(chat_id, reply, context.bot)
 
 
 async def list_watches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
