@@ -105,7 +105,7 @@ async def get_conversation(client, conversation_id: str) -> dict:
 
 
 async def wait_running(client, conversation_id: str, interval: float, timeout: float) -> str:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     while loop.time() < deadline:
         await asyncio.sleep(interval)

@@ -211,12 +211,15 @@ def run_cycle() -> dict:
     if branch != BRANCH:
         raise RuntimeError(f"on branch '{branch}', expected '{BRANCH}'")
 
-    sync_remote()
-
+    # Commit local work BEFORE syncing. Rebasing a dirty work tree aborts as soon
+    # as the remote moved a file the local tree also changed ("cannot rebase: You
+    # have unstaged changes"), which would fail every cycle and never push.
     if has_changes():
         commit_all()
     else:
         print("No local changes.")
+
+    sync_remote()
 
     return {"pushed": push_if_ahead(token)}
 

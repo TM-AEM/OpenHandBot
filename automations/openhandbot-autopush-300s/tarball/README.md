@@ -8,9 +8,10 @@ Commits any pending workspace changes and pushes them to `main` of
 1. Resolve the push credential: `GITHUB_TOKEN` from the environment, otherwise a
    stored secret of the same name.
 2. Ensure a git work tree exists (clone `main` if the directory has none).
-3. `git fetch origin main`; fast-forward if behind, rebase if diverged
+3. `git add -A` + commit when there are local changes (before syncing, so the
+   rebase never runs against a dirty work tree).
+4. `git fetch origin main`; fast-forward if behind, rebase if diverged
    (a rebase conflict aborts and reports instead of clobbering anything).
-4. `git add -A` + commit when there are local changes.
 5. `git push origin HEAD:main` only when local is ahead of `origin/main`.
 
 Credentials are never written to `.git/config`: the token is embedded in an

@@ -208,7 +208,7 @@ class OpenHandsClient:
         return next((t for t in tasks if t), {}) or {}
 
     async def wait_for_start(self, task_id: str, timeout: float = 180.0, interval: float = 3.0) -> str:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         while loop.time() < deadline:
             task = await self.get_start_task(task_id)

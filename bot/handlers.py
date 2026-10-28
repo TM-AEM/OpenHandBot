@@ -59,7 +59,7 @@ async def _safe_edit(query, text: str, **kwargs) -> bool:
         return False
 
 
-async def _edit_or_send(query, text: str, chat_id: int, bot, **kwargs) -> None:
+async def _edit_or_send(query, text: str, chat_id: int, bot, **kwargs) -> bool:
     """يعدّل الرسالة الحالية؛ ولو طويلة عليها يبعتها مقسّمة من جديد.
 
     بيرجّع True لو اتعرض العرض فعلاً (اتعدّلت الرسالة أو اتبعتت من جديد)، وFalse لو
