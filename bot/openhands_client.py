@@ -15,6 +15,10 @@ from .errors import ApiError, describe_status
 EVENTS_PER_PAGE = 20
 SEARCH_LIMIT = 20
 REPOS_PAGE_SIZE = 8
+# TASK 55 (المرحلة A): حدود طلبي آخر تبادل. رسالة المستخدم ممكن تقع برا أول 20
+# MessageEvent لو الـ agent عمل خطوات أدوات كتير، فبنفلتر بالنوع بدل ما نجرّب نلمّ كل حاجة.
+EXCHANGE_MSG_LIMIT = 20
+EXCHANGE_ACTION_LIMIT = 30
 
 
 class OpenHandsClient:
@@ -119,6 +123,35 @@ class OpenHandsClient:
             if text:
                 return text
         return None
+
+    async def get_last_exchange(self, conversation_id: str) -> tuple[str | None, str | None]:
+        """(آخر رسالة للمستخدم، آخر رد/تقرير للـ agent). أي منهم ممكن يكون None."""
+        msg_events, action_events = await asyncio.gather(
+            self.search_events(conversation_id, limit=EXCHANGE_MSG_LIMIT, kind="MessageEvent"),
+            self.search_events(conversation_id, limit=EXCHANGE_ACTION_LIMIT, kind="ActionEvent"),
+        )
+        user_text: str | None = None
+        agent_msg: tuple | None = None  # (timestamp | None, text)
+        for event in msg_events:
+            source = event.get("source")
+            if source == "user":
+                if user_text is None:
+                    text = _message_text(event)
+                    if text:
+                        user_text = text
+            elif source == "agent" and agent_msg is None:
+                text = _agent_report(event)
+                if text:
+                    agent_msg = (parse_timestamp(event.get("timestamp")), text)
+            if user_text is not None and agent_msg is not None:
+                break
+        finish: tuple | None = None
+        for event in action_events:
+            text = _agent_report(event)  # بيرجّع نص FinishAction بس لـ ActionEvent
+            if text:
+                finish = (parse_timestamp(event.get("timestamp")), text)
+                break
+        return user_text, _pick_newer(agent_msg, finish)
 
     async def list_files(self, conversation_id: str, path: str = "") -> list[str]:
         params: dict[str, Any] = {}
@@ -248,6 +281,20 @@ def _agent_report(event: dict) -> str | None:
             if isinstance(text, str) and text.strip():
                 return text
     return None
+
+
+def _pick_newer(msg: tuple | None, finish: tuple | None) -> str | None:
+    """الأحدث بالـ timestamp. عند التساوي أو غياب الطوابع: الأفضلية لتقرير FinishAction."""
+    if msg is None:
+        return finish[1] if finish else None
+    if finish is None:
+        return msg[1]
+    (t_msg, text_msg), (t_fin, text_fin) = msg, finish
+    if t_msg is not None and t_fin is not None:
+        return text_msg if t_msg > t_fin else text_fin
+    if t_msg is not None:
+        return text_msg
+    return text_fin
 
 
 def _message_text(event: dict) -> str:

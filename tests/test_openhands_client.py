@@ -217,3 +217,125 @@ def test_search_repositories():
 
     client = make_client(handler)
     assert asyncio.run(client.search_repositories(query="bot")) == [{"full_name": "x/y"}]
+
+
+# =====================================================================
+# TASK 55 (المرحلة A): get_last_exchange — آخر برومت مستخدم + آخر رد agent
+# =====================================================================
+import asyncio  # noqa: E402
+
+from bot.openhands_client import (  # noqa: E402
+    EXCHANGE_ACTION_LIMIT,
+    EXCHANGE_MSG_LIMIT,
+)
+
+
+def _msg(source, text, ts=None):
+    ev = {"kind": "MessageEvent", "source": source,
+          "llm_message": {"content": [{"type": "text", "text": text}]}}
+    if ts is not None:
+        ev["timestamp"] = ts
+    return ev
+
+
+def _finish(text, ts=None):
+    ev = {"kind": "ActionEvent", "action": {"kind": "FinishAction", "message": text}}
+    if ts is not None:
+        ev["timestamp"] = ts
+    return ev
+
+
+def _exchange_client(msg_items, action_items, recorder=None):
+    def handler(request):
+        kind = request.url.params.get("kind__eq")
+        if recorder is not None:
+            recorder.append((kind, request.url.params.get("limit"),
+                             request.url.params.get("sort_order")))
+        items = msg_items if kind == "MessageEvent" else action_items
+        return httpx.Response(200, json={"items": items})
+
+    return make_client(handler)
+
+
+def test_exchange_returns_user_prompt_and_agent_reply():
+    client = _exchange_client(
+        [_msg("user", "برومتي"), _msg("agent", "ردي")],
+        [],
+    )
+    assert asyncio.run(client.get_last_exchange("c")) == ("برومتي", "ردي")
+
+
+def test_exchange_finish_newer_than_agent_message():
+    client = _exchange_client(
+        [_msg("user", "ب", "2026-01-01T00:00:00Z"), _msg("agent", "رد قديم", "2026-01-01T00:00:10Z")],
+        [_finish("التقرير النهائي", "2026-01-01T00:00:20Z")],
+    )
+    assert asyncio.run(client.get_last_exchange("c")) == ("ب", "التقرير النهائي")
+
+
+def test_exchange_agent_message_newer_than_finish():
+    client = _exchange_client(
+        [_msg("user", "ب", "2026-01-01T00:00:00Z"), _msg("agent", "رد أحدث", "2026-01-01T00:00:30Z")],
+        [_finish("تقرير أقدم", "2026-01-01T00:00:20Z")],
+    )
+    assert asyncio.run(client.get_last_exchange("c")) == ("ب", "رد أحدث")
+
+
+def test_exchange_no_user_messages():
+    client = _exchange_client([_msg("agent", "ردي")], [])
+    user_text, reply = asyncio.run(client.get_last_exchange("c"))
+    assert user_text is None and reply == "ردي"
+
+
+def test_exchange_no_reply_at_all():
+    client = _exchange_client([_msg("user", "برومتي")], [])
+    assert asyncio.run(client.get_last_exchange("c")) == ("برومتي", None)
+
+
+def test_exchange_missing_timestamps_prefer_finish_without_raising():
+    # لا طوابع على أي حدث: الأفضلية لتقرير FinishAction، ومايرميش استثناء.
+    client = _exchange_client([_msg("user", "ب"), _msg("agent", "رد")], [_finish("تقرير")])
+    assert asyncio.run(client.get_last_exchange("c")) == ("ب", "تقرير")
+
+
+def test_exchange_unparseable_timestamp_prefers_finish():
+    client = _exchange_client(
+        [_msg("user", "ب", "not-a-date"), _msg("agent", "رد", "also-bad")],
+        [_finish("تقرير", "still-bad")],
+    )
+    assert asyncio.run(client.get_last_exchange("c")) == ("ب", "تقرير")
+
+
+def test_exchange_blank_text_is_skipped():
+    client = _exchange_client(
+        [_msg("user", "   "), _msg("user", "برومت حقيقي"), _msg("agent", "  "), _msg("agent", "رد حقيقي")],
+        [],
+    )
+    assert asyncio.run(client.get_last_exchange("c")) == ("برومت حقيقي", "رد حقيقي")
+
+
+def test_exchange_request_shape():
+    recorder = []
+    client = _exchange_client([_msg("user", "ب")], [], recorder=recorder)
+    asyncio.run(client.get_last_exchange("c"))
+    assert ("MessageEvent", str(EXCHANGE_MSG_LIMIT), "TIMESTAMP_DESC") in recorder
+    assert ("ActionEvent", str(EXCHANGE_ACTION_LIMIT), "TIMESTAMP_DESC") in recorder
+
+
+def test_exchange_api_error_propagates():
+    def handler(request):
+        return httpx.Response(500, json={"detail": "boom"})
+
+    client = make_client(handler)
+    with pytest.raises(ApiError):
+        asyncio.run(client.get_last_exchange("c"))
+
+
+def test_exchange_finish_action_uses_shared_parser():
+    # ActionEvent بلا FinishAction (زي CmdRunAction) مايتحسبش رد.
+    client = _exchange_client(
+        [_msg("user", "ب")],
+        [{"kind": "ActionEvent", "action": {"kind": "CmdRunAction", "command": "ls"}}],
+    )
+    assert asyncio.run(client.get_last_exchange("c")) == ("ب", None)
+
