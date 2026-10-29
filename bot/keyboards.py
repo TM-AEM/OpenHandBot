@@ -31,6 +31,11 @@ UNWATCH = "إلغاء"
 CANCEL_ROUTE = "إلغاء التوجيه"
 COPY_REPLY = "📋 نسخ الرد"
 FULL_REPLY = "عرض كامل"
+NOTIFICATIONS = "الإشعارات"
+NOTIF_MENU = "notif:menu"
+NOTIF_TOGGLE = "notif:toggle"
+NOTIF_TURN_OFF = "⛔ إيقاف الإشعارات"
+NOTIF_TURN_ON = "✅ تفعيل الإشعارات"
 
 
 def main_menu() -> InlineKeyboardMarkup:
@@ -40,10 +45,18 @@ def main_menu() -> InlineKeyboardMarkup:
             _btn(NEW_CHAT, callback_data="newchat"),
         ]
     ]
+    # NTF-04: نقطة دخول ضبط الإشعارات الاستباقية.
+    rows.append([_btn(NOTIFICATIONS, callback_data=NOTIF_MENU)])
     # القرار 4: زر «متابعاتي» (إدارة يدوية للمتابعات) مخفي مؤقتًا مع باقي الميزات المؤجّلة.
     if not features.is_hidden("followups"):
         rows.append([_btn(WATCHES, callback_data="watched:0")])
     return InlineKeyboardMarkup(rows)
+
+
+def notifications_menu(enabled: bool) -> InlineKeyboardMarkup:
+    """أزرار ضبط الإشعارات: زر تبديل واضح + رجوع. النص بيعكس الحالة الحالية."""
+    toggle = _btn(NOTIF_TURN_OFF if enabled else NOTIF_TURN_ON, callback_data=NOTIF_TOGGLE)
+    return InlineKeyboardMarkup([[toggle], [_btn(BACK, callback_data="menu")]])
 
 
 def watches_menu(items: list, page: int, has_more: bool) -> InlineKeyboardMarkup:

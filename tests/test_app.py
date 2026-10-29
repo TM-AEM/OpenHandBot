@@ -168,3 +168,58 @@ def test_creation_worker_wired_and_recovered_before_start(tmp_path, monkeypatch)
     assert "start" in order[2:]
     assert creation is not None
 
+
+def test_post_init_registers_notifier_and_wires_owner_delivery(tmp_path, monkeypatch):
+    """NTF-25: التطبيق بيسجّل المُبلّغ في bot_data['notifier'] وبيربط المراقب بيه عبر
+    set_owner_delivery، وما بيعملش task مراقب/مُبلّغ تاني عند إعادة التهيئة."""
+    calls = {"watcher_start": 0, "watcher_stop": 0, "notifier_start": 0, "notifier_stop": 0}
+    seen = {}
+
+    def fake_watcher_start(self):
+        calls["watcher_start"] += 1
+
+    async def fake_watcher_stop(self):
+        calls["watcher_stop"] += 1
+
+    def fake_notifier_start(self):
+        calls["notifier_start"] += 1
+
+    async def fake_notifier_stop(self):
+        calls["notifier_stop"] += 1
+
+    def fake_set_owner_delivery(self, callback):
+        seen["callback"] = callback
+
+    monkeypatch.setattr("bot.watcher.Watcher.start", fake_watcher_start)
+    monkeypatch.setattr("bot.watcher.Watcher.stop", fake_watcher_stop)
+    monkeypatch.setattr("bot.notifier.Notifier.start", fake_notifier_start)
+    monkeypatch.setattr("bot.notifier.Notifier.stop", fake_notifier_stop)
+    monkeypatch.setattr("bot.watcher.Watcher.set_owner_delivery", fake_set_owner_delivery)
+
+    app = build_application(make_config(tmp_path))
+
+    async def lifecycle():
+        await app.post_init(app)
+        await app.post_init(app)  # إعادة تهيئة مكرّرة: مفيش task تاني
+        watcher = app.bot_data["watcher"]
+        notifier = app.bot_data["notifier"]
+        # نقطة التنسيق مربوطة، والمُبلّغ بيوصّل التسجيل للقاعدة فعلاً (مش mock للمُبلّغ).
+        assert callable(seen["callback"])
+        seen["callback"]("c1", "finished", "2026-01-01T00:00:00+00:00")
+        assert app.bot_data["db"].get_notification_state("c1").notified_status == "finished"
+        await app.post_shutdown(app)
+        return watcher, notifier
+
+    watcher, notifier = asyncio.run(lifecycle())
+
+    from bot.notifier import Notifier as _Notifier
+    from bot.watcher import Watcher as _Watcher
+    assert isinstance(watcher, _Watcher)
+    assert isinstance(notifier, _Notifier)
+    # task واحد لكل مكوّن عبر إعادات التهيئة.
+    assert calls["watcher_start"] == 1
+    assert calls["notifier_start"] == 1
+    # إيقاف نظيف للاتنين.
+    assert calls["watcher_stop"] == 1
+    assert calls["notifier_stop"] == 1
+

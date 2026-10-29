@@ -1,7 +1,10 @@
 from bot.messages import (
+    SANDBOX_ERROR,
     escape_html,
     format_conversation,
     format_cost,
+    get_status,
+    is_terminal,
     pr_url,
     split_message,
     state_label,
@@ -13,6 +16,24 @@ def test_state_labels_arabic():
     assert state_label("running") == "شغال"
     assert state_label(None) == "غير معروف"
     assert state_label("weird") == "weird"
+    assert state_label(SANDBOX_ERROR) == "خطأ بيئة"
+
+
+def test_get_status_is_the_single_canonical_derivation():
+    # sandbox_status ∈ {ERROR, MISSING} ⇒ sandbox_error (بأي حالة أحرف)، وإلا execution_status.
+    assert get_status({"execution_status": "finished"}) == "finished"
+    assert get_status({"execution_status": "RUNNING"}) == "running"
+    assert get_status({"execution_status": "finished", "sandbox_status": "ERROR"}) == SANDBOX_ERROR
+    assert get_status({"execution_status": "finished", "sandbox_status": "MISSING"}) == SANDBOX_ERROR
+    assert get_status({"execution_status": "running", "sandbox_status": "RUNNING"}) == "running"
+    assert get_status({}) == "unknown"
+
+
+def test_is_terminal_includes_sandbox_error():
+    for s in ("finished", "error", "stuck", "waiting_for_confirmation", SANDBOX_ERROR):
+        assert is_terminal(s)
+    for s in ("running", "idle", "paused", None, "unknown"):
+        assert not is_terminal(s)
 
 
 def test_split_short_unchanged():

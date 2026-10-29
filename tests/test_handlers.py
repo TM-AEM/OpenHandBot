@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -21,6 +22,7 @@ class FakeMessage:
 class FakeQuery:
     def __init__(self):
         self.edits = []
+        self.edits_markup = []
         self.message = SimpleNamespace(chat_id=99)
 
     async def answer(self):
@@ -28,6 +30,7 @@ class FakeQuery:
 
     async def edit_message_text(self, text, **kw):
         self.edits.append(text)
+        self.edits_markup.append(kw.get("reply_markup"))
 
 
 def make_update(user_id, text="hi"):
@@ -983,3 +986,62 @@ def test_exchange_cache_evicts_oldest(tmp_path):
     assert "c0" not in cache  # الأقدم اتشال
     assert f"c{h.EXCHANGE_CACHE_MAX + 4}" in cache
 
+
+
+# ================================= NTF-17.2: R-2 (user-facing unwatch error) ================
+class _RemoveFailsDb(Database):
+    """remove_watched يرمي خطأ SQLite (فحص مسار الفشل)."""
+
+    def remove_watched(self, conversation_id):
+        raise sqlite3.OperationalError("disk I/O error")
+
+
+class _RemoveFailsWatcher:
+    """مراقب fake: unwatch يرمي خطأ SQLite."""
+
+    def unwatch(self, conversation_id):
+        raise sqlite3.OperationalError("disk I/O error")
+
+
+def test_unwatch_db_failure_shows_error_and_keeps_retry(tmp_path):
+    ctx = _ctx_with(tmp_path, DetailClient(None))
+    ctx.bot_data["db"].add_watched("c1")
+    ctx.bot_data["db"] = _RemoveFailsDb(str(tmp_path / "t2.sqlite3"))
+    ctx.bot_data["db"].add_watched("c1")
+    update = _cb_update(1, "unwatch:c1")
+    asyncio.run(h.unwatch_conversation(update, ctx))
+    edits = update.callback_query.edits
+    assert len(edits) == 1
+    assert "تعذّر" in edits[0]  # رسالة خطأ واضحة
+    assert "اتشال" not in edits[0]  # مايدّعيش النجاح
+    markup = update.callback_query.edits_markup[0]
+    cbs = [b.callback_data for row in markup.inline_keyboard for b in row]
+    assert "unwatch:c1" in cbs  # زر المحاولة متاح
+
+
+def test_unwatch_success_still_reports_removal(tmp_path):
+    ctx = _ctx_with(tmp_path, DetailClient(None))
+    ctx.bot_data["db"].add_watched("c1")
+    update = _cb_update(1, "unwatch:c1")
+    asyncio.run(h.unwatch_conversation(update, ctx))
+    assert update.callback_query.edits == ["تمام، اتشال من المتابعة."]
+    assert not ctx.bot_data["db"].is_watched("c1")
+
+
+def test_unwatch_via_watcher_failure_shows_error(tmp_path):
+    ctx = _ctx_with(tmp_path, DetailClient(None))
+    ctx.bot_data["db"].add_watched("c1")
+    ctx.bot_data["watcher"] = _RemoveFailsWatcher()
+    update = _cb_update(1, "unwatch:c1")
+    asyncio.run(h.unwatch_conversation(update, ctx))
+    assert "تعذّر" in update.callback_query.edits[0]
+    assert ctx.bot_data["db"].is_watched("c1")  # لسه متابَع
+
+
+def test_unwatch_non_owner_ignored(tmp_path):
+    ctx = _ctx_with(tmp_path, DetailClient(None))
+    ctx.bot_data["db"].add_watched("c1")
+    update = _cb_update(999, "unwatch:c1")  # مش المالك
+    asyncio.run(h.unwatch_conversation(update, ctx))
+    assert update.callback_query.edits == []
+    assert ctx.bot_data["db"].is_watched("c1")

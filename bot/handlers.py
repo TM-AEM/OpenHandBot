@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import sqlite3
 import time
 
 from telegram import InputFile, Update
@@ -139,6 +140,50 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     context.bot_data["db"].clear_awaiting(update.effective_user.id)  # تنقّل = خروج من أي توجيه
     await q.edit_message_text("أهلاً 👋 اختار من الأزرار:", reply_markup=kb.main_menu())
+
+
+def _notifications_text(enabled: bool) -> str:
+    state = "مفعّلة ✅" if enabled else "متوقفة ⛔"
+    return (
+        f"إشعارات OpenHands الاستباقية: {state}\n\n"
+        "لما تكون مفعّلة، هبلّغك لما أي محادثة توصل لحالة نهائية "
+        "(انتهت/خطأ/متعلّقة/مستنية تأكيد/خطأ بيئة).\n"
+        "الإيقاف بيوقف الإشعارات الاستباقية بس — باقي أوامر البوت وأزراره زي ما هي."
+    )
+
+
+async def notifications_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _guard(update, context):
+        return
+    db = context.bot_data["db"]
+    await update.message.reply_text(
+        _notifications_text(db.get_notifications_enabled()),
+        reply_markup=kb.notifications_menu(db.get_notifications_enabled()),
+    )
+
+
+async def notifications_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    if not _allowed(update, context.bot_data["config"]):
+        return
+    db = context.bot_data["db"]
+    enabled = db.get_notifications_enabled()
+    await q.edit_message_text(_notifications_text(enabled), reply_markup=kb.notifications_menu(enabled))
+
+
+async def notifications_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not _allowed(update, context.bot_data["config"]):
+        await q.answer()
+        return
+    db = context.bot_data["db"]
+    new_state = not db.get_notifications_enabled()
+    db.set_notifications_enabled(new_state)
+    await q.answer("تم التحديث ✅")
+    await q.edit_message_text(
+        _notifications_text(new_state), reply_markup=kb.notifications_menu(new_state)
+    )
 
 
 async def list_conversations(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -304,7 +349,12 @@ async def watch_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not conv:
         await _safe_edit(q, "الشات مش موجود.")
         return
-    db.add_watched(conversation_id, conv.get("title", ""), q.message.chat_id)
+    # NTF-19: لو الشات متابَع بالفعل، الضغطة دي إعادة نداء مكرّرة (double-tap) ⇒ نحافظ على
+    # المعرّف والعلامة المعلّقة (new_lifecycle=False). لو مش متابَع، الصف مش موجود فالـ INSERT
+    # بيعمل دورة جديدة بمعرّف جديد تلقائيًا.
+    db.add_watched(
+        conversation_id, conv.get("title", ""), q.message.chat_id, new_lifecycle=False
+    )
     db.set_last_state(conversation_id, conv.get("execution_status") or "")
     await _safe_edit(
         q, "تمام، الشات اتضاف للمتابعة ✅", reply_markup=kb.conversation_actions(conversation_id, True)
@@ -317,7 +367,26 @@ async def unwatch_conversation(update: Update, context: ContextTypes.DEFAULT_TYP
     if not _allowed(update, context.bot_data["config"]):
         return
     conversation_id = q.data.split(":", 1)[1]
-    context.bot_data["db"].remove_watched(conversation_id)
+    # NTF-17: نمرّ عبر المراقب (لو موجود) عشان أي تسليم معلّق في الذاكرة يتكمّل ذرّيًا،
+    # ومايحصلش إرسال مكرّر بعد إزالة المتابعة.
+    watcher = context.bot_data.get("watcher")
+    remover = watcher.unwatch if watcher is not None else context.bot_data["db"].remove_watched
+    try:
+        remover(conversation_id)
+    except sqlite3.Error:
+        log.exception("تعذّر إزالة متابعة الشات %s", conversation_id)
+        # نبني نفس قائمة المتابعات تاني عشان زر المحاولة يفضل متاح (الشات لسه متابَع).
+        try:
+            items = context.bot_data["db"].list_watched()
+            markup = kb.watches_menu(items[:PAGE_SIZE], 0, len(items) > PAGE_SIZE)
+        except sqlite3.Error:
+            markup = None
+        await _safe_edit(
+            q,
+            "تعذّر إلغاء المتابعة دلوقتي (خطأ مؤقت في قاعدة البيانات). جرّب تاني.",
+            reply_markup=markup,
+        )
+        return
     await _safe_edit(q, "تمام، اتشال من المتابعة.")
 
 

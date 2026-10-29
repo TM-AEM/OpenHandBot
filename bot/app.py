@@ -14,6 +14,7 @@ from telegram.ext import (
 from . import features, handlers
 from .config import Config
 from .db import Database
+from .notifier import Notifier
 from .openhands_client import OpenHandsClient
 from .outbox import CreationWorker, OutboxWorker
 from .watcher import Watcher
@@ -35,11 +36,14 @@ def build_application(config: Config) -> Application:
 
     app.add_handler(CommandHandler("start", handlers.start))
     app.add_handler(CommandHandler("cancel", handlers.cancel_route))
+    app.add_handler(CommandHandler("notifications", handlers.notifications_command))
     app.add_handler(CommandHandler("outbox", handlers.outbox_list))
     app.add_handler(CommandHandler("outbox_status", handlers.outbox_status))
     app.add_handler(CommandHandler("outbox_discard", handlers.outbox_discard))
     app.add_handler(CommandHandler("outbox_mark_sent", handlers.outbox_mark_sent))
     app.add_handler(CallbackQueryHandler(handlers.show_menu, pattern=r"^menu$"))
+    app.add_handler(CallbackQueryHandler(handlers.notifications_menu, pattern=r"^notif:menu$"))
+    app.add_handler(CallbackQueryHandler(handlers.notifications_toggle, pattern=r"^notif:toggle$"))
     app.add_handler(CallbackQueryHandler(handlers.cancel_route_button, pattern=r"^cancelroute$"))
     app.add_handler(CallbackQueryHandler(handlers.list_conversations, pattern=r"^list:"))
     app.add_handler(CallbackQueryHandler(handlers.open_conversation, pattern=r"^open:"))
@@ -87,16 +91,44 @@ def build_application(config: Config) -> Application:
             )
             application.bot_data["creation_worker"] = creation_worker
             creation_worker.start()
-        watcher = Watcher(
-            client,
-            db,
-            application.bot,
-            chat_id=config.owner_id,
-            interval=config.watcher_interval,
-            allowed_chats=config.allowed_telegram_ids,  # الشات الخاص id = id المستخدم
-        )
-        application.bot_data["watcher"] = watcher
-        watcher.start()
+        # حرس زي باقي الـ workers: إعادة تهيئة مكرّرة ما تعملش task مراقب تاني.
+        if application.bot_data.get("watcher") is None:
+            watcher = Watcher(
+                client,
+                db,
+                application.bot,
+                chat_id=config.owner_id,
+                interval=config.watcher_interval,
+                allowed_chats=config.allowed_telegram_ids,  # الشات الخاص id = id المستخدم
+            )
+            application.bot_data["watcher"] = watcher
+            watcher.start()
+        # المُبلّغ العام (NTF-03): إشعارات كل المحادثات. بيشارك نفس المراقب ملكية
+        # الإشعارات المتابَعة (بيسجّل لقطتها بس بدون تسليم) عشان مفيش ازدواج.
+        if application.bot_data.get("notifier") is None:
+            notifier = Notifier(
+                client,
+                db,
+                application.bot,
+                chat_id=config.owner_id,
+                interval=config.watcher_interval,
+                base_url=config.openhands_base_url,
+                allowed_chats=config.allowed_telegram_ids,
+            )
+            application.bot_data["notifier"] = notifier
+            notifier.start()
+        # نقطة التنسيق مع المُبلّغ: بعد ما تليجرام يأكّد إشعار مملوك للمراقب، بنسجّل الحالة
+        # المعيارية عبر المُبلّغ **قبل** ما المتابعة تتشال (فما يعيدش نفس الإشعار). بنضبطها
+        # هنا بعد إنشاء المُبلّغ (المراقب بيتعمل قبله). لو التسجيل فشل، المُبلّغ بيرميها
+        # للمراقب اللي بيمنع الإزالة ويعيد المحاولة في دورة جاية.
+        watcher = application.bot_data.get("watcher")
+        notifier = application.bot_data.get("notifier")
+        if watcher is not None and notifier is not None:
+            watcher.set_owner_delivery(
+                lambda conversation_id, status, now: notifier.record_notification_sent(
+                    conversation_id, status, now
+                )
+            )
 
     async def _post_shutdown(application: Application) -> None:
         outbox_worker: OutboxWorker | None = application.bot_data.get("outbox_worker")
@@ -108,6 +140,9 @@ def build_application(config: Config) -> Application:
         watcher: Watcher | None = application.bot_data.get("watcher")
         if watcher:
             await watcher.stop()
+        notifier: Notifier | None = application.bot_data.get("notifier")
+        if notifier:
+            await notifier.stop()
         await client.aclose()
         # إغلاق نظيف: نرجّع بيانات WAL للقاعدة الرئيسية ونقصّر الـ WAL.
         try:

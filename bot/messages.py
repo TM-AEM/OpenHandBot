@@ -12,6 +12,9 @@ _NO_REPLY = "لسه مفيش رد."
 _REPLY_MIN = 200
 _ELLIPSIS = " …"
 
+# حالة نهائية خاصة بفشل بيئة التنفيذ (مش من execution_status؛ مشتقة من sandbox_status).
+SANDBOX_ERROR = "sandbox_error"
+
 STATE_LABELS = {
     "running": "شغال",
     "idle": "خامل",
@@ -20,10 +23,32 @@ STATE_LABELS = {
     "finished": "منتهي",
     "error": "خطأ",
     "stuck": "متعلّق",
+    SANDBOX_ERROR: "خطأ بيئة",
     None: "غير معروف",
 }
 
 DONE_STATES = {"finished", "error", "stuck", "waiting_for_confirmation"}
+# الحالات النهائية المؤهّلة للإشعار: حالات الانتهاء + خطأ البيئة.
+TERMINAL_STATES = DONE_STATES | {SANDBOX_ERROR}
+
+
+def get_status(conversation: dict) -> str:
+    """الحالة المعيارية الوحيدة لمحادثة — المصدر الواحد للحقيقة للمراقب والمُبلّغ.
+
+    `execution_status` (بحروف صغيرة)، إلا لو `sandbox_status ∈ {ERROR, MISSING}`
+    فالحالة `sandbox_error`. الدالة نقية ومفيهاش أي اعتماد على باقي الوحدات.
+    """
+    execution = conversation.get("execution_status")
+    status = str(execution).lower() if execution is not None else "unknown"
+    sandbox = str(conversation.get("sandbox_status") or "").upper()
+    if sandbox in {"ERROR", "MISSING"}:
+        return SANDBOX_ERROR
+    return status
+
+
+def is_terminal(status: str | None) -> bool:
+    """حالة نهائية مؤهّلة للإشعار؟ (تشمل sandbox_error)."""
+    return status in TERMINAL_STATES
 
 
 def state_label(state: str | None) -> str:
