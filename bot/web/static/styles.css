@@ -146,3 +146,14 @@ html, body {
 .link { color: #60a5fa; font-size: 13px; }
 .more { display: flex; justify-content: center; margin-top: 10px; }
 .toast { position: fixed; inset-inline: 0; bottom: 18px; margin: 0 auto; width: fit-content; max-width: 90%; padding: 10px 16px; border-radius: 999px; background: #0f172a; color: #f8fafc; font-size: 14px; box-shadow: 0 6px 20px rgba(0,0,0,.35); }
+.op-box { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; }
+.op-status { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+.op-label { opacity: .75; }
+.op-pill { font-size: 12px; padding: 3px 10px; border-radius: 999px; background: #334155; color: #e2e8f0; white-space: nowrap; }
+.op-pill[data-op="pending"] { background: #475569; }
+.op-pill[data-op="accepted"] { background: #15803d; }
+.op-pill[data-op="failed"] { background: #b91c1c; }
+.op-pill[data-op="ambiguous"] { background: #b45309; }
+.op-pill[data-op="unknown"] { background: #475569; }
+.op-note { margin: 0; font-size: 13px; opacity: .85; }
+.op-actions { display: flex; gap: 8px; flex-wrap: wrap; }

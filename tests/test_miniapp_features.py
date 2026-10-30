@@ -83,13 +83,82 @@ class FakeDb:
         self.removed.append(cid)
         self.watched.pop(cid, None)
 
-    def add_or_group_outbox(self, cid, chat_id, text, now):
-        self.outbox.append((cid, chat_id, text))
-        return len(self.outbox)
+    def add_or_group_outbox(self, cid, chat_id, text, now, window=None, client_ref=None):
+        # idempotency: نفس (cid, chat_id, client_ref) ⇒ نفس السجل، مفيش برومت مكرّر.
+        if client_ref:
+            for item in self.outbox:
+                if item["cid"] == cid and item["chat_id"] == chat_id and item["ref"] == client_ref:
+                    return item["id"]
+        item = {
+            "id": len(self.outbox) + 1,
+            "cid": cid,
+            "chat_id": chat_id,
+            "text": text,
+            "ref": client_ref,
+            "status": "pending",
+        }
+        self.outbox.append(item)
+        return item["id"]
 
-    def add_creation_job(self, chat_id, repo, text, now):
-        self.creation.append((chat_id, repo, text))
-        return len(self.creation)
+    def get_outbox(self, outbox_id):
+        for item in self.outbox:
+            if item["id"] == outbox_id:
+                return _Row(
+                    id=item["id"], conversation_id=item["cid"], status=item["status"],
+                    created_at="t", updated_at="t",
+                )
+        return None
+
+    def find_outbox_by_ref(self, cid, chat_id, client_ref):
+        for item in self.outbox:
+            if item["cid"] == cid and item["chat_id"] == chat_id and item["ref"] == client_ref:
+                return _Row(
+                    id=item["id"], conversation_id=item["cid"], status=item["status"],
+                    created_at="t", updated_at="t",
+                )
+        return None
+
+    def add_creation_job(self, chat_id, repo, text, now, client_ref=None):
+        if client_ref:
+            for job in self.creation:
+                if job["chat_id"] == chat_id and job["ref"] == client_ref:
+                    return job["id"]
+        job = {
+            "id": len(self.creation) + 1,
+            "chat_id": chat_id,
+            "repo": repo,
+            "text": text,
+            "ref": client_ref,
+            "status": "pending",
+            "conversation_id": None,
+        }
+        self.creation.append(job)
+        return job["id"]
+
+    def get_creation_job(self, job_id):
+        for job in self.creation:
+            if job["id"] == job_id:
+                return _Row(
+                    id=job["id"], repo=job["repo"], status=job["status"],
+                    conversation_id=job["conversation_id"], created_at="t", updated_at="t",
+                )
+        return None
+
+    def find_creation_job_by_ref(self, chat_id, client_ref):
+        for job in self.creation:
+            if job["chat_id"] == chat_id and job["ref"] == client_ref:
+                return _Row(
+                    id=job["id"], repo=job["repo"], status=job["status"],
+                    conversation_id=job["conversation_id"], created_at="t", updated_at="t",
+                )
+        return None
+
+
+class _Row:
+    """صف وهمي بأقل الحقول اللي الـ DTO بيقراها."""
+
+    def __init__(self, **kw) -> None:
+        self.__dict__.update(kw)
 
 
 class FakeApplication:
@@ -293,7 +362,7 @@ def test_send_prompt_queues_and_wakes_worker():
         headers={"origin": ORIGIN},
     )
     assert r.status_code == 200 and r.json()["queued"] is True
-    assert db.outbox == [("c1", OWNER, "اعمل حاجة")]
+    assert [(i["cid"], i["chat_id"], i["text"]) for i in db.outbox] == [("c1", OWNER, "اعمل حاجة")]
     assert worker.woken == 1
 
 
@@ -344,7 +413,7 @@ def test_create_chat_queues_and_wakes_worker():
         headers={"origin": ORIGIN},
     )
     assert r.status_code == 200 and r.json()["queued"] is True
-    assert db.creation == [(OWNER, "owner/repo", "ابدأ")]
+    assert [(j["chat_id"], j["repo"], j["text"]) for j in db.creation] == [(OWNER, "owner/repo", "ابدأ")]
     assert worker.woken == 1
 
 

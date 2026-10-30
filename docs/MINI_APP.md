@@ -58,16 +58,45 @@ Telegram WebView ──HTTPS──▶ ingress (TLS) ──HTTP──▶ الحا
 | `/api/v1/conversations` | GET | كوكي | لأ | آخر الشاتات (صفحات، `?page=&refresh=1`) |
 | `/api/v1/conversations/{id}` | GET | كوكي | لأ | تفاصيل شات + آخر برومت/رد + رابط PR |
 | `/api/v1/conversations/{id}/status` | GET | كوكي | لأ | حالة شات بس |
-| `/api/v1/conversations/{id}/prompt` | POST | كوكي | ✔ | `{"text": "..."}` ⇒ يسجّل البرومت في الصندوق |
+| `/api/v1/conversations/{id}/prompt` | POST | كوكي | ✔ | `{"text": "...", "client_ref": "..."}` ⇒ يسجّل البرومت في الصندوق |
 | `/api/v1/conversations/{id}/watch` | POST | كوكي | ✔ | يضيف الشات للمتابعة |
 | `/api/v1/conversations/{id}/watch` | DELETE | كوكي | ✔ | يلغي المتابعة |
 | `/api/v1/watches` | GET | كوكي | لأ | قائمة المتابعات |
 | `/api/v1/repositories` | GET | كوكي | لأ | بحث المستودعات (`?q=&page=`) |
-| `/api/v1/chats` | POST | كوكي | ✔ | `{"repository": "owner/repo", "text": "..."}` ⇒ شات جديد |
+| `/api/v1/chats` | POST | كوكي | ✔ | `{"repository": "owner/repo", "text": "...", "client_ref": "..."}` ⇒ شات جديد |
+| `/api/v1/operations/outbox` | GET | كوكي | لأ | حالة عملية برومت (`?id=` أو `?conversation_id=&client_ref=`) |
+| `/api/v1/operations/creation` | GET | كوكي | لأ | حالة عملية إنشاء شات (`?id=` أو `?client_ref=`) |
 | `/api/v1/*` (غير معروف) | أي | — | — | `404` JSON موحّد |
 | `/`, `/mini/`, `/mini/<asset>` | GET | لأ | لأ | الواجهة والأصول الثابتة (**بدون تحديد معدّل**) |
 
-## 5. إعادة استخدام منطق البوت (مفيش تكرار)
+## 5. تدفّقات البرومت/الشات الجديد (OHB2-07): idempotency + حالات العملية
+
+المشكلة: إعادة المحاولة من الواجهة (double-tap، أو انقطاع الاتصال بعد ما السيرفر
+استلم الطلب) كان ممكن تعمل **برومت مكرّر** أو **شات جديد مكرّر**. الحل بيبني على
+الصندوق المتين الموجود (مفيش مسار إرسال جديد):
+
+- **معرّف عملية من العميل (`client_ref`)**: الواجهة بتولّد معرّف فريد لكل عملية
+  (نفس المعرّف بيتعاد في كل إعادة محاولة لنفس النص). الـ API بيقبله في
+  `POST /conversations/{id}/prompt` و`POST /chats`.
+- **idempotency على مستوى القاعدة**: `add_or_group_outbox` و`add_creation_job`
+  بيرجّعوا نفس السجل لو نفس `(conversation_id/chat_id, client_ref)` موجود —
+  فإعادة الإرسال بنفس المعرّف ما بتعملش سجل تاني (عمود `client_ref` جديد، غير مدمّر).
+- **حالات العملية**: `GET /operations/outbox` و`GET /operations/creation` بيرجّعوا
+  DTO آمن (مفيش نص البرومت ولا تفاصيل داخلية): `pending` / `accepted` / `failed` /
+  `ambiguous` / `unknown`. الاستعلام ممكن بـ `id=` أو بـ `client_ref=` (بعد نتيجة غامضة
+  من غير ما نعرف الـ id).
+- **النتيجة الغامضة**: لو الاتصال اتقطع، الواجهة **ما بتعيدش الإرسال تلقائياً** —
+  بتستعلم عن الحالة الأول (GET آمن)، وإعادة الإرسال يدوية صريحة بنفس المعرّف
+  (idempotent، مفيش تكرار). عند القبول، إنشاء الشات بينقّل لصفحة التفاصيل.
+- **دورة حياة المعرّف (OHB2-07-FIX)**: منطق توليد المعرّف معزول في وحدة مستقلة عن
+  الـ DOM (`bot/web/static/ops.js`) ومُختبرة بـ Node. القاعدة: عملية **نشطة**
+  (`pending`/`ambiguous`) بنفس المفتاح ⇒ نفس المعرّف؛ عملية **نهائية**
+  (`accepted`/`failed`) ⇒ أول إرسال جديد بنفس المفتاح ياخد **معرّف جديد**. مفتاح
+  البرومت = `(conversation_id, text)`، ومفتاح إنشاء الشات = `(repository, text)` —
+  فالفشل أو النجاح السابق **مايلغيش** عملية جديدة، وطلب نفس النص في **مستودع مختلف**
+  عملية جديدة. الاختبارات: `tests/frontend/ops.test.js` (شوف §12).
+
+## 6. إعادة استخدام منطق البوت (مفيش تكرار)
 
 `bot/web/services.py::MiniAppService` هي الطبقة الرقيقة الوحيدة فوق المكوّنات الموجودة:
 
@@ -85,7 +114,7 @@ Telegram WebView ──HTTPS──▶ ingress (TLS) ──HTTP──▶ الحا
   (at-most-once، تعافي عند إعادة التشغيل، تجميع) — مفيش ازدواج ولا سلوكين مختلفين.
 - الخدمة **ما بتبدأش أي worker**؛ بس بتنبّه الموجود عبر `application.bot_data`.
 
-## 6. تدفّق المصادقة (initData) + التحصين (S1)
+## 7. تدفّق المصادقة (initData) + التحصين (S1)
 
 بيتّبع [إجراء تيليجرام الرسمي](https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app):
 
@@ -112,7 +141,7 @@ Telegram WebView ──HTTPS──▶ ingress (TLS) ──HTTP──▶ الحا
 - مستخدم غير مسموح ⇒ `403` (ومفيش أي تفاصيل حساسة في الرسالة). أي جلسة لمستخدم اتشال من
   القايمة بتتبطّل وتترفض.
 
-## 7. تحديد المعدّل (S2)
+## 8. تحديد المعدّل (S2)
 
 `bot/web/ratelimit.py::SlidingWindowLimiter` — نافذة منزلقة في الذاكرة، بدون تبعيات، بساعة قابلة للحقن.
 
@@ -128,7 +157,7 @@ Telegram WebView ──HTTPS──▶ ingress (TLS) ──HTTP──▶ الحا
 - **مفيش تسجيل بيانات حساسة**: المفاتيح معرّفات مستعارة (توكن الجلسة أو `ip:...`)، مش توكنات.
 - الطلب المرفوض **ما بيتسجّلش** (عشان ما يمدّدش الحظر).
 
-## 8. تحديد IP العميل + الـ proxy (S3)
+## 9. تحديد IP العميل + الـ proxy (S3)
 
 **اكتشاف فعلي (probe على الـ runtime):** الـ ingress (Traefik) **ما بينضّفش** أي `X-Forwarded-For`
 جاي من العميل — بيعمل **إلحاق** للند الحقيقي على اليمين:
@@ -153,7 +182,7 @@ Telegram WebView ──HTTPS──▶ ingress (TLS) ──HTTP──▶ الحا
 - **افتراض النشر:** الـ Mini App خلف ingress واحد بيتحكم فيه المشغّل، والوصول مقصور على المالك
   المسموح بعد مصادقة initData. تحديد المعدّل دفاع إضافي (طبقة داخل العملية)، مش خط الدفاع الوحيد.
 
-## 9. حماية Origin (S4)
+## 10. حماية Origin (S4)
 
 طلبات **تغيّر الحالة** لازم تكون من أصل مسموح (`bot/web/app.py::_origin_ok`):
 
@@ -164,7 +193,7 @@ Telegram WebView ──HTTPS──▶ ingress (TLS) ──HTTP──▶ الحا
 - `SameSite=Strict` **ما اتضعّفش** — ده خط دفاع أول، وفحص الـ Origin خط تاني.
 - الرد الرفض: `403 {"error": "bad_origin"}`.
 
-## 10. متغيرات البيئة
+## 11. متغيرات البيئة
 
 ```
 MINI_APP_URL=                 # رابط عام https (مطلوب لما MINI_APP_ENABLED=1)
@@ -181,7 +210,7 @@ MINI_APP_API_RATE_PER_MINUTE=60
 MINI_APP_RATE_MAX_KEYS=4096
 ```
 
-## 11. التطوير المحلي والاختبار
+## 12. التطوير المحلي والاختبار
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
@@ -201,12 +230,21 @@ python -m pytest -q tests/test_miniapp_initdata.py tests/test_miniapp_api.py \
     tests/test_miniapp_integration.py tests/test_miniapp_config.py
 ```
 
-## 12. القيد غير المحلول: اسم مضيف مرتبط بالجلسة
+اختبارات منطق الواجهة (دورة حياة معرّف العملية — idempotency): بتشتغل بـ Node المدمج
+على **نفس** الوحدة اللي الواجهة بتستعملها (`bot/web/static/ops.js`):
+
+```bash
+node --test tests/frontend/*.test.js
+```
+
+(كمان بتتغلّف جوه `pytest` عبر `tests/test_frontend_ops.py`، وبتتخطّى بأمان لو Node مش متاح.)
+
+## 13. القيد غير المحلول: اسم مضيف مرتبط بالجلسة
 
 الـ runtime بتاع OpenHands **مؤقّت**: اسم المضيف (الـ work host) مرتبط بالجلسة وممكن يتغيّر عند
 إعادة تهيئة الـ sandbox ⇒ الرابط الحالي **مش رابط إنتاج دائم** (راجع OHB2-04 §8/§9).
 
-## 13. اللي فاضل لمهام OHB2 اللاحقة
+## 14. اللي فاضل لمهام OHB2 اللاحقة
 
 - جلسات **ثابتة عبر إعادة التشغيل** (المخزن الحالي في الذاكرة ⇒ أي restart بيلغي الجلسات).
 - ميزات لسه مش معروضة في الـ Mini App: الملفات، التكلفة، تصدير الشات (موجودة في البوت، ومخفية

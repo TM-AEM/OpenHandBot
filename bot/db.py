@@ -107,6 +107,8 @@ class OutboxItem:
     created_at: str
     updated_at: str
     attempts: int = 0
+    # OHB2-07: معرّف العملية اللي العميل يولّده لمنع الازدواج عند إعادة المحاولة.
+    client_ref: str | None = None
 
 
 @dataclass
@@ -122,6 +124,8 @@ class CreationJob:
     created_at: str
     updated_at: str
     attempts: int = 0
+    # OHB2-07: معرّف العملية اللي العميل يولّده لمنع ازدواج إنشاء الشات عند إعادة المحاولة.
+    client_ref: str | None = None
 
 
 class Database:
@@ -168,7 +172,8 @@ class Database:
                 error           TEXT,
                 created_at      TEXT NOT NULL,
                 updated_at      TEXT NOT NULL,
-                attempts        INTEGER NOT NULL DEFAULT 0
+                attempts        INTEGER NOT NULL DEFAULT 0,
+                client_ref      TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox(status);
             CREATE TABLE IF NOT EXISTS creation_jobs (
@@ -182,7 +187,8 @@ class Database:
                 error           TEXT,
                 created_at      TEXT NOT NULL,
                 updated_at      TEXT NOT NULL,
-                attempts        INTEGER NOT NULL DEFAULT 0
+                attempts        INTEGER NOT NULL DEFAULT 0,
+                client_ref      TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_creation_jobs_status ON creation_jobs(status);
             CREATE TABLE IF NOT EXISTS settings (
@@ -240,6 +246,20 @@ class Database:
         outbox_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(outbox)")}
         if outbox_cols and "attempts" not in outbox_cols:
             self._conn.execute("ALTER TABLE outbox ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+        # OHB2-07: معرّف العملية اللي العميل يولّده (idempotency). عمود إضافي nullable،
+        # والصفوف القديمة بتاخد NULL (مفيش فقد بيانات، والسلوك القديم زي ما هو).
+        if outbox_cols and "client_ref" not in outbox_cols:
+            self._conn.execute("ALTER TABLE outbox ADD COLUMN client_ref TEXT")
+        creation_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(creation_jobs)")}
+        if creation_cols and "client_ref" not in creation_cols:
+            self._conn.execute("ALTER TABLE creation_jobs ADD COLUMN client_ref TEXT")
+        # بعد ضمان وجود العمودين (للجداول القديمة كمان)، نعمل فهارس معرّف العملية.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_outbox_client_ref ON outbox(client_ref)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_creation_jobs_client_ref ON creation_jobs(client_ref)"
+        )
         # creation_jobs اتعمل في 04A-6 (جدول جديد)؛ CREATE IF NOT EXISTS فوق بيكفّي
         # للقواعد القديمة، وبنضمن عمود attempts لو الجدول موجود من نسخة أقدم.
 
@@ -692,6 +712,7 @@ class Database:
         text: str,
         now: str,
         window: timedelta | None = None,
+        client_ref: str | None = None,
     ) -> int:
         """تجميع (القرار 2): لو فيه برومت 'pending' لنفس الوجهة اتحدّث خلال `window`،
 
@@ -699,13 +720,28 @@ class Database:
 
         الوجهة = (conversation_id, chat_id). العملية كلها جوه BEGIN IMMEDIATE عشان
         رسالتين متزامنتين مايعملوش سجلين منفصلين لنفس الدفعة. بنرجّع id السجل.
+
+        OHB2-07 (idempotency): لو `client_ref` اتزوّد وفيه سجل موجود بنفس
+        (conversation_id, chat_id, client_ref)، بنرجّع الـ id بتاعه من غير أي كتابة —
+        فإعادة إرسال نفس العملية (double-tap / إعادة محاولة بعد انقطاع الرد) ما بتعملش
+        برومت مكرّر.
         """
         window = window if window is not None else GROUP_WINDOW
         conn = self._conn
         conn.execute("BEGIN IMMEDIATE")
         try:
+            if client_ref:
+                existing = conn.execute(
+                    "SELECT id FROM outbox "
+                    "WHERE conversation_id=? AND chat_id=? AND client_ref=? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (conversation_id, chat_id, client_ref),
+                ).fetchone()
+                if existing is not None:
+                    conn.commit()
+                    return int(existing["id"])
             row = conn.execute(
-                "SELECT id, text, updated_at FROM outbox "
+                "SELECT id, text, updated_at, client_ref FROM outbox "
                 "WHERE conversation_id=? AND chat_id=? AND status=? ORDER BY id DESC LIMIT 1",
                 (conversation_id, chat_id, OUTBOX_PENDING),
             ).fetchone()
@@ -717,18 +753,28 @@ class Database:
                 and row_dt is not None
                 and now_dt - row_dt <= window
             )
-            if within:
+            # بنسمح بالتجميع مع صف لسه 'pending' لو مالوش معرّف عملية، أو معرّفه نفس
+            # معرّفنا. لو الصف ليه معرّف تاني ⇒ ما ندمجش (نعمل صف مستقل) عشان
+            # الـ idempotency بتاعة العملية التانية ما تتلغيش.
+            mergeable = within and (
+                not client_ref or row["client_ref"] in (None, client_ref)
+            )
+            if mergeable:
                 merged = row["text"] + "\n" + text
+                # نطبع معرّف العملية على الصف لو كان فاضي، عشان إعادة إرسال نفس
+                # العملية تلاقيه وما تكرّرش.
+                stamped = row["client_ref"] or client_ref
                 conn.execute(
-                    "UPDATE outbox SET text=?, updated_at=? WHERE id=?",
-                    (merged, now, row["id"]),
+                    "UPDATE outbox SET text=?, updated_at=?, client_ref=? WHERE id=?",
+                    (merged, now, stamped, row["id"]),
                 )
                 out_id = int(row["id"])
             else:
                 cur = conn.execute(
-                    "INSERT INTO outbox(conversation_id, chat_id, text, status, created_at, updated_at) "
-                    "VALUES(?, ?, ?, ?, ?, ?)",
-                    (conversation_id, chat_id, text, OUTBOX_PENDING, now, now),
+                    "INSERT INTO outbox"
+                    "(conversation_id, chat_id, text, status, created_at, updated_at, client_ref) "
+                    "VALUES(?, ?, ?, ?, ?, ?, ?)",
+                    (conversation_id, chat_id, text, OUTBOX_PENDING, now, now, client_ref),
                 )
                 out_id = int(cur.lastrowid)
             conn.commit()
@@ -736,6 +782,17 @@ class Database:
             conn.rollback()
             raise
         return out_id
+
+    def find_outbox_by_ref(
+        self, conversation_id: str, chat_id: int, client_ref: str
+    ) -> OutboxItem | None:
+        """أحدث سجل صندوق بنفس معرّف العملية (idempotency) أو None."""
+        row = self._conn.execute(
+            "SELECT * FROM outbox "
+            "WHERE conversation_id=? AND chat_id=? AND client_ref=? ORDER BY id DESC LIMIT 1",
+            (conversation_id, chat_id, client_ref),
+        ).fetchone()
+        return self._row_to_outbox(row) if row else None
 
     def set_outbox_status(
         self, outbox_id: int, status: str, now: str, error: str | None = None, bump: bool = False
@@ -872,18 +929,42 @@ class Database:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             attempts=row["attempts"],
+            client_ref=row["client_ref"],
         )
 
     # ----------------------------------------------------------- creation jobs
-    def add_creation_job(self, chat_id: int, repo: str | None, text: str, now: str) -> int:
-        """يسجّل طلب شات جديد (status='pending') قبل أي POST بدء (مفيش conversation_id)."""
+    def add_creation_job(
+        self, chat_id: int, repo: str | None, text: str, now: str, client_ref: str | None = None
+    ) -> int:
+        """يسجّل طلب شات جديد (status='pending') قبل أي POST بدء (مفيش conversation_id).
+
+        OHB2-07 (idempotency): لو `client_ref` اتزوّد وفيه طلب موجود بنفس
+        (chat_id, client_ref)، بنرجّع الـ id بتاعه من غير إنشاء طلب جديد — فإعادة
+        المحاولة بعد انقطاع الرد ما بتبدأش شات تاني.
+        """
+        if client_ref:
+            existing = self._conn.execute(
+                "SELECT id FROM creation_jobs WHERE chat_id=? AND client_ref=? "
+                "ORDER BY id DESC LIMIT 1",
+                (chat_id, client_ref),
+            ).fetchone()
+            if existing is not None:
+                return int(existing["id"])
         cur = self._conn.execute(
-            "INSERT INTO creation_jobs(chat_id, repo, text, status, created_at, updated_at) "
-            "VALUES(?, ?, ?, ?, ?, ?)",
-            (chat_id, repo, text, CREATION_PENDING, now, now),
+            "INSERT INTO creation_jobs(chat_id, repo, text, status, created_at, updated_at, client_ref) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?)",
+            (chat_id, repo, text, CREATION_PENDING, now, now, client_ref),
         )
         self._conn.commit()
         return int(cur.lastrowid)
+
+    def find_creation_job_by_ref(self, chat_id: int, client_ref: str) -> CreationJob | None:
+        """أحدث طلب شات جديد بنفس معرّف العملية (idempotency) أو None."""
+        row = self._conn.execute(
+            "SELECT * FROM creation_jobs WHERE chat_id=? AND client_ref=? ORDER BY id DESC LIMIT 1",
+            (chat_id, client_ref),
+        ).fetchone()
+        return self._row_to_creation(row) if row else None
 
     def get_creation_job(self, job_id: int) -> CreationJob | None:
         row = self._conn.execute("SELECT * FROM creation_jobs WHERE id=?", (job_id,)).fetchone()
@@ -980,6 +1061,7 @@ class Database:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             attempts=row["attempts"],
+            client_ref=row["client_ref"],
         )
 
     def close(self) -> None:

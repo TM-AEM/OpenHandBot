@@ -193,6 +193,8 @@ class MiniApp:
                 self.conversation_prompt,
                 methods=["POST"],
             ),
+            Route(f"{API_PREFIX}/operations/outbox", self.outbox_operation, methods=["GET"]),
+            Route(f"{API_PREFIX}/operations/creation", self.creation_operation, methods=["GET"]),
             Route(
                 f"{API_PREFIX}/conversations/{{conversation_id}}/watch",
                 self.conversation_watch,
@@ -369,13 +371,74 @@ class MiniApp:
             return _error(400, "bad_request", "صيغة الطلب غير صحيحة.")
         try:
             data = await self._service.send_prompt(
-                request.path_params.get("conversation_id", ""), body.get("text", "")
+                request.path_params.get("conversation_id", ""),
+                body.get("text", ""),
+                body.get("client_ref"),
             )
         except ValidationError as exc:
             return _error(400, "bad_request", str(exc))
         except ApiError as exc:
             return self._api_error(exc)
         return _json(data)
+
+    async def outbox_operation(self, request):
+        """حالة عملية برومت: بـ id= أو بـ conversation_id + client_ref (بعد نتيجة غامضة)."""
+        session, err = await self._guarded(request, state_changing=False)
+        if err is not None:
+            return err
+        try:
+            data = self._lookup_outbox(request)
+        except ValidationError as exc:
+            return _error(400, "bad_request", str(exc))
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json(data)
+
+    def _lookup_outbox(self, request) -> dict:
+        raw_id = (request.query_params.get("id") or "").strip()
+        ref = (request.query_params.get("client_ref") or "").strip()
+        if raw_id:
+            try:
+                outbox_id = int(raw_id)
+            except ValueError:
+                raise ValidationError("رقم العملية غير صالح") from None
+            return self._service.outbox_operation(outbox_id)
+        if ref:
+            conversation_id = request.query_params.get("conversation_id") or ""
+            found = self._service.find_outbox_operation(conversation_id, ref)
+            if found is None:
+                raise ApiError("العملية مش موجودة.", 404)
+            return found
+        raise ValidationError("لازم تحدّد id أو client_ref")
+
+    async def creation_operation(self, request):
+        """حالة عملية إنشاء شات: بـ id= أو بـ client_ref (بعد نتيجة غامضة)."""
+        session, err = await self._guarded(request, state_changing=False)
+        if err is not None:
+            return err
+        try:
+            data = self._lookup_creation(request)
+        except ValidationError as exc:
+            return _error(400, "bad_request", str(exc))
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json(data)
+
+    def _lookup_creation(self, request) -> dict:
+        raw_id = (request.query_params.get("id") or "").strip()
+        ref = (request.query_params.get("client_ref") or "").strip()
+        if raw_id:
+            try:
+                job_id = int(raw_id)
+            except ValueError:
+                raise ValidationError("رقم العملية غير صالح") from None
+            return self._service.creation_operation(job_id)
+        if ref:
+            found = self._service.find_creation_operation(ref)
+            if found is None:
+                raise ApiError("العملية مش موجودة.", 404)
+            return found
+        raise ValidationError("لازم تحدّد id أو client_ref")
 
     async def conversation_watch(self, request):
         session, err = await self._guarded(request, state_changing=True)
@@ -443,7 +506,7 @@ class MiniApp:
             return _error(400, "bad_request", "صيغة الطلب غير صحيحة.")
         try:
             data = await self._service.create_chat(
-                body.get("repository", ""), body.get("text", "")
+                body.get("repository", ""), body.get("text", ""), body.get("client_ref")
             )
         except ValidationError as exc:
             return _error(400, "bad_request", str(exc))

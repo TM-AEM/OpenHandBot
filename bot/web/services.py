@@ -18,6 +18,7 @@ from ..errors import ApiError
 from ..messages import get_status, pr_url, state_label, truncate
 from .. import features
 from .. import outbox
+from .. import db as db_module
 
 log = logging.getLogger(__name__)
 
@@ -25,6 +26,30 @@ PAGE_SIZE = 10
 MAX_PROMPT_CHARS = 8000
 MAX_REPO_LEN = 200
 MAX_ID_LEN = 200
+# OHB2-07: معرّف العملية اللي العميل يولّده (idempotency). قاصر على حروف/أرقام/شرطة
+# وشرطة سفلية، بطول محدود، عشان ما يتحوّلش لقناة حقن أو مفتاح ضخم في الذاكرة/القاعدة.
+MAX_REF_LEN = 64
+
+# OHB2-07: خرائط حالة العملية الداخلية لحالة واجهة واضحة. أي حالة مش معروفة ⇒ 'unknown'
+# (fail closed: ما نأكّدش نجاح حاجة مش متأكدين منها).
+_OUTBOX_STATES = {
+    db_module.OUTBOX_PENDING: "pending",
+    db_module.OUTBOX_CLAIMED: "pending",
+    db_module.OUTBOX_SENDING: "pending",
+    db_module.OUTBOX_SENT: "accepted",
+    db_module.OUTBOX_FAILED: "failed",
+    db_module.OUTBOX_UNKNOWN: "ambiguous",
+    db_module.OUTBOX_DISCARDED: "failed",
+}
+_CREATION_STATES = {
+    db_module.CREATION_PENDING: "pending",
+    db_module.CREATION_CLAIMED: "pending",
+    db_module.CREATION_STARTING: "pending",
+    db_module.CREATION_DONE: "accepted",
+    db_module.CREATION_FAILED: "failed",
+    db_module.CREATION_UNKNOWN: "ambiguous",
+    db_module.CREATION_DISCARDED: "failed",
+}
 
 
 class ValidationError(ValueError):
@@ -56,6 +81,16 @@ def _require_repo(value: str | None) -> str:
         raise ValidationError("اسم المستودع لازم يكون بالشكل owner/repo")
     if any(ch.isspace() for ch in text):
         raise ValidationError("اسم المستودع غير صالح")
+    return text
+
+
+def _require_ref(value: str | None) -> str:
+    """يتحقّق من معرّف العملية اللي العميل يولّده (idempotency) أو يرجّع فاضي."""
+    text = (value or "").strip()
+    if not text:
+        return ""
+    if len(text) > MAX_REF_LEN or not all(ch.isalnum() or ch in "-_" for ch in text):
+        raise ValidationError("معرّف العملية غير صالح")
     return text
 
 
@@ -215,17 +250,94 @@ class MiniAppService:
             raise ApiError("الشات مش موجود.", 404)
         return _conversation_dto(convs[0], cid in self._watched_ids())
 
-    async def send_prompt(self, conversation_id: str, text: str) -> dict:
-        """يسجّل البرومت في الصندوق المتين (نفس مسار البوت) وينبّه الـ worker المالك."""
+    async def send_prompt(
+        self, conversation_id: str, text: str, client_ref: str | None = None
+    ) -> dict:
+        """يسجّل البرومت في الصندوق المتين (نفس مسار البوت) وينبّه الـ worker المالك.
+
+        `client_ref` (OHB2-07): معرّف عملية من العميل. لو نفس العملية اتبعتت تاني
+        (double-tap/إعادة محاولة)، بنرجّع نفس السجل بدل ما نعمل برومت مكرّر.
+        """
         cid = _require_id(conversation_id)
         body = _require_text(text)
+        ref = _require_ref(client_ref)
         if self._db is None:
             raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
         chat_id = self._config.owner_id
-        outbox_id = self._db.add_or_group_outbox(cid, chat_id, body, outbox.now_iso())
+        outbox_id = self._db.add_or_group_outbox(
+            cid, chat_id, body, outbox.now_iso(), client_ref=ref or None
+        )
         self._drop_list_cache()
         self._wake("outbox_worker")
-        return {"ok": True, "queued": True, "outbox_id": outbox_id}
+        return {
+            "ok": True,
+            "queued": True,
+            "outbox_id": outbox_id,
+            "operation": self.outbox_operation(outbox_id),
+        }
+
+    # --------------------------------------------------- operation status
+    def outbox_operation(self, outbox_id: int) -> dict:
+        """حالة عملية برومت (DTO آمن: مفيش نص البرومت ولا تفاصيل داخلية خام)."""
+        if self._db is None:
+            raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
+        item = self._db.get_outbox(outbox_id)
+        if item is None:
+            raise ApiError("العملية مش موجودة.", 404)
+        return self._outbox_dto(item)
+
+    def creation_operation(self, job_id: int) -> dict:
+        """حالة عملية إنشاء شات (DTO آمن)."""
+        if self._db is None:
+            raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
+        job = self._db.get_creation_job(job_id)
+        if job is None:
+            raise ApiError("العملية مش موجودة.", 404)
+        return self._creation_dto(job)
+
+    def find_outbox_operation(self, conversation_id: str, client_ref: str) -> dict | None:
+        """يبحث عن عملية برومت بمعرّف العميل (للاستعلام بعد نتيجة غامضة) أو None."""
+        if self._db is None:
+            raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
+        cid = _require_id(conversation_id)
+        ref = _require_ref(client_ref)
+        if not ref:
+            raise ValidationError("معرّف العملية مطلوب")
+        item = self._db.find_outbox_by_ref(cid, self._config.owner_id, ref)
+        return self._outbox_dto(item) if item else None
+
+    def find_creation_operation(self, client_ref: str) -> dict | None:
+        """يبحث عن عملية إنشاء شات بمعرّف العميل (للاستعلام بعد نتيجة غامضة) أو None."""
+        if self._db is None:
+            raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
+        ref = _require_ref(client_ref)
+        if not ref:
+            raise ValidationError("معرّف العملية مطلوب")
+        job = self._db.find_creation_job_by_ref(self._config.owner_id, ref)
+        return self._creation_dto(job) if job else None
+
+    @staticmethod
+    def _outbox_dto(item) -> dict:
+        return {
+            "kind": "prompt",
+            "id": item.id,
+            "conversation_id": item.conversation_id,
+            "state": _OUTBOX_STATES.get(item.status, "unknown"),
+            "created_at": item.created_at,
+            "updated_at": item.updated_at,
+        }
+
+    @staticmethod
+    def _creation_dto(job) -> dict:
+        return {
+            "kind": "creation",
+            "id": job.id,
+            "repository": job.repo or "",
+            "state": _CREATION_STATES.get(job.status, "unknown"),
+            "conversation_id": job.conversation_id or "",
+            "created_at": job.created_at,
+            "updated_at": job.updated_at,
+        }
 
     # ----------------------------------------------------------- watches
     def list_watches(self, page: int = 0) -> dict:
@@ -305,13 +417,27 @@ class MiniAppService:
         }
 
     # ------------------------------------------------------------ new chat
-    async def create_chat(self, repository: str, text: str) -> dict:
-        """يسجّل طلب شات جديد في جدول المهام المتين وينبّه الـ worker المالك."""
+    async def create_chat(
+        self, repository: str, text: str, client_ref: str | None = None
+    ) -> dict:
+        """يسجّل طلب شات جديد في جدول المهام المتين وينبّه الـ worker المالك.
+
+        `client_ref` (OHB2-07): معرّف عملية من العميل. لو نفس الطلب اتبعت تاني
+        (double-tap/إعادة محاولة)، بنرجّع نفس الطلب بدل ما نبدأ شات مكرّر.
+        """
         repo = _require_repo(repository)
         body = _require_text(text)
+        ref = _require_ref(client_ref)
         if self._db is None:
             raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
-        job_id = self._db.add_creation_job(self._config.owner_id, repo, body, outbox.now_iso())
+        job_id = self._db.add_creation_job(
+            self._config.owner_id, repo, body, outbox.now_iso(), client_ref=ref or None
+        )
         self._drop_list_cache()
         self._wake("creation_worker")
-        return {"ok": True, "queued": True, "job_id": job_id}
+        return {
+            "ok": True,
+            "queued": True,
+            "job_id": job_id,
+            "operation": self.creation_operation(job_id),
+        }

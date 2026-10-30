@@ -98,6 +98,126 @@
     });
   }
 
+  // منطق دورة حياة معرّف العملية (OHB2-07-FIX) — مشترك ومُختبر في ops.js.
+  var OPS = window.RecovoOps;
+  if (!OPS) { throw new Error("RecovoOps مش محمّل (ops.js)"); }
+  function opKey(parts) { return OPS.identityKey(parts); }
+
+  // حالات العملية اللي السيرفر بيرجّعها: pending/accepted/failed/ambiguous/unknown.
+  var OP_TEXT = {
+    pending: "قيد التنفيذ…",
+    accepted: "وصل ✅",
+    failed: "فشل",
+    ambiguous: "مش متأكدين",
+    unknown: "مش معروف"
+  };
+
+  function opPill(op) {
+    var state = (op && op.state) || "unknown";
+    var pill = el("span", "op-pill", OP_TEXT[state] || state);
+    pill.setAttribute("data-op", state);
+    return pill;
+  }
+
+  // يستعلم عن حالة العملية (GET آمن، idempotent) باستخدام معرّف العملية.
+  function queryOperation(kind, ref, conversationId) {
+    var q = "?client_ref=" + encodeURIComponent(ref);
+    if (kind === "prompt") { q += "&conversation_id=" + encodeURIComponent(conversationId); }
+    var path = kind === "prompt" ? "/operations/outbox" : "/operations/creation";
+    return get(path + q).then(function (res) {
+      if (res.status === 404) { return { ok: true, data: { state: "unknown" } }; }
+      return res;
+    });
+  }
+
+  // يعرض حالة العملية جوه صندوق، ويستعلم بتراجع محدود (مفيش إعادة إرسال تلقائية).
+  // `resend` دالة بتعيد إرسال نفس العملية بنفس المعرّف (idempotent) عند الطلب الصريح.
+  function trackOperation(box, kind, ref, conversationId, onAccepted, resend, manager) {
+    var status = el("div", "op-status");
+    status.appendChild(el("span", "op-label", "حالة العملية: "));
+    status.appendChild(opPill({ state: "pending" }));
+    box.appendChild(status);
+    var attempts = 0;
+    var maxAttempts = 6;
+    function poll() {
+      queryOperation(kind, ref, conversationId).then(function (res) {
+        if (!res.ok) { return; }
+        var op = res.data || {};
+        var state = op.state || "unknown";
+        // نسجّل الحالة اللي رصدناها: نهائية ⇒ العملية خلصت، فإرسال جديد بنفس
+        // المفتاح ياخد معرّف جديد. غامضة ⇒ تفضل نشطة (المعرّف يتحفظ).
+        if (manager) { manager.resolve(ref, state); }
+        status.innerHTML = "";
+        status.appendChild(el("span", "op-label", "حالة العملية: "));
+        status.appendChild(opPill(op));
+        if (state === "accepted") {
+          if (onAccepted) { onAccepted(op); }
+          return;
+        }
+        attempts += 1;
+        if (state !== "pending" || attempts >= maxAttempts) {
+          // فشل/غامض/مش معروف — أو لسه pending بعد ما استنفدنا المحاولات: نعرض
+          // إجراءات صريحة (استعلام + إعادة محاولة بنفس المعرّف). مفيش إعادة تلقائية.
+          showOpActions(box, kind, ref, conversationId, state, onAccepted, resend, manager);
+          return;
+        }
+        setTimeout(poll, 1500 + attempts * 500);
+      }).catch(function () { /* نتجاهل أخطاء الاستعلام — نعرض آخر حالة معروفة */ });
+    }
+    setTimeout(poll, 800);
+  }
+
+  var OP_NOTE = {
+    ambiguous: "النتيجة غامضة (ممكن يكون وصل). استعلم عن الحالة الأول قبل أي إعادة إرسال.",
+    failed: "العملية فشلت بشكل مؤكد.",
+    pending: "لسه قيد التنفيذ. استعلم تاني بعد شوية.",
+    unknown: "حالة العملية مش معروفة. استعلم عنها."
+  };
+
+  // عند نتيجة غامضة/فاشلة/لسه معلّقة: نعرض إجراءات صريحة — استعلام (قراءة) وإعادة
+  // محاولة بنفس معرّف العملية (idempotent، مفيش تكرار). مفيش أي إعادة تلقائية.
+  function showOpActions(box, kind, ref, conversationId, state, onAccepted, resend, manager) {
+    if (box.querySelector(".op-actions")) { return; }
+    var note = el("p", "op-note", OP_NOTE[state] || OP_NOTE.unknown);
+    var actions = el("div", "op-actions");
+    var checkBtn = el("button", "btn ghost small", "استعلام عن الحالة");
+    checkBtn.addEventListener("click", function () {
+      checkBtn.disabled = true;
+      queryOperation(kind, ref, conversationId).then(function (res) {
+        checkBtn.disabled = false;
+        var op = (res && res.data) || {};
+        var s = op.state || "unknown";
+        if (manager) { manager.resolve(ref, s); }
+        box.querySelectorAll(".op-status").forEach(function (n) { n.remove(); });
+        var line = el("div", "op-status");
+        line.appendChild(el("span", "op-label", "حالة العملية: "));
+        line.appendChild(opPill(op));
+        box.appendChild(line);
+        box.querySelectorAll(".op-actions, .op-note").forEach(function (n) { n.remove(); });
+        if (s === "accepted") { if (onAccepted) { onAccepted(op); } }
+        else { showOpActions(box, kind, ref, conversationId, s, onAccepted, resend, manager); }
+      }).catch(function () { checkBtn.disabled = false; toast("مش قادر أوصل للسيرفر."); });
+    });
+    actions.appendChild(checkBtn);
+    var retryBtn = el("button", "btn small", "إعادة المحاولة");
+    retryBtn.addEventListener("click", function () {
+      retryBtn.disabled = true;
+      resend(ref).then(function (res) {
+        retryBtn.disabled = false;
+        if (res.ok) {
+          box.querySelectorAll(".op-status, .op-actions, .op-note").forEach(function (n) { n.remove(); });
+          trackOperation(box, kind, ref, conversationId, onAccepted, resend, manager);
+          toast("اتعادت المحاولة بنفس العملية ✅");
+        } else {
+          toast(friendlyMessage(res.status, res.data));
+        }
+      }).catch(function () { retryBtn.disabled = false; toast("مش قادر أوصل للسيرفر."); });
+    });
+    actions.appendChild(retryBtn);
+    box.appendChild(note);
+    box.appendChild(actions);
+  }
+
   // -------------------------------------------------------------- auth
   function authenticate() {
     var raw = (tg && tg.initData) ? tg.initData : "";
@@ -203,17 +323,45 @@
       prompt.placeholder = "اكتب برومت للشات ده…";
       box.appendChild(prompt);
       var send = el("button", "btn", "إرسال البرومت");
+      var opBox = el("div", "op-box");
+      box.appendChild(send);
+      box.appendChild(opBox);
+      // مدير معرّف العملية: نفس المفتاح (نص البرومت) + عملية نشطة ⇒ نفس المعرّف
+      // (إعادة محاولة/ضغط مزدوج مايكرّرش). عملية نهائية ⇒ معرّف جديد لنفس النص.
+      var promptOps = OPS.createRefManager();
+      function promptKey(text) { return opKey([id, text]); }
+      function resend(ref) {
+        return post(
+          "/conversations/" + encodeURIComponent(id) + "/prompt",
+          { text: promptOps.payload(), client_ref: ref }
+        );
+      }
       send.addEventListener("click", function () {
         var text = prompt.value.trim();
         if (!text) { toast("اكتب نص الأول."); return; }
+        if (send.disabled) { return; }
+        // عملية نشطة بنفس النص ⇒ نفس المعرّف؛ غير كده ⇒ معرّف جديد.
+        var ref = promptOps.acquire(promptKey(text), text);
         send.disabled = true;
-        post("/conversations/" + encodeURIComponent(id) + "/prompt", { text: text }).then(function (res) {
+        opBox.innerHTML = "";
+        resend(ref).then(function (res) {
           send.disabled = false;
-          if (res.ok) { prompt.value = ""; toast("وصل ✅"); }
-          else { toast(friendlyMessage(res.status, res.data)); }
-        }).catch(function () { send.disabled = false; toast("مش قادر أوصل للسيرفر."); });
+          if (res.ok) {
+            prompt.value = "";
+            trackOperation(opBox, "prompt", ref, id, null, resend, promptOps);
+          } else {
+            // فشل مؤكّد (مثلاً 400) ⇒ العملية خلصت، فإعادة الإرسال بنفس النص
+            // تعمل عملية جديدة بدل ما تتلغى.
+            promptOps.resolve(ref, "failed");
+            toast(friendlyMessage(res.status, res.data));
+          }
+        }).catch(function () {
+          // انقطاع الشبكة: النتيجة غامضة. ما نعيدش الإرسال تلقائياً — نستعلم عن
+          // الحالة بمعرّف العملية (نفس النص ما اتبعتش مرتين).
+          send.disabled = false;
+          trackOperation(opBox, "prompt", ref, id, null, resend, promptOps);
+        });
       });
-      box.appendChild(send);
 
       var watchBtn = el("button", "btn ghost small", d.watched ? "إلغاء المتابعة" : "متابعة");
       watchBtn.addEventListener("click", function () {
@@ -283,17 +431,53 @@
     if (form) { form.hidden = false; }
   }
 
+  // إنشاء شات جديد: نسجّل في طابور الإنشاء المتين، وبعدها نتابع حالة العملية
+  // (pending/accepted/failed/ambiguous). عند النجاح ننتقل لصفحة تفاصيل الشات.
+  // المفتاح بيشمل المستودع + النص: نفس البرومت في مستودع مختلف = عملية جديدة.
+  var createOps = OPS.createRefManager();
+  function createKey(repo, text) { return opKey([repo, text]); }
+  function resendCreate(ref) {
+    return post("/chats", {
+      repository: state.selectedRepo,
+      text: createOps.payload(),
+      client_ref: ref
+    });
+  }
   function createChat() {
     var text = ($("newchat-text").value || "").trim();
     if (!state.selectedRepo) { toast("اختار مستودع الأول."); return; }
     if (!text) { toast("اكتب البرومت الأول."); return; }
     var btn = $("newchat-send");
+    if (btn.disabled) { return; }
+    // عملية نشطة بنفس (مستودع + نص) ⇒ نفس المعرّف؛ غير كده ⇒ معرّف جديد.
+    var ref = createOps.acquire(createKey(state.selectedRepo, text), text);
+    var opBox = $("newchat-op");
+    opBox.innerHTML = "";
     btn.disabled = true;
-    post("/chats", { repository: state.selectedRepo, text: text }).then(function (res) {
+    function accepted(op) {
+      if (op && op.conversation_id) {
+        toast("اتبدأ الشات ✅");
+        $("newchat-text").value = "";
+        openDetail(op.conversation_id);
+      } else {
+        toast("اتبدأ الشات ✅ — حدّث القايمة.");
+        showView("view-chats");
+        loadChats(true);
+      }
+    }
+    resendCreate(ref).then(function (res) {
       btn.disabled = false;
-      if (res.ok) { $("newchat-text").value = ""; toast("وصل ✅ جاري بدء الشات."); showView("view-chats"); loadChats(true); }
-      else { toast(friendlyMessage(res.status, res.data)); }
-    }).catch(function () { btn.disabled = false; toast("مش قادر أوصل للسيرفر."); });
+      if (res.ok) {
+        trackOperation(opBox, "creation", ref, null, accepted, resendCreate, createOps);
+      } else {
+        createOps.resolve(ref, "failed");
+        toast(friendlyMessage(res.status, res.data));
+      }
+    }).catch(function () {
+      // انقطاع الشبكة: النتيجة غامضة ⇒ ما نعيدش الإنشاء تلقائياً، نتابع بالمعرّف.
+      btn.disabled = false;
+      trackOperation(opBox, "creation", ref, null, accepted, resendCreate, createOps);
+    });
   }
 
   // ------------------------------------------------------------ settings
