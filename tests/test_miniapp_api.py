@@ -192,3 +192,15 @@ def test_path_traversal_blocked(client):
 
 def test_api_unknown_route_404(client):
     assert client.get("/api/v1/nope").status_code == 404
+
+
+def test_index_is_framable_by_telegram(client):
+    r = client.get("/mini/")
+    # لازم تيليجرام يقدر يعرضها في iframe (Telegram Web) ⇒ مفيش X-Frame-Options مانع،
+    # والتقييد بالـ CSP frame-ancestors اللي بيسمح لتيليجرام بس.
+    assert "x-frame-options" not in {k.lower() for k in r.headers}
+    csp = r.headers.get("content-security-policy", "")
+    assert "frame-ancestors" in csp and "telegram.org" in csp
+    # الـ API نفسه مايتسمحش يتعمله framing.
+    api = client.get("/health")
+    assert api.headers.get("x-frame-options") == "SAMEORIGIN"

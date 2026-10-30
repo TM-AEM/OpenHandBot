@@ -253,11 +253,12 @@ class MiniApp:
             "Content-Type": content_type,
             "X-Content-Type-Options": "nosniff",
             "Referrer-Policy": "no-referrer",
-            "X-Frame-Options": "SAMEORIGIN",
             "Content-Security-Policy": _STATIC_CSP if is_html else "default-src 'none'; frame-ancestors https://web.telegram.org https://*.telegram.org",
         }
         if is_html:
             # الصفحة نفسها ما تتكاشش، لكن الأصول ذات النسخة تتكاش من مسار /mini/.
+            # ملاحظة: ما بنحطّش X-Frame-Options هنا عشان Telegram Web (iframe) يقدر يعرض
+            # الـ Mini App؛ التقييد بالـ CSP frame-ancestors اللي بيسمح لتيليجرام بس.
             headers["Cache-Control"] = "no-store"
         else:
             headers["Cache-Control"] = "public, max-age=604800, immutable"
