@@ -15,6 +15,17 @@ def _btn(text: str, callback_data: str) -> InlineKeyboardButton:
         raise ValueError("callback_data أطول من 64 بايت")
     return InlineKeyboardButton(text, callback_data=callback_data)
 
+
+def mini_app_button(url: str) -> InlineKeyboardButton:
+    """زر inline لفتح الـ Mini App (OHB2-03). لازم https:// عام."""
+    return InlineKeyboardButton(MINI_APP, web_app={"url": url})
+
+
+def mini_app_launch(url: str) -> InlineKeyboardMarkup:
+    """لوحة فتح الـ Mini App: زر web_app وحده."""
+    return InlineKeyboardMarkup([[mini_app_button(url)]])
+
+
 BACK = "رجوع"
 REPLY = "رد"
 REFRESH = "تحديث"
@@ -36,15 +47,22 @@ NOTIF_MENU = "notif:menu"
 NOTIF_TOGGLE = "notif:toggle"
 NOTIF_TURN_OFF = "⛔ إيقاف الإشعارات"
 NOTIF_TURN_ON = "✅ تفعيل الإشعارات"
+# OHB2-03: فتح الـ Mini App
+MINI_APP = "🚀 فتح التطبيق"
+MINI_APP_CB = "app:open"
 
 
-def main_menu() -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = [
+def main_menu(mini_app_url: str = "") -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    # OHB2-03: نقطة دخول الـ Mini App (زر web_app) فوق القائمة لو الرابط متاح.
+    if mini_app_url:
+        rows.append([mini_app_button(mini_app_url)])
+    rows.append(
         [
             _btn(MY_CHATS, callback_data="list:0"),
             _btn(NEW_CHAT, callback_data="newchat"),
         ]
-    ]
+    )
     # NTF-04: نقطة دخول ضبط الإشعارات الاستباقية.
     rows.append([_btn(NOTIFICATIONS, callback_data=NOTIF_MENU)])
     # القرار 4: زر «متابعاتي» (إدارة يدوية للمتابعات) مخفي مؤقتًا مع باقي الميزات المؤجّلة.

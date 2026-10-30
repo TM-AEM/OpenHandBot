@@ -633,3 +633,24 @@ def test_increment_watched_retry_if_seq_cas(tmp_path):
     db.add_watched("c1", "t", new_lifecycle=True)  # دورة جديدة
     assert db.increment_watched_retry_if_seq("c1", seq) == 0  # CAS فشل
     assert db.get_watched("c1").retry_count == 0  # العدّاد الجديد ما اتلمسش
+
+
+# =====================================================================
+# OHB2-02: has_notification_states — استعلام EXISTS خفيف
+# =====================================================================
+def test_has_notification_states_false_when_empty(tmp_path):
+    db = make_db(tmp_path)
+    assert db.has_notification_states() is False
+
+
+def test_has_notification_states_true_after_write(tmp_path):
+    db = make_db(tmp_path)
+    db.upsert_notification_state("c1", status="running", notified_status="running", retry_count=0)
+    assert db.has_notification_states() is True
+
+
+def test_has_notification_states_agrees_with_list(tmp_path):
+    db = make_db(tmp_path)
+    assert db.has_notification_states() == bool(db.list_notification_states())
+    db.upsert_notification_state("c1", status="done", notified_status="done", retry_count=0)
+    assert db.has_notification_states() == bool(db.list_notification_states())

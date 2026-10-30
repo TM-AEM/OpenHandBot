@@ -21,12 +21,13 @@ def make_client(handler):
     return OpenHandsClient("https://example.test", "key", transport=httpx.MockTransport(handler))
 
 
-def test_list_files_malformed_top_level_returns_empty():
-    # جسم مش list ومش dict فيه items ⇒ قايمة فاضية بأمان (مش انهيار).
+def test_list_files_malformed_top_level_raises():
+    # OHB2-01: جسم مش list ومش dict فيه items ⇒ خطأ API آمن (مش نتيجة فاضية مضلّلة).
     def handler(request):
         return httpx.Response(200, json={"unexpected": True})
 
-    assert asyncio.run(make_client(handler).list_files("c1")) == []
+    with pytest.raises(ApiError):
+        asyncio.run(make_client(handler).list_files("c1"))
 
 
 def test_list_files_non_string_entries_are_dropped():

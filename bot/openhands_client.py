@@ -63,8 +63,8 @@ class OpenHandsClient:
         if page_id:
             params["page_id"] = page_id
         data = await self._get("/app-conversations/search", params=params)
-        items = data.get("items", data) if isinstance(data, dict) else data
-        items = [it for it in items if it]
+        items = _as_items(data)
+        items = [it for it in items if isinstance(it, dict) and it]
         items.sort(key=lambda it: it.get("updated_at") or "", reverse=True)
         next_page = data.get("next_page_id") if isinstance(data, dict) else None
         return {"items": items, "next_page_id": next_page}
@@ -94,8 +94,8 @@ class OpenHandsClient:
         if kind:
             params["kind__eq"] = kind
         data = await self._get(f"/conversation/{conversation_id}/events/search", params=params)
-        items = data.get("items", data) if isinstance(data, dict) else data
-        return [e for e in items if e]
+        items = _as_items(data)
+        return [e for e in items if isinstance(e, dict) and e]
 
     async def get_last_reply(self, conversation_id: str) -> str | None:
         """يرجّع آخر رد للـ agent أو تقرير FinishAction."""
@@ -158,7 +158,7 @@ class OpenHandsClient:
         if path:
             params["path"] = path
         data = await self._get(f"/app-conversations/{conversation_id}/files", params=params or None)
-        items = data if isinstance(data, list) else data.get("items", [])
+        items = _as_items(data)
         return [f for f in items if isinstance(f, str)]
 
     async def read_file(self, conversation_id: str, file_path: str) -> str:
@@ -204,8 +204,8 @@ class OpenHandsClient:
         لمتابعة مهمة بدء موجودة، فالاستطلاع بيها آمن.
         """
         data = await self._get("/app-conversations/start-tasks", params={"ids": task_id})
-        tasks = data if isinstance(data, list) else data.get("items", [])
-        return next((t for t in tasks if t), {}) or {}
+        tasks = _as_items(data)
+        return next((t for t in tasks if isinstance(t, dict) and t), {}) or {}
 
     async def wait_for_start(self, task_id: str, timeout: float = 180.0, interval: float = 3.0) -> str:
         loop = asyncio.get_running_loop()
@@ -232,8 +232,21 @@ class OpenHandsClient:
         if query:
             params["query"] = query
         data = await self._get("/git/repositories/search", params=params)
-        items = data.get("items", data) if isinstance(data, dict) else data
-        return [r for r in items if r]
+        items = _as_items(data)
+        return [r for r in items if isinstance(r, dict) and r]
+
+
+def _as_items(data: Any) -> list:
+    """يستخرج قايمة العناصر من رد API بشكل آمن.
+
+    الموثّق: إما قايمة مباشرة أو dict فيه `items`. أي شكل تاني (str/int/None/dict بدون
+    items) ⇒ خطأ API آمن بدل ما نرجع نتيجة فاضية مضلّلة.
+    """
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict) and isinstance(data.get("items"), list):
+        return data["items"]
+    raise ApiError("رد غير متوقع من OpenHands")
 
 
 def _decode_json(resp: httpx.Response) -> Any:

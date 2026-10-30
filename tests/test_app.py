@@ -2,12 +2,28 @@
 import asyncio
 import re
 
-from telegram.ext import CallbackQueryHandler
+import pytest
+from telegram import BotCommand, BotCommandScopeChat, MenuButtonCommands
+from telegram.ext import CallbackQueryHandler, CommandHandler
 
-from bot.app import build_application
+from bot.app import BOT_COMMANDS, build_application
 from bot.config import Config
 from bot.db import Database
 from bot.outbox import CreationWorker, OutboxWorker
+
+
+@pytest.fixture(autouse=True)
+def _no_network_commands(monkeypatch):
+    """يمنع أي نداء شبكة حقيقي لتسجيل قائمة الأوامر أثناء اختبارات دورة الحياة."""
+
+    async def _noop_my_commands(self, commands, scope=None, **kw):
+        return True
+
+    async def _noop_menu_button(self, chat_id=None, menu_button=None, **kw):
+        return True
+
+    monkeypatch.setattr("telegram.Bot.set_my_commands", _noop_my_commands)
+    monkeypatch.setattr("telegram.Bot.set_chat_menu_button", _noop_menu_button)
 
 
 def make_config(tmp_path) -> Config:
@@ -223,3 +239,80 @@ def test_post_init_registers_notifier_and_wires_owner_delivery(tmp_path, monkeyp
     assert calls["watcher_stop"] == 1
     assert calls["notifier_stop"] == 1
 
+
+
+# =====================================================================
+# OHB2-03: تسجيل قائمة الأوامر + عدم الانحراف عن الـ handlers
+# =====================================================================
+def _command_names(app):
+    names = set()
+    for group in app.handlers.values():
+        for h in group:
+            if isinstance(h, CommandHandler) and h.commands:
+                names.update(h.commands)
+    return names
+
+
+def test_bot_commands_match_registered_command_handlers(tmp_path):
+    app = build_application(make_config(tmp_path))
+    registered = _command_names(app)
+    listed = {name for name, _ in BOT_COMMANDS}
+    # مفيش أمر متسجّل بدون وصف في القائمة، والعكس.
+    assert registered == listed
+
+
+def test_bot_commands_are_valid_and_arabic_described():
+    for name, desc in BOT_COMMANDS:
+        assert name == name.lower() and " " not in name
+        assert 1 <= len(name) <= 32
+        assert desc.strip()
+        assert len(desc) <= 256
+
+
+def test_register_commands_sets_owner_scope_and_commands_menu():
+    """_register_commands يبعت set_my_commands بنطاق شات المالك ويثبّت زر «الأوامر»."""
+    calls = {"commands": None, "scope": None, "menu": "unset", "menu_chat": None}
+
+    class FakeBot:
+        async def set_my_commands(self, commands, scope=None, **kw):
+            calls["commands"] = commands
+            calls["scope"] = scope
+
+        async def set_chat_menu_button(self, chat_id=None, menu_button=None, **kw):
+            calls["menu"] = menu_button
+            calls["menu_chat"] = chat_id
+
+    from types import SimpleNamespace
+
+    from bot.app import _register_commands
+
+    app = SimpleNamespace(bot=FakeBot())
+    asyncio.run(_register_commands(app, owner_id=777))
+
+    assert isinstance(calls["scope"], BotCommandScopeChat)
+    assert calls["scope"].chat_id == 777
+    assert all(isinstance(c, BotCommand) for c in calls["commands"])
+    assert [c.command for c in calls["commands"]] == [n for n, _ in BOT_COMMANDS]
+    assert isinstance(calls["menu"], MenuButtonCommands)
+    assert calls["menu_chat"] == 777
+
+
+def test_post_init_command_registration_failure_is_non_fatal(tmp_path, monkeypatch):
+    """لو تسجيل الأوامر فشل (شبكة)، الـ post_init يكمّل وما يرميش."""
+    async def boom(application, owner_id):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr("bot.app._register_commands", boom)
+    monkeypatch.setattr("bot.outbox.OutboxWorker.start", lambda self: None)
+    monkeypatch.setattr("bot.outbox.CreationWorker.start", lambda self: None)
+    monkeypatch.setattr("bot.watcher.Watcher.start", lambda self: None)
+    monkeypatch.setattr("bot.notifier.Notifier.start", lambda self: None)
+
+    app = build_application(make_config(tmp_path))
+
+    async def lifecycle():
+        await app.post_init(app)
+        await app.post_shutdown(app)
+
+    asyncio.run(lifecycle())  # مايرميش رغم فشل التسجيل
+    assert app.bot_data.get("watcher") is not None

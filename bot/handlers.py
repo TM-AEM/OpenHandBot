@@ -122,6 +122,30 @@ async def _guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     return True
 
 
+def _mini_app_url(context: ContextTypes.DEFAULT_TYPE) -> str:
+    """رابط الـ Mini App من الإعداد (فاضي لو الميزة متوقفة)."""
+    return getattr(context.bot_data.get("config"), "mini_app_url", "") or ""
+
+
+MINI_APP_UNAVAILABLE = "التطبيق المصغّر مش متاح دلوقتي. الأوامر والأزرار العادية شغالة زي ما هي."
+
+
+HELP_TEXT = (
+    "أنا بوت تحكمك في OpenHands Cloud. الأوامر المتاحة:\n"
+    "/start — القائمة الرئيسية\n"
+    "/app — فتح التطبيق المصغّر (Mini App)\n"
+    "/help — هذه المساعدة\n"
+    "/notifications — ضبط الإشعارات الاستباقية\n"
+    "/cancel — إلغاء التوجيه الحالي\n"
+    "\n"
+    "صيانة الصندوق (للمالك):\n"
+    "/outbox — السجلات المعلّقة\n"
+    "/outbox_status — تفاصيل سجل واحد\n"
+    "/outbox_discard — شطب سجل (يتطلب confirm)\n"
+    "/outbox_mark_sent — تأكيد إرسال سجل (يتطلب confirm)"
+)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _guard(update, context):
         return
@@ -129,8 +153,36 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "أهلاً 👋\nأنا بوت تحكمك في OpenHands Cloud.\n"
         "اختار من الأزرار تحت، أو افتح شات وابعتله برومت.",
-        reply_markup=kb.main_menu(),
+        reply_markup=kb.main_menu(_mini_app_url(context)),
     )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _guard(update, context):
+        return
+    await update.message.reply_text(HELP_TEXT)
+
+
+async def app_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _guard(update, context):
+        return
+    url = _mini_app_url(context)
+    if not url:
+        await update.message.reply_text(MINI_APP_UNAVAILABLE)
+        return
+    await update.message.reply_text("افتح التطبيق من الزر:", reply_markup=kb.mini_app_launch(url))
+
+
+async def app_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    if not _allowed(update, context.bot_data["config"]):
+        return
+    url = _mini_app_url(context)
+    if not url:
+        await q.edit_message_text(MINI_APP_UNAVAILABLE, reply_markup=kb.main_menu(_mini_app_url(context)))
+        return
+    await q.edit_message_text("افتح التطبيق من الزر:", reply_markup=kb.mini_app_launch(url))
 
 
 async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -139,7 +191,9 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _allowed(update, context.bot_data["config"]):
         return
     context.bot_data["db"].clear_awaiting(update.effective_user.id)  # تنقّل = خروج من أي توجيه
-    await q.edit_message_text("أهلاً 👋 اختار من الأزرار:", reply_markup=kb.main_menu())
+    await q.edit_message_text(
+        "أهلاً 👋 اختار من الأزرار:", reply_markup=kb.main_menu(_mini_app_url(context))
+    )
 
 
 def _notifications_text(enabled: bool) -> str:
@@ -210,7 +264,7 @@ async def list_conversations(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if items:
             context.bot_data["list_cache"] = (time.monotonic(), items)
     if not items:
-        await _safe_edit(q, "ما فيهاش شاتات.", reply_markup=kb.main_menu())
+        await _safe_edit(q, "ما فيهاش شاتات.", reply_markup=kb.main_menu(_mini_app_url(context)))
         return
     start = page * PAGE_SIZE
     chunk = items[start : start + PAGE_SIZE]
@@ -318,7 +372,7 @@ async def list_watches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     page = int(q.data.split(":", 1)[1])
     items = context.bot_data["db"].list_watched()
     if not items:
-        await _safe_edit(q, "مفيش شاتات متابَعة.", reply_markup=kb.main_menu())
+        await _safe_edit(q, "مفيش شاتات متابَعة.", reply_markup=kb.main_menu(_mini_app_url(context)))
         return
     start = page * PAGE_SIZE
     chunk = items[start : start + PAGE_SIZE]
@@ -582,7 +636,7 @@ async def cancel_route_button(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not _allowed(update, context.bot_data["config"]):
         return
     context.bot_data["db"].clear_awaiting(update.effective_user.id)
-    await _safe_edit(q, "اتلغى التوجيه ✅", reply_markup=kb.main_menu())
+    await _safe_edit(q, "اتلغى التوجيه ✅", reply_markup=kb.main_menu(_mini_app_url(context)))
 
 
 async def _send_prompt(
@@ -655,11 +709,11 @@ async def repos_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         _, gen_raw, page_raw = q.data.split(":", 2)
         gen, page = int(gen_raw), int(page_raw)
     except ValueError:
-        await _safe_edit(q, _NAV_EXPIRED, reply_markup=kb.main_menu())
+        await _safe_edit(q, _NAV_EXPIRED, reply_markup=kb.main_menu(_mini_app_url(context)))
         return
     nav = _repo_nav(context, update.effective_user.id)
     if nav.get("gen") != gen:  # زر من قايمة أقدم
-        await _safe_edit(q, _NAV_EXPIRED, reply_markup=kb.main_menu())
+        await _safe_edit(q, _NAV_EXPIRED, reply_markup=kb.main_menu(_mini_app_url(context)))
         return
     await _show_repos(q, context, page=page, query=nav.get("query", ""), user_id=update.effective_user.id)
 
@@ -687,7 +741,7 @@ async def _show_repos(
     start = page * REPOS_PAGE_SIZE
     chunk = repos[start : start + REPOS_PAGE_SIZE]
     if not chunk:
-        await _safe_edit(q, "ما لقيتش مستودعات.", reply_markup=kb.main_menu())
+        await _safe_edit(q, "ما لقيتش مستودعات.", reply_markup=kb.main_menu(_mini_app_url(context)))
         return
     # الأسماء الكاملة والبحث بيتخزّنوا هنا؛ الأزرار بتحمل رقم النسخة والفهرس بس (حد 64 بايت).
     gen = context.bot_data["repo_gen"] = context.bot_data.get("repo_gen", 0) + 1
@@ -712,12 +766,12 @@ async def pick_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         _, gen_raw, idx_raw = q.data.split(":", 2)
         gen, idx = int(gen_raw), int(idx_raw)
     except ValueError:
-        await _safe_edit(q, _NAV_EXPIRED, reply_markup=kb.main_menu())
+        await _safe_edit(q, _NAV_EXPIRED, reply_markup=kb.main_menu(_mini_app_url(context)))
         return
     nav = _repo_nav(context, update.effective_user.id)
     names = nav.get("names") or []
     if nav.get("gen") != gen or not 0 <= idx < len(names) or not names[idx]:
-        await _safe_edit(q, _NAV_EXPIRED, reply_markup=kb.main_menu())
+        await _safe_edit(q, _NAV_EXPIRED, reply_markup=kb.main_menu(_mini_app_url(context)))
         return
     repo = names[idx]
     context.bot_data["db"].set_awaiting(update.effective_user.id, repo, "newchat")

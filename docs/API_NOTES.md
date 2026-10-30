@@ -64,3 +64,22 @@
 ## مرجع
 - https://docs.openhands.dev/openhands/usage/cloud/cloud-api.md
 - مواصفات OpenAPI: `GET https://app.all-hands.dev/openapi.json` (v1.68.1 وقت الفحص).
+
+## OHB2-01 — عقد شكل الردود (تحقق schema)
+كل دوال `OpenHandsClient` العامة بتمرّ على `_as_items(data)`: بتقبل **مصفوفة مباشرة**
+أو **dict فيه `items` مصفوفة**، وأي شكل تاني (str/int/None/dict بدون items) ⇒
+`ApiError("رد غير متوقع من OpenHands")` بدل نتيجة فاضية مضلّلة. العناصر غير-dict
+بتتسقط بأمان (مفيش انهيار على `it.get`).
+
+| الدالة | الشكل المقبول | ملاحظات |
+|---|---|---|
+| `search_conversations` | list أو `{items:[...], next_page_id}` | يرتّب client-side، يسقط null |
+| `get_conversations` | list أو `{items:[...]}` | **مصفوفة فيها null مسموحة** (توثيق مؤكّد) |
+| `search_events` | list أو `{items:[...]}` | يسقط العناصر غير-dict |
+| `list_files` | list نصي أو `{items:[...]}` | يحتفظ بالسلاسل فقط |
+| `get_start_task` | list أو `{items:[...]}` | أول عنصر dict غير فاضي |
+| `search_repositories` | list أو `{items:[...]}` | عناصر dict |
+| أي جسم مش JSON | — | `ApiError` آمن (بدون JSONDecodeError خام) |
+
+كمان: `OPENHANDS_BASE_URL` لمضيف خارجي **لازم** `https://`؛ HTTP العادي مسموح فقط
+لـ loopback (`localhost`/`127.0.0.1`/`::1`) للتطوير المحلي.

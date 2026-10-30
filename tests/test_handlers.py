@@ -1045,3 +1045,73 @@ def test_unwatch_non_owner_ignored(tmp_path):
     asyncio.run(h.unwatch_conversation(update, ctx))
     assert update.callback_query.edits == []
     assert ctx.bot_data["db"].is_watched("c1")
+
+
+# =====================================================================
+# OHB2-03: أوامر /help و /app وزر فتح التطبيق
+# =====================================================================
+def _web_app_urls(markup):
+    if markup is None:
+        return []
+    urls = []
+    for row in markup.inline_keyboard:
+        for b in row:
+            if b.web_app:
+                urls.append(b.web_app["url"] if isinstance(b.web_app, dict) else b.web_app.url)
+    return urls
+
+
+def test_help_owner_gets_commands_list(tmp_path):
+    ctx = make_context(1, tmp_path)
+    update = make_update(1)
+    asyncio.run(h.help_command(update, ctx))
+    assert len(update.message.replies) == 1
+    assert "/app" in update.message.replies[0] and "/help" in update.message.replies[0]
+
+
+def test_help_ignores_non_owner(tmp_path):
+    ctx = make_context(1, tmp_path)
+    update = make_update(999)
+    asyncio.run(h.help_command(update, ctx))
+    assert update.message.replies == []
+
+
+def test_app_command_without_url_is_graceful(tmp_path):
+    ctx = make_context(1, tmp_path)  # FakeConfig.mini_app_url فاضي
+    update = make_update(1)
+    asyncio.run(h.app_command(update, ctx))
+    assert len(update.message.replies) == 1
+    assert "مش متاح" in update.message.replies[0]
+
+
+def test_app_command_with_url_sends_web_app_button(tmp_path):
+    ctx = make_context(1, tmp_path)
+    ctx.bot_data["config"].mini_app_url = "https://app.example.com/mini"
+    update = make_update(1)
+    asyncio.run(h.app_command(update, ctx))
+    assert len(update.message.replies) == 1
+
+
+def test_app_open_callback_without_url_shows_unavailable(tmp_path):
+    ctx = make_context(1, tmp_path)
+    update = _cb_update(1, "app:open")
+    asyncio.run(h.app_open(update, ctx))
+    assert update.callback_query.edits  # رسالة "مش متاح"
+    assert "مش متاح" in update.callback_query.edits[0]
+
+
+def test_app_open_callback_with_url_edits_to_web_app_button(tmp_path):
+    ctx = make_context(1, tmp_path)
+    ctx.bot_data["config"].mini_app_url = "https://app.example.com/mini"
+    update = _cb_update(1, "app:open")
+    asyncio.run(h.app_open(update, ctx))
+    markup = update.callback_query.edits_markup[0]
+    assert _web_app_urls(markup) == ["https://app.example.com/mini"]
+
+
+def test_start_menu_includes_web_app_button_when_configured(tmp_path):
+    ctx = make_context(1, tmp_path)
+    ctx.bot_data["config"].mini_app_url = "https://app.example.com/mini"
+    update = make_update(1)
+    asyncio.run(h.start(update, ctx))
+    assert len(update.message.replies) == 1

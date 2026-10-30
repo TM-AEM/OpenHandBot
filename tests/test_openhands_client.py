@@ -339,3 +339,73 @@ def test_exchange_finish_action_uses_shared_parser():
     )
     assert asyncio.run(client.get_last_exchange("c")) == ("ب", None)
 
+
+
+# =====================================================================
+# OHB2-01: التحقق من شكل ردود OpenHands — رد غير متوقع ⇒ ApiError آمن
+# =====================================================================
+import asyncio as _asyncio  # noqa: E402
+
+
+def _client_returning(payload):
+    def handler(request):
+        return httpx.Response(200, json=payload)
+
+    return make_client(handler)
+
+
+def test_search_conversations_non_list_items_raises():
+    # items نوعها غلط (str) ⇒ خطأ آمن، مش نتيجة فاضية مضلّلة.
+    client = _client_returning({"items": "nope"})
+    with pytest.raises(ApiError):
+        _asyncio.run(client.search_conversations())
+
+
+def test_search_conversations_wrong_top_level_type_raises():
+    client = _client_returning(42)
+    with pytest.raises(ApiError):
+        _asyncio.run(client.search_conversations())
+
+
+def test_search_events_wrong_top_level_type_raises():
+    client = _client_returning("not-a-list")
+    with pytest.raises(ApiError):
+        _asyncio.run(client.search_events("c1"))
+
+
+def test_search_events_non_dict_members_are_dropped():
+    client = _client_returning([{"kind": "MessageEvent"}, None, "x", 5])
+    assert _asyncio.run(client.search_events("c1")) == [{"kind": "MessageEvent"}]
+
+
+def test_list_files_wrong_top_level_type_raises():
+    client = _client_returning({"nope": 1})
+    with pytest.raises(ApiError):
+        _asyncio.run(client.list_files("c1"))
+
+
+def test_search_repositories_wrong_top_level_type_raises():
+    client = _client_returning("bad")
+    with pytest.raises(ApiError):
+        _asyncio.run(client.search_repositories())
+
+
+def test_get_start_task_wrong_top_level_type_raises():
+    client = _client_returning(True)
+    with pytest.raises(ApiError):
+        _asyncio.run(client.get_start_task("t1"))
+
+
+def test_malformed_json_body_raises_safe_api_error():
+    def handler(request):
+        return httpx.Response(200, content=b"<html>proxy error</html>")
+
+    client = make_client(handler)
+    with pytest.raises(ApiError):
+        _asyncio.run(client.search_conversations())
+
+
+def test_get_conversations_null_entries_preserved_as_dropped():
+    # الموثّق: مصفوفة فيها null — بنسقطها وبنحتفظ بالـ dict بس.
+    client = _client_returning([{"id": "a"}, None, "x"])
+    assert _asyncio.run(client.get_conversations(["a"])) == [{"id": "a"}]

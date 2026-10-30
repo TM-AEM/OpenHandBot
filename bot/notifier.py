@@ -146,7 +146,7 @@ class Notifier:
     # ------------------------------------------------------------------- tick
     async def tick(self) -> None:
         # لقطة أول تشغيل (فاضية = مفيش أي لقطة سابقة) لتأسيس خط الأساس بدون إشعار.
-        first_run = not self._db.list_notification_states()
+        first_run = not self._db.has_notification_states()
         try:
             conversations = await self._fetch_all()
         except ApiError as exc:

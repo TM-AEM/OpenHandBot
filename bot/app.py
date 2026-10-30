@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 
+from telegram import BotCommand, BotCommandScopeChat, MenuButtonCommands
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -22,6 +23,32 @@ from .watcher import Watcher
 log = logging.getLogger(__name__)
 
 
+# OHB2-03: قائمة الأوامر المعروضة في قائمة تيليجرام (وصف عربي). لازم تفضل متوافقة مع
+# تسجيل الـ CommandHandler تحت — في اختبار بيثبت عدم الانحراف.
+BOT_COMMANDS: tuple[tuple[str, str], ...] = (
+    ("start", "القائمة الرئيسية"),
+    ("app", "فتح التطبيق المصغّر"),
+    ("help", "المساعدة والأوامر"),
+    ("notifications", "ضبط الإشعارات الاستباقية"),
+    ("cancel", "إلغاء التوجيه الحالي"),
+    ("outbox", "سجلات الصندوق المعلّقة"),
+    ("outbox_status", "تفاصيل سجل صندوق"),
+    ("outbox_discard", "شطب سجل صندوق"),
+    ("outbox_mark_sent", "تأكيد إرسال سجل صندوق"),
+)
+
+
+async def _register_commands(application: Application, owner_id: int) -> None:
+    """يسجّل قائمة الأوامر للمالك، ويثبّت زر القائمة على «الأوامر» (مش Web App)."""
+    commands = [BotCommand(name, desc) for name, desc in BOT_COMMANDS]
+    scope = BotCommandScopeChat(chat_id=owner_id)
+    await application.bot.set_my_commands(commands, scope=scope)
+    # القرار: زر القائمة يفضل «أوامر» عشان أي إعداد سابق من BotFather ما يستبدلش القائمة.
+    await application.bot.set_chat_menu_button(
+        chat_id=owner_id, menu_button=MenuButtonCommands()
+    )
+
+
 def build_application(config: Config) -> Application:
     # U04: بدون concurrent_updates أي أمر بطيء (تصدير/قايمة ملفات) بيأخّر تأكيد
     # "وصل ✅" لأن التحديثات بتتعالج واحد ورا التاني. التزامن آمن هنا لأن حالة
@@ -36,12 +63,15 @@ def build_application(config: Config) -> Application:
 
     app.add_handler(CommandHandler("start", handlers.start))
     app.add_handler(CommandHandler("cancel", handlers.cancel_route))
+    app.add_handler(CommandHandler("help", handlers.help_command))
+    app.add_handler(CommandHandler("app", handlers.app_command))
     app.add_handler(CommandHandler("notifications", handlers.notifications_command))
     app.add_handler(CommandHandler("outbox", handlers.outbox_list))
     app.add_handler(CommandHandler("outbox_status", handlers.outbox_status))
     app.add_handler(CommandHandler("outbox_discard", handlers.outbox_discard))
     app.add_handler(CommandHandler("outbox_mark_sent", handlers.outbox_mark_sent))
     app.add_handler(CallbackQueryHandler(handlers.show_menu, pattern=r"^menu$"))
+    app.add_handler(CallbackQueryHandler(handlers.app_open, pattern=r"^app:open$"))
     app.add_handler(CallbackQueryHandler(handlers.notifications_menu, pattern=r"^notif:menu$"))
     app.add_handler(CallbackQueryHandler(handlers.notifications_toggle, pattern=r"^notif:toggle$"))
     app.add_handler(CallbackQueryHandler(handlers.cancel_route_button, pattern=r"^cancelroute$"))
@@ -75,6 +105,12 @@ def build_application(config: Config) -> Application:
         # 0) صيانة تشغيل آمنة: فحص سريع للتكامل + تحسين + checkpoint للـ WAL.
         #    لو القاعدة تالفة بنسجّل تحذير واضح بس البوت يفضل شغّال (ما بيرميش).
         db.run_startup_maintenance()
+        # 0.1) OHB2-03: سجّل قائمة الأوامر في واجهة تيليجرام + ثبّت زر «الأوامر».
+        #      فشل الشبكة هنا ما يمنعش تشغيل البوت (الأوامر نفسها لسه شغالة بالكتابة).
+        try:
+            await _register_commands(application, config.owner_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("تعذّر تسجيل قائمة الأوامر (%s)", type(exc).__name__)
         # 1) تعافي الصندوق (يحوّل 'sending'/'starting' المتروك لـ 'unknown') قبل أي معالجة.
         await handlers.outbox_recover(application)
         await handlers.creation_recover(application)

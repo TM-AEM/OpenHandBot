@@ -1018,6 +1018,13 @@ class Database:
     # لها إشعار، وده اللي يمنع التكرار. منفصلة عن جدول watched (مفيش اقتران ضمني).
     _UNCHANGED = object()
 
+    def has_notification_states(self) -> bool:
+        """هل فيه أي لقطة إشعار مخزّنة؟ استعلام EXISTS خفيف بدل تحميل كل الصفوف."""
+        row = self._conn.execute(
+            "SELECT 1 FROM notification_state LIMIT 1"
+        ).fetchone()
+        return row is not None
+
     def list_notification_states(self) -> dict[str, NotificationState]:
         rows = self._conn.execute(
             "SELECT conversation_id, status, notified_status, retry_count, updated_at "

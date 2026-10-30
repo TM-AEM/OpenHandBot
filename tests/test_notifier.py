@@ -531,3 +531,44 @@ def test_notifier_pending_then_terminal_matching_prior_status_is_still_sent(tmp_
     asyncio.run(n.tick())  # استرجاع يسجّل finished ثم B=error
     assert len(bot.sent) == 2  # error لسه اتّبعت (مفيش فقد لانتقال)
     assert db.get_notification_state("c1").notified_status == "error"
+
+
+# =====================================================================
+# OHB2-02: أول تشغيل بيعتمد على EXISTS — مفيش تحميل كل اللقطات
+# =====================================================================
+def test_first_run_uses_exists_query_not_full_list(tmp_path):
+    # نثبت إن tick() بيستخدم has_notification_states (EXISTS) مش list_notification_states.
+    pages = one_page([conv("a", "running")])
+    db = Database(str(tmp_path / "t.sqlite3"))
+    bot = FakeBot()
+    n = Notifier(FakeSearchClient(pages), db, bot, chat_id=1)
+    called = {"exists": 0, "list": 0}
+    real_exists = db.has_notification_states
+    real_list = db.list_notification_states
+
+    def spy_exists():
+        called["exists"] += 1
+        return real_exists()
+
+    def spy_list():
+        called["list"] += 1
+        return real_list()
+
+    db.has_notification_states = spy_exists
+    db.list_notification_states = spy_list
+    asyncio.run(n.tick())
+    assert called["exists"] == 1
+    assert called["list"] == 0
+    assert bot.sent == []  # خط أساس بلا إشعار
+    assert db.get_notification_state("a").notified_status == "running"
+
+
+def test_second_run_is_not_first_run_after_baseline(tmp_path):
+    # بعد تأسيس خط الأساس، الدورة الجاية مش "أول تشغيل" ⇒ انتقال نهائي بيتبعت.
+    pages = one_page([conv("a", "running")])
+    n, db, bot = make_notifier(tmp_path, pages)
+    asyncio.run(n.tick())
+    assert bot.sent == []
+    n._client._pages[None] = {"items": [conv("a", "finished")], "next_page_id": None}
+    asyncio.run(n.tick())
+    assert len(bot.sent) == 1

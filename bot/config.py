@@ -1,6 +1,8 @@
 import os
 import re
 from dataclasses import dataclass, field
+from ipaddress import ip_address
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
@@ -15,6 +17,8 @@ class Config:
     log_level: str = "INFO"
     watcher_interval: int = 25
     db_path: str = "bot_state.sqlite3"
+    # رابط الـ Mini App (HTTPS). فاضي = الميزة متوقفة (الزر بيقول "غير متاحة").
+    mini_app_url: str = ""
 
     @property
     def secrets(self) -> tuple[str, str]:
@@ -43,6 +47,19 @@ _URL_RE = re.compile(r"^https?://[^\s/]+(/\S*)?$")
 MIN_INTERVAL = 5
 MAX_INTERVAL = 3600
 _LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+_LOOPBACK_HOSTS = {"localhost"}
+
+
+def _is_loopback_host(host: str) -> bool:
+    """هل المضيف loopback (تطوير محلي)؟ أي حاجة تانية بتتطلب HTTPS."""
+    if not host:
+        return False
+    if host in _LOOPBACK_HOSTS:
+        return True
+    try:
+        return ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def _clean(env, name: str, default: str = "") -> str:
@@ -114,6 +131,13 @@ def load_config(env: dict | None = None) -> Config:
     base_url = _clean(env, "OPENHANDS_BASE_URL") or "https://app.all-hands.dev"
     if not _URL_RE.match(base_url):
         raise ConfigError("OPENHANDS_BASE_URL لازم يبدأ بـ http:// أو https://")
+    # ممنوع إرسال مفتاح الـ API على HTTP عادي لمضيف خارجي (غير loopback).
+    parts = urlsplit(base_url)
+    if parts.scheme != "https" and not _is_loopback_host(parts.hostname or ""):
+        raise ConfigError(
+            "OPENHANDS_BASE_URL لازم يكون https:// لمضيف خارجي — "
+            "HTTP العادي مسموح بس للتطوير المحلي (localhost/127.0.0.1)"
+        )
 
     interval_raw = _clean(env, "WATCHER_INTERVAL", "25")
     try:
@@ -133,6 +157,15 @@ def load_config(env: dict | None = None) -> Config:
 
     db_path = _clean(env, "DB_PATH") or "bot_state.sqlite3"
 
+    # رابط الـ Mini App (اختياري). لو موجود لازم يكون https:// عام صالح.
+    mini_app_url = _clean(env, "MINI_APP_URL")
+    if mini_app_url:
+        if not _URL_RE.match(mini_app_url) or not mini_app_url.startswith("https://"):
+            raise ConfigError("MINI_APP_URL لازم يكون رابط https:// صالح")
+        host = urlsplit(mini_app_url).hostname or ""
+        if _is_loopback_host(host):
+            raise ConfigError("MINI_APP_URL لازم يكون رابط عام (مش loopback) لأن تيليجرام بيفتحه من جهاز المستخدم")
+
     return Config(
         telegram_bot_token=token,
         openhands_api_key=api_key,
@@ -142,4 +175,5 @@ def load_config(env: dict | None = None) -> Config:
         log_level=log_level,
         watcher_interval=interval,
         db_path=db_path,
+        mini_app_url=mini_app_url,
     )

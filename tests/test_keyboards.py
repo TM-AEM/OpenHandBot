@@ -136,3 +136,29 @@ def test_repositories_menu_has_search_and_pick():
     cbs = _callbacks(kb.repositories_menu(items, 0, has_more=False, gen=7))
     assert "pickrepo:7:0" in cbs
     assert "reposearch" in cbs
+
+
+# =====================================================================
+# OHB2-03: زر الـ Mini App (web_app) في القائمة
+# =====================================================================
+def test_main_menu_without_url_has_no_web_app_button():
+    markup = kb.main_menu()
+    assert all(b.web_app is None for row in markup.inline_keyboard for b in row)
+
+
+def test_main_menu_with_url_has_web_app_button_first():
+    markup = kb.main_menu("https://app.example.com/mini")
+    first = markup.inline_keyboard[0][0]
+    assert first.web_app is not None
+    assert first.web_app["url"] == "https://app.example.com/mini"
+    # باقي الأزرار الأساسية لسه موجودة.
+    cbs = _callbacks(markup)
+    assert "list:0" in cbs and "newchat" in cbs and kb.NOTIF_MENU in cbs
+
+
+def test_mini_app_launch_is_web_app_only():
+    markup = kb.mini_app_launch("https://app.example.com/mini")
+    row = markup.inline_keyboard[0]
+    assert len(row) == 1
+    assert row[0].web_app is not None
+    assert row[0].callback_data is None
