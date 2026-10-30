@@ -1322,3 +1322,153 @@ def test_watcher_deliver_path_skips_during_window(tmp_path):
     asyncio.run(w.tick())  # جوّه النافذة ⇒ تخطّي
     assert bot.raised == 1
     db.close()
+
+# ==================== OHB2-08-03: unwatch reconciliation reliability ====================
+# الدليل in-memory (`_marker_pending`) بيتسجّل لما كتابة العلامة الدائمة نفسها تفشل. قبل
+# الإصلاح، الإزالة من مسار مباشر (`db.remove_watched` بدون المراقب — زي الـ Mini App لما
+# المراقب مش متاح) كانت بتسيبه معلّق ⇒ المُبلّغ يعيد إرسال نفس الحالة النهائية (ازدواج).
+# الـ hook `db.on_unwatch` (المراقب بيسجّله) بيثبّت التلميح كعلامة دائمة قبل الحذف.
+
+
+def test_ohb2_08_03_fallback_unwatch_reconciles_hint_no_duplicate(tmp_path):
+    """OHB2-08-03: إزالة مباشرة (`db.remove_watched`، المراقب مش متاح) مع تلميح in-memory
+    ⇒ التلميح يتثبّت ويتسجّل قبل الحذف، فالمُبلّغ ما يكرّرش الإشعار."""
+    db = _MarkerFailsThenOk(str(tmp_path / "t.sqlite3"))
+    _seed_full(db)
+    bot = FakeBot()
+    w = Watcher(_finished_client(), db, bot, chat_id=1)
+    asyncio.run(w.tick())  # إرسال + فشل كتابة العلامة ⇒ تلميح in-memory فقط
+    assert len(bot.sent) == 1
+    assert "c1" in w._marker_pending
+    assert db.get_watched("c1").pending_delivery_state is None  # مفيش علامة دائمة
+
+    db.remove_watched("c1")  # المسار المباشر (بدون watcher.unwatch)
+    assert not db.is_watched("c1")
+    assert db.get_notification_state("c1").notified_status == "finished"  # الدليل محفوظ
+
+    nbot = FakeBot()
+    asyncio.run(Notifier(_search_finished_client(), db, nbot, chat_id=1).tick())
+    assert nbot.sent == []  # مفيش إشعار مكرّر
+    db.close()
+
+
+def test_ohb2_08_03_direct_delete_without_hook_would_duplicate(tmp_path):
+    """OHB2-08-03 (حرس): بدون ربط الـ hook، الحذف المباشر يفقد دليل التلميح ⇒ إشعار مكرّر.
+    الاختبار ده يثبّت إن الحماية الفعلية مصدرها ربط `on_unwatch`، مش مجرد التلميح."""
+    db = _MarkerFailsThenOk(str(tmp_path / "t.sqlite3"))
+    _seed_full(db)
+    bot = FakeBot()
+    w = Watcher(_finished_client(), db, bot, chat_id=1)
+    asyncio.run(w.tick())
+    assert "c1" in w._marker_pending
+
+    db.on_unwatch = None  # نحاكي غياب الحماية
+    db.remove_watched("c1")
+    assert db.get_notification_state("c1").notified_status == "running"  # الدليل اتفقد
+
+    nbot = FakeBot()
+    asyncio.run(Notifier(_search_finished_client(), db, nbot, chat_id=1).tick())
+    assert len(nbot.sent) == 1  # ازدواج (السلوك قبل الإصلاح)
+    db.close()
+
+
+def test_ohb2_08_03_completing_path_reconciles_hint(tmp_path):
+    """OHB2-08-03: `remove_watched_completing` (المستدعي عارف الحالة المعلّقة) يثبّت التلميح
+    كمان، فالتسجيل يتكمّل والحذف يحصل."""
+    db = _MarkerFailsThenOk(str(tmp_path / "t.sqlite3"))
+    _seed_full(db)
+    w = Watcher(_finished_client(), db, FakeBot(), chat_id=1)
+    asyncio.run(w.tick())
+    assert "c1" in w._marker_pending
+
+    ok = db.remove_watched_completing("c1", "finished")
+    assert ok is True
+    assert not db.is_watched("c1")
+    assert db.get_notification_state("c1").notified_status == "finished"
+    db.close()
+
+
+def test_ohb2_08_03_repeated_unwatch_is_idempotent(tmp_path):
+    """OHB2-08-03: تكرار الإزالة (مباشر ثم عبر المراقب) لا يفسد الحالة ولا يكرّر الأثر."""
+    db = _MarkerFailsThenOk(str(tmp_path / "t.sqlite3"))
+    _seed_full(db)
+    w = Watcher(_finished_client(), db, FakeBot(), chat_id=1)
+    asyncio.run(w.tick())
+
+    db.remove_watched("c1")
+    db.remove_watched("c1")  # تاني: no-op
+    w.unwatch("c1")          # كمان عبر المراقب
+    assert not db.is_watched("c1")
+    assert db.get_notification_state("c1").notified_status == "finished"
+
+    nbot = FakeBot()
+    asyncio.run(Notifier(_search_finished_client(), db, nbot, chat_id=1).tick())
+    assert nbot.sent == []
+    db.close()
+
+
+def test_ohb2_08_03_restart_after_fallback_unwatch_no_duplicate(tmp_path):
+    """OHB2-08-03: إعادة تشغيل بعد إزالة مباشرة ⇒ الحالة تتقارب للقاعدة (مفيش إشعار مكرّر)."""
+    path = str(tmp_path / "t.sqlite3")
+    db = _MarkerFailsThenOk(path)
+    _seed_full(db)
+    w = Watcher(_finished_client(), db, FakeBot(), chat_id=1)
+    asyncio.run(w.tick())
+    db.remove_watched("c1")
+    db.close()
+
+    db2 = Database(path)  # إعادة تشغيل (المراقب الجديد)
+    assert not db2.is_watched("c1")
+    assert db2.get_notification_state("c1").notified_status == "finished"
+    nbot = FakeBot()
+    asyncio.run(Notifier(_search_finished_client(), db2, nbot, chat_id=1).tick())
+    assert nbot.sent == []
+    db2.close()
+
+
+def test_ohb2_08_03_unwatch_preserves_retry_deadline_and_unrelated(tmp_path):
+    """OHB2-08-03: الإزالة ما تلمسش موعد RetryAfter الدائم لمحادثة تانية، وما تشيلهاش."""
+    db = Database(str(tmp_path / "t.sqlite3"))
+    _seed_full(db, "c1")
+    _seed_full(db, "c2")
+    db.set_retry_not_before("c2", "2030-01-01T00:00:00+00:00")
+    # ننشئ مراقب لربط hook التسوية (on_unwatch) قبل الإزالة المباشرة.
+    Watcher(_finished_client(), db, FakeBot(), chat_id=1)
+
+    db.remove_watched("c1")
+
+    assert not db.is_watched("c1")
+    assert db.is_watched("c2")  # محادثة غير مرتبطة ما اتأثّرت
+    assert db.get_retry_not_before("c2") == "2030-01-01T00:00:00+00:00"
+    db.close()
+
+
+def test_ohb2_08_03_rewatch_after_unwatch_clean(tmp_path):
+    """OHB2-08-03: إعادة متابعة بعد إزالة ما بتورّثش حالة قديمة (دورة جديدة نظيفة)."""
+    db = _MarkerFailsThenOk(str(tmp_path / "t.sqlite3"))
+    _seed_full(db)
+    w = Watcher(_finished_client(), db, FakeBot(), chat_id=1)
+    asyncio.run(w.tick())
+    db.remove_watched("c1")
+    assert db.get_notification_state("c1").notified_status == "finished"
+
+    db.add_watched("c1", "t")  # دورة جديدة
+    assert db.is_watched("c1")
+    assert db.get_watched("c1").pending_delivery_state is None
+    assert "c1" not in w._marker_pending
+    db.close()
+
+
+def test_ohb2_08_03_failed_reconcile_blocks_removal(tmp_path):
+    """OHB2-08-03: لو تثبيت التلميح فشل، الإزالة ما تتكمّلش (مفيش فقد صامت ولا نجاح كاذب)."""
+    db = _MarkerAlwaysFails(str(tmp_path / "t.sqlite3"))
+    _seed_full(db)
+    w = Watcher(_finished_client(), db, FakeBot(), chat_id=1)
+    w._marker_pending["c1"] = ("finished", db.get_watched("c1").watch_seq)
+
+    with pytest.raises(sqlite3.OperationalError):
+        db.remove_watched("c1")
+
+    assert db.is_watched("c1")  # لسه متابَع (الإزالة اترجعت)
+    assert "c1" in w._marker_pending  # التلميح محفوظ (retry آمن)
+    db.close()

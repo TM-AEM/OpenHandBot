@@ -471,3 +471,71 @@ def test_stale_forbidden_session_is_revoked_and_blocked():
     r = client.get("/api/v1/app/bootstrap")
     assert r.status_code == 403
     assert app.sessions.get(session.token) is None  # الجلسة اتبطلت
+
+
+# ==================== OHB2-08-03: Mini App unwatch reconciliation ====================
+def _authed_origin_client(monkeypatch, db, app=None):
+    """عميل مصادق جاهز لطلب DELETE (origin صالح) للمسار الحقيقي."""
+    monkeypatch.setattr("bot.features.DEFERRED_FEATURES_HIDDEN", False)
+    c = TestClient(
+        build_web_app(make_config(), db, client=FakeClient(), application=app),
+        raise_server_exceptions=False,
+    )
+    c.post("/api/v1/auth", json={"initData": make_init_data(OWNER)})
+    return c
+
+
+def test_unwatch_returns_ok_and_persists(monkeypatch):
+    """OHB2-08-03: طلب إزالة مصادق بيرجّع 200 ويثبّت الحالة في القاعدة (بدون مراقب)."""
+    db = FakeDb()
+    db.watched["c1"] = {"id": "c1", "title": "T"}
+    c = _authed_origin_client(monkeypatch, db)
+    r = c.delete("/api/v1/conversations/c1/watch", headers={"origin": ORIGIN})
+    assert r.status_code == 200
+    assert r.json() == {"ok": True, "watched": False}
+    assert "c1" not in db.watched
+    assert db.removed == ["c1"]
+
+
+def test_unwatch_requires_authentication(monkeypatch):
+    """OHB2-08-03: بدون جلسة ⇒ 401، ومفيش تعديل في القاعدة."""
+    monkeypatch.setattr("bot.features.DEFERRED_FEATURES_HIDDEN", False)
+    db = FakeDb()
+    db.watched["c1"] = {"id": "c1", "title": "T"}
+    c = TestClient(build_web_app(make_config(), db, client=FakeClient()),
+                   raise_server_exceptions=False)
+    r = c.delete("/api/v1/conversations/c1/watch", headers={"origin": ORIGIN})
+    assert r.status_code == 401
+    assert "c1" in db.watched  # ما اتشالش
+
+
+def test_unwatch_requires_valid_origin(monkeypatch):
+    """OHB2-08-03: طلب بيغيّر الحالة بدون origin صالح ⇒ 403، مفيش تعديل."""
+    db = FakeDb()
+    db.watched["c1"] = {"id": "c1", "title": "T"}
+    c = _authed_origin_client(monkeypatch, db)
+    r = c.delete("/api/v1/conversations/c1/watch", headers={"origin": "https://evil.test"})
+    assert r.status_code == 403
+    assert "c1" in db.watched
+
+
+def test_unwatch_routes_through_watcher_when_available(monkeypatch):
+    """OHB2-08-03: لو المراقب موجود في bot_data، الإزالة تمرّ عبره (تسوية ذرّية معلّقة)."""
+
+    class _Recorder:
+        def __init__(self):
+            self.calls = []
+
+        def unwatch(self, cid):
+            self.calls.append(cid)
+
+    watcher = _Recorder()
+
+    class _App:
+        bot_data = {"watcher": watcher}
+
+    db = FakeDb()
+    c = _authed_origin_client(monkeypatch, db, app=_App())
+    r = c.delete("/api/v1/conversations/c1/watch", headers={"origin": ORIGIN})
+    assert r.status_code == 200
+    assert watcher.calls == ["c1"]  # مرّ عبر المراقب مش الحذف المباشر

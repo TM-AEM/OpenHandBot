@@ -91,6 +91,10 @@ class Watcher:
         # NTF-20: ننسّق التلميح in-memory مع أي دورة متابعة جديدة يبدأها أي مستدعي
         # (`add_watched(new_lifecycle=True)`)، حتى لو المستدعي مايعرفش المراقب.
         db.on_new_watch_lifecycle = self._on_new_watch_lifecycle
+        # OHB2-08-03: ننسّق التلميح in-memory مع أي إزالة متابعة تتم من أي مسار (الـ handlers
+        # أو الـ Mini App fallback `db.remove_watched` لما المراقب مش متاح)، حتى لو المستدعي
+        # مايعرفش المراقب. كده دليل تسليم in-memory مايتسيّبش معلّق ⇒ مايحصلش إشعار مكرّر.
+        db.on_unwatch = self._on_unwatch
 
     def _on_new_watch_lifecycle(self, conversation_id: str) -> None:
         """NTF-20: hook بيتنادى من `Database.add_watched` قبل بدء دورة متابعة جديدة.
@@ -109,6 +113,25 @@ class Watcher:
         if w is not None and hint[1] == w.watch_seq:
             self._db.set_pending_delivery(conversation_id, hint[0])
         self._marker_pending.pop(conversation_id, None)
+
+    def _on_unwatch(self, conversation_id: str) -> None:
+        """OHB2-08-03: hook بيتنادى من `Database.remove_watched*` قبل حذف الصف.
+
+        بيثبّت التلميح in-memory المطابق كعلامة دائمة **قبل** الحذف، فالـ fallback (لما
+        المستدعي بينادي `db.remove_watched` مباشرةً بدل `watcher.unwatch`، أو المراقب مش
+        متاح لحظتها) يلاقي العلامة ويكمّل التسجيل بدل ما يسيبه معلّق ⇒ مايحصلش إشعار مكرّر.
+        التلميح بيتبط بمعرّف دورة المتابعة (`watch_seq`)، فمتابعة اتعملت من جديد (معرّف
+        مختلف) بتتجاهله.
+
+        التلميح **مابيتشالش** هنا: المستدعي اللي بيعرف إن العملية نجحت هو اللي بيشيله
+        (`Watcher.unwatch` / `_on_new_watch_lifecycle`)، فلو الحذف فشل بعد التثبيت الدليل
+        يفضل متاح (retry آمن). لو الكتابة نفسها فشلت، الاستثناء بيطلع فالإزالة ما تتكمّلش
+        (fail-safe، مفيش فقد صامت).
+        """
+        w = self._db.get_watched(conversation_id)
+        hint = self._marker_pending.get(conversation_id)
+        if hint is not None and w is not None and hint[1] == w.watch_seq:
+            self._db.set_pending_delivery(conversation_id, hint[0])
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._run())

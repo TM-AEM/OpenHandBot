@@ -140,6 +140,13 @@ class Database:
         # جديدة. المراقب بيسجّله (زي set_owner_delivery) عشان كل مستدعي `add_watched`
         # (handlers/outbox/creation) يستفيد من غير ما يعرف المراقب.
         self.on_new_watch_lifecycle = None
+        # OHB2-08-03: hook اختياري **مكمّل** ينسّق دليل التسليم in-memory (تلميح
+        # `_marker_pending` اللي بيتسجّل لما كتابة العلامة الدائمة نفسها تفشل) عند إزالة
+        # المتابعة. المراقب بيسجّله (زي `on_new_watch_lifecycle`)، فأي مسار إزالة (الـ
+        # handlers أو الـ Mini App fallback `db.remove_watched` لما المراقب مش متاح) ينسّق
+        # التلميح بدل ما يسيبه معلّق ⇒ مايحصلش إشعار مكرّر. اختياري: لو None (استخدام
+        # مستقل) السلوك زي ما هو. بيرمي لو فشل، فالإزالة ما تتكمّلش (fail-safe).
+        self.on_unwatch = None
         self._init_schema()
 
     def _init_schema(self) -> None:
@@ -268,6 +275,23 @@ class Database:
         )
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_creation_jobs_client_ref ON creation_jobs(client_ref)"
+        )
+        # OHB2-08-04: فهرسان مركّبان مبنيّان على أنماط استعلام فعلية (EXPLAIN QUERY PLAN +
+        # قياس). `idx_outbox_status` بيفلتر بـ status بس، فاستعلامات النضج/التجميع بتقرأ كل
+        # صفوف الحالة وتعمل ترتيب مؤقّت (USE TEMP B-TREE FOR ORDER BY). الفهرسين دول بيمدّوا
+        # مسار الفهرس للحقول اللي بيتفلتر/بيترتّب بيها كمان:
+        # - `idx_outbox_status_updated`: بيسرّع `seconds_until_mature` (تحديد موعد نوم الـ
+        #   worker — بيتنادى كل دورة) ويخلي الحجز الناضج يفلتر status+updated_at جوه الفهرس.
+        # - `idx_outbox_conv_chat_status`: بيسرّع استعلام التجميع في `add_or_group_outbox`
+        #   (بيدور على أحدث 'pending' لنفس الوجهة (conversation_id, chat_id)).
+        # مفيش مسار كتابة (claim/set_status) بيتأثّر: بيحجز بالـ rowid الأساسي زي ما هو،
+        # و`idx_outbox_status` لسه متاح لاستعلامات status-only. إضافي وidempotent.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_outbox_status_updated ON outbox(status, updated_at)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_outbox_conv_chat_status "
+            "ON outbox(conversation_id, chat_id, status)"
         )
         # creation_jobs اتعمل في 04A-6 (جدول جديد)؛ CREATE IF NOT EXISTS فوق بيكفّي
         # للقواعد القديمة، وبنضمن عمود attempts لو الجدول موجود من نسخة أقدم.
@@ -408,7 +432,13 @@ class Database:
         `notification_state` **قبل** حذف الصف، والاتنين في معاملة واحدة (`BEGIN IMMEDIATE`
         + commit/rollback). كده لو التسجيل فشل، الحذف ما بيحصلش (مفيش ازدواج صامت)،
         والاستثناء بيطلع للمستدعي. لو مفيش صف أصلاً، الحذف بيكمل عادي (سلوك متسق).
+
+        OHB2-08-03: قبل أي كتابة، بننسّق دليل التسليم in-memory عبر `on_unwatch` (لو
+        المراقب سجّله) — يثبّت أي تلميح مطابق كعلامة دائمة جوه نفس المعاملة، فالـ fallback
+        (لما المراقب مش متاح) ما يفقدش دليل تسليم اتّبعت فعلًا ⇒ مفيش إشعار مكرّر.
         """
+        if self.on_unwatch is not None:
+            self.on_unwatch(conversation_id)
         conn = self._conn
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -439,7 +469,11 @@ class Database:
         لما كتابة العلامة الدائمة نفسها فشلت). العلامة الدائمة، لو موجودة، بتاخد الأولوية
         على القيمة المارّرة. بيرجّع True لو كان فيه صف واتشال، وFalse لو مفيش صف (no-op).
         بيرمي لو التسجيل فشل (مفيش حذف جزئي — الذرّية محفوظة).
+
+        OHB2-08-03: بننسّق دليل in-memory عبر `on_unwatch` قبل أي كتابة (زي `remove_watched`).
         """
+        if self.on_unwatch is not None:
+            self.on_unwatch(conversation_id)
         now = now or datetime.now(timezone.utc).isoformat()
         conn = self._conn
         conn.execute("BEGIN IMMEDIATE")
@@ -474,7 +508,14 @@ class Database:
 
         بيرجّع True لو الصف المطابق اتشال، وFalse لو الصف مش موجود أو الدورة اتغيّرت.
         بيرمي لو التسجيل فشل (المعاملة كلها بترجع، والصف بيفضل — retry آمن).
+
+        OHB2-08-03: بننسّق دليل in-memory عبر `on_unwatch` قبل أي كتابة. الـ hook مربوط
+        بمعرّف دورة المتابعة، فلو الدورة اتغيّرت (الصف مش هيتشال) التلميح المطابق للدورة
+        الحالية بيتثبّت كعلامة دائمة — إصلاح تلقائي غير ضار (الدليل مضمون بغض النظر عن
+        نتيجة الـ CAS).
         """
+        if self.on_unwatch is not None:
+            self.on_unwatch(conversation_id)
         conn = self._conn
         conn.execute("BEGIN IMMEDIATE")
         try:

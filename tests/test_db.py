@@ -654,3 +654,135 @@ def test_has_notification_states_agrees_with_list(tmp_path):
     assert db.has_notification_states() == bool(db.list_notification_states())
     db.upsert_notification_state("c1", status="done", notified_status="done", retry_count=0)
     assert db.has_notification_states() == bool(db.list_notification_states())
+
+
+# ==================== OHB2-08-04: SQLite index optimization ====================
+def _index_columns(conn, index_name):
+    """أعمدة فهرس بالترتيب (من PRAGMA index_info)، أو None لو الفهرس مش موجود."""
+    rows = conn.execute(f"PRAGMA index_info({index_name})").fetchall()
+    if not rows:
+        return None
+    return [r[2] for r in rows]
+
+
+def _plan_text(conn, sql, params=()):
+    rows = conn.execute("EXPLAIN QUERY PLAN " + sql, params).fetchall()
+    return " | ".join(r[3] for r in rows)
+
+
+def test_new_indexes_created_on_fresh_db(tmp_path):
+    """OHB2-08-04: قاعدة جديدة بتاخد الفهرسين المركّبين بالأعمدة والترتيب المتوقّعين."""
+    db = make_db(tmp_path)
+    conn = db._conn
+    assert _index_columns(conn, "idx_outbox_status_updated") == ["status", "updated_at"]
+    assert _index_columns(conn, "idx_outbox_conv_chat_status") == [
+        "conversation_id", "chat_id", "status",
+    ]
+    db.close()
+
+
+def test_new_indexes_added_to_existing_db_without_data_loss(tmp_path):
+    """OHB2-08-04: قاعدة قديمة (من غير الفهارس الجديدة) بتاخدها عند الفتح، والصفوف تفضل."""
+    import sqlite3
+
+    path = str(tmp_path / "old.sqlite3")
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        "CREATE TABLE outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id TEXT NOT NULL,"
+        " chat_id INTEGER NOT NULL, text TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',"
+        " error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,"
+        " attempts INTEGER NOT NULL DEFAULT 0, client_ref TEXT);"
+    )
+    conn.execute(
+        "INSERT INTO outbox(conversation_id, chat_id, text, status, created_at, updated_at)"
+        " VALUES('c1', 7, 'قديم', 'pending', 't0', 't0')"
+    )
+    conn.commit()
+    conn.close()
+
+    db = Database(path)
+    conn = db._conn
+    assert _index_columns(conn, "idx_outbox_status_updated") == ["status", "updated_at"]
+    assert _index_columns(conn, "idx_outbox_conv_chat_status") == [
+        "conversation_id", "chat_id", "status",
+    ]
+    # الصفوف محفوظة زي ما هي.
+    item = db.list_outbox_by_status("pending")[0]
+    assert item.conversation_id == "c1" and item.text == "قديم"
+    db.close()
+
+
+def test_repeated_initialization_is_idempotent(tmp_path):
+    """OHB2-08-04: فتح القاعدة مرارًا لا يكرّر الفهارس ولا يرمي."""
+    path = str(tmp_path / "t.sqlite3")
+    for _ in range(3):
+        db = Database(path)
+        names = [r[1] for r in db._conn.execute("PRAGMA index_list(outbox)").fetchall()]
+        assert names.count("idx_outbox_status_updated") == 1
+        assert names.count("idx_outbox_conv_chat_status") == 1
+        db.close()
+
+
+def test_maturity_query_uses_status_updated_index(tmp_path):
+    """OHB2-08-04: استعلام النضج (موعد نوم الـ worker) يستخدم الفهرس المركّب بدل ترتيب مؤقّت."""
+    db = make_db(tmp_path)
+    plan = _plan_text(
+        db._conn,
+        "SELECT updated_at FROM outbox WHERE status='pending' ORDER BY updated_at LIMIT 1",
+    )
+    assert "idx_outbox_status_updated" in plan
+    assert "TEMP B-TREE FOR ORDER BY" not in plan.upper()
+    db.close()
+
+
+def test_grouping_query_uses_conv_chat_status_index(tmp_path):
+    """OHB2-08-04: استعلام التجميع يستخدم فهرس الوجهة+الحالة."""
+    db = make_db(tmp_path)
+    plan = _plan_text(
+        db._conn,
+        "SELECT id, text, updated_at, client_ref FROM outbox "
+        "WHERE conversation_id=? AND chat_id=? AND status=? ORDER BY id DESC LIMIT 1",
+        ("c1", 1, "pending"),
+    )
+    assert "idx_outbox_conv_chat_status" in plan
+    db.close()
+
+
+def test_claim_path_unchanged_by_new_indexes(tmp_path):
+    """OHB2-08-04: مسار الحجز الذرّي (rowid) ما اتغيّرش بالفهارس الجديدة."""
+    db = make_db(tmp_path)
+    plan = _plan_text(
+        db._conn,
+        "UPDATE outbox SET status='claimed', updated_at=? WHERE id=("
+        "SELECT id FROM outbox WHERE status='pending' ORDER BY id LIMIT 1) RETURNING *",
+        ("t",),
+    )
+    assert "INTEGER PRIMARY KEY (rowid=?)" in plan
+    db.close()
+
+
+def test_claim_and_list_behavior_intact_with_indexes(tmp_path):
+    """OHB2-08-04: الحجز والعدّ والقوائم لسه شغالين صح بعد الفهارس."""
+    db = make_db(tmp_path)
+    for i in range(3):
+        db.add_outbox(f"c{i}", 1, f"p{i}", "t0")
+    claimed = db.claim_outbox("t1")
+    assert claimed is not None and claimed.status == "claimed"
+    assert db.count_outbox("pending") == 2
+    assert len(db.list_open_outbox()) == 3
+    db.close()
+
+
+def test_batch1_persistence_intact_after_index_migration(tmp_path):
+    """OHB2-08-04: علامات التسليم المعلّق ومواعيد RetryAfter (Batch 1) لسه بتفضل بعد إعادة الفتح."""
+    path = str(tmp_path / "t.sqlite3")
+    db = Database(path)
+    db.add_watched("c1", "t")
+    db.set_notifier_pending("c1", "finished", "2026-01-01T00:00:00+00:00")
+    db.set_retry_not_before("c1", "2030-01-01T00:00:00+00:00")
+    db.close()
+
+    db2 = Database(path)  # إعادة فتح ⇒ تشغيل _migrate تاني (idempotent)
+    assert db2.get_notifier_pending("c1") == "finished"
+    assert db2.get_retry_not_before("c1") == "2030-01-01T00:00:00+00:00"
+    db2.close()
