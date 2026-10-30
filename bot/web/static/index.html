@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#0f172a">
+  <title>OpenHandBot</title>
+  <link rel="stylesheet" href="/mini/styles.css?v=1">
+</head>
+<body>
+  <main class="app" id="app" aria-busy="true">
+    <header class="topbar">
+      <span class="brand">OpenHandBot</span>
+      <span class="badge" id="env-badge" hidden></span>
+    </header>
+
+    <section class="state" id="state-loading" role="status" aria-live="polite">
+      <div class="spinner" aria-hidden="true"></div>
+      <p>بيتم التحميل…</p>
+    </section>
+
+    <section class="state" id="state-error" hidden role="alert">
+      <div class="icon" aria-hidden="true">⚠️</div>
+      <h2 class="state-title">تعذّر فتح التطبيق</h2>
+      <p class="state-msg" id="error-msg">حصل خطأ غير متوقع.</p>
+      <button class="btn" id="retry-btn" type="button">إعادة المحاولة</button>
+    </section>
+
+    <section class="state" id="state-empty" hidden>
+      <div class="icon" aria-hidden="true">📭</div>
+      <h2 class="state-title">لسه مفيش حاجة هنا</h2>
+      <p class="state-msg">الواجهة جاهزة، والأقسام هتظهر في التحديثات الجاية.</p>
+    </section>
+
+    <section class="content" id="state-ready" hidden>
+      <div class="card">
+        <p class="card-label">مسجّل دخول كـ</p>
+        <p class="card-value" id="user-name">—</p>
+      </div>
+      <div class="card row">
+        <span class="card-label">الإشعارات الاستباقية</span>
+        <span class="pill" id="notif-state">—</span>
+      </div>
+      <p class="hint">ده أساس التطبيق بس. باقي الميزات (الشاتات، البرومتات، الملفات) جاية في تحديثات لاحقة.</p>
+    </section>
+  </main>
+
+  <script src="/mini/app.js?v=1" defer></script>
+</body>
+</html>

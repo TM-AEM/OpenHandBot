@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import AsyncExitStack
 
 from telegram import BotCommand, BotCommandScopeChat, MenuButtonCommands
 from telegram.ext import (
@@ -189,4 +190,58 @@ def build_application(config: Config) -> Application:
 
     app.post_init = _post_init
     app.post_shutdown = _post_shutdown
+
+    # OHB2-05: خلفية الـ Mini App. مقفولة افتراضيًا؛ لما تتفتح بنشغّل ASGI جوه نفس
+    # العملية (نفس قاعدة البيانات، مفيش worker تاني). لو السيرفر فشل يبدأ (منفذ مستخدم)
+    # بنفشل التشغيل كله بوضوح بدل ما نكمل بحالة غير متسقة.
+    _wire_mini_app(app, config, db)
     return app
+
+
+def _wire_mini_app(application: Application, config: Config, db: Database) -> None:
+    """يربط خلفية الـ Mini App بدورة حياة البوت (OHB2-05)."""
+    if not config.mini_app_enabled:
+        return
+    if not config.mini_app_url:
+        raise RuntimeError(
+            "MINI_APP_ENABLED=1 لكن MINI_APP_URL فاضي — لازم رابط https عام للـ Mini App"
+        )
+
+    from .web import build_web_app
+    from .web.runner import web_server_lifespan
+
+    web_app = build_web_app(config, db)
+    application.bot_data["mini_app"] = web_app
+
+    original_post_init = application.post_init
+    original_post_shutdown = application.post_shutdown
+    exit_stack = AsyncExitStack()
+
+    async def _mini_post_init(application: Application) -> None:
+        if original_post_init is not None:
+            await original_post_init(application)
+        # حرس: إعادة تهيئة مكرّرة ما تبدأش سيرفر تاني.
+        if application.bot_data.get("mini_app_server") is not None:
+            return
+        # بنبدأ السيرفر بعد ما الـ workers/المراقب يشتغلوا. لو رفع، الخطأ بيطلع ويوقف
+        # التشغيل كله (ما بنسيبهوش يفشل بصمت).
+        stack = await exit_stack.__aenter__()
+        server, task = await stack.enter_async_context(
+            web_server_lifespan(web_app, "0.0.0.0", config.mini_app_port)
+        )
+        application.bot_data["mini_app_server"] = server
+        application.bot_data["mini_app_task"] = task
+        logging.getLogger(__name__).info(
+            "Mini App بيستمع على 0.0.0.0:%s", config.mini_app_port
+        )
+
+    async def _mini_post_shutdown(application: Application) -> None:
+        try:
+            await exit_stack.aclose()
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).warning("إغلاق الـ Mini App اتخطّى (%s)", type(exc).__name__)
+        if original_post_shutdown is not None:
+            await original_post_shutdown(application)
+
+    application.post_init = _mini_post_init
+    application.post_shutdown = _mini_post_shutdown

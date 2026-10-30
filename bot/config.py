@@ -19,6 +19,12 @@ class Config:
     db_path: str = "bot_state.sqlite3"
     # رابط الـ Mini App (HTTPS). فاضي = الميزة متوقفة (الزر بيقول "غير متاحة").
     mini_app_url: str = ""
+    # OHB2-05: خلفية الـ Mini App (ASGI). مقفولة افتراضيًا عشان ما تغيّرش سلوك البوت الحالي.
+    mini_app_enabled: bool = False
+    mini_app_port: int = 12000
+    mini_app_initdata_max_age: int = 300
+    mini_app_session_ttl: int = 3600
+    mini_app_cookie_secure: bool = True
 
     @property
     def secrets(self) -> tuple[str, str]:
@@ -68,6 +74,20 @@ def _clean(env, name: str, default: str = "") -> str:
     if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
         value = value[1:-1].strip()
     return value
+
+
+_TRUE = {"1", "true", "yes", "on", "y"}
+_FALSE = {"0", "false", "no", "off", "n", ""}
+
+
+def _parse_bool(env, name: str, default: bool) -> bool:
+    """يقرأ متغير بيئة منطقي (1/true/yes/on). أي قيمة غير معروفة ⇒ القيمة الافتراضية."""
+    raw = (env.get(name) or "").strip().lower()
+    if raw in _TRUE:
+        return True
+    if raw in _FALSE:
+        return False
+    return default
 
 
 def _parse_ids(raw: str) -> list[int]:
@@ -166,6 +186,33 @@ def load_config(env: dict | None = None) -> Config:
         if _is_loopback_host(host):
             raise ConfigError("MINI_APP_URL لازم يكون رابط عام (مش loopback) لأن تيليجرام بيفتحه من جهاز المستخدم")
 
+    # OHB2-05: خلفية الـ Mini App (ASGI). مقفولة افتراضيًا.
+    mini_app_enabled = _parse_bool(env, "MINI_APP_ENABLED", False)
+    port_raw = _clean(env, "MINI_APP_PORT", "12000")
+    try:
+        mini_app_port = int(port_raw)
+    except ValueError as exc:
+        raise ConfigError("MINI_APP_PORT لازم يكون رقم منفذ صحيح (1..65535)") from exc
+    if not 1 <= mini_app_port <= 65535:
+        raise ConfigError("MINI_APP_PORT لازم يكون بين 1 و 65535")
+
+    def _positive(name: str, default: int) -> int:
+        raw = _clean(env, name, str(default))
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ConfigError(f"{name} لازم يكون رقم صحيح موجب") from exc
+        if value <= 0:
+            raise ConfigError(f"{name} لازم يكون رقم موجب")
+        return value
+
+    # مهلة صلاحية initData (ثواني). افتراضي 300 (5 دقايق) زي توصية تيليجرام.
+    mini_app_initdata_max_age = _positive("MINI_APP_INITDATA_MAX_AGE", 300)
+    # عمر جلسة الـ Mini App (ثواني).
+    mini_app_session_ttl = _positive("MINI_APP_SESSION_TTL", 3600)
+    # كوكي الـ session لازم Secure في الإنتاج؛ ممكن يتقفل للتطوير المحلي على http.
+    mini_app_cookie_secure = _parse_bool(env, "MINI_APP_COOKIE_SECURE", True)
+
     return Config(
         telegram_bot_token=token,
         openhands_api_key=api_key,
@@ -176,4 +223,9 @@ def load_config(env: dict | None = None) -> Config:
         watcher_interval=interval,
         db_path=db_path,
         mini_app_url=mini_app_url,
+        mini_app_enabled=mini_app_enabled,
+        mini_app_port=mini_app_port,
+        mini_app_initdata_max_age=mini_app_initdata_max_age,
+        mini_app_session_ttl=mini_app_session_ttl,
+        mini_app_cookie_secure=mini_app_cookie_secure,
     )
