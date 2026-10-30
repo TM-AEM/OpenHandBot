@@ -7,14 +7,24 @@
   (وبيعلّم `notified_status`) لكن مايبعتش لها — عشان ما يحصلش ازدواج.
 - التعطيل بوقف التسليم بس، مع استمرار تحديث اللقطات وتعليم الحالة ⇒ مفيش تراكم قديم
   يتّبع عند إعادة التفعيل.
+
+OHB2-08-01: علامة التسليم المعلّق بقت **دائمة** في جدول `notifier_pending` (مش تلميح
+in-memory). بتتكتب بعد ما تليجرام يأكّد الإرسال وقبل التسجيل الدائم، وبتفضل بعد إعادة
+تشغيل العملية ⇒ الدورة الجاية تسوّيها **قبل أي إرسال** بدل ما تعيد الإرسال أعمى.
+
+ملاحظة صريحة (مفيش exactly-once): تليجرام مابيرجّعش مفتاح idempotency لـ `sendMessage`.
+فيه نافذة غامضة غير قابلة للإزالة بين ما تليجرام **يقبل** الرسالة وما نسجّل التسليم
+**بشكل دائم** محليًا: لو العملية اتقطعت جوّه النافذة دي، بعد إعادة التشغيل ممكن الرسالة
+تتبعت تاني (احتمال ازدواج). بنضيّق النافذة (علامة write-ahead + تسجيل ذرّي) لكن ما
+بنلغيهاش، وبنفضّل استرجاع آمن وعدم يقين صريح على فقد إشعار بصمت.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from telegram.error import TelegramError
+from telegram.error import RetryAfter, TelegramError
 
 from .db import NotificationState
 from .errors import ApiError
@@ -39,6 +49,30 @@ STATUS_MESSAGES = {
     SANDBOX_ERROR: "❌ حدث خطأ في بيئة تنفيذ OpenHands.",
 }
 _DEFAULT_MESSAGE = "⚠️ تغيّرت حالة المحادثة."
+
+
+def _retry_after_seconds(exc: RetryAfter) -> float:
+    """مدة الانتظار اللي تليجرام طلبها (`retry_after`). int ثواني أو timedelta."""
+    value = exc.retry_after
+    if isinstance(value, timedelta):
+        return max(0.0, value.total_seconds())
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _parse_retry_deadline(raw: str | None) -> datetime | None:
+    """يحلّل موعد إعادة محاولة دائم (UTC ISO). None لو القيمة فاضية/تالفة (fail-safe)."""
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except (ValueError, TypeError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def format_notification(conv: dict, status: str, base_url: str) -> str:
@@ -76,14 +110,22 @@ class Notifier:
         self._interval = interval
         self._base_url = base_url
         self._page_size = page_size
-        # محادثات اتبعتت لتليجرام بس تسجيل الحالة فشل (SQLite). بنخزّن الحالة المعلّقة
-        # عشان الدورة الجاية تعيد التسجيل قبل أي إرسال تاني (مافيش إعادة إرسال أعمى).
-        # in-memory فقط: ما بتحميش من إعادة تشغيل العملية (بنسجّل ده صراحةً).
-        self._pending: dict[str, str] = {}
+        # OHB2-08-01: علامة التسليم المعلّق بقت **دائمة** في `db.notifier_pending`. مفيش
+        # تلميح in-memory بيحمل دليل تسليم (كان بيضيع بإعادة التشغيل). الدورة الجاية
+        # بتقرأ العلامة من القاعدة وتكمّل التسجيل **قبل أي إرسال**.
+        #
+        # OHB2-08-02R: مواعيد إعادة المحاولة بعد RetryAfter بقت **دائمة لكل محادثة** في
+        # `db.notifier_retry_not_before` (UTC ISO)، مش مؤقّت in-memory. كده الموعد بيفضل
+        # بعد إعادة التشغيل، و429 لمحادثة ما بيوقفش باقي المحادثات.
         self._task: asyncio.Task | None = None
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._run())
+
+    def _deadline_iso(self, delay_seconds: float) -> str:
+        """موعد إعادة محاولة مطلق (UTC ISO) = ساعة المُبلّغ + المدة. يستخدم `_clock`
+        القابل للحقن في الاختبارات (ساعة وهمية)."""
+        return (self._clock() + timedelta(seconds=delay_seconds)).isoformat()
 
     def record_notification_sent(self, conversation_id: str, status: str, now: str) -> None:
         """نقطة التنسيق مع المراقب: يسجّل إشعار حالة نهائية اتّبع من المالك (المراقب).
@@ -172,11 +214,37 @@ class Notifier:
         cid = conv.get("id")
         status = get_status(conv)
 
-        # تسليم معلّق من دورة سابقة (تليجرام أكّد بس التسجيل فشل): نعيد التسجيل **قبل** أي
-        # قرار إرسال. لو نجح، بنكمّل عادي — اللقطة بقت محدّثة فمفيش إرسال تاني لنفس الحالة.
-        if cid in self._pending:
-            if not self._retry_pending(cid, now):
-                return  # التسجيل لسه فاشل: نستنى الدورة الجاية، ما نرسلش تاني
+        # OHB2-08-01: تسليم معلّق **دائم** من دورة سابقة (تليجرام أكّد بس التسجيل فشل،
+        # أو استرجاع بعد إعادة تشغيل): نسوّيه (نسجّل الحالة اللي اتّبعت فعلًا ونمسح
+        # العلامة) **قبل** أي قرار إرسال. لو التسجيل لسه فاشل، نستنى الدورة الجاية —
+        # ما نرسلش تاني. ده اللي بيمنع الإرسال الأعمى بعد restart.
+        pending = self._db.get_notifier_pending(cid)
+        if pending is not None:
+            try:
+                self._db.reconcile_notifier_pending(cid, now)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "تعذّر تسجيل إشعار المحادثة %s المعلّق (%s)، هنعيد المحاولة في الدورة الجاية",
+                    cid, type(exc).__name__,
+                )
+                return
+
+        # OHB2-08-02R: موعد إعادة المحاولة **الدائم** للمحادثة دي بعد RetryAfter. لو لسه
+        # ما عدّاش، نتخطّى المحادثة دي بس (مش الدورة كلها) — 429 لمحادثة ما بيوقفش باقي
+        # المحادثات. لو الموعد عدّى (أو القيمة تالفة) نمسحه ونكمّل عادي. موعد **منتهي** أو
+        # غير صالح ⇒ إعادة محاولة (fail-safe)، مش فقد إشعار.
+        raw_deadline = self._db.get_retry_not_before(cid)
+        if raw_deadline is not None:
+            deadline = _parse_retry_deadline(raw_deadline)
+            if deadline is not None and self._clock() < deadline:
+                return
+            try:
+                self._db.clear_retry_not_before(cid)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "تعذّر مسح موعد إعادة محاولة إشعار %s (%s)، هيتخطّى",
+                    cid, type(exc).__name__,
+                )
 
         # أول تشغيل (مفيش لقطة سابقة خالص): تأسيس خط أساس بدون إشعار — حتى عن
         # المحادثات المنتهية الموجودة، عشان ما نغرقش المستخدم بإشعارات قديمة.
@@ -220,6 +288,24 @@ class Notifier:
 
         try:
             await send_long(self._chat_id, format_notification(conv, status, self._base_url), self._bot)
+        except RetryAfter as exc:
+            # OHB2-08-02R: تليجرام طلب انتظار (429). **مش** فشل دائم: ما نزوّدش عدّاد
+            # المحاولات، وما نعلّمش الحالة. نسجّل موعد إعادة محاولة **دائم** (UTC) للمحادثة
+            # دي بس، فالحالة تفضل مؤهّلة وباقي المحادثات ما بتتأثّرش. لو الكتابة فشلت،
+            # نتخطّى بلا عدّاد (fail-safe: ممكن نحاول بدري، مش نفقد إشعار).
+            delay = _retry_after_seconds(exc)
+            try:
+                self._db.set_retry_not_before(cid, self._deadline_iso(delay))
+            except Exception as exc2:  # noqa: BLE001
+                log.warning(
+                    "تعذّر تسجيل موعد إعادة محاولة إشعار %s (%s)؛ هنحاول الدورة الجاية",
+                    cid, type(exc2).__name__,
+                )
+            log.warning(
+                "تليجرام طلب انتظار %.0f ثانية لإشعار المحادثة %s (429)، هنعيد بعد كده",
+                delay, cid,
+            )
+            return
         except TelegramError as exc:
             # فشل التسليم: نحدّث الحالة المرصودة بس **من غير** ما نعلّمها "محسوبة"
             # (notified_status يفضل زي ما هو) عشان يتعاود. العدّاد مستمر ومحدود.
@@ -233,32 +319,25 @@ class Notifier:
                 log.warning("استسلمنا من إشعار المحادثة %s بعد %d محاولة فاشلة", cid, count)
             return
 
-        # تليجرام أكّد النجاح ⇒ نسجّل الحالة "محسوبة" (بعد التأكيد، مش قبله). لو التسجيل
-        # فشل، بنحتفظ بحالة معلّقة (in-memory) وندوّرها في الدورة الجاية — ما بنعيدش
-        # الإرسال أعمى، وما بنسجّلش كإن التسليم نجح.
+        # تليجرام أكّد النجاح. OHB2-08-01: نسجّل **علامة تسليم معلّق دائمة** الأول (بعد
+        # التأكيد وقبل التسجيل الدائم). لو الكتابة نفسها فشلت، ما بنسجّلش النجاح الدائم
+        # (notified_status يفضل زي ما هو) فالحالة تفضل مؤهّلة، لكن **مفيش علامة دائمة** —
+        # ده يسيب نافذة إعادة إرسال عند إعادة التشغيل بالظبط، وبنعترف بيها (مفيش exactly-once).
         try:
-            self._db.upsert_notification_state(
-                cid, status=status, notified_status=status, retry_count=0, updated_at=now
-            )
+            self._db.set_notifier_pending(cid, status, now)
         except Exception as exc:  # noqa: BLE001
-            self._pending[cid] = status
+            log.warning(
+                "تعذّر تسجيل علامة تسليم إشعار %s (%s)؛ ممكن يتعاد الإرسال بعد إعادة تشغيل",
+                cid, type(exc).__name__,
+            )
+            return
+
+        # تسجيل ذرّي: ينجح أو يفشل مع بعض. لو نجح، العلامة اتمسحت واللقطة اتحدّثت ⇒ مفيش
+        # إعادة إرسال. لو فشل، العلامة **تفضل** ⇒ الدورة الجاية تسوّيها (مفيش فقد دليل).
+        try:
+            self._db.reconcile_notifier_pending(cid, now)
+        except Exception as exc:  # noqa: BLE001
             log.warning(
                 "تعذّر تسجيل إشعار المحادثة %s بعد تسليم ناجح (%s)، هنعيد المحاولة قبل أي إرسال",
                 cid, type(exc).__name__,
             )
-
-    def _retry_pending(self, cid: str, now: str) -> bool:
-        """يعيد تسجيل حالة تسليم معلّقة. True = اتسجّلت، False = لسه فاشلة (نتخطّى الإرسال)."""
-        status = self._pending[cid]
-        try:
-            self._db.upsert_notification_state(
-                cid, status=status, notified_status=status, retry_count=0, updated_at=now
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "تعذّر تسجيل إشعار المحادثة %s (%s)، هنعيد المحاولة في الدورة الجاية",
-                cid, type(exc).__name__,
-            )
-            return False
-        self._pending.pop(cid, None)
-        return True

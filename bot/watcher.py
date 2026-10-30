@@ -22,10 +22,11 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
-from telegram.error import TelegramError
+from telegram.error import RetryAfter, TelegramError
 
 from .errors import ApiError
 from .messages import SANDBOX_ERROR, get_status, is_terminal, state_label
+from .notifier import _parse_retry_deadline, _retry_after_seconds
 from .openhands_client import parse_timestamp
 from .sender import send_long
 
@@ -84,6 +85,9 @@ class Watcher:
         self._default_chat_id = chat_id
         self._interval = interval
         self._task: asyncio.Task | None = None
+        # OHB2-08-02R: مواعيد إعادة المحاولة بعد RetryAfter بقت **دائمة لكل محادثة** في
+        # `db.notifier_retry_not_before` (UTC ISO)، مش مؤقّت in-memory. كده الموعد بيفضل
+        # بعد إعادة التشغيل، و429 لمحادثة ما بيوقفش باقي المتابعات.
         # NTF-20: ننسّق التلميح in-memory مع أي دورة متابعة جديدة يبدأها أي مستدعي
         # (`add_watched(new_lifecycle=True)`)، حتى لو المستدعي مايعرفش المراقب.
         db.on_new_watch_lifecycle = self._on_new_watch_lifecycle
@@ -146,6 +150,22 @@ class Watcher:
             return
 
         for w in watched:
+            # OHB2-08-02R: موعد إعادة محاولة **دائم** للمحادثة دي بعد RetryAfter. لو لسه
+            # ما عدّاش، نتخطّى المحادثة دي بالكامل (بما فيها مسار الشات المفقود) — مش
+            # الدورة كلها. 429 لمحادثة ما بيوقفش باقي المتابعات. موعد منتهي/تالف ⇒ نمسحه
+            # ونكمّل (fail-safe: إعادة محاولة، مش فقد إشعار).
+            raw_deadline = self._db.get_retry_not_before(w.conversation_id)
+            if raw_deadline is not None:
+                deadline = _parse_retry_deadline(raw_deadline)
+                if deadline is not None and self._clock() < deadline:
+                    continue
+                try:
+                    self._db.clear_retry_not_before(w.conversation_id)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "تعذّر مسح موعد إعادة محاولة الشات %s (%s)، هيتخطّى",
+                        w.conversation_id, type(exc).__name__,
+                    )
             conv = convs.get(w.conversation_id)
             if not conv:
                 await self._handle_missing(w)
@@ -259,6 +279,11 @@ class Watcher:
     async def _deliver(self, w, text: str) -> bool:
         try:
             await send_long(self._destination(w), text, self._bot)
+        except RetryAfter as exc:
+            # OHB2-08-02R: 429 على مسار التسليم (مهلة/شات مفقود): نجدول إعادة محاولة
+            # دائمة للمحادثة (من غير عدّاد، من غير إزالة) ونرجّع False — ما بنصنّفه فشل.
+            self._schedule_retry_after(w.conversation_id, exc)
+            return False
         except TelegramError as exc:
             self._log_delivery_failure(w, exc)
             return False
@@ -273,6 +298,29 @@ class Watcher:
     def _expired(self, since_iso: str | None, limit: timedelta) -> bool:
         since = parse_timestamp(since_iso)
         return since is not None and self._clock() - since > limit
+
+    def _deadline_iso(self, delay_seconds: float) -> str:
+        """موعد إعادة محاولة مطلق (UTC ISO) = ساعة المراقب + المدة (OHB2-08-02R)."""
+        return (self._clock() + timedelta(seconds=delay_seconds)).isoformat()
+
+    def _schedule_retry_after(self, conversation_id: str, exc: RetryAfter) -> None:
+        """يسجّل موعد إعادة محاولة **دائم** للمحادثة بعد RetryAfter (429) (OHB2-08-02R).
+
+        ما بيستهلكش عدّاد محاولات، وما بيشيلش المتابعة، وما بيصنّف 429 فشل دائم. بيوقف
+        المحادثة دي بس لحد الموعد (fail-safe لو الكتابة فشلت: ممكن نحاول بدري، مش نفقد).
+        """
+        delay = _retry_after_seconds(exc)
+        try:
+            self._db.set_retry_not_before(conversation_id, self._deadline_iso(delay))
+        except Exception as exc2:  # noqa: BLE001
+            log.warning(
+                "تعذّر تسجيل موعد إعادة محاولة الشات %s (%s)؛ هنحاول الدورة الجاية",
+                conversation_id, type(exc2).__name__,
+            )
+        log.warning(
+            "تليجرام طلب انتظار %.0f ثانية لإشعار الشات %s (429)، هنعيد بعد كده",
+            delay, conversation_id,
+        )
 
     @staticmethod
     def _log_delivery_failure(w, exc: Exception) -> None:
@@ -302,7 +350,12 @@ class Watcher:
         NTF-23: العدّاد والإزالة مشروطان بمعرّف الدورة الملتقَط (`watch_seq`): لو دورة
         جديدة اتعملت أثناء await، قرار الفشل القديم ما يتطبّقش على الدورة الجديدة
         (ما نزوّدش عدّادها ولا نشيلها).
+        OHB2-08-02R: `RetryAfter` (429) مش فشل دائم — بنجدول موعد إعادة محاولة **دائم**
+        للمحادثة (من غير ما نزوّد العدّاد ولا نصنّفه فشل)، فباقي المتابعات ما بتتأثّرش.
         """
+        if isinstance(exc, RetryAfter):
+            self._schedule_retry_after(w.conversation_id, exc)
+            return
         count = self._db.increment_watched_retry_if_seq(w.conversation_id, w.watch_seq)
         if count == 0:
             return  # الدورة اتغيّرت/الصف مش موجود ⇒ قرار قديم ما يتطبّقش

@@ -202,6 +202,15 @@ class Database:
                 retry_count     INTEGER NOT NULL DEFAULT 0,
                 updated_at      TEXT
             );
+            CREATE TABLE IF NOT EXISTS notifier_pending (
+                conversation_id TEXT PRIMARY KEY,
+                state           TEXT NOT NULL,
+                updated_at      TEXT
+            );
+            CREATE TABLE IF NOT EXISTS notifier_retry_not_before (
+                conversation_id TEXT PRIMARY KEY,
+                not_before      TEXT NOT NULL
+            );
             """
         )
         self._migrate()
@@ -262,6 +271,9 @@ class Database:
         )
         # creation_jobs اتعمل في 04A-6 (جدول جديد)؛ CREATE IF NOT EXISTS فوق بيكفّي
         # للقواعد القديمة، وبنضمن عمود attempts لو الجدول موجود من نسخة أقدم.
+        # OHB2-08-01: علامة التسليم المعلّق للمُبلّغ العام (durable). الجدول بيتعمل من
+        # `CREATE TABLE IF NOT EXISTS` فوق، فالقواعد القديمة بتاخده تلقائيًا (إضافي وغير
+        # مدمّر — مفيش صفوف ولا فقد بيانات). مفيش أي تعديل على أعمدة موجودة.
 
     # ----------------------------------------------------------------- watched
     def add_watched(
@@ -1206,6 +1218,113 @@ class Database:
             conversation_id, status=status, notified_status=status, retry_count=0,
             updated_at=now, _commit=_commit,
         )
+
+    # --------------------------------------------- notifier durable pending (OHB2-08-01)
+    def set_notifier_pending(self, conversation_id: str, state: str, now: str) -> None:
+        """علامة write-ahead **دائمة** للمُبلّغ: إشعار انتهاء اتّبعت (اتقبل) لكن تسجيله
+        الدائم لسه معلّق.
+
+        بتتكتب **بعد** ما تليجرام يأكّد الإرسال و**قبل** تسجيل `notification_state`
+        الدائم. عكس التلميح in-memory القديم، العلامة دي بتفضل بعد إعادة تشغيل العملية،
+        فالدورة الجاية تسوّيها (تسجّل الحالة الدائمة) **قبل أي إرسال** — فمايحصلش إعادة
+        إرسال عمياء. كتابة ضيّقة على جدول مستقل، ما بتلمسش `notification_state`.
+        """
+        self._conn.execute(
+            "INSERT INTO notifier_pending(conversation_id, state, updated_at) VALUES(?,?,?) "
+            "ON CONFLICT(conversation_id) DO UPDATE SET "
+            "state=excluded.state, updated_at=excluded.updated_at",
+            (conversation_id, state, now),
+        )
+        self._conn.commit()
+
+    def get_notifier_pending(self, conversation_id: str) -> str | None:
+        """حالة التسليم المعلّق الدائمة لمحادثة، أو None لو مفيش علامة."""
+        row = self._conn.execute(
+            "SELECT state FROM notifier_pending WHERE conversation_id=?",
+            (conversation_id,),
+        ).fetchone()
+        return row["state"] if row else None
+
+    def list_notifier_pending(self) -> dict[str, str]:
+        """كل علامات التسليم المعلّق الدائمة (conversation_id -> state)."""
+        rows = self._conn.execute(
+            "SELECT conversation_id, state FROM notifier_pending"
+        ).fetchall()
+        return {r["conversation_id"]: r["state"] for r in rows}
+
+    def clear_notifier_pending(self, conversation_id: str) -> None:
+        """يمسح علامة التسليم المعلّق الدائمة (بعد نجاح التسجيل الدائم)."""
+        self._conn.execute(
+            "DELETE FROM notifier_pending WHERE conversation_id=?", (conversation_id,)
+        )
+        self._conn.commit()
+
+    def reconcile_notifier_pending(self, conversation_id: str, now: str) -> str | None:
+        """يسوّي علامة التسليم المعلّق **الدائمة** في معاملة واحدة ذرّية.
+
+        يسجّل الحالة اللي **اتّبعت فعلًا** (`notification_state.notified_status`) ويمسح
+        العلامة في نفس المعاملة (`BEGIN IMMEDIATE`): إما ينجحوا مع بعض أو يفشلوا مع بعض.
+        لو التسجيل فشل، العلامة تفضل ⇒ إعادة محاولة آمنة (مفيش فقد دليل، ومفيش إرسال
+        تاني). بيرجّع الحالة اللي اتسجّلت، أو None لو مفيش علامة. **ما بيعملش أي إرسال.**
+        """
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT state FROM notifier_pending WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()
+            if row is None:
+                conn.commit()
+                return None
+            state = row["state"]
+            self.record_notification_sent(conversation_id, state, now, _commit=False)
+            conn.execute(
+                "DELETE FROM notifier_pending WHERE conversation_id=?", (conversation_id,)
+            )
+            conn.commit()
+            return state
+        except Exception:
+            conn.rollback()
+            raise
+
+    # -------------------------------------- retry-after deadlines (OHB2-08-02R)
+    def set_retry_not_before(self, conversation_id: str, not_before_iso: str) -> None:
+        """يسجّل **موعد إعادة المحاولة الدائم** لمحادثة (UTC ISO) بعد RetryAfter (429).
+
+        عكس المؤقّت in-memory القديم، الموعد ده بيفضل بعد إعادة تشغيل العملية، فالدورة
+        الجاية ما بتحاولش قبل ما الموعد يعدّي. جدول مستقل (كتابة ضيّقة، ما بتلمسش
+        `notification_state` ولا `watched`).
+        """
+        self._conn.execute(
+            "INSERT INTO notifier_retry_not_before(conversation_id, not_before) VALUES(?,?) "
+            "ON CONFLICT(conversation_id) DO UPDATE SET not_before=excluded.not_before",
+            (conversation_id, not_before_iso),
+        )
+        self._conn.commit()
+
+    def get_retry_not_before(self, conversation_id: str) -> str | None:
+        """موعد إعادة المحاولة الدائم لمحادثة (UTC ISO)، أو None لو مفيش."""
+        row = self._conn.execute(
+            "SELECT not_before FROM notifier_retry_not_before WHERE conversation_id=?",
+            (conversation_id,),
+        ).fetchone()
+        return row["not_before"] if row else None
+
+    def list_retry_not_before(self) -> dict[str, str]:
+        """كل مواعيد إعادة المحاولة الدائمة (conversation_id -> UTC ISO)."""
+        rows = self._conn.execute(
+            "SELECT conversation_id, not_before FROM notifier_retry_not_before"
+        ).fetchall()
+        return {r["conversation_id"]: r["not_before"] for r in rows}
+
+    def clear_retry_not_before(self, conversation_id: str) -> None:
+        """يمسح موعد إعادة المحاولة الدائم (بعد ما يعدّي أو عند إعادة الجدولة)."""
+        self._conn.execute(
+            "DELETE FROM notifier_retry_not_before WHERE conversation_id=?",
+            (conversation_id,),
+        )
+        self._conn.commit()
 
     # -------------------------------------------------------- integrity / upkeep
     def quick_check(self) -> bool:
