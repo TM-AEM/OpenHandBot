@@ -77,11 +77,11 @@ def _clean(env, name: str, default: str = "") -> str:
 
 
 _TRUE = {"1", "true", "yes", "on", "y"}
-_FALSE = {"0", "false", "no", "off", "n", ""}
+_FALSE = {"0", "false", "no", "off", "n"}
 
 
 def _parse_bool(env, name: str, default: bool) -> bool:
-    """يقرأ متغير بيئة منطقي (1/true/yes/on). أي قيمة غير معروفة ⇒ القيمة الافتراضية."""
+    """يقرأ متغير بيئة منطقي (1/true/yes/on). غايب/فاضي/غير معروف ⇒ القيمة الافتراضية."""
     raw = (env.get(name) or "").strip().lower()
     if raw in _TRUE:
         return True
