@@ -2,8 +2,8 @@
 
 بتشغّل اختبارات Node المدمجة (node --test) على منطق دورة حياة معرّف العملية في
 `bot/web/static/ops.js`. عشان `pytest -q` يغطّيها كمان، بس بتتخطّى بأمان لو Node
-مش متاح في البيئة (CI مافيهوش خطوة Node، وده مقبول — الاختبارات لسه بتشتغل محليًا
-وبأمر صريح).
+مش متاح في البيئة. في GitHub Actions فيه job مستقل (`frontend` في ci.yml) بيشغّل
+`node --test tests/frontend/*.test.js` مباشرة، فالتغطية مش معتمدة على التخطّي ده.
 """
 from __future__ import annotations
 

@@ -237,7 +237,11 @@ python -m pytest -q tests/test_miniapp_initdata.py tests/test_miniapp_api.py \
 node --test tests/frontend/*.test.js
 ```
 
-(كمان بتتغلّف جوه `pytest` عبر `tests/test_frontend_ops.py`، وبتتخطّى بأمان لو Node مش متاح.)
+مطلوب Node.js 24 (LTS) أو أحدث. GitHub Actions بيشغّل الأمر ده تلقائيًا في job مستقل
+(`frontend` في `.github/workflows/ci.yml`، عبر `actions/setup-node@v4` بـ `node-version: "24"`)،
+وأي فشل في اختبارات الواجهة بيفشّل الـ CI. كمان فيه غلاف `pytest`
+(`tests/test_frontend_ops.py`) بيشغّل نفس الاختبارات، وبيتخطّى بأمان لو Node مش متاح
+في البيئة المحلية.
 
 ## 13. القيد غير المحلول: اسم مضيف مرتبط بالجلسة
 

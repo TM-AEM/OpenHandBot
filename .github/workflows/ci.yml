@@ -36,3 +36,16 @@ jobs:
         run: python -m pyflakes bot/ main.py tests/
       - name: Tests (pytest)
         run: python -m pytest -q
+
+  frontend:
+    name: Frontend tests (Node)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node.js 24 (LTS)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Frontend tests (node --test)
+        run: node --test tests/frontend/*.test.js
