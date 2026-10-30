@@ -1,7 +1,9 @@
-# Mini App (OHB2-05) — خلفية ASGI + مصادقة initData
+# Mini App (OHB2-05/06) — خلفية ASGI + مصادقة initData + ميزات البوت + تحصين أمني
 
-> **النطاق:** ده **الأساس بس** للـ Mini App. مفيش أي ميزات بوت كاملة هنا لسه
-> (الشاتات/البرومتات/الملفات جاية في مهام OHB2 لاحقة). راجع قسم «اللي فاضل» تحت.
+> **النطاق:** الـ Mini App دلوقتي **واجهة عملية** لقدرات البوت (الشاتات، البرومتات،
+> الشات الجديد، المتابعات، الإشعارات) — مش تطبيق منفصل. كل الطلبات بتنادي **نفس**
+> طبقة الخدمات وقاعدة البيانات بتاعة البوت (مفيش منطق أعمال مكرّر).
+> OHB2-06 ضاف كمان: تحصين توقيع initData، تحديد معدّل، حماية Origin، وتحديد IP العميل.
 
 ## 1. نظرة عامة
 
@@ -14,57 +16,76 @@ Telegram WebView ──HTTPS──▶ ingress (TLS) ──HTTP──▶ الحا
                                         • long polling بتاع البوت (زي ما هو)
                                         • سيرفر Uvicorn/Starlette (task جنب البوت)
                                         • نفس كائن Database الواحد
+                                        • نفس كائن OpenHandsClient
 ```
 
 - مفيش عملية تانية، مفيش worker تاني، مفيش اتصال SQLite تاني.
 - الواجهة والـ API على **نفس الأصل** (same-origin) ⇒ كوكي جلسة `SameSite=Strict` بدون تعقيدات CORS.
 - كل الردود JSON، والأخطاء بشكل موحّد `{"error": code, "message": ...}`.
 
-## 2. التبعيات الجديدة
+## 2. التبعيات
 
 | الحزمة | الإصدار | ليه |
 | --- | --- | --- |
 | `starlette` | `0.41.3` | إطار ASGI صغير (راوتنج + responses) بدون أي إطار ثقيل |
 | `uvicorn` | `0.34.0` | سيرفر ASGI قياسي، بيشتغل كـ task جوه event loop الموجود |
 
-اتضافوا في `requirements.txt`. مقصود إننا **ما ضفناش FastAPI** — مش محتاجينه لأساس بسيط.
+مقصور إننا **ما ضفناش FastAPI** ولا مكتبة rate-limiting خارجية — كل حاجة صغيرة وبدون تبعيات.
 
 ## 3. دمج السيرفر مع عملية البوت
 
-- `bot/app.py::_wire_mini_app` بيربط خلفية الـ Mini App بدورة حياة البوت، **بس لما `MINI_APP_ENABLED=1`**.
+- `bot/app.py::_wire_mini_app` بيربط خلفية الـ Mini App بدورة حياة البوت، **بس لما `MINI_APP_ENABLED=1`**،
+  وبيمرّر `client` (OpenHandsClient) و`application` للخدمة (عشان تنبّه الـ workers المالكين الموجودين).
 - `bot/web/runner.py::web_server_lifespan`:
   - بيربط الـ socket بنفسه (`_bind_socket`) ويمرّره لـ Uvicorn. كده فشل الربط (منفذ مستخدم)
-    يطلع `OSError` عادي ⇒ **التشغيل كله يفشل بوضوح** (fail-fast) بدل ما يكمل بحالة غير متسقة.
-    (سبب اختيارنا ده: Uvicorn لما يفشل الربط بينادي `sys.exit(1)` جوه الـ event loop،
-    وasyncio بيعيد رميه ويقتل العملية فجأة.)
+    يطلع `OSError` عادي ⇒ **التشغيل كله يفشل بوضوح** (fail-fast).
   - بيعطّل `uvicorn.Server.capture_signals` وقت التشغيل المشترك، عشان **البوت** هو اللي
-    يمسك SIGINT/SIGTERM ويعمل إغلاق نظيف (السيرفر بيتقفل عبر الـ lifespan).
+    يمسك SIGINT/SIGTERM ويعمل إغلاق نظيف.
+  - `proxy_headers=False` (شوف القسم 8 — قرار أمني مقصود).
 - الترتيب في `post_init`: البوت بيعمل تعافيه ويشغّل الـ workers/المراقب **قبل** ما سيرفر الويب
   يبدأ. في `post_shutdown`: السيرفر يقف **قبل** ما البوت يقفل الموارد (`client`, `db`).
 - حرس تكرار: إعادة تهيئة مكرّرة (`post_init` اتنادت مرتين) **ما بتبدأش سيرفر تاني**.
 
 ## 4. المسارات (API)
 
-| المسار | الميثود | مصادقة | الوصف |
-| --- | --- | --- | --- |
-| `/health` | GET | لأ | فحص صحة. مفيش أي أسرار/إعدادات في الرد |
-| `/api/v1/auth` | POST | لأ | يستقبل `{"initData": "..."}`، يتحقق منه، ويعمل كوكي جلسة |
-| `/api/v1/auth/logout` | POST | كوكي | يلغي الجلسة ويمسح الكوكي |
-| `/api/v1/app/bootstrap` | GET | كوكي | بيانات أولية للواجهة (اسم العرض + الإشعارات + الميتا) |
-| `/api/v1/*` (غير معروف) | أي | — | `404` بشكل JSON موحّد |
-| `/`, `/mini/`, `/mini/<asset>` | GET | لأ | الواجهة والأصول الثابتة |
+| المسار | الميثود | مصادقة | تغيير حالة | الوصف |
+| --- | --- | --- | --- | --- |
+| `/health` | GET | لأ | لأ | فحص صحة. مفيش أسرار. **بدون تحديد معدّل** |
+| `/api/v1/auth` | POST | لأ | لأ | يستقبل `{"initData": "..."}` ⇒ كوكي جلسة |
+| `/api/v1/auth/logout` | POST | كوكي | ✔ | يلغي الجلسة ويمسح الكوكي |
+| `/api/v1/app/bootstrap` | GET | كوكي | لأ | اسم العرض + الإشعارات + ميتا |
+| `/api/v1/app/notifications` | POST | كوكي | ✔ | `{"enabled": bool}` يضبط الإشعارات |
+| `/api/v1/conversations` | GET | كوكي | لأ | آخر الشاتات (صفحات، `?page=&refresh=1`) |
+| `/api/v1/conversations/{id}` | GET | كوكي | لأ | تفاصيل شات + آخر برومت/رد + رابط PR |
+| `/api/v1/conversations/{id}/status` | GET | كوكي | لأ | حالة شات بس |
+| `/api/v1/conversations/{id}/prompt` | POST | كوكي | ✔ | `{"text": "..."}` ⇒ يسجّل البرومت في الصندوق |
+| `/api/v1/conversations/{id}/watch` | POST | كوكي | ✔ | يضيف الشات للمتابعة |
+| `/api/v1/conversations/{id}/watch` | DELETE | كوكي | ✔ | يلغي المتابعة |
+| `/api/v1/watches` | GET | كوكي | لأ | قائمة المتابعات |
+| `/api/v1/repositories` | GET | كوكي | لأ | بحث المستودعات (`?q=&page=`) |
+| `/api/v1/chats` | POST | كوكي | ✔ | `{"repository": "owner/repo", "text": "..."}` ⇒ شات جديد |
+| `/api/v1/*` (غير معروف) | أي | — | — | `404` JSON موحّد |
+| `/`, `/mini/`, `/mini/<asset>` | GET | لأ | لأ | الواجهة والأصول الثابتة (**بدون تحديد معدّل**) |
 
-### الأمان في الردود
+## 5. إعادة استخدام منطق البوت (مفيش تكرار)
 
-- **مفيش أسرار** في أي رد: توكن البوت ومفتاح OpenHands بيتخزّنوا على السيرفر بس.
-- `/api/v1/app/bootstrap` بيرجّع **اسم العرض بس** — مش معرّف المستخدم ولا أي حقل داخلي.
-- كل ردود الـ API بترجّع `Cache-Control: no-store` (مفيش كاش لبيانات خاصة).
-- الأصول الثابتة (`/mini/*.css`, `*.js`) بتتكاش (`immutable`, سنة)؛ الـ HTML لأ (`no-store`).
-- هيدرات أمان على كل الردود: `X-Content-Type-Options`, `Referrer-Policy`, `X-Frame-Options`,
-  و`Content-Security-Policy` (الواجهة بتسمح بس لـ `self` + `telegram.org`؛ الـ API `default-src 'none'`).
-- حد حجم الطلب `16 KiB` (زيادة ⇒ `413`).
+`bot/web/services.py::MiniAppService` هي الطبقة الرقيقة الوحيدة فوق المكوّنات الموجودة:
 
-## 5. تدفّق المصادقة (initData)
+| عملية الـ Mini App | المنطق المُعاد استخدامه |
+| --- | --- |
+| قائمة الشاتات | `OpenHandsClient.search_conversations` + نفس كاش البوت القصير (`list_cache`) |
+| تفاصيل شات | `get_conversations` + `get_last_exchange` + `messages.get_status/state_label/truncate` |
+| إرسال برومت | **`db.add_or_group_outbox`** (نفس الصندوق المتين + التجميع) ثم `worker.wake()` |
+| شات جديد | **`db.add_creation_job`** ثم `worker.wake()` |
+| متابعة/إلغاء | `db.add_watched` / `db.remove_watched` (أو `watcher.unwatch` لو موجود) |
+| الإشعارات | `db.get/set_notifications_enabled` |
+| الحالة | `messages.get_status` (نفس مصدر الحقيقة) |
+
+- **مفيش إرسال مباشر من الـ API**: البرومتات والشاتات الجديدة بتمر بنفس الـ workers المالكين
+  (at-most-once، تعافي عند إعادة التشغيل، تجميع) — مفيش ازدواج ولا سلوكين مختلفين.
+- الخدمة **ما بتبدأش أي worker**؛ بس بتنبّه الموجود عبر `application.bot_data`.
+
+## 6. تدفّق المصادقة (initData) + التحصين (S1)
 
 بيتّبع [إجراء تيليجرام الرسمي](https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app):
 
@@ -72,35 +93,95 @@ Telegram WebView ──HTTPS──▶ ingress (TLS) ──HTTP──▶ الحا
 2. السيرفر (`bot/web/initdata.py`):
    - يشتق المفتاح السري: `secret = HMAC_SHA256("WebAppData", bot_token)`.
    - يبني `data_check_string` (كل الحقول ما عدا `hash`/`signature`، مرتبة أبجديًا، مفصولة بـ `\n`).
-   - يقارن `HMAC_SHA256(secret, data_check_string)` مع `hash` بمقارنة **ثابتة الزمن** (`hmac.compare_digest`).
+   - **S1 (OHB2-06):** يتحقق إن `hash` **64 حرف hex بالظبط** (`^[0-9a-fA-F]{64}$`) **قبل** أي مقارنة.
+     أي قيمة فاضية/قصيرة/طويلة/غير hex/بأحرف غير ASCII ⇒ `InitDataError` منظّم (401)، وما توصلش
+     لـ `hmac.compare_digest` (اللي كان بيرمي `TypeError` ⇒ 500).
+   - يقارن بمقارنة **ثابتة الزمن** (`hmac.compare_digest`)، وملفوفة في `try` كأمان إضافي.
    - يتحقق من `auth_date`: يرفض المستقبلي (بهامش 30 ثانية) ويرفض الأقدم من `MINI_APP_INITDATA_MAX_AGE`.
    - **بعد** نجاح التوقيع بس بيقرأ `id` المستخدم من حقل `user`.
-3. لو التحقق نجح **و** الـ id ∈ `ALLOWED_TELEGRAM_ID` ⇒ يتعمل توكن جلسة عشوائي (opaque)
-   ويتحطّ في كوكي `ohb_session` (`HttpOnly; Secure; SameSite=Strict; Path=/`).
+3. لو التحقق نجح **و** الـ id ∈ `ALLOWED_TELEGRAM_ID` ⇒ توكن جلسة عشوائي (opaque)
+   في كوكي `ohb_session` (`HttpOnly; Secure; SameSite=Strict; Path=/`).
 4. الطلبات اللاحقة بتيجي بالكوكي؛ السيرفر يدوّر على الجلسة في **مخزن في الذاكرة** (TTL).
 5. `logout` بيلغي الجلسة ويمسح الكوكي.
 
 ### ضمانات أمنية
 
-- مفيش ثقة في أي `id` جاي من الجافاسكريبت — بيُقرأ بعد التوقيع، وبيتحقق من `ALLOWED_TELEGRAM_ID` على السيرفر.
+- مفيش ثقة في أي `id` جاي من الجافاسكريبت — بيُقرأ بعد التوقيع، وبيتحقق من `ALLOWED_TELEGRAM_ID`.
 - مفيش بيانات مصادقة في `localStorage`؛ الجلسة كوكي HTTP-only فقط.
 - مفيش أسرار أو توقيعات في الكوكي نفسه (توكن عشوائي، والسيرفر هو اللي يعرف معناه).
-- مستخدم غير مسموح ⇒ `403` (ومفيش أي تفاصيل حساسة في الرسالة).
+- مستخدم غير مسموح ⇒ `403` (ومفيش أي تفاصيل حساسة في الرسالة). أي جلسة لمستخدم اتشال من
+  القايمة بتتبطّل وتترفض.
 
-## 6. متغيرات البيئة المطلوبة
+## 7. تحديد المعدّل (S2)
 
-راجع الجدول في `README.md` و`.env.example`. الجديد:
+`bot/web/ratelimit.py::SlidingWindowLimiter` — نافذة منزلقة في الذاكرة، بدون تبعيات، بساعة قابلة للحقن.
+
+- **`/auth`:** لكل **IP** — افتراضيًا **10/دقيقة** و**30/ساعة** (`MINI_APP_AUTH_RATE_PER_MINUTE`,
+  `MINI_APP_AUTH_RATE_PER_HOUR`).
+- **باقي الـ API المصادَقة:** لكل **جلسة** — افتراضيًا **60/دقيقة** (`MINI_APP_API_RATE_PER_MINUTE`).
+- التجاوز ⇒ **`429`** مع هيدر **`Retry-After`** صحيح (بالثواني).
+- **الانفجارات مسموحة**: الحدود متسامحة مع دفعات صغيرة، والواجهة بتعمل retry واحد بسيط (700ms)،
+  فالاتصال الضعيف ما بيتعاقبش.
+- **تنضيف المدخلات المنتهية**: كل فحص بيشيل الطوابع الأقدم من أوسع نافذة.
+- **حد للذاكرة**: `MINI_APP_RATE_MAX_KEYS` (افتراضي 4096) مع طرد الأقدم (LRU) ⇒ مفيش نمو بلا حد.
+- **`/health` والأصول الثابتة مش متحدّدين** عشان فحص الصحة وتحميل الواجهة يفضلوا شغالين.
+- **مفيش تسجيل بيانات حساسة**: المفاتيح معرّفات مستعارة (توكن الجلسة أو `ip:...`)، مش توكنات.
+- الطلب المرفوض **ما بيتسجّلش** (عشان ما يمدّدش الحظر).
+
+## 8. تحديد IP العميل + الـ proxy (S3)
+
+**اكتشاف فعلي (probe على الـ runtime):** الـ ingress (Traefik) **ما بينضّفش** أي `X-Forwarded-For`
+جاي من العميل — بيعمل **إلحاق** للند الحقيقي على اليمين:
+
+```
+عميل مزوّر:  X-Forwarded-For: 203.0.113.7            (من العميل)
+اللي وصل:    X-Forwarded-For: 203.0.113.7, 10.1.1.62 (Traefik لحق 10.1.1.62)
+وكمان:       X-Real-Ip: 10.1.1.62 ، TCP client = 10.2.97.6 (hop داخلي تاني)
+```
+
+النتيجة: `X-Forwarded-For` كله **غير موثوق** هنا. لو منحنا Uvicorn ثقة (`proxy_headers=True`)،
+كان هياخد أول قيمة غير موثوقة من اليمين = **القيمة المزوّرة من العميل** ⇒ انتحال IP.
+لذلك:
+
+- **`proxy_headers=False`** في `bot/web/runner.py` — بنستخدم `request.client.host` (الند الحقيقي).
+- `bot/web/clientip.py::resolve_client_ip` بيسقط أي IP محلي/غير صالح تحت مفتاح واحد `"unknown"`.
+- **القيد الموثّق:** في الـ topology دي، كل العملاء المباشرين بيمرّوا عبر نفس الـ hop الداخلي،
+  فـ IP المستخدم النهائي **مش ممكن نستخرجه بثقة**. يعني تحديد المعدّل «لكل IP» بيقرب من «عام».
+  ده **الخيار المتحفّظ الآمن (fail closed)**: ما بنصدّقش أي هيدر يزوّره العميل، وما بنفترضش إن IP
+  شفناه هو المستخدم النهائي. لو النشر بقى خلف proxy موثوق إحنا نتحكّم فيه، بيتضاف نطاقه هنا
+  ونستخدم XFF بأمان.
+- **افتراض النشر:** الـ Mini App خلف ingress واحد بيتحكم فيه المشغّل، والوصول مقصور على المالك
+  المسموح بعد مصادقة initData. تحديد المعدّل دفاع إضافي (طبقة داخل العملية)، مش خط الدفاع الوحيد.
+
+## 9. حماية Origin (S4)
+
+طلبات **تغيّر الحالة** لازم تكون من أصل مسموح (`bot/web/app.py::_origin_ok`):
+
+- `Origin` لازم يطابق `mini_app_allowed_origins` (بتتشتق من `MINI_APP_URL`، أو صريحة في
+  `MINI_APP_ALLOWED_ORIGINS`). شبكة أمان للتطوير: نفس الـ host المطلق.
+- `Sec-Fetch-Site: cross-site` ⇒ رفض فوري (إشارة إضافية، مش بديل عن فحص الـ Origin).
+- الطلبات **قراءة** (GET) ما بتتطلبش Origin.
+- `SameSite=Strict` **ما اتضعّفش** — ده خط دفاع أول، وفحص الـ Origin خط تاني.
+- الرد الرفض: `403 {"error": "bad_origin"}`.
+
+## 10. متغيرات البيئة
 
 ```
 MINI_APP_URL=                 # رابط عام https (مطلوب لما MINI_APP_ENABLED=1)
 MINI_APP_ENABLED=0            # 1 لتشغيل خلفية ASGI جوه عملية البوت
-MINI_APP_PORT=12000           # منفذ الاستماع داخل الحاوية
-MINI_APP_INITDATA_MAX_AGE=300 # أقصى عمر initData بالثواني
-MINI_APP_SESSION_TTL=3600     # عمر الجلسة بالثواني
+MINI_APP_PORT=12000
+MINI_APP_INITDATA_MAX_AGE=300
+MINI_APP_SESSION_TTL=3600
 MINI_APP_COOKIE_SECURE=1      # 1 إنتاج، 0 تطوير محلي على http فقط
+# OHB2-06:
+MINI_APP_ALLOWED_ORIGINS=     # فاضية = بتتشتق من MINI_APP_URL (فواصل للزيادة)
+MINI_APP_AUTH_RATE_PER_MINUTE=10
+MINI_APP_AUTH_RATE_PER_HOUR=30
+MINI_APP_API_RATE_PER_MINUTE=60
+MINI_APP_RATE_MAX_KEYS=4096
 ```
 
-## 7. التطوير المحلي والاختبار
+## 11. التطوير المحلي والاختبار
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
@@ -109,38 +190,26 @@ cp .env.example .env   # املأ القيم، وحط MINI_APP_ENABLED=1 للت�
 python main.py
 ```
 
-للتجربة المحلية على http: خلي `MINI_APP_COOKIE_SECURE=0` (وإلا المتصفح مش هيقبل الكوكي على http).
-`MINI_APP_URL` لازم يفضل رابط https عام حتى في التطوير (ده نفس الرابط اللي تيليجرام بيفتحه).
+للتجربة المحلية على http: خلي `MINI_APP_COOKIE_SECURE=0`، وأضف `http://localhost:12000`
+لـ `MINI_APP_ALLOWED_ORIGINS`.
 
 اختبارات الـ Mini App:
 
 ```bash
 python -m pytest -q tests/test_miniapp_initdata.py tests/test_miniapp_api.py \
+    tests/test_miniapp_features.py tests/test_miniapp_ratelimit.py \
     tests/test_miniapp_integration.py tests/test_miniapp_config.py
 ```
 
-المساعد `tests/_miniapp_helpers.py` بيولّد `initData` موقّع صح بنفس خوارزمية تيليجرام، فالاختبارات
-بتختبر الكود الحقيقي مش نسخة مزيّفة.
-
-## 8. ضبط رابط HTTPS العام
-
-- الرابط اللي بيدخل `MINI_APP_URL` هو رابط الـ ingress العام اللي بيوصل لـ `MINI_APP_PORT` جوه الحاوية.
-  في بيئة OpenHands runtime ده زي `https://work-1-<id>.prod-runtime.all-hands.dev/` (منفذ محلي 12000).
-- الـ ingress بيعمل TLS termination بشهادة `Let's Encrypt` عامة (مطلوبة لـ Telegram WebView)،
-  والسيرفر بيتكلم HTTP محلي بس.
-- **مهم:** `MINI_APP_URL` لازم يكون رابط عام (مش loopback) — فيه تحقق في `bot/config.py` بيمنع غير كده.
-
-## 9. القيد غير المحلول: اسم مضيف مرتبط بالجلسة
+## 12. القيد غير المحلول: اسم مضيف مرتبط بالجلسة
 
 الـ runtime بتاع OpenHands **مؤقّت**: اسم المضيف (الـ work host) مرتبط بالجلسة وممكن يتغيّر عند
-إعادة تهيئة الـ sandbox. يعني الرابط الحالي **مش رابط إنتاج دائم**. لو محتاجين رابط ثابت، ده
-لسه **غير محلول** (راجع OHB2-04 §8/§9) — الحلول المحتملة: تثبيت runtime/رابط، أو واجهة ثابتة على
-مستضيف مجاني (GitHub Pages) مع الـ API على الـ runtime.
+إعادة تهيئة الـ sandbox ⇒ الرابط الحالي **مش رابط إنتاج دائم** (راجع OHB2-04 §8/§9).
 
-## 10. اللي فاضل لمهام OHB2 اللاحقة
+## 13. اللي فاضل لمهام OHB2 اللاحقة
 
-- ميزات البوت الكاملة جوه الـ Mini App (الشاتات، فتح شات، إرسال برومت، شات جديد، الملفات…).
 - جلسات **ثابتة عبر إعادة التشغيل** (المخزن الحالي في الذاكرة ⇒ أي restart بيلغي الجلسات).
-- Rate limiting أوضح للـ API، وربما CSRF token لعمليات الكتابة.
+- ميزات لسه مش معروضة في الـ Mini App: الملفات، التكلفة، تصدير الشات (موجودة في البوت، ومخفية
+  بـ `features.is_hidden`)، ونسخ الرد الكامل.
 - تفعيل `MINI_APP_ENABLED` في الإنتاج + تحديث `/app` يشاور على الواجهة الفعلية.
-- معالجة الرابط الثابت (القسم 9).
+- معالجة الرابط الثابت (القسم 12).

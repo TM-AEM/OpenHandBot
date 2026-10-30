@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 import time
 from dataclasses import dataclass
 from urllib.parse import parse_qsl
@@ -24,6 +25,10 @@ FUTURE_SKEW = 30
 _HASH_KEY = "hash"
 _SIGNATURE_KEY = "signature"  # Ed25519 (مش مستخدمينه؛ بنتجاهله بأمان)
 _WEBAAP_DATA_KEY = b"WebAppData"
+# توقيع تيليجرام لازم يكون 64 حرف hex. بنتحقق من الصيغة **قبل** المقارنة عشان أي قيمة
+# غلط (فاضية/قصيرة/طويلة/غير hex/بأحرف غير ASCII) تترفض كخطأ مصادقة منظّم، وما توصلش
+# لـ `hmac.compare_digest` اللي بيرمي `TypeError` على النصوص غير ASCII.
+_HASH_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 class InitDataError(RuntimeError):
@@ -85,10 +90,19 @@ def validate_init_data(
     provided_hash = fields.get(_HASH_KEY, "")
     if not provided_hash:
         raise InitDataError("التوقيع مفقود")
+    # فحص الصيغة قبل أي مقارنة: 64 حرف hex بالظبط. بيمنع أي قيمة غير ASCII توصل
+    # لـ `compare_digest` (اللي بيرمي TypeError) ويضمن إن الرفض منظّم ومتسق.
+    if not _HASH_RE.match(provided_hash):
+        raise InitDataError("صيغة التوقيع غير صحيحة")
 
     expected = _expected_hash(_data_check_string(pairs), bot_token)
-    # مقارنة ثابتة الزمن لمنع هجمات التوقيت.
-    if not hmac.compare_digest(expected, provided_hash):
+    # مقارنة ثابتة الزمن لمنع هجمات التوقيت. القيمتين hex ASCII بنفس الطول (64) دلوقتي،
+    # وبنلفّها في try كأمان إضافي لو أي قيمة غير متوقعة وصلت.
+    try:
+        match = hmac.compare_digest(expected, provided_hash)
+    except TypeError:
+        match = False
+    if not match:
         raise InitDataError("التوقيع غير صحيح")
 
     auth_raw = fields.get("auth_date", "")

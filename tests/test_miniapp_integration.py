@@ -250,3 +250,13 @@ def test_post_init_fails_fast_when_port_in_use(tmp_path, monkeypatch):
     finally:
         holder.close()
 
+
+
+def test_uvicorn_does_not_trust_proxy_headers(tmp_path):
+    """S3: لازم proxy_headers مقفولة، عشان الـ ingress بيلحق XFF من غير ما ينضّفه."""
+    from bot.web.runner import build_uvicorn_config
+
+    app = build_web_app(make_config(tmp_path), None)
+    cfg = build_uvicorn_config(app, "127.0.0.1", 12000)
+    # المقصود: Uvicorn ما يعيدش كتابة client من X-Forwarded-For أبدًا.
+    assert cfg.proxy_headers is False

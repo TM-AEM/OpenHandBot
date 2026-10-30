@@ -1,15 +1,18 @@
-"""تطبيق الـ Mini App (ASGI) — طبقة الـ web الرقيقة فوق نفس خدمات البوت (OHB2-05).
+"""تطبيق الـ Mini App (ASGI) — طبقة الـ web الرقيقة فوق نفس خدمات البوت (OHB2-05/06).
 
 مبادئ:
 - مفيش منطق أعمال هنا: الطلبات بتنادي نفس طبقة الخدمات/قاعدة البيانات اللي البوت بيستخدمها.
 - مفيش اتصال SQLite تاني: نفس كائن `Database` المملوك للعملية الواحدة.
 - مفيش تسريب أسرار: توكن البوت ومفتاح OpenHands ما بيتنقلوش للعميل أبدًا.
 - مصادقة صارمة: التحقق من initData على السيرفر + قايمة المالك المسموح.
+- OHB2-06: تحديد معدّل (لكل IP على /auth، ولكل جلسة على المسارات المصادَقة)،
+  وحماية Origin لطلبات تغيّر الحالة، وتحديد IP العميل بشكل متحفّظ (بدون ثقة في الهيدرز).
 """
 from __future__ import annotations
 
 import json
 import logging
+import math
 from pathlib import Path
 
 from starlette.applications import Starlette
@@ -17,8 +20,11 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from ..config import Config
-from ..features import is_hidden
+from ..errors import ApiError, error_text
+from .clientip import resolve_client_ip
 from .initdata import DEFAULT_MAX_AGE, InitDataError, TelegramUser, validate_init_data
+from .ratelimit import api_limiter, auth_limiter
+from .services import MiniAppService, ValidationError
 from .sessions import SessionStore
 
 log = logging.getLogger(__name__)
@@ -63,12 +69,15 @@ _STATIC_CSP = (
 )
 
 
-def _json(payload: dict, status: int = 200) -> JSONResponse:
-    return JSONResponse(payload, status_code=status, headers=dict(_SECURITY_HEADERS))
+def _json(payload: dict, status: int = 200, headers: dict | None = None) -> JSONResponse:
+    merged = dict(_SECURITY_HEADERS)
+    if headers:
+        merged.update(headers)
+    return JSONResponse(payload, status_code=status, headers=merged)
 
 
-def _error(status: int, code: str, message: str) -> JSONResponse:
-    return _json({"error": code, "message": message}, status=status)
+def _error(status: int, code: str, message: str, headers: dict | None = None) -> JSONResponse:
+    return _json({"error": code, "message": message}, status=status, headers=headers)
 
 
 class MiniApp:
@@ -77,12 +86,16 @@ class MiniApp:
     `db` هو **نفس** كائن قاعدة بيانات البوت (مفيش اتصال تاني) — بنقرأ منه قراءة فقط.
     """
 
-    def __init__(self, config: Config, db=None) -> None:
+    def __init__(self, config: Config, db=None, client=None, application=None) -> None:
         self._config = config
         self._db = db
+        self._service = MiniAppService(config, db, client, application)
         self.sessions = SessionStore(config.mini_app_session_ttl)
         self.max_age = config.mini_app_initdata_max_age or DEFAULT_MAX_AGE
         self.owner_id = config.owner_id
+        self.allowed_origins = set(config.mini_app_allowed_origins)
+        self.auth_limiter = auth_limiter(config)
+        self.api_limiter = api_limiter(config)
         self.router = Starlette(routes=self._routes())
 
     # ------------------------------------------------------------- helpers
@@ -125,6 +138,37 @@ class MiniApp:
             raise _BadJson()
         return data
 
+    def _rate_limited(self, limiter, key: str) -> JSONResponse | None:
+        allowed, retry = limiter.allow(key)
+        if allowed:
+            return None
+        retry_int = max(1, int(math.ceil(retry))) if retry > 0 else 1
+        return _error(
+            429,
+            "rate_limited",
+            "طلبات كتير أوي، جرّب تاني بعد شوية.",
+            headers={"Retry-After": str(retry_int)},
+        )
+
+    def _origin_ok(self, request) -> bool:
+        """طلبات تغيّر الحالة لازم تكون من نفس الأصل (دفاع CSRF على طبقة الـ Origin).
+
+        `Sec-Fetch-Site` إشارة إضافية (مش بديل): لو المتصفح قال صريح `cross-site`،
+        نرفض على طول. غياب الهيدر ما بيرفضش (عملاء مش متصفحات)، والـ Origin هو الحكم.
+        """
+        if request.headers.get("sec-fetch-site", "").lower() == "cross-site":
+            return False
+        origin = request.headers.get("origin")
+        if not origin:
+            return False
+        if origin in self.allowed_origins:
+            return True
+        # شبكة أمان للتطوير: نفس الأصل المطلق لطلب الـ http المحلي.
+        host = request.headers.get("host")
+        if host and origin in (f"http://{host}", f"https://{host}"):
+            return True
+        return False
+
     # -------------------------------------------------------------- routes
     def _routes(self) -> list[Route]:
         return [
@@ -132,16 +176,75 @@ class MiniApp:
             Route(f"{API_PREFIX}/auth", self.auth, methods=["POST"]),
             Route(f"{API_PREFIX}/auth/logout", self.logout, methods=["POST"]),
             Route(f"{API_PREFIX}/app/bootstrap", self.bootstrap, methods=["GET"]),
-            Route(f"{API_PREFIX}/{{path:path}}", self.api_not_found, methods=["GET", "POST", "PUT", "PATCH", "DELETE"]),
+            Route(f"{API_PREFIX}/app/notifications", self.notifications, methods=["POST"]),
+            Route(f"{API_PREFIX}/conversations", self.conversations, methods=["GET"]),
+            Route(
+                f"{API_PREFIX}/conversations/{{conversation_id}}",
+                self.conversation_detail,
+                methods=["GET"],
+            ),
+            Route(
+                f"{API_PREFIX}/conversations/{{conversation_id}}/status",
+                self.conversation_status,
+                methods=["GET"],
+            ),
+            Route(
+                f"{API_PREFIX}/conversations/{{conversation_id}}/prompt",
+                self.conversation_prompt,
+                methods=["POST"],
+            ),
+            Route(
+                f"{API_PREFIX}/conversations/{{conversation_id}}/watch",
+                self.conversation_watch,
+                methods=["POST"],
+            ),
+            Route(
+                f"{API_PREFIX}/conversations/{{conversation_id}}/watch",
+                self.conversation_unwatch,
+                methods=["DELETE"],
+            ),
+            Route(f"{API_PREFIX}/watches", self.watches, methods=["GET"]),
+            Route(f"{API_PREFIX}/repositories", self.repositories, methods=["GET"]),
+            Route(f"{API_PREFIX}/chats", self.create_chat, methods=["POST"]),
+            Route(
+                f"{API_PREFIX}/{{path:path}}",
+                self.api_not_found,
+                methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+            ),
             Route("/", self.index, methods=["GET"]),
             Route("/mini/", self.index, methods=["GET"]),
             Route("/mini/{path:path}", self.static_file, methods=["GET"]),
         ]
 
+    # --------------------------------------------------------------- guard
+    async def _guarded(self, request, *, state_changing: bool):
+        """يرجّع (session, error_response). بيفحص المعدّل والجلسة والـ Origin.
+
+        ترتيب الفحص: حد المعدّل (قبل أي شغل) ⇒ الجلسة ⇒ Origin (لو طلب بيغيّر الحالة).
+        """
+        session = self._session_from_cookie(request)
+        key = session.token if session is not None else f"ip:{resolve_client_ip(request)}"
+        limited = self._rate_limited(self.api_limiter, key)
+        if limited is not None:
+            return None, limited
+        if session is None:
+            return None, _error(401, "unauthenticated", "محتاج تسجيل دخول.")
+        if not self._allowed(session.user_id):
+            self.sessions.revoke(session.token)
+            return None, _error(403, "forbidden", "الحساب ده مش مسموح له.")
+        if state_changing and not self._origin_ok(request):
+            return None, _error(403, "bad_origin", "الطلب جاي من أصل غير مسموح.")
+        return session, None
+
+    # -------------------------------------------------------------- health
     async def health(self, request):
         return _json({"status": "ok", "service": "openhandbot-mini", "version": 1})
 
+    # ---------------------------------------------------------------- auth
     async def auth(self, request):
+        limited = self._rate_limited(self.auth_limiter, resolve_client_ip(request))
+        if limited is not None:
+            return limited
         try:
             body = await self._read_body(request)
         except _BodyTooLarge:
@@ -178,42 +281,186 @@ class MiniApp:
         return response
 
     async def logout(self, request):
-        self.sessions.revoke(request.cookies.get(COOKIE_NAME))
+        session, err = await self._guarded(request, state_changing=True)
+        if err is not None:
+            return err
+        self.sessions.revoke(session.token)
         response = _json({"ok": True})
         response.delete_cookie(COOKIE_NAME, path="/")
         return response
 
+    # ----------------------------------------------------------- bootstrap
     async def bootstrap(self, request):
-        session = self._session_from_cookie(request)
-        if session is None:
-            return _error(401, "unauthenticated", "محتاج تسجيل دخول.")
-        if not self._allowed(session.user_id):
-            self.sessions.revoke(session.token)
-            return _error(403, "forbidden", "الحساب ده مش مسموح له.")
-        return _json(
-            {
-                "user": {"display_name": session.profile.get("display_name", "")},
-                "settings": {"notifications_enabled": self._config_notifications()},
-                "mini_app": {"version": 1, "locale": "ar", "direction": "rtl"},
-                "features": {
-                    name: not is_hidden(name)
-                    for name in ("files", "export", "cost", "followups")
-                },
-            }
-        )
+        session, err = await self._guarded(request, state_changing=False)
+        if err is not None:
+            return err
+        return _json(self._service.bootstrap(session))
 
-    def _config_notifications(self) -> bool:
-        """لقطة قراءة-فقط من قاعدة بيانات البوت. لو حصل خطأ نرجّع الافتراضي (مفعّل)."""
-        if self._db is None:
-            return True
+    async def notifications(self, request):
+        session, err = await self._guarded(request, state_changing=True)
+        if err is not None:
+            return err
         try:
-            return bool(self._db.get_notifications_enabled())
-        except Exception:  # noqa: BLE001 - القراءة ما تكسّرش الصفحة
-            return True
+            body = await self._read_body(request)
+        except _BodyTooLarge:
+            return _error(413, "payload_too_large", "الطلب كبير أوي.")
+        except _BadJson:
+            return _error(400, "bad_request", "صيغة الطلب غير صحيحة.")
+        enabled = body.get("enabled")
+        if not isinstance(enabled, bool):
+            return _error(400, "bad_request", "قيمة الإشعارات لازم تكون true أو false.")
+        try:
+            state = self._service.set_notifications(enabled)
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json({"ok": True, "notifications_enabled": state})
+
+    # ------------------------------------------------------- conversations
+    async def conversations(self, request):
+        session, err = await self._guarded(request, state_changing=False)
+        if err is not None:
+            return err
+        try:
+            page = int(request.query_params.get("page", "0") or 0)
+        except ValueError:
+            return _error(400, "bad_request", "رقم الصفحة غير صالح.")
+        refresh = request.query_params.get("refresh") == "1"
+        try:
+            data = await self._service.list_conversations(page=page, refresh=refresh)
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json(data)
+
+    async def conversation_detail(self, request):
+        session, err = await self._guarded(request, state_changing=False)
+        if err is not None:
+            return err
+        try:
+            data = await self._service.get_conversation(
+                request.path_params.get("conversation_id", "")
+            )
+        except ValidationError as exc:
+            return _error(400, "bad_request", str(exc))
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json(data)
+
+    async def conversation_status(self, request):
+        session, err = await self._guarded(request, state_changing=False)
+        if err is not None:
+            return err
+        try:
+            data = await self._service.get_status(request.path_params.get("conversation_id", ""))
+        except ValidationError as exc:
+            return _error(400, "bad_request", str(exc))
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json(data)
+
+    async def conversation_prompt(self, request):
+        session, err = await self._guarded(request, state_changing=True)
+        if err is not None:
+            return err
+        try:
+            body = await self._read_body(request)
+        except _BodyTooLarge:
+            return _error(413, "payload_too_large", "الطلب كبير أوي.")
+        except _BadJson:
+            return _error(400, "bad_request", "صيغة الطلب غير صحيحة.")
+        try:
+            data = await self._service.send_prompt(
+                request.path_params.get("conversation_id", ""), body.get("text", "")
+            )
+        except ValidationError as exc:
+            return _error(400, "bad_request", str(exc))
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json(data)
+
+    async def conversation_watch(self, request):
+        session, err = await self._guarded(request, state_changing=True)
+        if err is not None:
+            return err
+        try:
+            data = await self._service.watch(request.path_params.get("conversation_id", ""))
+        except ValidationError as exc:
+            return _error(400, "bad_request", str(exc))
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json(data)
+
+    async def conversation_unwatch(self, request):
+        session, err = await self._guarded(request, state_changing=True)
+        if err is not None:
+            return err
+        try:
+            data = self._service.unwatch(request.path_params.get("conversation_id", ""))
+        except ValidationError as exc:
+            return _error(400, "bad_request", str(exc))
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json(data)
+
+    async def watches(self, request):
+        session, err = await self._guarded(request, state_changing=False)
+        if err is not None:
+            return err
+        try:
+            page = int(request.query_params.get("page", "0") or 0)
+        except ValueError:
+            page = 0
+        try:
+            data = self._service.list_watches(page=page)
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json(data)
+
+    async def repositories(self, request):
+        session, err = await self._guarded(request, state_changing=False)
+        if err is not None:
+            return err
+        try:
+            page = int(request.query_params.get("page", "0") or 0)
+        except ValueError:
+            page = 0
+        try:
+            data = await self._service.list_repositories(
+                query=request.query_params.get("q", ""), page=page
+            )
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json(data)
+
+    async def create_chat(self, request):
+        session, err = await self._guarded(request, state_changing=True)
+        if err is not None:
+            return err
+        try:
+            body = await self._read_body(request)
+        except _BodyTooLarge:
+            return _error(413, "payload_too_large", "الطلب كبير أوي.")
+        except _BadJson:
+            return _error(400, "bad_request", "صيغة الطلب غير صحيحة.")
+        try:
+            data = await self._service.create_chat(
+                body.get("repository", ""), body.get("text", "")
+            )
+        except ValidationError as exc:
+            return _error(400, "bad_request", str(exc))
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json(data)
+
+    def _api_error(self, exc: ApiError) -> JSONResponse:
+        status = exc.status_code if exc.status_code and 400 <= exc.status_code < 600 else 502
+        if status >= 500:
+            log.warning("خطأ خدمة في الـ Mini App: %s", type(exc).__name__)
+        return _error(status, "api_error", error_text(exc))
 
     async def api_not_found(self, request):
         return _error(404, "not_found", "المسار مش موجود.")
 
+    # -------------------------------------------------------------- static
     async def index(self, request):
         return self._file_response(INDEX_FILE, fallback_to_index=True)
 
@@ -221,7 +468,6 @@ class MiniApp:
         rel = request.path_params.get("path", "")
         return self._serve_relative(rel)
 
-    # -------------------------------------------------------------- static
     def _safe_path(self, rel: str) -> Path | None:
         if not rel:
             return None
@@ -273,6 +519,6 @@ class _BadJson(Exception):
     pass
 
 
-def build_web_app(config: Config, db=None) -> Starlette:
+def build_web_app(config: Config, db=None, client=None, application=None) -> Starlette:
     """يبني تطبيق ASGI مربوط بنفس قاعدة بيانات البوت (بدون اتصال تاني)."""
-    return MiniApp(config, db).router
+    return MiniApp(config, db, client, application).router

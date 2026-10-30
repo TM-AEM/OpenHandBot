@@ -52,3 +52,57 @@ def test_mini_app_positive_int_validation():
 
 def test_mini_app_cookie_secure_can_be_disabled_for_dev():
     assert load_config(env(MINI_APP_COOKIE_SECURE="0")).mini_app_cookie_secure is False
+
+
+# ---------------------------------------------------------------- OHB2-06
+def test_rate_limit_defaults():
+    cfg = load_config(env())
+    assert cfg.mini_app_auth_rate_per_minute == 10
+    assert cfg.mini_app_auth_rate_per_hour == 30
+    assert cfg.mini_app_api_rate_per_minute == 60
+    assert cfg.mini_app_rate_max_keys == 4096
+
+
+def test_rate_limit_overrides_and_validation():
+    cfg = load_config(
+        env(
+            MINI_APP_AUTH_RATE_PER_MINUTE="5",
+            MINI_APP_AUTH_RATE_PER_HOUR="20",
+            MINI_APP_API_RATE_PER_MINUTE="40",
+            MINI_APP_RATE_MAX_KEYS="128",
+        )
+    )
+    assert cfg.mini_app_auth_rate_per_minute == 5
+    assert cfg.mini_app_auth_rate_per_hour == 20
+    assert cfg.mini_app_api_rate_per_minute == 40
+    assert cfg.mini_app_rate_max_keys == 128
+    with pytest.raises(ConfigError):
+        load_config(env(MINI_APP_AUTH_RATE_PER_MINUTE="0"))
+    with pytest.raises(ConfigError):
+        load_config(env(MINI_APP_API_RATE_PER_MINUTE="-1"))
+
+
+def test_allowed_origins_derived_from_mini_app_url():
+    cfg = load_config(env(MINI_APP_URL="https://work-1.example.test/mini/"))
+    assert cfg.mini_app_allowed_origins == frozenset({"https://work-1.example.test"})
+
+
+def test_allowed_origins_explicit_override():
+    cfg = load_config(
+        env(
+            MINI_APP_URL="https://work-1.example.test/mini/",
+            MINI_APP_ALLOWED_ORIGINS="https://work-1.example.test, http://localhost:12000",
+        )
+    )
+    assert cfg.mini_app_allowed_origins == frozenset(
+        {"https://work-1.example.test", "http://localhost:12000"}
+    )
+
+
+def test_allowed_origins_rejects_invalid():
+    with pytest.raises(ConfigError):
+        load_config(env(MINI_APP_ALLOWED_ORIGINS="not-an-origin"))
+
+
+def test_allowed_origins_empty_when_no_url():
+    assert load_config(env()).mini_app_allowed_origins == frozenset()
