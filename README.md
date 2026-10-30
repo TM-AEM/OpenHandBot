@@ -58,6 +58,12 @@ python main.py
 | `WATCHER_INTERVAL` | اختياري، فترة الاستطلاع بالثواني بين 5 و3600، الافتراضي `25` |
 | `LOG_LEVEL` | اختياري، واحد من `DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL`، الافتراضي `INFO` |
 | `DB_PATH` | اختياري، مسار قاعدة SQLite، الافتراضي `bot_state.sqlite3` |
+| `MINI_APP_URL` | اختياري، رابط الـ Mini App العام (https). فاضي = الميزة متوقفة |
+| `MINI_APP_ENABLED` | اختياري، `1` لتشغيل خلفية الـ Mini App (ASGI) جوه نفس عملية البوت. الافتراضي `0` |
+| `MINI_APP_PORT` | اختياري، منفذ استماع السيرفر جوه الحاوية، الافتراضي `12000` |
+| `MINI_APP_INITDATA_MAX_AGE` | اختياري، أقصى عمر لبيانات تهيئة تيليجرام بالثواني، الافتراضي `300` |
+| `MINI_APP_SESSION_TTL` | اختياري، عمر جلسة الـ Mini App بالثواني، الافتراضي `3600` |
+| `MINI_APP_COOKIE_SECURE` | اختياري، `1` (افتراضي) لكوكي Secure؛ `0` للتطوير المحلي على http فقط |
 
 ## الاختبار
 

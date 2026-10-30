@@ -17,6 +17,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from ..config import Config
+from ..features import is_hidden
 from .initdata import DEFAULT_MAX_AGE, InitDataError, TelegramUser, validate_init_data
 from .sessions import SessionStore
 
@@ -194,7 +195,10 @@ class MiniApp:
                 "user": {"display_name": session.profile.get("display_name", "")},
                 "settings": {"notifications_enabled": self._config_notifications()},
                 "mini_app": {"version": 1, "locale": "ar", "direction": "rtl"},
-                "features": {"files": False, "export": False, "cost": False, "followups": False},
+                "features": {
+                    name: not is_hidden(name)
+                    for name in ("files", "export", "cost", "followups")
+                },
             }
         )
 
