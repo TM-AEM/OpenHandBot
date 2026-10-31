@@ -13,4 +13,5 @@ export AUTOPUSH_INTERVAL="$INTERVAL"
 export AUTOPUSH_BRANCH="${AUTOPUSH_BRANCH:-main}"
 
 echo "[$(date -u +%FT%TZ)] starting autopush daemon: repo=$REPO_DIR interval=${INTERVAL}s log=$LOG" >>"$LOG"
-exec python3 "$DIR/main.py" --daemon >>"$LOG" 2>&1
+# -u keeps the log readable in real time despite the redirect.
+exec python3 -u "$DIR/main.py" --daemon >>"$LOG" 2>&1
