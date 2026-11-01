@@ -34,7 +34,8 @@ Phase 0 is read-only: **no production code was changed** to produce this documen
 
 ## 4. Feature matrix (Telegram side, from handler registration + `bot/features.py`)
 
-`DEFERRED_FEATURES_HIDDEN = True`; `HIDDEN_FEATURES = {files, export, cost, followups}`.
+`DEFERRED_FEATURES_HIDDEN = False` (features enabled — F-08 reactivation, Option A, 2026-11-01);
+`HIDDEN_FEATURES = {files, export, cost, followups}`.
 
 | Feature | Handler(s) | Telegram state | Mini App state | Notes |
 |---|---|---|---|---|
@@ -47,13 +48,14 @@ Phase 0 is read-only: **no production code was changed** to produce this documen
 | Status | `show_status` | visible | planned | `^status:` |
 | Copy / full reply | `copy_reply`, `full_reply` | visible | planned | `^copy:`, `^full:` |
 | Outbox ops | `outbox_list/status/discard/mark_sent` | visible | planned | `confirm` required on writes |
-| **Followups** | `list_watches`, `watch_conversation`, `unwatch_conversation` | **hidden** | planned | `is_hidden("followups")` |
-| **Cost** | `show_cost` | **hidden** | planned | `is_hidden("cost")` |
-| **Export** | `export_conversation` | **hidden** | planned | `is_hidden("export")` |
-| **Files** | `list_files`, `show_file` | **hidden** | planned | `is_hidden("files")` |
+| **Followups** | `list_watches`, `watch_conversation`, `unwatch_conversation` | **visible** (F-08) | planned | `is_hidden("followups")`; `unwatch` ownership exception (F-07) |
+| **Cost** | `show_cost` | **visible** (F-08) | planned | `is_hidden("cost")` |
+| **Export** | `export_conversation` | **visible** (F-08) | planned | `is_hidden("export")` |
+| **Files** | `list_files`, `show_file` | **visible** (F-08) | planned | `is_hidden("files")` |
 
-All four hidden features have complete handler + service code and data; only entry points
-are suppressed. Auto-follow after prompt (`bot/watcher.py`) remains active regardless.
+All four features have complete handler + service code and data and are now **enabled** (entry points
+registered) after the F-08 reactivation; they can be hidden again as a group by setting
+`DEFERRED_FEATURES_HIDDEN = True`. Auto-follow after prompt (`bot/watcher.py`) remains active regardless.
 
 ## 5. Services and state owners (single-owner, must not be duplicated)
 
