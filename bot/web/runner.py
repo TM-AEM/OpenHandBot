@@ -64,6 +64,12 @@ def build_uvicorn_config(app: Starlette, host: str, port: int) -> uvicorn.Config
         access_log=False,
         server_header=False,
         lifespan="on",
+        # S3: ما بنستخدمش --proxy-headers. الـ ingress (Traefik) بيلحق الند على
+        # X-Forwarded-For من غير ما ينضّف القيمة الجاية من العميل، فلو اتمنح Uvicorn
+        # ثقة كان هياخد أول قيمة من اليمين (المزوّرة من العميل) ⇒ انتحال IP. بنسيب
+        # `request.client.host` هو الند الحقيقي، وبنسقط أي IP محلي/غير صالح تحت مفتاح
+        # واحد في طبقة تحديد المعدّل (شوف bot/web/clientip.py).
+        proxy_headers=False,
     )
 
 

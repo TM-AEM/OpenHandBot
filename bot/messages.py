@@ -1,6 +1,8 @@
 """نصوص عربي + تقسيم الرسايل الطويلة عند حد تيليجرام."""
 from __future__ import annotations
 
+import math
+
 TELEGRAM_LIMIT = 4096
 MAX_PARTS = 3
 # TASK 55 (المرحلة B): حدود معاينة العرض الخفيف + مساحة محجوزة لذيل التوجيه.
@@ -156,20 +158,36 @@ def format_conversation_view(conv: dict, user_text: str | None, reply: str | Non
     return header + user_block + reply_block + _NO_REPLY, False
 
 
+def _finite_number(value):
+    """رقم محدود (int/float، مش bool) أو None — نفس تحقّق السيرفر (OHB2-09-A2-03)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
 def format_cost(metrics: dict | None) -> str:
-    """سطر التكلفة والتوكنز من حقل metrics على الشات."""
+    """سطر التكلفة والتوكنز من حقل metrics على الشات.
+
+    العقد: الحقل `accumulated_cost` بلا عملة مثبتة ⇒ **مفيش** أي رمز عملة (`$`) ولا
+    اسم عملة في المخرَج (OHB2-09-A2-03، نفس قرار OHB2-09-04-R1 على الواجهة). القيم
+    غير المحدودة (NaN/±Infinity) والـ bool والقيم غير الرقمية بتتجاهل (مفيش تمثيل كاذب).
+    """
     if not metrics:
         return "مفيش بيانات تكلفة."
-    cost = metrics.get("accumulated_cost")
+    cost = _finite_number(metrics.get("accumulated_cost"))
     usage = metrics.get("accumulated_token_usage") or {}
     model = metrics.get("model_name") or usage.get("model") or "غير معروف"
     lines = [f"الموديل: {model}"]
     if cost is not None:
+        # F1 (BATCH-C): عدد صحيح ضخم (أكبر من مدى الـ double) بيكسر float() بـ OverflowError.
+        # `_finite_number` بيقبله (int محدود) لكن التحويل ممكن يفشل ⇒ نرجع للتمثيل النصي
+        # الدقيق للعدد الصحيح بدل ما نرمي استثناء جوه معالج الـ callback.
         try:
-            cost = f"{float(cost):.4f}"
-        except (TypeError, ValueError):
-            pass
-        lines.append(f"التكلفة التراكمية: ${cost}")
+            lines.append(f"التكلفة التراكمية: {float(cost):.4f}")
+        except (OverflowError, ValueError):
+            lines.append(f"التكلفة التراكمية: {cost}")
     prompt = usage.get("prompt_tokens")
     completion = usage.get("completion_tokens")
     if prompt is not None or completion is not None:

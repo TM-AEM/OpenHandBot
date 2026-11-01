@@ -160,6 +160,10 @@ def test_list_conversations_ignores_non_owner(tmp_path):
 
 
 class DetailClient:
+    # OHB2-09-A2-01/02: تفويض الشات بقى بيتحقّق من الملكية ⇒ العميل الوهمي بيعرّف هوية
+    # `/users/me` وبيضمن `created_by_user_id` مطابق (تقدر تتخطّى القيمة صراحةً في `conv`).
+    OWNER_UUID = "owner-uuid-123"
+
     def __init__(self, conv, files=None, content="", blob=b"zip"):
         self._conv = conv
         self._files = files or []
@@ -167,12 +171,25 @@ class DetailClient:
         self._blob = blob
 
     async def get_conversations(self, ids):
-        return [self._conv] if self._conv else []
+        if not self._conv:
+            return []
+        conv = {
+            **self._conv,
+            "created_by_user_id": self._conv.get("created_by_user_id", self.OWNER_UUID),
+        }
+        return [conv]
+
+    async def get_current_user(self):
+        return {"id": self.OWNER_UUID}
 
     async def list_files(self, conversation_id, path=""):
         return self._files
 
     async def read_file(self, conversation_id, file_path):
+        return self._content
+
+    async def read_file_text_bounded(self, conversation_id, file_path, max_response_bytes=None):
+        # OHB2-09-06: مسار البوت بقى بيقرا محدود عبر FileService ⇒ الفيك لازم يدعم العقد ده.
         return self._content
 
     async def export_conversation(self, conversation_id):
@@ -289,7 +306,8 @@ def test_show_cost_reports_metrics(tmp_path):
     ctx = _ctx_with(tmp_path, client)
     update = _cb_update(1, "cost:c1")
     asyncio.run(h.show_cost(update, ctx))
-    assert "$2.5" in update.callback_query.edits[-1]
+    assert "$2.5" not in update.callback_query.edits[-1]  # OHB2-09-A2-03: مفيش عملة مفبركة
+    assert "2.5000" in update.callback_query.edits[-1]
 
 
 def test_list_files_caches_and_paginates(tmp_path):
@@ -703,6 +721,8 @@ def test_create_chat_direct_ambiguous_is_unknown(tmp_path):
 class ExchangeClient:
     """عميل موحّد للاختبارات: شات + تبادل + قايمة مع عدّادات نداءات."""
 
+    OWNER_UUID = "owner-uuid-123"
+
     def __init__(self, conv, user_text="برومتي", reply="ردي", *, open_error=None,
                  exchange_error=None, list_items=None):
         self._conv = conv
@@ -717,7 +737,13 @@ class ExchangeClient:
     async def get_conversations(self, ids):
         if self._open_error:
             raise self._open_error
-        return [self._conv] if self._conv else []
+        if not self._conv:
+            return []
+        conv = {**self._conv, "created_by_user_id": self._conv.get("created_by_user_id", self.OWNER_UUID)}
+        return [conv]
+
+    async def get_current_user(self):
+        return {"id": self.OWNER_UUID}
 
     async def get_last_exchange(self, cid):
         self.exchange_calls += 1

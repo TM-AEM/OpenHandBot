@@ -196,3 +196,122 @@ def test_remove_watched_missing_row_is_noop(tmp_path):
     db = Database(str(tmp_path / "t.sqlite3"))
     db.remove_watched("nope")  # مفيش استثناء
     assert not db.is_watched("nope")
+
+
+# =====================================================================
+# OHB2-08-01: علامة التسليم المعلّق الدائمة للمُبلّغ العام (notifier_pending)
+# =====================================================================
+class _ReconcileFailsDb(Database):
+    """record_notification_sent يرمي قبل أي كتابة (لمحاكاة فشل التسجيل الدائم)."""
+
+    def record_notification_sent(self, cid, status, now, *, _commit=True):
+        raise sqlite3.OperationalError("disk I/O error (record)")
+
+
+def test_notifier_pending_migration_adds_table_and_is_idempotent(tmp_path):
+    """قاعدة قديمة (بدون notifier_pending) بتاخد الجدول إضافيًا، والترقية آمنة تتكرر."""
+    path = str(tmp_path / "legacy_np.sqlite3")
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        "CREATE TABLE watched (conversation_id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '',"
+        " last_state TEXT, chat_id INTEGER, submitted_at TEXT, added_at TEXT,"
+        " retry_count INTEGER NOT NULL DEFAULT 0);"
+    )
+    conn.execute("INSERT INTO watched(conversation_id, title) VALUES('c1', 'عنوان')")
+    conn.commit()
+    conn.close()
+
+    db = Database(path)  # الترقية هنا
+    assert db.list_notifier_pending() == {}
+    db.set_notifier_pending("c1", "finished", "t1")
+    assert db.get_notifier_pending("c1") == "finished"
+    db.close()
+
+    db2 = Database(path)  # إعادة فتح ⇒ الترقية تتكرر بأمان (ما تفقدش الصف)
+    assert db2.get_notifier_pending("c1") == "finished"
+    assert len(db2.list_watched()) == 1  # بيانات قديمة ما اتلمستش
+    db2.close()
+
+
+def test_notifier_pending_set_get_clear(tmp_path):
+    db = Database(str(tmp_path / "t.sqlite3"))
+    assert db.get_notifier_pending("c1") is None
+    db.set_notifier_pending("c1", "finished", "t1")
+    assert db.get_notifier_pending("c1") == "finished"
+    assert db.list_notifier_pending() == {"c1": "finished"}
+    db.set_notifier_pending("c1", "error", "t2")  # تحديث (upsert)
+    assert db.get_notifier_pending("c1") == "error"
+    db.clear_notifier_pending("c1")
+    assert db.get_notifier_pending("c1") is None
+    db.close()
+
+
+def test_reconcile_notifier_pending_records_and_clears(tmp_path):
+    db = Database(str(tmp_path / "t.sqlite3"))
+    db.upsert_notification_state("c1", status="running", notified_status="running", updated_at="t")
+    db.set_notifier_pending("c1", "finished", "t1")
+
+    recorded = db.reconcile_notifier_pending("c1", "t2")
+
+    assert recorded == "finished"
+    assert db.get_notification_state("c1").notified_status == "finished"
+    assert db.get_notifier_pending("c1") is None
+    db.close()
+
+
+def test_reconcile_notifier_pending_no_marker_is_noop(tmp_path):
+    db = Database(str(tmp_path / "t.sqlite3"))
+    assert db.reconcile_notifier_pending("c1", "t1") is None
+    db.close()
+
+
+def test_reconcile_notifier_pending_failure_retains_marker(tmp_path):
+    """فشل التسجيل الدائم ⇒ العلامة تفضل (إعادة محاولة آمنة، مفيش فقد دليل)."""
+    db = _ReconcileFailsDb(str(tmp_path / "t.sqlite3"))
+    db.upsert_notification_state("c1", status="running", notified_status="running", updated_at="t")
+    db.set_notifier_pending("c1", "finished", "t1")
+
+    with pytest.raises(sqlite3.OperationalError):
+        db.reconcile_notifier_pending("c1", "t2")
+
+    assert db.get_notifier_pending("c1") == "finished"  # العلامة باقية
+    assert db.get_notification_state("c1").notified_status == "running"  # ما اتسجّلش
+    db.close()
+
+
+# =====================================================================
+# OHB2-08-02R: مواعيد إعادة المحاولة الدائمة (DB layer)
+# =====================================================================
+def test_retry_not_before_migration_adds_table_and_is_idempotent(tmp_path):
+    """الجدول يتعمل تلقائيًا لقاعدة قديمة، وإعادة الفتح ما بتأثرش على الصفوف."""
+    path = str(tmp_path / "t.sqlite3")
+    db = Database(path)
+    db.set_retry_not_before("c1", "2030-01-01T00:00:00+00:00")
+    db.close()
+
+    db2 = Database(path)  # إعادة فتح ⇒ المخطط يتطبّق تاني (idempotent)
+    assert db2.get_retry_not_before("c1") == "2030-01-01T00:00:00+00:00"
+    db2.close()
+
+
+def test_retry_not_before_set_get_clear(tmp_path):
+    db = Database(str(tmp_path / "t.sqlite3"))
+    assert db.get_retry_not_before("c1") is None
+    db.set_retry_not_before("c1", "2030-01-01T00:00:00+00:00")
+    assert db.get_retry_not_before("c1") == "2030-01-01T00:00:00+00:00"
+    db.set_retry_not_before("c1", "2031-01-01T00:00:00+00:00")  # upsert
+    assert db.get_retry_not_before("c1") == "2031-01-01T00:00:00+00:00"
+    db.clear_retry_not_before("c1")
+    assert db.get_retry_not_before("c1") is None
+    db.close()
+
+
+def test_retry_not_before_isolated_per_conversation(tmp_path):
+    """كل محادثة لها موعدها المستقل (ما بتتأثرش ببعض)."""
+    db = Database(str(tmp_path / "t.sqlite3"))
+    db.set_retry_not_before("c1", "2030-01-01T00:00:00+00:00")
+    assert db.get_retry_not_before("c2") is None
+    db.clear_retry_not_before("c1")
+    assert db.get_retry_not_before("c2") is None
+    assert db.list_retry_not_before() == {}
+    db.close()

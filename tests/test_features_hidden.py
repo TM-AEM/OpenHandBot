@@ -40,11 +40,12 @@ def _make_config(tmp_path):
     )
 
 
-def test_deferred_features_are_hidden_by_default():
-    assert features.is_hidden("files")
-    assert features.is_hidden("export")
-    assert features.is_hidden("cost")
-    assert features.is_hidden("followups")
+def test_deferred_features_are_restored_by_default():
+    """OHB2-09-06/07: الميزات الأربع اتسترجعت (مفعّلة افتراضيًا)."""
+    assert not features.is_hidden("files")
+    assert not features.is_hidden("export")
+    assert not features.is_hidden("cost")
+    assert not features.is_hidden("followups")
 
 
 def test_core_actions_remain_available_in_menu_and_conversation():
@@ -55,22 +56,39 @@ def test_core_actions_remain_available_in_menu_and_conversation():
         assert cb in convo
 
 
-def test_no_deferred_callbacks_in_any_user_facing_menu():
+def test_deferred_callbacks_are_restored_in_user_facing_menus():
+    """OHB2-09-06: الأزرار المسترجَعة بقت ظاهرة في القوايم."""
+    menu = _callbacks(kb.main_menu())
+    unwatched = _callbacks(kb.conversation_actions("c1", watched=False))
+    watched = _callbacks(kb.conversation_actions("c1", watched=True))
+    for cb in ("watched:0", "files:c1:0", "cost:c1", "export:c1"):
+        assert cb in (menu + unwatched), cb
+    assert "watch:c1" in unwatched
+    assert "unwatch:c1" in watched
+
+
+def test_app_registers_deferred_handlers_when_restored(tmp_path):
+    """OHB2-09-06: تسجيل الـ handlers المسترجَعة بيفرّج نقاط الدخول دي."""
+    app = build_application(_make_config(tmp_path))
+    pats = _patterns(app)
+    for prefix in (r"^files:", r"^file:", r"^cost:", r"^export:", r"^watch:", r"^unwatch:", r"^watched:"):
+        assert prefix in pats, prefix
+    # الأساسيات لسه متسجّلة.
+    for prefix in (r"^list:", r"^open:", r"^reply:", r"^status:", r"^newchat$"):
+        assert prefix in pats, prefix
+
+
+def test_hide_switch_still_hides_when_enabled(monkeypatch, tmp_path):
+    """آلية الإخفاء لسه شغّالة: لو المفتاح اتشغّل، نقاط الدخول تختفي تاني (بدون حذف)."""
+    monkeypatch.setattr(features, "DEFERRED_FEATURES_HIDDEN", True)
     menu = _callbacks(kb.main_menu())
     convo = _callbacks(kb.conversation_actions("c1", watched=True))
-    all_cbs = menu + convo
     for prefix in ("files:", "file:", "cost:", "export:", "watch:", "unwatch:", "watched:"):
-        assert not any(cb.startswith(prefix) for cb in all_cbs), prefix
-
-
-def test_app_does_not_register_deferred_handlers(tmp_path):
+        assert not any(cb.startswith(prefix) for cb in (menu + convo)), prefix
     app = build_application(_make_config(tmp_path))
     pats = _patterns(app)
     for prefix in (r"^files:", r"^file:", r"^cost:", r"^export:", r"^watch:", r"^unwatch:", r"^watched:"):
         assert prefix not in pats, prefix
-    # الأساسيات متسجّلة فعلاً.
-    for prefix in (r"^list:", r"^open:", r"^reply:", r"^status:", r"^newchat$"):
-        assert prefix in pats, prefix
 
 
 def test_hiding_does_not_delete_implementations_or_schema():

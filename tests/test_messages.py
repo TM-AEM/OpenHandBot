@@ -143,10 +143,22 @@ def test_format_cost():
             "accumulated_token_usage": {"prompt_tokens": 100, "completion_tokens": 20},
         }
     )
-    assert "$1.25" in out
+    assert "1.2500" in out
+    assert "$" not in out  # OHB2-09-A2-03: مفيش عملة مفبركة
+    assert "usd" not in out.lower()
     assert "claude" in out
     assert "100" in out and "20" in out
     assert format_cost(None) == "مفيش بيانات تكلفة."
+
+
+def test_format_cost_no_currency_and_rejects_non_finite():
+    # OHB2-09-A2-03: نفس عقد OHB2-09-04-R1 — الحقل بلا عملة مثبتة ⇒ مفيش رمز عملة،
+    # والقيم غير المحدودة/الـ bool بتتجاهل (مفيش تمثيل كاذب).
+    assert "$" not in format_cost({"accumulated_cost": 2.5})
+    for bad in (float("nan"), float("inf"), float("-inf"), True, "x"):
+        out = format_cost({"accumulated_cost": bad, "model_name": "m"})
+        assert "التكلفة" not in out, (bad, out)
+    assert format_cost({"accumulated_cost": 0}) == "الموديل: غير معروف\nالتكلفة التراكمية: 0.0000"
 
 
 # =====================================================================
@@ -249,3 +261,13 @@ def test_view_long_title_and_prompt_stay_within_limit():
     out, _ = format_conversation_view(conv, "ب" * 6000, "ر" * 6000)
     assert len(out) + len(FOOTER) <= TELEGRAM_LIMIT
     assert out.count("ر") >= 200
+
+
+def test_format_cost_huge_int_does_not_crash():
+    """F1 (BATCH-C): عدد صحيح ضخم (أكبر من مدى الـ double) مايكسرش format_cost بـ
+    OverflowError. القيمة بتتعرض نصيًا بدقة بدل ما نرمي استثناء جوه معالج الـ callback."""
+    huge = 10 ** 400  # أكبر من max double ⇒ float(huge) يرمي OverflowError
+    out = format_cost({"accumulated_cost": huge, "model_name": "m"})
+    assert "التكلفة التراكمية" in out
+    assert str(huge) in out  # التمثيل النصي الدقيق محفوظ
+    assert "$" not in out
