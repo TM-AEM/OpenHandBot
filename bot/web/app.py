@@ -177,6 +177,17 @@ class MiniApp:
             Route(f"{API_PREFIX}/auth/logout", self.logout, methods=["POST"]),
             Route(f"{API_PREFIX}/app/bootstrap", self.bootstrap, methods=["GET"]),
             Route(f"{API_PREFIX}/app/notifications", self.notifications, methods=["POST"]),
+            Route(f"{API_PREFIX}/notifications", self.notification_inbox, methods=["GET"]),
+            Route(
+                f"{API_PREFIX}/notifications/read-all",
+                self.notifications_read_all,
+                methods=["POST"],
+            ),
+            Route(
+                f"{API_PREFIX}/notifications/{{item_id}}/read",
+                self.notification_read,
+                methods=["POST"],
+            ),
             Route(f"{API_PREFIX}/conversations", self.conversations, methods=["GET"]),
             Route(
                 f"{API_PREFIX}/conversations/{{conversation_id}}",
@@ -189,12 +200,32 @@ class MiniApp:
                 methods=["GET"],
             ),
             Route(
+                f"{API_PREFIX}/conversations/{{conversation_id}}/cost",
+                self.conversation_cost,
+                methods=["GET"],
+            ),
+            Route(
+                f"{API_PREFIX}/conversations/{{conversation_id}}/files",
+                self.conversation_files,
+                methods=["GET"],
+            ),
+            Route(
+                f"{API_PREFIX}/conversations/{{conversation_id}}/file",
+                self.conversation_file_preview,
+                methods=["GET"],
+            ),
+            Route(
                 f"{API_PREFIX}/conversations/{{conversation_id}}/prompt",
                 self.conversation_prompt,
                 methods=["POST"],
             ),
             Route(f"{API_PREFIX}/operations/outbox", self.outbox_operation, methods=["GET"]),
             Route(f"{API_PREFIX}/operations/creation", self.creation_operation, methods=["GET"]),
+            Route(
+                f"{API_PREFIX}/operations/outbox/reconcile",
+                self.outbox_reconcile,
+                methods=["POST"],
+            ),
             Route(
                 f"{API_PREFIX}/conversations/{{conversation_id}}/watch",
                 self.conversation_watch,
@@ -317,6 +348,44 @@ class MiniApp:
             return self._api_error(exc)
         return _json({"ok": True, "notifications_enabled": state})
 
+    # ---------------------------------------------------- notification inbox
+    async def notification_inbox(self, request):
+        session, err = await self._guarded(request, state_changing=False)
+        if err is not None:
+            return err
+        try:
+            page = int(request.query_params.get("page", "0") or 0)
+        except ValueError:
+            return _error(400, "bad_request", "رقم الصفحة غير صالح.")
+        unread_only = request.query_params.get("unread") in ("1", "true")
+        try:
+            data = self._service.list_notifications(page=page, unread_only=unread_only)
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json(data)
+
+    async def notification_read(self, request):
+        session, err = await self._guarded(request, state_changing=True)
+        if err is not None:
+            return err
+        try:
+            data = self._service.mark_notification_read(request.path_params.get("item_id", ""))
+        except ValidationError as exc:
+            return _error(400, "bad_request", str(exc))
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json(data)
+
+    async def notifications_read_all(self, request):
+        session, err = await self._guarded(request, state_changing=True)
+        if err is not None:
+            return err
+        try:
+            data = self._service.mark_all_notifications_read()
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json(data)
+
     # ------------------------------------------------------- conversations
     async def conversations(self, request):
         session, err = await self._guarded(request, state_changing=False)
@@ -353,6 +422,50 @@ class MiniApp:
             return err
         try:
             data = await self._service.get_status(request.path_params.get("conversation_id", ""))
+        except ValidationError as exc:
+            return _error(400, "bad_request", str(exc))
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json(data)
+
+    async def conversation_cost(self, request):
+        """OHB2-09-04: تكلفة/استهلاك شات (read-only، مصادَقة)."""
+        session, err = await self._guarded(request, state_changing=False)
+        if err is not None:
+            return err
+        try:
+            data = await self._service.get_cost(request.path_params.get("conversation_id", ""))
+        except ValidationError as exc:
+            return _error(400, "bad_request", str(exc))
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json(data)
+
+    async def conversation_files(self, request):
+        """OHB2-09-02: قايمة ملفات شات مصرّح به (read-only، مصادَقة)."""
+        session, err = await self._guarded(request, state_changing=False)
+        if err is not None:
+            return err
+        try:
+            data = await self._service.list_files(
+                request.path_params.get("conversation_id", "")
+            )
+        except ValidationError as exc:
+            return _error(400, "bad_request", str(exc))
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json(data)
+
+    async def conversation_file_preview(self, request):
+        """OHB2-09-02: معاينة نصية محدودة لملف من قايمة الشات."""
+        session, err = await self._guarded(request, state_changing=False)
+        if err is not None:
+            return err
+        try:
+            data = await self._service.read_file_preview(
+                request.path_params.get("conversation_id", ""),
+                request.query_params.get("path", ""),
+            )
         except ValidationError as exc:
             return _error(400, "bad_request", str(exc))
         except ApiError as exc:
@@ -418,6 +531,30 @@ class MiniApp:
             return err
         try:
             data = self._lookup_creation(request)
+        except ValidationError as exc:
+            return _error(400, "bad_request", str(exc))
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json(data)
+
+    async def outbox_reconcile(self, request):
+        """OHB2-09-05: تسوية يدوية لعملية برومت (discard/mark_sent) — parity مع البوت."""
+        session, err = await self._guarded(request, state_changing=True)
+        if err is not None:
+            return err
+        try:
+            body = await self._read_body(request)
+        except _BodyTooLarge:
+            return _error(413, "payload_too_large", "الطلب كبير أوي.")
+        except _BadJson:
+            return _error(400, "bad_request", "صيغة الطلب غير صحيحة.")
+        raw_id = body.get("id")
+        try:
+            outbox_id = int(raw_id)
+        except (TypeError, ValueError):
+            return _error(400, "bad_request", "رقم العملية غير صالح")
+        try:
+            data = self._service.reconcile_outbox(outbox_id, (body.get("action") or "").strip())
         except ValidationError as exc:
             return _error(400, "bad_request", str(exc))
         except ApiError as exc:
@@ -518,7 +655,8 @@ class MiniApp:
         status = exc.status_code if exc.status_code and 400 <= exc.status_code < 600 else 502
         if status >= 500:
             log.warning("خطأ خدمة في الـ Mini App: %s", type(exc).__name__)
-        return _error(status, "api_error", error_text(exc))
+        code = getattr(exc, "code", None) or "api_error"
+        return _error(status, code, error_text(exc))
 
     async def api_not_found(self, request):
         return _error(404, "not_found", "المسار مش موجود.")

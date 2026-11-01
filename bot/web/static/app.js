@@ -5,7 +5,9 @@
   var API = "/api/v1";
   var tg = (window.Telegram && window.Telegram.WebApp) || null;
   var REQUEST_TIMEOUT = 12000;
-  var state = { chatsPage: 0, currentChat: null, selectedRepo: null };
+  var state = { chatsPage: 0, currentChat: null, selectedRepo: null, inboxPage: 0, inboxLoading: false, inboxIds: {}, inboxHasMore: false, inboxVisible: false, inboxLastRefreshAt: 0, detailSeq: 0 };
+  // OHB2-08-07: مؤقّت التحديث الدوري (مرئي فقط) + آخر وقت تحديث (للتهدئة).
+  var inboxPollTimer = null;
 
   function $(id) { return document.getElementById(id); }
   function el(tag, cls, text) {
@@ -25,7 +27,11 @@
   }
 
   function showView(name) {
-    ["view-chats", "view-detail", "view-watches", "view-new", "view-settings"].forEach(function (id) {
+    // C4 (BATCH-C): لما نخرج من شاشة التفاصيل، نبطّل الشات الحالي. ده بيخلي حرس
+    // الردود القديمة (`currentChat`) فعالًا لوحده: رد تفاصيل جاي بعد ما المستخدم ساب
+    // الشاشة (تنقّل/رجوع) مايدهسش الشاشة الجديدة، مش بس لو فتح شات تاني.
+    if (name !== "view-detail") { state.currentChat = null; }
+    ["view-chats", "view-detail", "view-watches", "view-inbox", "view-new", "view-settings"].forEach(function (id) {
       var n = $(id);
       if (n) { n.hidden = (id !== name); }
     });
@@ -101,6 +107,14 @@
   // منطق دورة حياة معرّف العملية (OHB2-07-FIX) — مشترك ومُختبر في ops.js.
   var OPS = window.RecovoOps;
   if (!OPS) { throw new Error("RecovoOps مش محمّل (ops.js)"); }
+  var INBOX = window.RecovoInbox;
+  if (!INBOX) { throw new Error("RecovoInbox مش محمّل (inbox.js)"); }
+  var FILES = window.RecovoFiles;
+  if (!FILES) { throw new Error("RecovoFiles مش محمّل (files.js)"); }
+  var COST = window.RecovoCost;
+  if (!COST) { throw new Error("RecovoCost مش محمّل (cost.js)"); }
+  // OHB2-09-02: منع طلبات الملفات المكرّرة المتزامنة (نفس الشات/الملف).
+  var filesDeduper = FILES.createDeduper();
   function opKey(parts) { return OPS.identityKey(parts); }
 
   // حالات العملية اللي السيرفر بيرجّعها: pending/accepted/failed/ambiguous/unknown.
@@ -158,7 +172,7 @@
         if (state !== "pending" || attempts >= maxAttempts) {
           // فشل/غامض/مش معروف — أو لسه pending بعد ما استنفدنا المحاولات: نعرض
           // إجراءات صريحة (استعلام + إعادة محاولة بنفس المعرّف). مفيش إعادة تلقائية.
-          showOpActions(box, kind, ref, conversationId, state, onAccepted, resend, manager);
+          showOpActions(box, kind, ref, conversationId, state, onAccepted, resend, manager, op);
           return;
         }
         setTimeout(poll, 1500 + attempts * 500);
@@ -176,7 +190,7 @@
 
   // عند نتيجة غامضة/فاشلة/لسه معلّقة: نعرض إجراءات صريحة — استعلام (قراءة) وإعادة
   // محاولة بنفس معرّف العملية (idempotent، مفيش تكرار). مفيش أي إعادة تلقائية.
-  function showOpActions(box, kind, ref, conversationId, state, onAccepted, resend, manager) {
+  function showOpActions(box, kind, ref, conversationId, state, onAccepted, resend, manager, op) {
     if (box.querySelector(".op-actions")) { return; }
     var note = el("p", "op-note", OP_NOTE[state] || OP_NOTE.unknown);
     var actions = el("div", "op-actions");
@@ -185,17 +199,17 @@
       checkBtn.disabled = true;
       queryOperation(kind, ref, conversationId).then(function (res) {
         checkBtn.disabled = false;
-        var op = (res && res.data) || {};
-        var s = op.state || "unknown";
+        var op2 = (res && res.data) || {};
+        var s = op2.state || "unknown";
         if (manager) { manager.resolve(ref, s); }
         box.querySelectorAll(".op-status").forEach(function (n) { n.remove(); });
         var line = el("div", "op-status");
         line.appendChild(el("span", "op-label", "حالة العملية: "));
-        line.appendChild(opPill(op));
+        line.appendChild(opPill(op2));
         box.appendChild(line);
         box.querySelectorAll(".op-actions, .op-note").forEach(function (n) { n.remove(); });
-        if (s === "accepted") { if (onAccepted) { onAccepted(op); } }
-        else { showOpActions(box, kind, ref, conversationId, s, onAccepted, resend, manager); }
+        if (s === "accepted") { if (onAccepted) { onAccepted(op2); } }
+        else { showOpActions(box, kind, ref, conversationId, s, onAccepted, resend, manager, op2); }
       }).catch(function () { checkBtn.disabled = false; toast("مش قادر أوصل للسيرفر."); });
     });
     actions.appendChild(checkBtn);
@@ -214,8 +228,53 @@
       }).catch(function () { retryBtn.disabled = false; toast("مش قادر أوصل للسيرفر."); });
     });
     actions.appendChild(retryBtn);
+
+    // OHB2-09-05: تسوية يدوية للبرومتات المعلّقة (نفس أوامر البوت). بتظهر بس لما
+    // يبقى عندنا id، وبتعمل تحديث للحالة بعد النجاح. 409 (حالة نهائية/غير مناسبة)
+    // بيترجم لرسالة عربية من غير ما نغيّر حاجة محليًا.
+    if (kind === "prompt" && op && op.id !== undefined && op.id !== null && state !== "accepted") {
+      var markSent = el("button", "btn ghost small", "تأكيد الإرسال");
+      markSent.addEventListener("click", function () {
+        markSent.disabled = true;
+        reconcileOperation(op.id, "mark_sent").then(function (res) {
+          markSent.disabled = false;
+          if (!res.ok) { toast(friendlyMessage(res.status, res.data)); return; }
+          toast("اتعلّم كمُرسل ✅");
+          if (manager && res.data) { manager.resolve(ref, res.data.state || "accepted"); }
+          box.querySelectorAll(".op-status, .op-actions, .op-note").forEach(function (n) { n.remove(); });
+          var line = el("div", "op-status");
+          line.appendChild(el("span", "op-label", "حالة العملية: "));
+          line.appendChild(opPill(res.data));
+          box.appendChild(line);
+        }).catch(function () { markSent.disabled = false; toast("مش قادر أوصل للسيرفر."); });
+      });
+      actions.appendChild(markSent);
+
+      var discard = el("button", "btn ghost small", "شطب العملية");
+      discard.addEventListener("click", function () {
+        discard.disabled = true;
+        reconcileOperation(op.id, "discard").then(function (res) {
+          discard.disabled = false;
+          if (!res.ok) { toast(friendlyMessage(res.status, res.data)); return; }
+          toast("اتشالت العملية.");
+          if (manager && res.data) { manager.resolve(ref, res.data.state || "failed"); }
+          box.querySelectorAll(".op-status, .op-actions, .op-note").forEach(function (n) { n.remove(); });
+          var line = el("div", "op-status");
+          line.appendChild(el("span", "op-label", "حالة العملية: "));
+          line.appendChild(opPill(res.data));
+          box.appendChild(line);
+        }).catch(function () { discard.disabled = false; toast("مش قادر أوصل للسيرفر."); });
+      });
+      actions.appendChild(discard);
+    }
+
     box.appendChild(note);
     box.appendChild(actions);
+  }
+
+  // OHB2-09-05: تسوية عملية برومت معلّقة (discard/mark_sent) عبر مسار مصادَق (POST).
+  function reconcileOperation(id, action) {
+    return post("/operations/outbox/reconcile", { id: id, action: action });
   }
 
   // -------------------------------------------------------------- auth
@@ -240,6 +299,9 @@
     var feats = (data && data.features) || {};
     var watchesTab = document.querySelector('.tab[data-view="watches"]');
     if (watchesTab && feats.watches === false) { watchesTab.hidden = true; }
+    // OHB2-08-05: شارة غير المقروء في تبويب الإشعارات.
+    var inbox = (data && data.inbox) || {};
+    renderInboxBadge(inbox.unread_count);
   }
 
   function renderNotif(enabled) {
@@ -248,6 +310,133 @@
     btn.textContent = enabled ? "مفعّلة ✅" : "متوقفة ⛔";
     btn.setAttribute("data-enabled", enabled ? "1" : "0");
     btn.classList.toggle("on", enabled);
+  }
+
+  // --------------------------------------------------------------- inbox
+  function renderInboxBadge(count) {
+    var badge = $("inbox-badge");
+    if (!badge) { return; }
+    var text = INBOX.badgeText(count);
+    if (text) {
+      badge.textContent = text;
+      badge.hidden = false;
+    } else {
+      badge.hidden = true;
+    }
+  }
+
+  function kindLabel(kind) {
+    return INBOX.kindLabel(kind);
+  }
+
+  // OHB2-08-07: `silent` للتحديثات الخلفية (الرجوع للصفحة / poll) عشان ما نعرضش صف
+  // "بيتم التحميل…" وميضيء الشاشة من غير داعي. `page` بيتزامن مع اللي السيرفر رجّعه
+  // (السيرفر بيرجع للأولى لو تجاوزنا الحد) — OHB2-08-08.
+  function loadInbox(page, silent) {
+    var list = $("inbox-list");
+    if (!list) { return; }
+    // OHB2-08-06: حارس الطلب الجاري — الضغط المتكرّر على "المزيد"/"تحديث" مايعملش
+    // طلبات متداخلة (page=1 و page=2 في نفس اللحظة). الحارس أول حاجة عشان ما نلمسش
+    // حالة التحميل الجاري. بيتصفّر في then/catch تحت.
+    if (state.inboxLoading) { return; }
+    state.inboxLoading = true;
+    if (page === 0) { state.inboxIds = {}; if (!silent) { list.innerHTML = ""; list.appendChild(el("li", "loading-row", "بيتم التحميل…")); } }
+    get("/notifications?page=" + (page || 0)).then(function (res) {
+      state.inboxLoading = false;
+      var data = res.data || {};
+      if (!res.ok) {
+        // فشل تحديث خلفي ⇒ نتجاهله ونحافظ على المعروض (مفيش وميض/مسح).
+        if (silent) { return; }
+        if (page === 0) { list.innerHTML = ""; }
+        list.appendChild(el("li", "empty-row", friendlyMessage(res.status, res.data)));
+        return;
+      }
+      // OHB2-08-08: نزامن رقم الصفحة مع رد السيرفر (لو رجع للأولى بسبب تجاوز الحد)
+      // عشان "المزيد" يكمّل من المكان الصح بدل ما يطلب صفحة مش موجودة.
+      // R5-01: `state.inboxPage` = آخر صفحة **نجحت**، وهو المصدر الوحيد للحقيقة
+      // (بيتكتب هنا بس). كده فشل أي طلب (HTTP/شبكة) مايقدّمش الصفحة، و"المزيد" يعيد
+      // نفس الصفحة الفاشلة بدل ما يتخطاها.
+      if (typeof data.page === "number" && data.page >= 0) { state.inboxPage = data.page; }
+      state.inboxHasMore = !!data.has_more;
+      renderInboxBadge(data.unread_count);
+      var items = data.items || [];
+      if (page === 0) { list.innerHTML = ""; }
+      if (page === 0 && !items.length) { list.appendChild(el("li", "empty-row", "مفيش إشعارات.")); }
+      items.forEach(function (it) {
+        // OHB2-08-06: منع تكرار نفس الإشعار — الترقيم بـ offset ممكن يتداخل لما
+        // إشعارات جديدة تتصدّر القايمة، فنفس المعرّف يظهر في صفحتين.
+        var idKey = String(it.id);
+        if (state.inboxIds[idKey]) { return; }
+        state.inboxIds[idKey] = true;
+        var unread = INBOX.isUnread(it);
+        var li = el("li", "row" + (unread ? " unread" : ""));
+        var main = el("div", "row-main");
+        main.appendChild(el("span", "row-title", it.title || it.conversation_id || ""));
+        main.appendChild(el("span", "row-sub", kindLabel(it.kind)));
+        li.appendChild(main);
+        // OHB2-08-05 (Batch 3R): شارة حالة التسليم (مفيش شارة لو اتسلّم).
+        var delivery = INBOX.deliveryLabel(it.delivery_status);
+        if (delivery) { li.appendChild(el("span", "pill delivery", delivery)); }
+        li.appendChild(el("span", "pill", unread ? "جديد" : "مقروء"));
+        li.addEventListener("click", function () {
+          if (unread) {
+            post("/notifications/" + encodeURIComponent(it.id) + "/read", {}).then(function (r2) {
+              if (r2.ok) { renderInboxBadge(r2.data && r2.data.unread_count); }
+            }).catch(function () { /* نتجاهل: العرض لسه شغال */ });
+          }
+          if (it.conversation_id) { openDetail(it.conversation_id); }
+        });
+        list.appendChild(li);
+      });
+      var more = $("inbox-more");
+      if (more) { more.hidden = !data.has_more; }
+    }).catch(function () {
+      state.inboxLoading = false;
+      if (page === 0 && !silent) { list.innerHTML = ""; list.appendChild(el("li", "empty-row", "مش قادر أوصل للسيرفر.")); }
+    });
+  }
+
+  // OHB2-08-07: تحديث صندوق الإشعارات لو الصفحة مرئية وتبويب الإشعارات مفتوح فعلاً،
+  // مع تهدئة (ما نكرّرش التحديث في نفس اللحظة). بيتنادى من poll / رجوع الصفحة.
+  function refreshInboxIfVisible() {
+    if (!state.inboxVisible) { return; }
+    var view = $("view-inbox");
+    if (!view || view.hidden) { return; }
+    if (INBOX.shouldThrottleRefresh(state.inboxLastRefreshAt, Date.now())) { return; }
+    state.inboxLastRefreshAt = Date.now();
+    loadInbox(state.inboxPage, true);
+  }
+
+  // OHB2-08-07: نبدأ/نوقف poll حسب رؤية الصفحة. مخفية ⇒ نوقف (مفيش طلبات خلفية).
+  function setInboxPolling(visible) {
+    if (inboxPollTimer) { clearInterval(inboxPollTimer); inboxPollTimer = null; }
+    if (visible) {
+      var ms = INBOX.refreshInterval(true);
+      inboxPollTimer = setInterval(refreshInboxIfVisible, ms);
+    }
+  }
+
+  // OHB2-08-07: لما الصفحة ترجع مرئية نحدّث فورًا (لو التبويب مفتوح) + نرجّع الـ poll.
+  function onVisibilityChange() {
+    var visible = !document.hidden;
+    state.inboxVisible = visible;
+    setInboxPolling(visible);
+    if (visible) { refreshInboxIfVisible(); }
+  }
+
+  function markAllRead() {
+    var btn = $("inbox-read-all");
+    if (btn) { btn.disabled = true; }
+    post("/notifications/read-all", {}).then(function (res) {
+      if (btn) { btn.disabled = false; }
+      if (res.ok) {
+        renderInboxBadge(res.data && res.data.unread_count);
+        // R5-01: نفس الثابت — خط الأساس بيتضبط من مسار النجاح بس (loadInbox(0)).
+        loadInbox(0);
+      } else {
+        toast(friendlyMessage(res.status, res.data));
+      }
+    }).catch(function () { if (btn) { btn.disabled = false; } toast("مش قادر أوصل للسيرفر."); });
   }
 
   // -------------------------------------------------------------- chats
@@ -289,7 +478,13 @@
     box.appendChild(el("div", "loading-row", "بيتم التحميل…"));
     showView("view-detail");
     state.currentChat = id;
+    // OHB2-09-07 (B-07-07): حرس ضد الردود القديمة. لو المستخدم فتح شات تاني قبل ما
+    // يرجع رد الأول، بنتجاهل الرد القديم عشان مايدهسش عرض الشات الأحدث (مفيش تسريب
+    // حالة بين الشاتات). بنقارن الرقم التسلسلي قبل أي تحديث للـ DOM.
+    var seq = ++state.detailSeq;
+    function current() { return state.detailSeq === seq && state.currentChat === id; }
     get("/conversations/" + encodeURIComponent(id)).then(function (res) {
+      if (!current()) { return; }
       if (!res.ok) { box.innerHTML = ""; box.appendChild(el("p", "empty-row", friendlyMessage(res.status, res.data))); return; }
       var d = res.data || {};
       box.innerHTML = "";
@@ -376,10 +571,112 @@
         }).catch(function () { watchBtn.disabled = false; toast("مش قادر أوصل للسيرفر."); });
       });
       box.appendChild(watchBtn);
+
+      // OHB2-09-02: قسم الملفات (قايمة + معاينة). كل حاجة عبر الـ Files API المصادَق،
+      // والواجهة ما بتفترضش إن ملف قابل للقراءة لمجرد ظهوره في القايمة.
+      box.appendChild(renderFilesSection(id));
+
+      // OHB2-09-04: قسم التكلفة/الاستهلاك (نداء منفصل، ومابيفشّلش التفاصيل لو فشل).
+      box.appendChild(renderCostSection(id));
     }).catch(function () {
+      if (!current()) { return; }
       box.innerHTML = "";
       box.appendChild(el("p", "empty-row", "مش قادر أوصل للسيرفر."));
     });
+  }
+
+  // ------------------------------------------------------------ files (OHB2-09-02)
+  function filesErrorText(res) {
+    var data = (res && res.data) || {};
+    return FILES.errorLabel(data.error, friendlyMessage(res && res.status, data));
+  }
+
+  function renderFilesSection(id) {
+    var wrap = el("div", "files-section");
+    var head = el("div", "toolbar");
+    head.appendChild(el("span", "card-label", "ملفات الشات"));
+    var refresh = el("button", "btn ghost small", "تحديث");
+    head.appendChild(refresh);
+    wrap.appendChild(head);
+
+    var list = el("ul", "list");
+    var previewBox = el("div", "file-preview");
+    wrap.appendChild(list);
+    wrap.appendChild(previewBox);
+
+    function showLoading(container, text) {
+      container.innerHTML = "";
+      container.appendChild(el("li", "loading-row", text || "بيتم التحميل…"));
+    }
+
+    function loadPreview(path) {
+      previewBox.innerHTML = "";
+      previewBox.appendChild(el("p", "loading-row", "بيتم تحميل الملف…"));
+      // نفس المفتاح (شات/مسار) أثناء التحميل ⇒ نفس الطلب (مفيش تكرار).
+      filesDeduper.run("preview:" + id + ":" + path, function () {
+        return get(
+          "/conversations/" + encodeURIComponent(id) + "/file?path=" + encodeURIComponent(path)
+        );
+      }).then(function (res) {
+        previewBox.innerHTML = "";
+        if (!res.ok) { previewBox.appendChild(el("p", "empty-row", filesErrorText(res))); return; }
+        var pre = el("pre", "file-text", FILES.previewText(res.data));
+        previewBox.appendChild(pre);
+        if (FILES.isTruncated(res.data)) {
+          previewBox.appendChild(el("p", "hint", "المعاينة مقصوصة (الملف أكبر)."));
+        }
+      }).catch(function () {
+        previewBox.innerHTML = "";
+        previewBox.appendChild(el("p", "empty-row", "مش قادر أوصل للسيرفر."));
+      });
+    }
+
+    function load() {
+      showLoading(list);
+      previewBox.innerHTML = "";
+      filesDeduper.run("files:" + id, function () {
+        return get("/conversations/" + encodeURIComponent(id) + "/files");
+      }).then(function (res) {
+        list.innerHTML = "";
+        if (!res.ok) { list.appendChild(el("li", "empty-row", filesErrorText(res))); return; }
+        var files = (res.data && res.data.files) || [];
+        if (!files.length) { list.appendChild(el("li", "empty-row", "مفيش ملفات.")); return; }
+        files.forEach(function (path) {
+          var li = el("li", "row");
+          li.appendChild(el("span", "row-title", path));
+          li.addEventListener("click", function () { loadPreview(path); });
+          list.appendChild(li);
+        });
+      }).catch(function () {
+        list.innerHTML = "";
+        list.appendChild(el("li", "empty-row", "مش قادر أوصل للسيرفر."));
+      });
+    }
+
+    refresh.addEventListener("click", load);
+    load();
+    return wrap;
+  }
+
+  // ------------------------------------------------------------ cost (OHB2-09-04)
+  function renderCostSection(id) {
+    var wrap = el("div", "cost-section");
+    wrap.appendChild(el("span", "card-label", "التكلفة والاستهلاك"));
+    var body = el("div", "cost-body");
+    body.appendChild(el("p", "loading-row", "بيتم التحميل…"));
+    wrap.appendChild(body);
+    get("/conversations/" + encodeURIComponent(id) + "/cost").then(function (res) {
+      body.innerHTML = "";
+      if (!res.ok) {
+        body.appendChild(el("p", "empty-row", filesErrorText(res)));
+        return;
+      }
+      body.appendChild(el("pre", "cost-text", COST.formatCost(res.data)));
+    }).catch(function () {
+      body.innerHTML = "";
+      body.appendChild(el("p", "empty-row", "مش قادر أوصل للسيرفر."));
+    });
+    return wrap;
   }
 
   // ------------------------------------------------------------ watches
@@ -502,6 +799,7 @@
           showView("view-" + view);
           if (view === "chats") { state.chatsPage = 0; loadChats(false); }
           if (view === "watches") { loadWatches(); }
+          if (view === "inbox") { state.inboxLastRefreshAt = Date.now(); loadInbox(0); }
           if (view === "new") { loadRepos(""); }
         });
       })(tabs[i]);
@@ -509,11 +807,24 @@
     $("chats-refresh").addEventListener("click", function () { state.chatsPage = 0; loadChats(true); });
     $("chats-next").addEventListener("click", function () { state.chatsPage += 1; loadChats(false); });
     $("watches-refresh").addEventListener("click", loadWatches);
+    $("inbox-refresh").addEventListener("click", function () { state.inboxLastRefreshAt = Date.now(); loadInbox(0); });
+    $("inbox-next").addEventListener("click", function () {
+      if (state.inboxLoading) { return; }
+      if (!state.inboxHasMore) { return; }  // OHB2-08-08: مفيش المزيد ⇒ ما نطلبش صفحة مش موجودة.
+      // R5-01: نطلب الصفحة الجاية من غير ما نقدّم `state.inboxPage` — بيتقدّم بس لما
+      // الطلب ينجح (في مسار النجاح جوه loadInbox). لو فشل، الضغط التاني يعيد نفس الصفحة.
+      loadInbox(INBOX.nextPage(state.inboxPage, true));
+    });
+    $("inbox-read-all").addEventListener("click", markAllRead);
     $("repo-search-btn").addEventListener("click", function () { loadRepos($("repo-search").value); });
     $("repo-search").addEventListener("keydown", function (e) { if (e.key === "Enter") { loadRepos($("repo-search").value); } });
     $("newchat-send").addEventListener("click", createChat);
     $("notif-toggle").addEventListener("click", toggleNotif);
     $("retry-btn").addEventListener("click", start);
+    // OHB2-08-07: نربط رؤية الصفحة (تبويب المتصفح/الخلفية) + نبدأ الحالة الابتدائية.
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    state.inboxVisible = !document.hidden;
+    setInboxPolling(state.inboxVisible);
   }
 
   function start() {

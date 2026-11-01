@@ -10,6 +10,16 @@ def make_client(handler):
     return OpenHandsClient("https://example.test", "key", transport=transport)
 
 
+class _RawStream(httpx.AsyncByteStream):
+    """تدفّق بايتات للاختبار — التنزيل المحدود بيقرا الخام (`aiter_raw`)."""
+
+    def __init__(self, data: bytes):
+        self._data = data
+
+    async def __aiter__(self):
+        yield self._data
+
+
 def test_search_conversations_sorts_desc_and_drops_nulls():
     def handler(request):
         assert request.url.path == "/api/v1/app-conversations/search"
@@ -199,7 +209,7 @@ def test_read_file_uses_file_path_param():
 def test_export_conversation_returns_bytes():
     def handler(request):
         assert request.url.path == "/api/v1/app-conversations/c1/download"
-        return httpx.Response(200, content=b"PK\x03\x04zip")
+        return httpx.Response(200, stream=_RawStream(b"PK\x03\x04zip"))
 
     import asyncio
 
@@ -409,3 +419,47 @@ def test_get_conversations_null_entries_preserved_as_dropped():
     # الموثّق: مصفوفة فيها null — بنسقطها وبنحتفظ بالـ dict بس.
     client = _client_returning([{"id": "a"}, None, "x"])
     assert _asyncio.run(client.get_conversations(["a"])) == [{"id": "a"}]
+
+
+# =====================================================================
+# OHB2-09-01: قراءة نص الملف مع تمييز الرد غير النصي + هوية المستخدم
+# =====================================================================
+def test_read_file_text_returns_string():
+    def handler(request):
+        assert request.url.path == "/api/v1/app-conversations/c1/file"
+        assert request.url.params.get("file_path") == "a.py"
+        return httpx.Response(200, json="print('hi')\n")
+
+    assert _asyncio.run(make_client(handler).read_file_text("c1", "a.py")) == "print('hi')\n"
+
+
+def test_read_file_text_returns_none_for_non_string():
+    client = _client_returning({"not": "a string"})
+    assert _asyncio.run(client.read_file_text("c1", "a.py")) is None
+
+
+def test_read_file_text_returns_empty_string_for_empty_file():
+    client = _client_returning("")
+    assert _asyncio.run(client.read_file_text("c1", "a.py")) == ""
+
+
+def test_read_file_text_propagates_http_error():
+    def handler(request):
+        return httpx.Response(404, json={"detail": "مش موجود"})
+
+    with pytest.raises(ApiError):
+        _asyncio.run(make_client(handler).read_file_text("c1", "a.py"))
+
+
+def test_get_current_user_returns_dict():
+    def handler(request):
+        assert request.url.path == "/api/v1/users/me"
+        return httpx.Response(200, json={"id": "owner-uuid", "role": "owner"})
+
+    me = _asyncio.run(make_client(handler).get_current_user())
+    assert me.get("id") == "owner-uuid"
+
+
+def test_get_current_user_non_dict_returns_empty():
+    client = _client_returning(["unexpected"])
+    assert _asyncio.run(client.get_current_user()) == {}

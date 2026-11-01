@@ -53,8 +53,11 @@ Telegram WebView ──HTTPS──▶ ingress (TLS) ──HTTP──▶ الحا
 | `/health` | GET | لأ | لأ | فحص صحة. مفيش أسرار. **بدون تحديد معدّل** |
 | `/api/v1/auth` | POST | لأ | لأ | يستقبل `{"initData": "..."}` ⇒ كوكي جلسة |
 | `/api/v1/auth/logout` | POST | كوكي | ✔ | يلغي الجلسة ويمسح الكوكي |
-| `/api/v1/app/bootstrap` | GET | كوكي | لأ | اسم العرض + الإشعارات + ميتا |
+| `/api/v1/app/bootstrap` | GET | كوكي | لأ | اسم العرض + الإشعارات + ميتا + `inbox.unread_count` |
 | `/api/v1/app/notifications` | POST | كوكي | ✔ | `{"enabled": bool}` يضبط الإشعارات |
+| `/api/v1/notifications` | GET | كوكي | لأ | صندوق الإشعارات (صفحات، `?page=&unread=1`) |
+| `/api/v1/notifications/{id}/read` | POST | كوكي | ✔ | يعلّم إشعار كمقروء |
+| `/api/v1/notifications/read-all` | POST | كوكي | ✔ | يعلّم كل الإشعارات كمقروءة |
 | `/api/v1/conversations` | GET | كوكي | لأ | آخر الشاتات (صفحات، `?page=&refresh=1`) |
 | `/api/v1/conversations/{id}` | GET | كوكي | لأ | تفاصيل شات + آخر برومت/رد + رابط PR |
 | `/api/v1/conversations/{id}/status` | GET | كوكي | لأ | حالة شات بس |
@@ -193,6 +196,24 @@ Telegram WebView ──HTTPS──▶ ingress (TLS) ──HTTP──▶ الحا
 - `SameSite=Strict` **ما اتضعّفش** — ده خط دفاع أول، وفحص الـ Origin خط تاني.
 - الرد الرفض: `403 {"error": "bad_origin"}`.
 
+### تفويض ملكية الشات (OHB2-09-A2-02)
+
+كل مسار بيوصل لبيانات شات **محدّد** في الـ Mini App بيمر من تفويض ملكية واحد
+(`bot/files.py::authorize_conversation` عبر `MiniAppService._authorize_conversation`)
+**قبل** أي قراءة أو أثر جانبي: `/conversations/{id}`، `/status`، `/cost`، `/files`،
+`/file`، `/prompt` (POST)، و`/watch` (POST). القرار:
+
+- الشات لازم يكون موجود ومملوك لهوية المالك الحالية (`/users/me`)؛ غياب المالك أو
+  اختلافه ⇒ `403 unauthorized` (فشل مغلق). معرّف غير صالح ⇒ `400`. شات مش موجود ⇒ `404`.
+- `POST /conversations/{id}/prompt` بيفوّض **قبل** تسجيل أي برومت في الصندوق، فمستخدم
+  مصادَق (مش المالك) مايقدرش يوجّه برومت لشات مش بتاعه ولا يترك سجل صندوق.
+- **استثناء مقصود:** `DELETE /conversations/{id}/watch` (unwatch) **مش** مربوط بملكية
+  الشات — عملية على قايمة متابعات المالك نفسه (حالة مالك واحد)، وبتفضل شغّالة حتى لو
+  الشات مش موجود/مملوك دلوقتي (تمنع حالة عالقة، وتكافؤ مع أمر البوت). حمايتها: جلسة
+  المالك + Origin + معرّف صالح.
+- عند فشل التفويض **ما بيتجابش** أي بيانات محمية (آخر تبادل/ملفات/مقاييس) — مُثبت
+  بعدّادات النداءات في `tests/test_a2_conversation_authz.py`.
+
 ## 11. متغيرات البيئة
 
 ```
@@ -227,11 +248,13 @@ python main.py
 ```bash
 python -m pytest -q tests/test_miniapp_initdata.py tests/test_miniapp_api.py \
     tests/test_miniapp_features.py tests/test_miniapp_ratelimit.py \
-    tests/test_miniapp_integration.py tests/test_miniapp_config.py
+    tests/test_miniapp_integration.py tests/test_miniapp_config.py \
+    tests/test_miniapp_inbox.py
 ```
 
-اختبارات منطق الواجهة (دورة حياة معرّف العملية — idempotency): بتشتغل بـ Node المدمج
-على **نفس** الوحدة اللي الواجهة بتستعملها (`bot/web/static/ops.js`):
+اختبارات منطق الواجهة (دورة حياة معرّف العملية — idempotency، ومنطق صندوق الإشعارات):
+بتشتغل بـ Node المدمج على **نفس** الوحدات اللي الواجهة بتستعملها
+(`bot/web/static/ops.js` و`bot/web/static/inbox.js`):
 
 ```bash
 node --test tests/frontend/*.test.js
@@ -248,10 +271,113 @@ node --test tests/frontend/*.test.js
 الـ runtime بتاع OpenHands **مؤقّت**: اسم المضيف (الـ work host) مرتبط بالجلسة وممكن يتغيّر عند
 إعادة تهيئة الـ sandbox ⇒ الرابط الحالي **مش رابط إنتاج دائم** (راجع OHB2-04 §8/§9).
 
+## 13ب. صندوق الإشعارات (OHB2-08-05)
+
+> المرجع الشامل لمنظومة الإشعارات (البنية، القاعدة، الموثوقية، عقد الـ API، الواجهة،
+> التشغيل، والتحقّق) في `docs/NOTIFICATIONS.md`. القسم ده ملخّص الواجهة بالعربي.
+
+سجل **متين (event-first / write-ahead)** للإشعارات: الحدث بيتسجّل في الصندوق **قبل** أي
+إرسال على تيليجرام، فمايتفقدش لو الإرسال فشل أو العملية وقعت. المستخدم يرجع يشوف الإشعارات
+من الـ Mini App حتى بعد ما الرسالة تتوه في شات تيليجرام.
+
+- الجدول `notification_inbox` (في `bot/db.py`): `id` (PK)، `conversation_id`، `title`،
+  `kind`، `message`، `created_at`، `read_at` (NULL = غير مقروء)، `event_key` (هوية الحدث)،
+  وحالة التسليم المتينة: `delivery_status` (`pending`/`delivered`/`failed`)،
+  `delivery_attempts`، `last_attempt_at`، `delivered_at`، `last_error`، `next_retry_at`،
+  `chat_id`، و`transition_status` (الحالة المرصودة عند إنشاء الحدث — **وصفية** للعرض)
+  و`transition_seq` (رقم عصر الانتقال = **الهوية** الموحّدة بين العاملين، Batch 3R-FIX2)،
+  و`claim_token`/`claim_at` (حجز ذرّي بمدة صلاحية لمحاولة تسليم جارية — Batch 3R-FIX2-F1).
+  **إضافي** — بيتعمل بـ `CREATE TABLE IF NOT EXISTS` والترحيل
+  بيضيف الأعمدة الجديدة لـ `ALTER TABLE`، فالقواعد القديمة بتاخدها تلقائيًا من غير فقد بيانات.
+- **الحدث أولًا (write-ahead)**: الحدث بيتسجّل `pending` عند **لحظة اكتشاف** الانتقال،
+  **قبل** أي إرسال (في المراقب `_record_event`/`_notify`/`_deliver` والمُبلّغ
+  `_record_inbox_event`). بعد الإرسال بيتحدّث: `delivered` عند النجاح، أو `delivery_attempts++`
+  مع `next_retry_at` عند فشل مؤقّت/`RetryAfter`، أو `failed` عند استنفاد الميزانية. كده
+  مفيش فقد حدث لو تيليجرام فشل أو العملية وقعت. الكتابة معزولة: أي فشل في الصندوق ما
+  يكسرش تسليم الإشعار (الإرسال يمشي، والحدث يبقى `pending` للاسترجاع).
+- **الاسترجاع (recovery sweep)**: في بداية كل دورة، المراقب والمُبلّغ بيعيدوا محاولة الأحداث
+  المعلّقة اللي **مش** مملوكة لمسار نشط (مش متابَعة دلوقتي، ومفيش عليها علامة `notifier_pending`
+  جارية، ومش ظاهرة في نتائج البحث الحالية) — فحدث اتشالت متابعته بعد استنفاد المحاولات أو
+  علّق عبر إعادة تشغيل لسه بيوصل. الأحداث المملوكة لمسار نشط بتتعامل في مكانها (مفيش إرسال مزدوج).
+- **F-1 (Batch 3R-FIX2-F1): استرجاع الحدث النهائي العالق أثناء بقاء المتابعة**: لو المراقب
+  اكتشف انتقالًا نهائيًا وتسليمه فشل (الحدث `pending`)، وبعدها اتسجّلت الحالة النهائية على صف
+  المتابعة (`watched.last_state` بقى نهائي) — المسار النشط للمراقب مابيرجعش يحاول (شرط
+  `is_terminal(state) and not is_terminal(w.last_state)` بقى False)، والمُبلّل كان يستثني
+  المحادثة المتابَعة من الاسترجاع ⇒ الحدث يفضل `pending` للأبد لحد ما المتابعة تتشال.
+  الإصلاح: المُبلّل بقى يسترجع **حدث الانتقال النهائي الحالي** للمحادثة المتابَعة **العالقة**
+  (`_watched_event_stuck`: المتابعة موجودة + `last_state` نهائي + الحدث هو العصر
+  الحالي). مفيش ازدواج: الأحداث غير المتابَعة بيفضل يتولّاها استرجاع المراقب، والمسار النشط
+  للمتابعة غير العالقة بيفضل مالكها.
+- **الحجز الذرّي (claim lease، Batch 3R-FIX2-F1)**: قبل أي إرسال استرجاعي، العامل بيحجز الصف
+  ذرّيًا (`claim_pending_inbox`: `UPDATE ... WHERE id=? AND delivery_status='pending' AND
+  (claim_token IS NULL OR claim_at<=cutoff)`) في معاملة `BEGIN IMMEDIATE` — فلو العاملين
+  حاولوا نفس الحدث في نفس اللحظة واحد بس يبعت (آمن عبر اتصالات SQLite منفصلة، مفيش
+  check-then-act). `claim_at` بيدّي الحجز **مدة صلاحية**: حجز قديم (من عملية وقعت قبل ما تحرّره)
+  بيتخطّاه الاسترجاع تلقائيًا فمافيش حدث يعلق محجوزًا للأبد. الحجز بيتشال بعد كل محاولة
+  (`record_inbox_attempt`/`mark_inbox_delivered`/`mark_inbox_failed`/`set_inbox_retry_deadline`).
+  ده **مش** ضمان exactly-once: نافذة غموض تيليجرام (قبول الرسالة قبل تسجيل التسليم) لسه موجودة
+  ومقصودة — بنفضّل استرجاع آمن وعدم يقين صريح على فقد إشعار بصمت.
+- `kind` ∈ `terminal` (شات متابَع انتهى) / `timeout` (مهلة 24 ساعة) / `missing` (شات
+  مفقود) / `stale_report` (مفيش تقرير جديد) / `proactive` (إشعار عام من المُبلّغ).
+- **الهوية المنطقية للحدث (idempotency)** — هوية **دائمة** مش مبنية على نص الحالة:
+  - المراقب: `conversation_id | kind | watch_seq | last_state` (`watch_seq` معرّف دائم
+    وفريد لكل دورة متابعة).
+  - المُبلّغ: `conversation_id | proactive | transition_seq`، حيث `transition_seq` = **رقم
+    عصر الاكتشاف** الدائم في `notification_state`: يزيد **مرة واحدة عند اكتشاف** انتقال
+    حالة نهائية جديد (`note_transition`، مش عند التسليم)، ويثبت خلال كل إعادات المحاولة
+    لنفس الانتقال. كده `finished→running→finished` بيدّي رقمين مختلفين ⇒ حدثين منفصلين
+    (مفيش حجب لإشعار تكرار)، وإعادة الاستطلاع/إعادة التشغيل لنفس الانتقال بتعيد نفس الرقم
+    (مفيش تكرار).
+  - قيد تفرّد **جزئي** على القاعدة (`idx_inbox_event_key ... WHERE event_key IS NOT NULL`)
+    بيمنع تسجيل نفس الحدث مرتين (retry / restart / reconcile) — الحماية على مستوى القاعدة
+    مش الذاكرة. الصفوف القديمة (event_key = NULL) ما بتتأثّرش بالقيد، وإعادة المتابعة
+    (`watch_seq` جديد) بتعتبر حدث جديد (سجل منفصل، مش ازدواج).
+- **هوية الانتقال الموحّدة عبر العاملين (Batch 3R-FIX2)**: المراقب والمُبلّل بيسجّلوا **نفس
+  رقم عصر الانتقال** (`transition_seq` من `note_transition`) لنفس الانتقال — مش وصف الحالة.
+  وفيه قيد تفرّد **جزئي** إضافي
+  (`idx_inbox_transition_seq_unique ON (conversation_id, transition_seq) WHERE transition_seq
+  IS NOT NULL AND delivery_status='pending'`). فلو الاتنين لقوا نفس الانتقال (مثلاً المراقب
+  استنفد المحاولات والمُبلّل لسه شايفه)، التاني بياخد `None` من `add_inbox_event` ⇒
+  **مفيش صف منافس ومفيش رسالة تانية** لنفس الانتقال. اللي بيوصل الحدث (عبر مساره أو
+  الاسترجاع) بيسجّل الانتقال "مُبلّغ" عبر `record_notification_sent` عشان التاني ما يبعتهوش.
+  القيد **معلّق بس** (`pending`) فصف `failed` ما يمنعش انتقالًا جديدًا حقيقيًا لنفس الحالة.
+  **إصلاح Batch 3R-FIX2**: الهوية كانت قبل كده على `transition_status` (وصف الحالة)، وده كان
+  بيحجب انتقالًا حقيقيًا تاني بنفس الحالة (مثلاً `finished` معلّق ثم `finished` جديد) — بقى
+  على رقم العصر، فكل انتقال حقيقي بياخد رقمًا مختلفًا وحدثًا منفصلًا.
+- **`notifier_pending` مربوط بالحدث**: علامة التسليم المعلّق الدائمة بتحمل `event_id` +
+  `transition_seq`، فالتسوية بعد إعادة التشغيل بتعلّم **نفس** حدث الصندوق `delivered`
+  (ذرّيًا، `BEGIN IMMEDIATE`) — مفيش حدث معلّق للأبد. (Batch 3R-FIX2: `transition_seq` بقى
+  **عصر اكتشاف** بيتثبّت عند الاكتشاف في `note_transition`، فالتسوية ما بتلمسوش.)
+- **حدود payload ونمو محدود**: الرسالة بتتقصّ عند `INBOX_MAX_MESSAGE_CHARS` (1000).
+  التقليم عند الإدراج (نفس المعاملة) بسياسة صريحة (Batch 3R-FIX): **الصفوف المعلّقة
+  (`pending`) وغير المقروءة (`read_at IS NULL`) مايتقلّمش أبدًا**؛ **المقروءة بس** مؤهّلة
+  للتقليم الأقدم أولًا لحد `INBOX_MAX_PER_CONVERSATION` (50) لكل محادثة و`INBOX_MAX_TOTAL`
+  (500) عامًا — والسقفين **سقفان ناعمان**: لو الصفوف المحمية لوحدها تعدّيهم، الجدول يتعدّاهم
+  (مفيش حذف صامت لإشعار لسه ما شافهوش المستخدم). القايمة بترقيم على مستوى SQL
+  (`INBOX_PAGE_SIZE = 10`) بترتيب `id DESC` (مستقر لأن الـ id تسلسلي). `unread_count` بيرجع
+  مع كل صفحة ومع `bootstrap` لشارة التبويب.
+- **الترحيل**: الأعمدة الجديدة (`event_key`، `delivery_status`، `delivery_attempts`، ...
+  و`transition_status`، و`transition_seq` في `notification_inbox`) و`transition_seq` +
+  `discovered_status` في `notification_state` بتتضاف لقاعدة موجودة عبر
+  `ALTER TABLE ... ADD COLUMN` في `_migrate`، والفهارس الفريدة الجزئية (`idx_inbox_event_key`
+  و`idx_inbox_transition_seq_unique`) بتتعمل **بعد** ضمان الأعمدة (نمط المستودع) — idempotent وآمن
+  عند تكرار الفتح. الفهرس القديم `idx_inbox_transition_unique` (على `transition_status`) بيتشال
+  عند الفتح (فهرس بس — مفيش مساس بالبيانات). جداول Batch 1/2 (`watched`/`notification_state`/
+  `outbox`/`notifier_pending`/`notifier_retry_not_before`) ما بتتلمسش غير إضافة الأعمدة الإضافية.
+- الواجهة: تبويب **الإشعارات** بشارة غير المقروء، قايمة، تعليم عند الضغط (وبيفتح الشات)،
+  شارة حالة التسليم (`بيتسلّم…`/`فشل التسليم`)، وزر **تعليم الكل كمقروء**.
+- **API**: `GET /api/v1/notifications?page=&unread=1`، `POST /api/v1/notifications/{id}/read`،
+  `POST /api/v1/notifications/read-all`. الـ DTO ما بيكشفش `event_key` (حمولة داخلية)، وبيحمّل
+  `delivery_status`/`delivery_attempts`/`delivered_at`، وبيترقّم بترقيم محدود، والصفحة
+  الفاضية بسبب تجاوز الحد بترجع للأولى.
+
 ## 14. اللي فاضل لمهام OHB2 اللاحقة
 
 - جلسات **ثابتة عبر إعادة التشغيل** (المخزن الحالي في الذاكرة ⇒ أي restart بيلغي الجلسات).
 - ميزات لسه مش معروضة في الـ Mini App: الملفات، التكلفة، تصدير الشات (موجودة في البوت، ومخفية
   بـ `features.is_hidden`)، ونسخ الرد الكامل.
+- صندوق الإشعارات: **مفيش حذف/أرشفة** من الواجهة (التقليم تلقائي عند الحدود)، ولا فلترة
+  "غير المقروء فقط" في الواجهة (الـ API بيدعم `unread=1`)، ولا إشعارات "مقروءة جزئيًا" —
+  لو مطلوب نضيفه لاحقًا. **مفيش cleanup worker**: التقليم جوه نفس معاملة الإدراج.
 - تفعيل `MINI_APP_ENABLED` في الإنتاج + تحديث `/app` يشاور على الواجهة الفعلية.
 - معالجة الرابط الثابت (القسم 12).

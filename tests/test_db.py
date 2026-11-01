@@ -786,3 +786,241 @@ def test_batch1_persistence_intact_after_index_migration(tmp_path):
     assert db2.get_notifier_pending("c1") == "finished"
     assert db2.get_retry_not_before("c1") == "2030-01-01T00:00:00+00:00"
     db2.close()
+
+
+# ------------------------------------------ OHB2-08-05: صندوق الإشعارات
+def test_inbox_add_and_list_newest_first(tmp_path):
+    db = make_db(tmp_path)
+    a = db.add_inbox_item("c1", "عنوان", "terminal", "رسالة أولى", "2026-01-01T00:00:00+00:00")
+    b = db.add_inbox_item("c1", "عنوان", "proactive", "رسالة تانية", "2026-01-01T00:01:00+00:00")
+    items = db.list_inbox()
+    assert [it.id for it in items] == [b, a]  # الأحدث أولًا
+    assert items[0].message == "رسالة تانية"
+    assert items[0].kind == "proactive"
+    assert items[0].unread is True and items[0].read_at is None
+    db.close()
+
+
+def test_inbox_unread_count_and_mark_read(tmp_path):
+    db = make_db(tmp_path)
+    a = db.add_inbox_item("c1", "t", "terminal", "x", "t0")
+    db.add_inbox_item("c1", "t", "terminal", "y", "t1")
+    assert db.count_inbox() == 2
+    assert db.count_inbox(unread_only=True) == 2
+    assert db.mark_inbox_read(a, "t2") is True
+    assert db.count_inbox(unread_only=True) == 1
+    # idempotent: إعادة التعليم ما تكسّرش ومازالت True.
+    assert db.mark_inbox_read(a, "t3") is True
+    assert db.count_inbox(unread_only=True) == 1
+    db.close()
+
+
+def test_inbox_mark_read_missing_returns_false(tmp_path):
+    db = make_db(tmp_path)
+    assert db.mark_inbox_read(999, "t") is False
+    db.close()
+
+
+def test_inbox_mark_all_read(tmp_path):
+    db = make_db(tmp_path)
+    db.add_inbox_item("c1", "t", "terminal", "x", "t0")
+    db.add_inbox_item("c2", "t", "proactive", "y", "t1")
+    changed = db.mark_all_inbox_read("t2")
+    assert changed == 2
+    assert db.count_inbox(unread_only=True) == 0
+    assert db.mark_all_inbox_read("t3") == 0  # مفيش غير مقروء تاني
+    db.close()
+
+
+def test_inbox_list_unread_only_and_paging(tmp_path):
+    db = make_db(tmp_path)
+    ids = [db.add_inbox_item("c1", "t", "terminal", f"m{i}", f"t{i}") for i in range(5)]
+    db.mark_inbox_read(ids[0], "tx")  # الأقدم مقروء
+    page0 = db.list_inbox(limit=2, offset=0)
+    page1 = db.list_inbox(limit=2, offset=2)
+    assert len(page0) == 2 and len(page1) == 2
+    assert {it.id for it in page0}.isdisjoint({it.id for it in page1})
+    unread = db.list_inbox(unread_only=True)
+    assert ids[0] not in [it.id for it in unread]
+    assert len(unread) == 4
+    db.close()
+
+
+def test_inbox_message_truncated(tmp_path):
+    from bot.db import INBOX_MAX_MESSAGE_CHARS
+
+    db = make_db(tmp_path)
+    db.add_inbox_item("c1", "t", "terminal", "x" * (INBOX_MAX_MESSAGE_CHARS + 500), "t0")
+    item = db.list_inbox()[0]
+    assert len(item.message) == INBOX_MAX_MESSAGE_CHARS
+    db.close()
+
+
+def test_inbox_pruned_per_conversation(tmp_path):
+    from bot.db import INBOX_MAX_PER_CONVERSATION
+
+    db = make_db(tmp_path)
+    for i in range(INBOX_MAX_PER_CONVERSATION + 10):
+        db.add_inbox_item("c1", "t", "terminal", f"m{i}", "t0")
+    # غير المقروءة محمية (Batch 3R-FIX)؛ بعد ما تتعلّم مقروءة، إدراج إضافي يستدعي التقليم.
+    db.mark_all_inbox_read("tr")
+    db.add_inbox_item("c1", "t", "terminal", "mZ", "t1")  # صف غير مقروء (يستدعي تقليم c1)
+    db.add_inbox_item("c2", "t", "terminal", "other", "t0")  # محادثة تانية ما تتأثّرش
+    kept = db.list_inbox(limit=1000)
+    c1 = [it for it in kept if it.conversation_id == "c1"]
+    read_c1 = [it for it in c1 if not it.unread]
+    unread_c1 = [it for it in c1 if it.unread]
+    # المقروءة اتقلّمت للسقف، والصف غير المقروء (mZ) محفوظ فوق السقف (سقف ناعم).
+    assert len(read_c1) == INBOX_MAX_PER_CONVERSATION
+    assert [it.message for it in unread_c1] == ["mZ"]
+    assert len([it for it in kept if it.conversation_id == "c2"]) == 1
+    assert c1[0].message == "mZ"  # الأحدث أولًا
+    assert all(it.message != "m0" for it in c1)  # الأقدم المقروء اتشال
+    db.close()
+
+
+def test_inbox_survives_reopen(tmp_path):
+    path = str(tmp_path / "t.sqlite3")
+    db = Database(path)
+    db.add_inbox_item("c1", "t", "terminal", "x", "t0")
+    db.close()
+    db2 = Database(path)  # إعادة فتح ⇒ CREATE TABLE IF NOT EXISTS تاني (idempotent)
+    assert db2.count_inbox() == 1
+    assert db2.list_inbox()[0].message == "x"
+    db2.close()
+
+
+def test_inbox_upgrades_old_db_without_table(tmp_path):
+    """قاعدة قديمة من غير جدول الصندوق بتاخده عند الفتح (إضافي، من غير فقد)."""
+    path = str(tmp_path / "old.sqlite3")
+    db = Database(path)
+    db.add_watched("c1", "قديم")
+    db._conn.execute("DROP TABLE notification_inbox")  # نحاكي قاعدة أقدم من OHB2-08-05
+    db._conn.commit()
+    db.close()
+
+    db2 = Database(path)
+    assert [w.conversation_id for w in db2.list_watched()] == ["c1"]  # البيانات القديمة سليمة
+    db2.add_inbox_item("c1", "t", "terminal", "جديد", "t0")
+    assert db2.count_inbox() == 1
+    db2.close()
+
+
+# --------------------------------- OHB2-08-05: هوية الحدث + التقليم العام
+def test_inbox_event_key_dedup_same_event(tmp_path):
+    """نفس `event_key` ⇒ مفيش صف جديد (الرجوع None)، والإدراج الأول يرجّع معرّف."""
+    db = make_db(tmp_path)
+    a = db.add_inbox_item("c1", "t", "terminal", "x", "t0", event_key="c1|terminal|seq1|running")
+    b = db.add_inbox_item("c1", "t", "terminal", "x", "t1", event_key="c1|terminal|seq1|running")
+    assert a == 1 and b is None
+    assert db.count_inbox() == 1
+    # الحدث نفسه بنص مختلف لسه مرفوض (الهوية هي المفتاح مش النص).
+    assert db.add_inbox_item("c1", "t", "terminal", "نص مختلف", "t2",
+                             event_key="c1|terminal|seq1|running") is None
+    assert db.count_inbox() == 1
+    db.close()
+
+
+def test_inbox_event_key_different_events_coexist(tmp_path):
+    """مفاتيح مختلفة ⇒ صفوف مختلفة (حتى نفس المحادثة والنوع)."""
+    db = make_db(tmp_path)
+    db.add_inbox_item("c1", "t", "terminal", "x", "t0", event_key="c1|terminal|seq1|running")
+    db.add_inbox_item("c1", "t", "terminal", "y", "t1", event_key="c1|terminal|seq2|running")
+    db.add_inbox_item("c1", "t", "timeout", "z", "t2", event_key="c1|timeout|seq2|running")
+    assert db.count_inbox() == 3
+    db.close()
+
+
+def test_inbox_null_event_key_not_deduped(tmp_path):
+    """من غير مفتاح (سلوك قديم): كل إدراج بيعمل صف — قيد التفرّد الجزئي ما بيمسّش NULL."""
+    db = make_db(tmp_path)
+    db.add_inbox_item("c1", "t", "terminal", "x", "t0")
+    db.add_inbox_item("c1", "t", "terminal", "y", "t1")
+    assert db.count_inbox() == 2
+    db.close()
+
+
+def test_inbox_event_key_unique_index_enforced(tmp_path):
+    """القيد على مستوى القاعدة: الإدراج المباشر بنفس المفتاح يفشل (مش الذاكرة)."""
+    db = make_db(tmp_path)
+    db.add_inbox_item("c1", "t", "terminal", "x", "t0", event_key="k1")
+    with pytest.raises(sqlite3.IntegrityError):
+        db._conn.execute(
+            "INSERT INTO notification_inbox(conversation_id, title, kind, message, created_at, "
+            "read_at, event_key) VALUES('c1','t','terminal','y','t1',NULL,'k1')"
+        )
+    db.close()
+
+
+def test_inbox_event_key_migrated_onto_old_table(tmp_path):
+    """قاعدة فيها جدول الصندوق من غير عمود المفتاح بتاخد العمود + القيد عند الفتح."""
+    path = str(tmp_path / "old.sqlite3")
+    db = Database(path)
+    db._conn.execute("DROP TABLE notification_inbox")
+    db._conn.execute(
+        "CREATE TABLE notification_inbox ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id TEXT NOT NULL, "
+        "title TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL DEFAULT '', "
+        "message TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, read_at TEXT)"
+    )
+    db._conn.execute(
+        "INSERT INTO notification_inbox(conversation_id, title, kind, message, created_at) "
+        "VALUES('c1','t','terminal','قديم','t0')"
+    )
+    db._conn.commit()
+    db.close()
+
+    db2 = Database(path)  # الفتح التاني يعمل ALTER + INDEX
+    cols = {r["name"] for r in db2._conn.execute("PRAGMA table_info(notification_inbox)")}
+    assert "event_key" in cols
+    assert db2.count_inbox() == 1  # السجل القديم محفوظ (event_key=NULL)
+    # القيد بقى شغال.
+    db2.add_inbox_item("c1", "t", "terminal", "x", "t1", event_key="k")
+    assert db2.add_inbox_item("c1", "t", "terminal", "x", "t2", event_key="k") is None
+    db2.close()
+
+
+def test_inbox_global_cap_prunes_oldest(tmp_path):
+    """السقف العام بيحتفظ بأحدث INBOX_MAX_TOTAL عبر كل المحادثات (للمقروءة)."""
+    from bot.db import INBOX_MAX_TOTAL
+
+    db = make_db(tmp_path)
+    # نتجاوز السقف بمحادثات مختلفة (عشان السقف لكل-محادثة ما يشتغلش).
+    for i in range(INBOX_MAX_TOTAL + 25):
+        db.add_inbox_item(f"c{i % 60}", "t", "terminal", f"m{i}", f"t{i}")
+    db.mark_all_inbox_read("tr")  # المقروءة بس مؤهّلة للتقليم (Batch 3R-FIX)
+    db.add_inbox_item("cZ", "t", "terminal", "mZ", "tZ")  # غير مقروء (يستدعي التقليم العام)
+    # المقروءة اتقلّمت للسقف العام، والصف غير المقروء محفوظ فوقه (سقف ناعم).
+    read_kept = [it for it in db.list_inbox(limit=1000) if not it.unread]
+    unread_kept = [it for it in db.list_inbox(limit=1000) if it.unread]
+    assert len(read_kept) == INBOX_MAX_TOTAL
+    assert [it.message for it in unread_kept] == ["mZ"]
+    # الأحدث محفوظ والأقدم المقروء اتشال.
+    newest = db.list_inbox(limit=1)[0]
+    assert newest.message == "mZ"
+    assert all(it.message != "m0" for it in db.list_inbox(limit=1000))
+    db.close()
+
+
+def test_inbox_batch1_batch2_tables_preserved(tmp_path):
+    """التغيير إضافي: جداول Batch 1/2 (watched/notification_state/outbox/...) لسه موجودة."""
+    db = make_db(tmp_path)
+    tables = {
+        r["name"]
+        for r in db._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    for t in ("watched", "notification_state", "notifier_pending", "outbox", "creation_jobs",
+              "notification_inbox"):
+        assert t in tables
+    db.close()
+
+
+def test_inbox_created_at_and_event_key_roundtrip(tmp_path):
+    """الحقول المحفوظة بترجع زي ما هي (created_at UTC ISO + event_key)."""
+    db = make_db(tmp_path)
+    db.add_inbox_item("c1", "عنوان", "proactive", "نص", "2026-10-13T00:00:00+00:00",
+                      event_key="c1|proactive|finished")
+    it = db.list_inbox()[0]
+    assert it.created_at == "2026-10-13T00:00:00+00:00"
+    assert it.event_key == "c1|proactive|finished"
+    db.close()

@@ -15,6 +15,7 @@ from tests._miniapp_helpers import BOT_TOKEN, make_init_data
 
 OWNER = 555
 ORIGIN = "https://app.test"
+OWNER_UUID = "owner-uuid-123"
 
 
 class FakeClient:
@@ -22,7 +23,15 @@ class FakeClient:
         self.convs = convs or {}
 
     async def get_conversations(self, ids):
-        return [self.convs[i] for i in ids if i in self.convs]
+        # كل الشاتات الوهمية مملوكة للمالك الحالي افتراضيًا (تقدر تتخطّى بـ created_by_user_id).
+        return [
+            {**self.convs[i], "created_by_user_id": self.convs[i].get("created_by_user_id", OWNER_UUID)}
+            for i in ids
+            if i in self.convs
+        ]
+
+    async def get_current_user(self):
+        return {"id": OWNER_UUID}
 
     async def get_last_exchange(self, conversation_id):
         return (None, None)
@@ -140,7 +149,7 @@ def _authed(tmp_path, **over):
 def test_prompt_duplicate_ref_does_not_duplicate(tmp_path):
     """double-tap: نفس client_ref مرتين ⇒ سجل صندوق واحد بس."""
     db = Database(str(tmp_path / "d.sqlite3"))
-    c = _authed(tmp_path, _kwargs={"db": db, "client": FakeClient()})
+    c = _authed(tmp_path, _kwargs={"db": db, "client": FakeClient(convs={"c1": {"id": "c1"}})})
     body = {"text": "اعمل حاجة", "client_ref": "ref-abc"}
     r1 = c.post("/api/v1/conversations/c1/prompt", json=body, headers={"origin": ORIGIN})
     r2 = c.post("/api/v1/conversations/c1/prompt", json=body, headers={"origin": ORIGIN})

@@ -16,6 +16,8 @@ from tests._miniapp_helpers import BOT_TOKEN, make_init_data
 OWNER = 555
 OTHER = 999
 ORIGIN = "https://app.test"
+# OHB2-09-A2-02: تفويض الشات بيقارن `created_by_user_id` بهوية `/users/me`.
+OWNER_UUID = "owner-uuid-123"
 
 
 # ------------------------------------------------------------------- fakes
@@ -31,7 +33,15 @@ class FakeClient:
         return {"items": list(self.items), "next_page_id": None}
 
     async def get_conversations(self, ids):
-        return [self.convs[i] for i in ids if i in self.convs]
+        # كل الشاتات الوهمية مملوكة للمالك الحالي افتراضيًا (تقدر تتخطّى بـ created_by_user_id).
+        return [
+            {**self.convs[i], "created_by_user_id": self.convs[i].get("created_by_user_id", OWNER_UUID)}
+            for i in ids
+            if i in self.convs
+        ]
+
+    async def get_current_user(self):
+        return {"id": OWNER_UUID}
 
     async def get_last_exchange(self, conversation_id):
         return self.exchange
@@ -352,7 +362,7 @@ def test_send_prompt_queues_and_wakes_worker():
     worker = FakeWorker()
     app = FakeApplication(outbox_worker=worker)
     c = TestClient(
-        build_web_app(make_config(), db, client=FakeClient(), application=app),
+        build_web_app(make_config(), db, client=FakeClient(convs={"c1": {"id": "c1"}}), application=app),
         raise_server_exceptions=False,
     )
     c.post("/api/v1/auth", json={"initData": make_init_data(OWNER)})
@@ -367,7 +377,7 @@ def test_send_prompt_queues_and_wakes_worker():
 
 
 def test_send_prompt_rejects_empty_text():
-    c = TestClient(build_web_app(make_config(), FakeDb(), client=FakeClient()),
+    c = TestClient(build_web_app(make_config(), FakeDb(), client=FakeClient(convs={"c1": {"id": "c1"}})),
                    raise_server_exceptions=False)
     c.post("/api/v1/auth", json={"initData": make_init_data(OWNER)})
     r = c.post("/api/v1/conversations/c1/prompt", json={"text": "   "}, headers={"origin": ORIGIN})
@@ -387,15 +397,15 @@ def test_watch_and_unwatch(monkeypatch):
     assert r.status_code == 200 and "c1" not in db.watched
 
 
-def test_watches_hidden_by_default():
-    """القرار 4: المتابعات مخفية ⇒ endpoints المتابعة ترجّع 404 في الـ Mini App كمان."""
+def test_watches_available_when_restored(monkeypatch):
+    """OHB2-09-06/07: المتابعات اتسترجعت ⇒ endpoints المتابعة شغّالة في الـ Mini App."""
     db = FakeDb()
     client = FakeClient(convs={"c1": {"id": "c1", "title": "T", "execution_status": "running"}})
     c = TestClient(build_web_app(make_config(), db, client=client), raise_server_exceptions=False)
     c.post("/api/v1/auth", json={"initData": make_init_data(OWNER)})
-    assert c.get("/api/v1/watches").status_code == 404
-    assert c.post("/api/v1/conversations/c1/watch", headers={"origin": ORIGIN}).status_code == 404
-    assert c.delete("/api/v1/conversations/c1/watch", headers={"origin": ORIGIN}).status_code == 404
+    assert c.get("/api/v1/watches").status_code == 200
+    assert c.post("/api/v1/conversations/c1/watch", headers={"origin": ORIGIN}).status_code == 200
+    assert c.delete("/api/v1/conversations/c1/watch", headers={"origin": ORIGIN}).status_code == 200
 
 
 def test_create_chat_queues_and_wakes_worker():

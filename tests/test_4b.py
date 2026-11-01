@@ -115,6 +115,21 @@ def test_api_error_and_user_text_redact_secrets():
     assert KEY not in error_text(RuntimeError(f"raw {KEY}"))  # غير ApiError: نص عام
 
 
+def test_describe_status_redacts_upstream_detail():
+    """M14 regression (BATCH-C FC3): تفاصيل الخطأ الخام من upstream (`detail`) لازم
+    تتنقّح عبر `describe_status` قبل ما تتضمّن في رسالة `ApiError`. قبل التقوية كان
+    `describe_status` بيضمّن `detail` من غير `redact()`، فأي سر يتسرّب جوّه تفاصيل رد
+    upstream (مثلاً مفتاح OpenHands) كان يظهر للمستخدم/يتسجّل. دلوقتي بيتنقّح."""
+    from bot.errors import describe_status
+
+    register_secrets(KEY)
+    out = describe_status(500, f"boom token={KEY}")
+    assert KEY not in out
+    assert "***" in out
+    # الوصف الأساسي للحالة لسه موجود (مش اتشال).
+    assert "خطأ داخلي" in out
+
+
 def test_client_network_error_does_not_expose_raw_exception_text():
     register_secrets(KEY)
 
@@ -458,11 +473,19 @@ def test_start_command_clears_pending_state(tmp_path):
 
 
 class OpenClient:
+    OWNER_UUID = "owner-uuid-123"
+
     def __init__(self, conv):
         self._conv = conv
 
     async def get_conversations(self, ids):
-        return [self._conv]
+        if not self._conv:
+            return []
+        conv = {**self._conv, "created_by_user_id": self._conv.get("created_by_user_id", self.OWNER_UUID)}
+        return [conv]
+
+    async def get_current_user(self):
+        return {"id": self.OWNER_UUID}
 
     async def get_last_reply(self, cid):
         return "رد"
@@ -515,6 +538,8 @@ from telegram.error import BadRequest, TelegramError  # noqa: E402
 class OpenFlowClient:
     """عميل فتح شات: conversation + آخر رد، مع عدّادات نداءات ومسارات خطأ/تعليق."""
 
+    OWNER_UUID = "owner-uuid-123"
+
     def __init__(self, conv, reply="رد", *, list_calls=None, open_error=None,
                  reply_error=None, hang=False):
         self._conv = conv
@@ -530,7 +555,13 @@ class OpenFlowClient:
             await asyncio.Event().wait()  # تعليق (اختبار المهلة)
         if self._open_error:
             raise self._open_error
-        return [self._conv] if self._conv else []
+        if not self._conv:
+            return []
+        conv = {**self._conv, "created_by_user_id": self._conv.get("created_by_user_id", self.OWNER_UUID)}
+        return [conv]
+
+    async def get_current_user(self):
+        return {"id": self.OWNER_UUID}
 
     async def get_last_reply(self, conversation_id):
         if self._reply_error:

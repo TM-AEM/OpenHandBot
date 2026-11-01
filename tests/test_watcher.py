@@ -1472,3 +1472,162 @@ def test_ohb2_08_03_failed_reconcile_blocks_removal(tmp_path):
     assert db.is_watched("c1")  # لسه متابَع (الإزالة اترجعت)
     assert "c1" in w._marker_pending  # التلميح محفوظ (retry آمن)
     db.close()
+
+
+# ==================== OHB2-08-05: تسجيل الإشعارات في الصندوق (history) ====================
+def test_inbox_records_terminal_notification(tmp_path):
+    """إشعار انتهاء متابعة ناجح بيتسجّل في الصندوق بعد التسليم (نوع terminal)."""
+    db = Database(str(tmp_path / "t.sqlite3"))
+    _seed_watch(db)
+    w = Watcher(_finished_client(), db, FakeBot(), chat_id=1)
+
+    asyncio.run(w.tick())
+
+    items = db.list_inbox()
+    assert len(items) == 1
+    assert items[0].kind == "terminal"
+    assert items[0].conversation_id == "c1"
+    assert "انتهى الشات" in items[0].message
+    assert items[0].unread is True
+    db.close()
+
+
+def test_inbox_event_recorded_pending_when_send_fails(tmp_path):
+    """OHB2-08-05 (Batch 3R): الإرسال فشل ⇒ الحدث **لسه يتسجّل** (pending) — مش بيتفقد.
+
+    ده عكس السلوك القديم (delivery-history-only). الحدث بيفضل ظاهر/معلّق لحد ما يتسلّم
+    أو يتصنّف failed، فالحدث مايتفقدش لو تليجرام فشل.
+    """
+    db = Database(str(tmp_path / "t.sqlite3"))
+    _seed_watch(db)
+    w = Watcher(_finished_client(), db, FailBot(), chat_id=1)
+
+    asyncio.run(w.tick())
+
+    items = db.list_inbox()
+    assert len(items) == 1 and items[0].kind == "terminal"
+    assert items[0].delivery_status == "pending"
+    assert items[0].delivery_attempts >= 1
+    db.close()
+
+
+def test_inbox_records_timeout_delivery(tmp_path):
+    """إشعار المهلة (24 ساعة) بيتسجّل بنوع timeout (مسار متابعة بدون برومبت)."""
+    db = Database(str(tmp_path / "t.sqlite3"))
+    db.add_watched("c1", "عنوان")
+    db._conn.execute(
+        "UPDATE watched SET added_at=? WHERE conversation_id=?", ("2020-01-01T00:00:00+00:00", "c1")
+    )
+    db._conn.commit()
+    db.upsert_notification_state("c1", status="running", notified_status="running", updated_at="t")
+    client = FakeClient({"c1": {"id": "c1", "title": "عنوان", "execution_status": "running"}})
+    w = Watcher(client, db, FakeBot(), chat_id=1)
+
+    asyncio.run(w.tick())
+
+    items = db.list_inbox()
+    assert len(items) == 1 and items[0].kind == "timeout"
+    assert not db.is_watched("c1")
+    db.close()
+
+
+def test_inbox_records_missing_delivery(tmp_path):
+    """شات متابَع اختفى بعد MISSING_LIMIT دورة ⇒ إشعار missing في الصندوق."""
+    db = Database(str(tmp_path / "t.sqlite3"))
+    db.add_watched("gone", "اتمسح")
+    w = Watcher(FakeClient({}), db, FakeBot(), chat_id=1)
+
+    for _ in range(MISSING_LIMIT):
+        asyncio.run(w.tick())
+
+    items = db.list_inbox()
+    assert len(items) == 1 and items[0].kind == "missing"
+    assert items[0].conversation_id == "gone"
+    db.close()
+
+
+def test_inbox_write_failure_does_not_break_delivery(tmp_path):
+    """فشل كتابة الصندوق (SQLite) ما يمنعش التسليم ولا إزالة المتابعة (عزل تام)."""
+    class _InboxFailsDb(Database):
+        def add_inbox_event(self, *a, **kw):
+            raise sqlite3.OperationalError("inbox down")
+
+    db = _InboxFailsDb(str(tmp_path / "t.sqlite3"))
+    _seed_watch(db)
+    bot = FakeBot()
+    w = Watcher(_finished_client(), db, bot, chat_id=1)
+
+    asyncio.run(w.tick())
+
+    assert len(bot.sent) == 1          # التسليم حصل
+    assert db.list_watched() == []     # والمتابعة اتشالت عادي
+    assert db.count_inbox() == 0       # بس الصندوق فاضي (الكتابة فشلت)
+    db.close()
+
+
+def test_recovery_delivers_pending_event_after_watch_removed(tmp_path):
+    """OHB2-08-05 (Batch 3R) BLOCKER-1: حدث معلّق (المتابعة اتشالت) بيتسلّم بالاسترجاع.
+
+    محاكاة السيناريو القاتل: إرسال فشل مرّات كفاية ⇒ المتابعة اتشالت، لكن الحدث لسه
+    `pending` في الصندوق. دورة تانية (بمتابعة ناجحة) لازم **تسترجعه وتبعته** — مش تفضل
+    الأحداث مفقودة.
+    """
+    db = Database(str(tmp_path / "t.sqlite3"))
+    _seed_watch(db)
+    fail = FailBot()
+    w_fail = Watcher(_finished_client(), db, fail, chat_id=1)
+    for _ in range(MAX_WATCH_NOTIFY_RETRIES):
+        asyncio.run(w_fail.tick())
+
+    assert not db.is_watched("c1")          # المتابعة اتشالت بعد الاستنفاد
+    items = db.list_inbox()
+    assert len(items) == 1                   # بس الحدث لسه موجود (مش مفقود)
+    assert items[0].delivery_status == "pending"
+
+    # دورة تانية ببوت شغّال: الاسترجاع يبعت الحدث المعلّق ويعلّمه delivered.
+    ok = FakeBot()
+    w_ok = Watcher(FakeClient({}), db, ok, chat_id=1)  # مفيش متابعات
+    asyncio.run(w_ok.tick())
+
+    assert len(ok.sent) == 1
+    assert db.list_inbox()[0].delivery_status == "delivered"
+    db.close()
+
+
+# =====================================================================
+# OHB2-08-05: idempotency الصندوق (مفتاح الحدث) + إعادة المتابعة
+# =====================================================================
+def test_inbox_event_key_stable_across_retry(tmp_path):
+    """نفس الحدث (نفس watch_seq/الحالة) مسجّل مرتين ⇒ صف واحد (مفيش ازدواج)."""
+    db = Database(str(tmp_path / "t.sqlite3"))
+    _seed_watch(db)
+    w = Watcher(_finished_client(), db, FakeBot(), chat_id=1)
+
+    asyncio.run(w.tick())
+
+    items = db.list_inbox()
+    assert len(items) == 1
+    key = items[0].event_key
+    assert key  # المفتاح اتكتب
+    # نحاكي إعادة معالجة نفس الحدث (retry/restart/reconcile) بنفس المفتاح.
+    w._record_inbox("c1", "عنوان", "terminal", "نفس النص", event_key=key)
+    assert db.count_inbox() == 1
+    db.close()
+
+
+def test_inbox_event_key_differs_after_rewatch(tmp_path):
+    """إعادة المتابعة (watch_seq جديد) بتعتبر حدث جديد ⇒ سجل جديد (مش ازدواج)."""
+    db = Database(str(tmp_path / "t.sqlite3"))
+    _seed_watch(db)
+    w = Watcher(_finished_client(), db, FakeBot(), chat_id=1)
+    asyncio.run(w.tick())
+    first_key = db.list_inbox()[0].event_key
+
+    # متابعة جديدة لنفس الشات (دورة جديدة ⇒ watch_seq جديد).
+    _seed_watch(db)
+    asyncio.run(w.tick())
+
+    items = db.list_inbox()
+    assert len(items) == 2
+    assert items[0].event_key != first_key
+    db.close()

@@ -6,7 +6,7 @@
     <meta name="color-scheme" content="light dark">
     <meta name="theme-color" content="#0f172a">
     <title>OpenHandBot</title>
-    <link rel="stylesheet" href="/mini/styles.css?v=4">
+    <link rel="stylesheet" href="/mini/styles.css?v=5">
   </head>
   <body>
     <main class="app" id="app" aria-busy="true">
@@ -31,6 +31,7 @@
         <nav class="tabs" role="tablist">
           <button class="tab" type="button" data-view="chats" role="tab">الشاتات</button>
           <button class="tab" type="button" data-view="watches" role="tab">المتابعات</button>
+          <button class="tab" type="button" data-view="inbox" role="tab">الإشعارات <span class="badge" id="inbox-badge" hidden></span></button>
           <button class="tab" type="button" data-view="new" role="tab">شات جديد</button>
           <button class="tab" type="button" data-view="settings" role="tab">الإعدادات</button>
         </nav>
@@ -52,6 +53,17 @@
             <button class="btn ghost" type="button" id="watches-refresh">تحديث</button>
           </div>
           <ul class="list" id="watches-list"></ul>
+        </div>
+
+        <div class="view" id="view-inbox" hidden>
+          <div class="toolbar">
+            <button class="btn ghost" type="button" id="inbox-refresh">تحديث</button>
+            <button class="btn ghost" type="button" id="inbox-read-all">تعليم الكل كمقروء</button>
+          </div>
+          <ul class="list" id="inbox-list"></ul>
+          <div class="more" id="inbox-more" hidden>
+            <button class="btn ghost" type="button" id="inbox-next">المزيد</button>
+          </div>
         </div>
 
         <div class="view" id="view-new" hidden>
@@ -80,7 +92,10 @@
       <div class="toast" id="toast" hidden role="status" aria-live="polite"></div>
     </main>
 
-    <script src="/mini/ops.js?v=4" defer></script>
-    <script src="/mini/app.js?v=4" defer></script>
+    <script src="/mini/ops.js?v=5" defer></script>
+    <script src="/mini/inbox.js?v=5" defer></script>
+    <script src="/mini/files.js?v=5" defer></script>
+    <script src="/mini/cost.js?v=5" defer></script>
+    <script src="/mini/app.js?v=5" defer></script>
   </body>
 </html>

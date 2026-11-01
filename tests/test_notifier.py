@@ -973,3 +973,174 @@ def test_retry_after_deadline_does_not_affect_durable_marker(tmp_path):
     assert db.get_notification_state("c1").notified_status == "finished"
     assert db.get_notifier_pending("c1") is None
     db.close()
+
+
+# ==================== OHB2-08-05: تسجيل الإشعارات الاستباقية في الصندوق ====================
+def test_inbox_records_proactive_notification(tmp_path):
+    """إشعار استباقي ناجح بيتسجّل في الصندوق بنوع proactive بعد التسليم."""
+    n, db, bot = make_notifier(tmp_path, one_page([conv("c1", "finished")]))
+    seed(db, "c1", "running")
+
+    asyncio.run(n.tick())
+
+    assert len(bot.sent) == 1
+    items = db.list_inbox()
+    assert len(items) == 1
+    assert items[0].kind == "proactive"
+    assert items[0].conversation_id == "c1"
+    assert items[0].unread is True
+    db.close()
+
+
+def test_inbox_not_recorded_when_disabled(tmp_path):
+    """الإشعارات معطّلة ⇒ مفيش إرسال ومفيش تسجيل في الصندوق (تسليم مكتوم)."""
+    n, db, bot = make_notifier(tmp_path, one_page([conv("c1", "finished")]))
+    seed(db, "c1", "running")
+    db.set_notifications_enabled(False)
+
+    asyncio.run(n.tick())
+
+    assert bot.sent == []
+    assert db.count_inbox() == 0
+    db.close()
+
+
+def test_inbox_not_recorded_when_watched(tmp_path):
+    """شات متابَع ⇒ المُبلّغ ما يبعتش (المراقب هو المالك) ⇒ مفيش تسجيل في الصندوق."""
+    n, db, bot = make_notifier(tmp_path, one_page([conv("c1", "finished")]))
+    seed(db, "c1", "running")
+    db.add_watched("c1", "t")
+
+    asyncio.run(n.tick())
+
+    assert bot.sent == []
+    assert db.count_inbox() == 0
+    db.close()
+
+
+def test_inbox_event_recorded_pending_when_send_fails(tmp_path):
+    """OHB2-08-05 (Batch 3R): فشل الإرسال ⇒ الحدث **لسه يتسجّل** (pending) مش بيتفقد."""
+    bot = FakeBot(fail=True)
+    n, db, _ = make_notifier(tmp_path, one_page([conv("c1", "finished")]), bot=bot)
+    seed(db, "c1", "running")
+
+    asyncio.run(n.tick())
+
+    items = db.list_inbox()
+    assert len(items) == 1 and items[0].kind == "proactive"
+    assert items[0].delivery_status == "pending"
+    assert items[0].delivery_attempts >= 1
+    db.close()
+
+
+def test_inbox_write_failure_does_not_break_notification(tmp_path):
+    """فشل كتابة الصندوق ما يمنعش التسجيل الدائم للتسليم (عزل تام)."""
+    class _InboxFailsDb(Database):
+        def add_inbox_event(self, *a, **kw):
+            raise sqlite3.OperationalError("inbox down")
+
+    db = _InboxFailsDb(str(tmp_path / "t.sqlite3"))
+    bot = FakeBot()
+    n = Notifier(
+        FakeSearchClient(one_page([conv("c1", "finished")])),
+        db, bot, chat_id=1, base_url="https://app.all-hands.dev",
+    )
+    seed(db, "c1", "running")
+
+    asyncio.run(n.tick())
+
+    assert len(bot.sent) == 1
+    assert db.get_notification_state("c1").notified_status == "finished"  # التسجيل حصل
+    assert db.count_inbox() == 0
+    db.close()
+
+
+def test_inbox_event_key_stable_for_same_status(tmp_path):
+    """نفس (المحادثة، النوع، الحالة) ⇒ مفتاح ثابت ⇒ إعادة التسجيل ما بتعملش ازدواج."""
+    n, db, bot = make_notifier(tmp_path, one_page([conv("c1", "finished")]))
+    seed(db, "c1", "running")
+
+    asyncio.run(n.tick())
+
+    items = db.list_inbox()
+    assert len(items) == 1
+    key = items[0].event_key
+    assert key
+    # محاكاة إعادة إرسال لنفس الحالة بعد restart (نافذة OHB2-08-01 المعروفة):
+    # نفس المفتاح ⇒ الصندوق ما ياخدش سجل تاني.
+    n._record_inbox({"id": "c1", "title": "t"}, "c1", "finished")
+    assert db.count_inbox() == 1
+    db.close()
+
+
+def test_inbox_not_duplicated_when_retry_after_then_success(tmp_path):
+    """RetryAfter ثم نجاح ⇒ صف واحد بس في الصندوق (مفيش ازدواج من إعادة المحاولة).
+
+    OHB2-08-05 (Batch 3R): الحدث بيتسجّل مرة واحدة عند الاكتشاف (event-first) ويفضل
+    `pending` خلال الـ 429، وبعد النجاح بيتعلّم `delivered` — نفس الصف، مفيش ازدواج.
+    """
+    bot = _RetryAfterBot(30)
+    n, db, _ = make_notifier(tmp_path, one_page([conv("c1", "finished")]), bot=bot)
+    seed(db, "c1", "running")
+
+    asyncio.run(n.tick())  # 429 ⇒ مفيش إرسال، لكن الحدث اتسجّل pending
+    assert db.count_inbox() == 1
+    assert db.list_inbox()[0].delivery_status == "pending"
+    # نمسح نافذة الانتظار الدائمة ونجدول دورة تانية (المحاولة التانية بتنجح).
+    db.clear_retry_not_before("c1")
+    asyncio.run(n.tick())
+
+    assert len(bot.sent) == 1
+    assert db.count_inbox() == 1
+    assert db.list_inbox()[0].delivery_status == "delivered"
+    db.close()
+
+
+def test_inbox_recorded_on_success_after_transient_failure(tmp_path):
+    """فشل شبكة مؤقّت (TelegramError) ثم نجاح ⇒ نفس الحدث يتعلّم delivered (مفيش ازدواج)."""
+    bot = _FlakyBot(fails=1)
+    n, db, _ = make_notifier(tmp_path, one_page([conv("c1", "finished")]), bot=bot)
+    seed(db, "c1", "running")
+
+    asyncio.run(n.tick())  # فشل مؤقّت ⇒ الحدث مسجّل pending
+    assert db.count_inbox() == 1
+    assert db.list_inbox()[0].delivery_status == "pending"
+    asyncio.run(n.tick())  # نجاح ⇒ نفس الصف بيتعلّم delivered
+
+    assert db.count_inbox() == 1
+    assert db.list_inbox()[0].kind == "proactive"
+    assert db.list_inbox()[0].delivery_status == "delivered"
+    db.close()
+
+
+def test_inbox_records_distinct_events_for_recurring_status(tmp_path):
+    """OHB2-08-05 (Batch 3R) HIGH-1: finished→running→finished ⇒ حدثين منفصلين.
+
+    السلوك القديم كان بيعتمد event_key = (cid, proactive, status)، فالإشعار التاني
+    لـ finished كان بيتحجب (count_inbox=1). دلوقتي الهوية بعدّاد الانتقال الدائم ⇒
+    كل انتقال حقيقي بيسجّل حدث، والاتنين يتسلّموا.
+    """
+    db = Database(str(tmp_path / "t.sqlite3"))
+    bot = FakeBot()
+    page = {"items": [conv("c1", "finished")], "next_page_id": None}
+    client = FakeSearchClient({None: page})
+    n = Notifier(client, db, bot, chat_id=1, base_url="https://app.all-hands.dev")
+    seed(db, "c1", "running")  # المسجّل = running
+
+    # أول finished ⇒ إشعار + حدث (pending⇒delivered).
+    asyncio.run(n.tick())
+    assert len(bot.sent) == 1
+
+    # رجع running (غير مؤهّل) ⇒ بيتسجّل من غير إشعار.
+    client._pages = {None: {"items": [conv("c1", "running")], "next_page_id": None}}
+    asyncio.run(n.tick())
+    assert len(bot.sent) == 1
+
+    # finished تاني ⇒ **انتقال جديد** ⇒ إشعار تاني + حدث تاني (مش محجوب).
+    client._pages = {None: {"items": [conv("c1", "finished")], "next_page_id": None}}
+    asyncio.run(n.tick())
+
+    assert len(bot.sent) == 2
+    assert db.count_inbox() == 2
+    assert all(it.delivery_status == "delivered" for it in db.list_inbox())
+    db.close()

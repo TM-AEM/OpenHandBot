@@ -43,6 +43,46 @@ CREATION_UNKNOWN = "unknown"
 CREATION_FAILED = "failed"
 CREATION_DISCARDED = "discarded"
 
+# OHB2-08-05: صندوق الإشعارات (history) — سجل **تراكمي** للإشعارات اللي اتسلّمت فعلًا
+# على تيليجرام، عشان المستخدم يرجع يشوفها من الـ Mini App بعد ما الرسالة تتوه في الشات.
+# ده **مش** مصدر حقيقة جديد للتسليم: `notification_state`/`watched`/`notifier_pending`
+# هما اللي بيحكموا هل الإشعار اتبعت ولا لأ. الصندوق بيسجّل **بعد** نجاح الإرسال بس،
+# فبيبقى متسق مع التسليم الفعلي (مفيش ازدواج ومفيش إشعار وهمي).
+# أنواع الإشعارات (kind) اللي بتتكتب في الصندوق.
+INBOX_KIND_TERMINAL = "terminal"       # شات متابَع وصل حالة نهائية (المراقب)
+INBOX_KIND_TIMEOUT = "timeout"         # انتهت مهلة متابعة (24 ساعة)
+INBOX_KIND_MISSING = "missing"         # شات متابَع اختفى من OpenHands
+INBOX_KIND_STALE_REPORT = "stale_report"  # مفيش تقرير جديد بعد البرومبت
+INBOX_KIND_PROACTIVE = "proactive"     # إشعار استباقي عام (المُبلّغ)
+
+# أقصى طول لنص الإشعار المحفوظ. ردود الـ agent ممكن تكون ضخمة؛ بنقصّها عشان القاعدة ما
+# تتضخّمش. الرسالة الكاملة بتفضل في تيليجرام؛ الصندوق ملخّص قابل للعرض.
+INBOX_MAX_MESSAGE_CHARS = 1000
+# أقصى عدد إشعارات محفوظة لكل محادثة (تقليم تراكمي عند الإدراج ⇒ نمو محدود).
+INBOX_MAX_PER_CONVERSATION = 50
+# أقصى عدد إشعارات محفوظة إجمالًا (تقليم عام عند الإدراج ⇒ سقف تخزين صلب حتى مع محادثات
+# كتير). بيمنع النمو غير المحدود لو المستخدم راقب مئات الشاتات.
+INBOX_MAX_TOTAL = 500
+# أقصى عدد عناصر في صفحة قايمة الصندوق (يتفرض في طبقة الـ API).
+INBOX_PAGE_SIZE = 10
+
+# OHB2-08-05 (Batch 3R): حالة تسليم الحدث (مستقلة تمامًا عن حالة القراءة `read_at`).
+#   pending   : الحدث اتسجّل بثبات (durable) ولسه ماتسلّمش لتليجرام. **مايتقلّمش أبدًا.**
+#   delivered : تليجرام أكّد التسليم. الحدث باقي في الصندوق كسجل تاريخي.
+#   failed    : استنفدنا ميزانية المحاولات (رفض دائم أو فشل متكرّر). الحدث **باقي**
+#               ظاهر للمستخدم (مفيش فقد صامت)، بس مايتعادش تلقائيًا.
+INBOX_DELIVERY_PENDING = "pending"
+INBOX_DELIVERY_DELIVERED = "delivered"
+INBOX_DELIVERY_FAILED = "failed"
+# أقصى طول لتصنيف خطأ التسليم المحفوظ (نوع الاستثناء بس — مفيش نص حسّاس/أسرار).
+INBOX_MAX_ERROR_CHARS = 120
+# أقصى عدد محاولات تسليم للحدث الواحد قبل ما نصنّفه فاشل (ميزانية مستقلة لكل حدث).
+INBOX_DELIVERY_MAX_ATTEMPTS = 5
+# OHB2-08-05 (Batch 3R-FIX2-F1): مدة صلاحية حجز الحدث (claim lease). حجز أقدم من كده بيتخطّى/
+# يتحرّر (العملية اللي أخدته وقعت قبل ما تحرّره) ⇒ الحدث ما يعلقش محجوزًا للأبد. أطول من أي
+# إرسال عادي (ثوانٍ) فمايسببش إرسالًا مزدوجًا عمليًا.
+INBOX_CLAIM_LEASE = timedelta(minutes=5)
+
 
 # مهلة أي حالة توجيه (من آخر نشاط). القرار 1: توجيه 10 دقايق.
 AWAITING_TTL = timedelta(minutes=10)
@@ -94,6 +134,16 @@ class NotificationState:
     notified_status: str | None = None
     retry_count: int = 0
     updated_at: str | None = None
+    # OHB2-08-05 (Batch 3R-FIX2): عدّاد انتقالات دائم = **عصر الاكتشاف** لكل انتقال حالة
+    # نهائية. بيزيد **مرة واحدة عند اكتشاف** انتقال جديد (مش عند التسليم)، ويثبت خلال كل
+    # إعادات المحاولة لنفس الانتقال ⇒ إعادة الاستطلاع/إعادة التشغيل لنفس الانتقال تعيد نفس
+    # الرقم (idempotent)، وانتقال جديد لنفس الحالة (finished→running→finished) بياخد رقمًا
+    # جديدًا ⇒ حدث منفصل. ده الهوية الموحّدة بين المراقب والمُبلّل.
+    transition_seq: int = 0
+    # OHB2-08-05 (Batch 3R-FIX2): الحالة النهائية اللي «عصر» `transition_seq` الحالي بيخصّها.
+    # بتمنع ترقية العدّاد مرتين لنفس الانتقال المتكرّر، وبتتصفّر عند رؤية حالة غير نهائية
+    # (دورة حياة جديدة). NULL = مفيش عصر مفتوح.
+    discovered_status: str | None = None
 
 
 @dataclass
@@ -126,6 +176,58 @@ class CreationJob:
     attempts: int = 0
     # OHB2-07: معرّف العملية اللي العميل يولّده لمنع ازدواج إنشاء الشات عند إعادة المحاولة.
     client_ref: str | None = None
+
+
+@dataclass
+class InboxItem:
+    """OHB2-08-05: حدث إشعار واحد في الصندوق (سجل دائم للحدث المُكتشَف).
+
+    الحدث بيتسجّل عند **لحظة اكتشافه المنطقية** (قبل أي محاولة إرسال لتليجرام)، وحالة
+    التسليم (`delivery_status`) بتتحدّث **بعد كده** بشكل مستقل — فالصندوق سجل للأحداث
+    المُكتشَفة، مش سجل للتسليمات الناجحة بس.
+    """
+
+    id: int
+    conversation_id: str
+    title: str
+    kind: str
+    message: str
+    created_at: str
+    read_at: str | None = None
+    # OHB2-08-05: مفتاح الهوية المنطقية للحدث (idempotency). NULL للسجلات القديمة اللي
+    # اتكتبت قبل إضافة العمود. بيُستخدم لقيد التفرّد الجزئي عشان نفس الحدث ما يتسجّلش مرتين.
+    event_key: str | None = None
+    # OHB2-08-05 (Batch 3R): بيانات التسليم المستقلة عن حالة القراءة.
+    delivery_status: str = INBOX_DELIVERY_DELIVERED
+    delivery_attempts: int = 0
+    last_attempt_at: str | None = None
+    delivered_at: str | None = None
+    last_error: str | None = None
+    next_retry_at: str | None = None
+    # OHB2-08-05 (Batch 3R): وجهة التسليم المحفوظة مع الحدث (المراقب/المُبلّغ) عشان
+    # إعادة المحاولة/الاسترجاع يقدروا يبعتوا الحدث حتى لو صف المتابعة اتشال.
+    chat_id: int | None = None
+    # OHB2-08-05 (Batch 3R-FIX2): الحالة **المرصودة** عند إنشاء الحدث — **وصفية** بس
+    # (للعرض/التنسيق). مش الهوية: الهوية هي `transition_seq`.
+    transition_status: str | None = None
+    # OHB2-08-05 (Batch 3R-FIX2): هوية الانتقال الدائمة (عصر الاكتشاف). قيد التفرّد الجزئي
+    # بيشتغل على (المحادثة، `transition_seq`) للصفوف المعلّقة، فانتقالين مختلفين بنفس الحالة
+    # بياخدوا رقمين مختلفين ⇒ حدثين منفصلين (حتى لو واحد لسه معلّق). NULL للسجلات القديمة.
+    transition_seq: int | None = None
+    # OHB2-08-05 (Batch 3R-FIX2-F1): رمز حجز ذرّي (claim lease) لمحاولة تسليم جارية. NULL =
+    # مش محجوز (متاح للاسترجاع). بيتكتب في معاملة ذرّية قبل الإرسال وبيتشال بعد المحاولة،
+    # فبيمنع المراقب والمُبلّل من إرسال نفس الحدث معًا في نفس اللحظة. مش هُوية دائمة.
+    claim_token: str | None = None
+    # وقت أخذ الحجز (ISO). بيسمح بحجز له مدة صلاحية: حجز قديم (من عملية وقعت) بيتحرّر تلقائيًا.
+    claim_at: str | None = None
+
+    @property
+    def unread(self) -> bool:
+        return self.read_at is None
+
+    @property
+    def delivery_pending(self) -> bool:
+        return self.delivery_status == INBOX_DELIVERY_PENDING
 
 
 class Database:
@@ -207,17 +309,49 @@ class Database:
                 status          TEXT,
                 notified_status TEXT,
                 retry_count     INTEGER NOT NULL DEFAULT 0,
-                updated_at      TEXT
+                updated_at      TEXT,
+                transition_seq  INTEGER NOT NULL DEFAULT 0,
+                discovered_status TEXT
             );
             CREATE TABLE IF NOT EXISTS notifier_pending (
                 conversation_id TEXT PRIMARY KEY,
                 state           TEXT NOT NULL,
-                updated_at      TEXT
+                updated_at      TEXT,
+                event_id        INTEGER,
+                transition_seq  INTEGER
             );
             CREATE TABLE IF NOT EXISTS notifier_retry_not_before (
                 conversation_id TEXT PRIMARY KEY,
                 not_before      TEXT NOT NULL
             );
+            -- OHB2-08-05: صندوق الإشعارات — سجل **دائم للأحداث المُكتشَفة** (مش للتسليمات
+            -- الناجحة بس). الحدث بيتسجّل عند اكتشافه قبل أي إرسال؛ وحالة التسليم
+            -- (`delivery_status`) بتتحدّث بشكل مستقل. بيتعمل هنا بـ IF NOT EXISTS
+            -- فالقواعد القديمة بتاخده تلقائيًا (إضافي وغير مدمّر — مفيش فقد بيانات).
+            CREATE TABLE IF NOT EXISTS notification_inbox (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT NOT NULL,
+                title           TEXT NOT NULL DEFAULT '',
+                kind            TEXT NOT NULL DEFAULT '',
+                message         TEXT NOT NULL DEFAULT '',
+                created_at      TEXT NOT NULL,
+                read_at         TEXT,
+                event_key       TEXT,
+                delivery_status TEXT NOT NULL DEFAULT 'delivered',
+                delivery_attempts INTEGER NOT NULL DEFAULT 0,
+                last_attempt_at TEXT,
+                delivered_at    TEXT,
+                last_error      TEXT,
+                next_retry_at   TEXT,
+                chat_id         INTEGER,
+                transition_status TEXT,
+                transition_seq  INTEGER,
+                claim_token     TEXT,
+                claim_at        TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_inbox_unread ON notification_inbox(read_at);
+            CREATE INDEX IF NOT EXISTS idx_inbox_conversation
+                ON notification_inbox(conversation_id, id);
             """
         )
         self._migrate()
@@ -298,6 +432,112 @@ class Database:
         # OHB2-08-01: علامة التسليم المعلّق للمُبلّغ العام (durable). الجدول بيتعمل من
         # `CREATE TABLE IF NOT EXISTS` فوق، فالقواعد القديمة بتاخده تلقائيًا (إضافي وغير
         # مدمّر — مفيش صفوف ولا فقد بيانات). مفيش أي تعديل على أعمدة موجودة.
+        # OHB2-08-05: عمود هوية الحدث في الصندوق (nullable ⇒ الصفوف القديمة بتاخد NULL،
+        # مفيش فقد بيانات). الفهارس بتتعمل **بعد** ضمان الأعمدة عشان القواعد القديمة ما تفشلش.
+        # OHB2-08-05 (Batch 3R): عمود عدّاد الانتقالات للمُبلّغ (nullable بقيمة افتراضية 0).
+        state_cols2 = {
+            r["name"] for r in self._conn.execute("PRAGMA table_info(notification_state)")
+        }
+        if state_cols2 and "transition_seq" not in state_cols2:
+            self._conn.execute(
+                "ALTER TABLE notification_state ADD COLUMN transition_seq "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+        # OHB2-08-05 (Batch 3R-FIX2): الحالة النهائية اللي عصر `transition_seq` بيخصّها.
+        if state_cols2 and "discovered_status" not in state_cols2:
+            self._conn.execute(
+                "ALTER TABLE notification_state ADD COLUMN discovered_status TEXT"
+            )
+        # OHB2-08-05 (Batch 3R): ربط علامة تسليم المُبلّغ المعلّقة بحدث الصندوق (event_id)
+        # عشان الاسترجاع بعد إعادة التشغيل يعلّم **نفس** الحدث `delivered` بدل ما يسيب حدثًا
+        # معلّق للأبد. عمود إضافي nullable (الصفوف القديمة بتاخد NULL).
+        np_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(notifier_pending)")}
+        if np_cols and "event_id" not in np_cols:
+            self._conn.execute("ALTER TABLE notifier_pending ADD COLUMN event_id INTEGER")
+        if np_cols and "transition_seq" not in np_cols:
+            self._conn.execute("ALTER TABLE notifier_pending ADD COLUMN transition_seq INTEGER")
+        inbox_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(notification_inbox)")}
+        if inbox_cols and "event_key" not in inbox_cols:
+            self._conn.execute("ALTER TABLE notification_inbox ADD COLUMN event_key TEXT")
+        # OHB2-08-05 (Batch 3R): أعمدة بيانات التسليم. كلها إضافية nullable (أو بقيمة
+        # افتراضية) ⇒ الصفوف القديمة مايتفقدش منها حاجة. الصفوف القديمة (اللي كانت
+        # بتتسجّل بعد نجاح الإرسال بس) بنعبّيها `delivered` (ده اللي حصل فعلًا)، والصفوف
+        # الجديدة بتتسجّل `pending` من البداية.
+        if inbox_cols and "delivery_status" not in inbox_cols:
+            self._conn.execute(
+                "ALTER TABLE notification_inbox ADD COLUMN delivery_status "
+                "TEXT NOT NULL DEFAULT 'delivered'"
+            )
+        if inbox_cols and "delivery_attempts" not in inbox_cols:
+            self._conn.execute(
+                "ALTER TABLE notification_inbox ADD COLUMN delivery_attempts "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+        if inbox_cols and "last_attempt_at" not in inbox_cols:
+            self._conn.execute("ALTER TABLE notification_inbox ADD COLUMN last_attempt_at TEXT")
+        if inbox_cols and "delivered_at" not in inbox_cols:
+            self._conn.execute("ALTER TABLE notification_inbox ADD COLUMN delivered_at TEXT")
+        if inbox_cols and "last_error" not in inbox_cols:
+            self._conn.execute("ALTER TABLE notification_inbox ADD COLUMN last_error TEXT")
+        if inbox_cols and "next_retry_at" not in inbox_cols:
+            self._conn.execute("ALTER TABLE notification_inbox ADD COLUMN next_retry_at TEXT")
+        if inbox_cols and "chat_id" not in inbox_cols:
+            self._conn.execute("ALTER TABLE notification_inbox ADD COLUMN chat_id INTEGER")
+        # OHB2-08-05 (Batch 3R-FIX): الحالة المرصودة عند إنشاء الحدث — هوية الانتقال
+        # المنطقية المشتركة بين المراقب والمُبلّل. عمود إضافي nullable (الصفوف القديمة
+        # بتاخد NULL ⇒ مفيش فقد بيانات ولا تأثّر على القيد الموحّد).
+        if inbox_cols and "transition_status" not in inbox_cols:
+            self._conn.execute(
+                "ALTER TABLE notification_inbox ADD COLUMN transition_status TEXT"
+            )
+        # OHB2-08-05 (Batch 3R-FIX2): عمود هوية الانتقال الدائمة (عصر الاكتشاف). إضافي
+        # nullable (الصفوف القديمة بتاخد NULL). **مش** وصف الحالة — الهوية الفعلية.
+        if inbox_cols and "transition_seq" not in inbox_cols:
+            self._conn.execute(
+                "ALTER TABLE notification_inbox ADD COLUMN transition_seq INTEGER"
+            )
+        # OHB2-08-05 (Batch 3R-FIX2-F1): رمز حجز ذرّي (claim lease) للحدث المعلّق — بيمنع
+        # إرسال نفس الحدث من العاملين معًا في نفس اللحظة. إضافي nullable (الصفوف القديمة
+        # بتاخد NULL = مش محجوز). بيتشال بعد كل محاولة تسليم (نجحت أو فشلت).
+        if inbox_cols and "claim_token" not in inbox_cols:
+            self._conn.execute(
+                "ALTER TABLE notification_inbox ADD COLUMN claim_token TEXT"
+            )
+        # وقت أخذ الحجز (ISO) — بيتقرن بـ `claim_token`. بيسمح بحجز له **مدة صلاحية**:
+        # حجز قديم (من عملية وقعت قبل ما تحرّره) بيتخطّى/يتحرّر تلقائيًا فما يعلّقش الحدث للأبد.
+        if inbox_cols and "claim_at" not in inbox_cols:
+            self._conn.execute(
+                "ALTER TABLE notification_inbox ADD COLUMN claim_at TEXT"
+            )
+        if inbox_cols:
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_inbox_event_key "
+                "ON notification_inbox(event_key) WHERE event_key IS NOT NULL"
+            )
+            # تنظيف: الفهرس القديم (Batch 3R-FIX) كان على (المحادثة، transition_status) وده
+            # كان بيحجب انتقالًا حقيقيًا تاني بنفس الحالة — اتصلّح في 3R-FIX2. بنشيله الأول
+            # (فهرس بس — مفيش مساس بالبيانات) عشان نستبدله بفهرس الهوية الصح.
+            self._conn.execute("DROP INDEX IF EXISTS idx_inbox_transition_unique")
+            # OHB2-08-05 (Batch 3R-FIX2): قيد التفرّد الموحّد على **هوية الانتقال**
+            # (`transition_seq`)، مش على وصف الحالة. ده اللي بيمنع ازدواج الإشعار لنفس
+            # الانتقال بين المراقب والمُبلّل، وفي نفس الوقت **مايحجبش** انتقالًا حقيقيًا
+            # مختلفًا بنفس الحالة (ليه رقم عصر مختلف). الصفوف المعلّقة بس داخلة، والقديمة
+            # (transition_seq=NULL) برّا. بيتعمل بعد ضمان الأعمدة عشان القواعد القديمة.
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_inbox_transition_seq_unique "
+                "ON notification_inbox(conversation_id, transition_seq) "
+                "WHERE transition_seq IS NOT NULL AND delivery_status='pending'"
+            )
+            # OHB2-08-05 (Batch 3R): فهرس التسليم المعلّق (جزئي، رخيص). بيتعمل بعد ضمان
+            # العمود عشان القواعد القديمة ما تفشلش.
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_inbox_delivery_pending "
+                "ON notification_inbox(delivery_status, id) "
+                "WHERE delivery_status='pending'"
+            )
+            # تنظيف: `idx_inbox_created(id)` كان زائد (الـ PK فهرس بالفعل) وبيضاعف الكتابة
+            # عند كل إدراج/تقليم. بنشيله لو موجود (فهرس بس — مفيش أي مساس بالبيانات).
+            self._conn.execute("DROP INDEX IF EXISTS idx_inbox_created")
 
     # ----------------------------------------------------------------- watched
     def add_watched(
@@ -862,6 +1102,34 @@ class Database:
             )
         self._conn.commit()
 
+    def set_outbox_status_if_in(
+        self,
+        outbox_id: int,
+        new_status: str,
+        now: str,
+        allowed_statuses,
+        error: str | None = None,
+    ) -> bool:
+        """تحويل حالة **ذرّي مشروط** (compare-and-set) — OHB2-09-05.
+
+        الـ UPDATE نفسه بيشيل شرط الحالة (`WHERE id=? AND status IN (...)`)، فالقرار
+        والكتابة في جملة واحدة: لو سجل تاني سبقنا وغيّر الحالة، الـ rowcount هيساوي 0
+        وما بيحصلش أي تغيير (مفيش سباق read-then-write). بترجّع True لو الحالة اتغيّرت
+        فعلاً. `allowed_statuses` مجموعة/تسلسل حالات المصدر المسموحة.
+        """
+        allowed = tuple(allowed_statuses)
+        if not allowed:
+            return False
+        placeholders = ", ".join("?" for _ in allowed)
+        cur = self._conn.execute(
+            f"UPDATE outbox SET status=?, error=?, updated_at=? "
+            f"WHERE id=? AND status IN ({placeholders})",
+            (new_status, error, now, outbox_id, *allowed),
+        )
+        changed = cur.rowcount == 1
+        self._conn.commit()
+        return changed
+
     def bump_outbox_attempt(self, outbox_id: int, now: str, error: str | None = None) -> int:
         """يزوّد attempts ذرّياً ويسيب الحالة 'pending' (محاولة إرسال مابدأتش ⇒ آمنة).
 
@@ -1162,28 +1430,30 @@ class Database:
 
     def list_notification_states(self) -> dict[str, NotificationState]:
         rows = self._conn.execute(
-            "SELECT conversation_id, status, notified_status, retry_count, updated_at "
-            "FROM notification_state"
+            "SELECT conversation_id, status, notified_status, retry_count, updated_at, "
+            "transition_seq, discovered_status FROM notification_state"
         ).fetchall()
         return {
             r["conversation_id"]: NotificationState(
                 r["conversation_id"], r["status"], r["notified_status"],
-                r["retry_count"], r["updated_at"],
+                r["retry_count"], r["updated_at"], r["transition_seq"],
+                r["discovered_status"],
             )
             for r in rows
         }
 
     def get_notification_state(self, conversation_id: str) -> NotificationState | None:
         row = self._conn.execute(
-            "SELECT conversation_id, status, notified_status, retry_count, updated_at "
-            "FROM notification_state WHERE conversation_id=?",
+            "SELECT conversation_id, status, notified_status, retry_count, updated_at, "
+            "transition_seq, discovered_status FROM notification_state WHERE conversation_id=?",
             (conversation_id,),
         ).fetchone()
         if row is None:
             return None
         return NotificationState(
             row["conversation_id"], row["status"], row["notified_status"],
-            row["retry_count"], row["updated_at"],
+            row["retry_count"], row["updated_at"], row["transition_seq"],
+            row["discovered_status"],
         )
 
     def upsert_notification_state(
@@ -1194,6 +1464,8 @@ class Database:
         notified_status=_UNCHANGED,
         retry_count=_UNCHANGED,
         updated_at: str | None = None,
+        transition_seq=_UNCHANGED,
+        discovered_status=_UNCHANGED,
         _commit: bool = True,
     ) -> None:
         """يحدّث لقطة محادثة واحدة بأعمدة ضيّقة (مفيش استبدال صف كامل ببيانات قديمة).
@@ -1219,6 +1491,12 @@ class Database:
         if retry_count is not self._UNCHANGED:
             sets.append("retry_count=?")
             params.append(retry_count)
+        if transition_seq is not self._UNCHANGED:
+            sets.append("transition_seq=?")
+            params.append(transition_seq)
+        if discovered_status is not self._UNCHANGED:
+            sets.append("discovered_status=?")
+            params.append(discovered_status)
         if updated_at is not None:
             sets.append("updated_at=?")
             params.append(updated_at)
@@ -1244,6 +1522,54 @@ class Database:
         self._conn.commit()
         return int(row["retry_count"]) if row else 0
 
+    def note_transition(
+        self, conversation_id: str, status: str, *, terminal: bool, now: str
+    ) -> int:
+        """OHB2-08-05 (Batch 3R-FIX2): يسجّل **اكتشاف** انتقال ويرجّع هويته الدائمة.
+
+        الهوية (`transition_seq`) = «عصر اكتشاف» الانتقال:
+        - انتقال حالة نهائية **جديد** (حالته مختلفة عن آخر حالة نهائية مُكتشَفة) ⇒ العدّاد
+          يزيد مرة واحدة ويثبت خلال كل إعادات المحاولة لنفس الانتقال (idempotent).
+        - إعادة استطلاع نفس الانتقال (نفس الحالة النهائية) ⇒ نفس الرقم (مفيش زيادة).
+        - رؤية حالة **غير نهائية** ⇒ نقفل العصر الحالي (`discovered_status=NULL`) عشان
+          الانتقال التالي لنفس الحالة النهائية ياخد رقمًا جديدًا (finished→running→finished).
+
+        بيُحدّث `status` (الحالة المرصودة) دائمًا. `BEGIN IMMEDIATE` بيخلي التسلسل ذرّيًا
+        بين العاملين. المراقب والمُبلّل بينادوا عليها ⇒ يشوفوا **نفس** الهوية لنفس الانتقال.
+        """
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT transition_seq, discovered_status FROM notification_state "
+                "WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()
+            seq = int(row["transition_seq"]) if row and row["transition_seq"] is not None else 0
+            discovered = row["discovered_status"] if row else None
+            if terminal:
+                if discovered != status:
+                    seq += 1
+                    discovered = status
+            else:
+                # رؤية حالة غير نهائية = دورة حياة جديدة ⇒ نقفل العصر (الانتقال القادم
+                # لنفس الحالة النهائية ياخد رقمًا جديدًا).
+                discovered = None
+            conn.execute(
+                "INSERT INTO notification_state"
+                "(conversation_id, transition_seq, discovered_status, status) "
+                "VALUES(?,?,?,?) "
+                "ON CONFLICT(conversation_id) DO UPDATE SET "
+                "transition_seq=excluded.transition_seq, "
+                "discovered_status=excluded.discovered_status, status=excluded.status",
+                (conversation_id, seq, discovered, status),
+            )
+            conn.commit()
+            return seq
+        except Exception:
+            conn.rollback()
+            raise
+
     def record_notification_sent(
         self, conversation_id: str, status: str, now: str, *, _commit: bool = True
     ) -> None:
@@ -1261,7 +1587,14 @@ class Database:
         )
 
     # --------------------------------------------- notifier durable pending (OHB2-08-01)
-    def set_notifier_pending(self, conversation_id: str, state: str, now: str) -> None:
+    def set_notifier_pending(
+        self,
+        conversation_id: str,
+        state: str,
+        now: str,
+        event_id: int | None = None,
+        transition_seq: int | None = None,
+    ) -> None:
         """علامة write-ahead **دائمة** للمُبلّغ: إشعار انتهاء اتّبعت (اتقبل) لكن تسجيله
         الدائم لسه معلّق.
 
@@ -1269,12 +1602,20 @@ class Database:
         الدائم. عكس التلميح in-memory القديم، العلامة دي بتفضل بعد إعادة تشغيل العملية،
         فالدورة الجاية تسوّيها (تسجّل الحالة الدائمة) **قبل أي إرسال** — فمايحصلش إعادة
         إرسال عمياء. كتابة ضيّقة على جدول مستقل، ما بتلمسش `notification_state`.
+
+        `event_id` = معرّف حدث الصندوق المرتبط، و`transition_seq` = هوية الانتقال،
+        (OHB2-08-05 Batch 3R) عشان التسوية بعد إعادة التشغيل تعلّم نفس الحدث `delivered`
+        وترقّي عدّاد الانتقالات لآخر انتقال اتسلّم فعلًا.
         """
         self._conn.execute(
-            "INSERT INTO notifier_pending(conversation_id, state, updated_at) VALUES(?,?,?) "
+            "INSERT INTO notifier_pending"
+            "(conversation_id, state, updated_at, event_id, transition_seq) "
+            "VALUES(?,?,?,?,?) "
             "ON CONFLICT(conversation_id) DO UPDATE SET "
-            "state=excluded.state, updated_at=excluded.updated_at",
-            (conversation_id, state, now),
+            "state=excluded.state, updated_at=excluded.updated_at, "
+            "event_id=COALESCE(excluded.event_id, notifier_pending.event_id), "
+            "transition_seq=COALESCE(excluded.transition_seq, notifier_pending.transition_seq)",
+            (conversation_id, state, now, event_id, transition_seq),
         )
         self._conn.commit()
 
@@ -1285,6 +1626,18 @@ class Database:
             (conversation_id,),
         ).fetchone()
         return row["state"] if row else None
+
+    def get_notifier_pending_row(self, conversation_id: str) -> tuple[int | None, int | None] | None:
+        """(event_id, transition_seq) لعلامة التسليم المعلّقة، أو None لو مفيش علامة."""
+        row = self._conn.execute(
+            "SELECT event_id, transition_seq FROM notifier_pending WHERE conversation_id=?",
+            (conversation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        event_id = int(row["event_id"]) if row["event_id"] is not None else None
+        seq = int(row["transition_seq"]) if row["transition_seq"] is not None else None
+        return event_id, seq
 
     def list_notifier_pending(self) -> dict[str, str]:
         """كل علامات التسليم المعلّق الدائمة (conversation_id -> state)."""
@@ -1307,19 +1660,30 @@ class Database:
         العلامة في نفس المعاملة (`BEGIN IMMEDIATE`): إما ينجحوا مع بعض أو يفشلوا مع بعض.
         لو التسجيل فشل، العلامة تفضل ⇒ إعادة محاولة آمنة (مفيش فقد دليل، ومفيش إرسال
         تاني). بيرجّع الحالة اللي اتسجّلت، أو None لو مفيش علامة. **ما بيعملش أي إرسال.**
+
+        OHB2-08-05 (Batch 3R): لو العلامة مربوطة بحدث صندوق (`event_id`)، بنعلّمه
+        `delivered` **في نفس المعاملة** — فالتسليم الناجح والحدث المتين يتحوّلوا لـ delivered
+        مع بعض (مفيش حدث معلّق للأبد بعد إعادة التشغيل).
         """
         conn = self._conn
         conn.execute("BEGIN IMMEDIATE")
         try:
             row = conn.execute(
-                "SELECT state FROM notifier_pending WHERE conversation_id=?",
+                "SELECT state, event_id FROM notifier_pending "
+                "WHERE conversation_id=?",
                 (conversation_id,),
             ).fetchone()
             if row is None:
                 conn.commit()
                 return None
             state = row["state"]
+            event_id = row["event_id"]
             self.record_notification_sent(conversation_id, state, now, _commit=False)
+            if event_id is not None:
+                self.mark_inbox_delivered(int(event_id), now, _commit=False)
+            # OHB2-08-05 (Batch 3R-FIX2): `transition_seq` بقى **عصر اكتشاف** بيتثبّت عند
+            # الاكتشاف (في `note_transition`)، مش عند التسليم. فالتسوية **ما بتلمسوش** —
+            # ترقيته هنا كانت ممكن تنزّله/تدوس على عصر انتقال أحدث.
             conn.execute(
                 "DELETE FROM notifier_pending WHERE conversation_id=?", (conversation_id,)
             )
@@ -1364,6 +1728,457 @@ class Database:
         self._conn.execute(
             "DELETE FROM notifier_retry_not_before WHERE conversation_id=?",
             (conversation_id,),
+        )
+        self._conn.commit()
+
+    # ------------------------------------------------ notification inbox (OHB2-08-05)
+    # OHB2-08-05 (Batch 3R): الصندوق بقى سجل **دائم للأحداث المُكتشَفة**، مش سجل للتسليمات
+    # الناجحة بس. الحدث بيتسجّل عند لحظة اكتشافه المنطقية (`add_inbox_event`،
+    # delivery_status='pending') **قبل** أي محاولة إرسال، وحالة التسليم بتتحدّث بعد كده
+    # بشكل مستقل (`mark_inbox_delivered` / `record_inbox_attempt`). كده الحدث مايتفقدش لو
+    # تيليجرام فشل أو العملية وقعت. حالة القراءة (`read_at`) مستقلة تمامًا عن حالة التسليم.
+    def add_inbox_event(
+        self,
+        conversation_id: str,
+        title: str,
+        kind: str,
+        message: str,
+        now: str,
+        *,
+        event_key: str | None = None,
+        chat_id: int | None = None,
+        transition_status: str | None = None,
+        transition_seq: int | None = None,
+    ) -> int | None:
+        """يسجّل حدث إشعار **دائم** (delivery_status='pending') ويرجّع المعرّف.
+
+        بيتنادى عند لحظة اكتشاف الحدث، **قبل** أي إرسال لتليجرام. الرسالة بتتقصّ عند
+        `INBOX_MAX_MESSAGE_CHARS`. التقليم (قراءة أولًا) في نفس المعاملة. الإدراج idempotent
+        لو `event_key` موجود (قيد التفرّد الجزئي) ⇒ يرجّع `None` (مفيش صف جديد).
+
+        `chat_id` = وجهة التسليم المحفوظة مع الحدث عشان الاسترجاع/إعادة المحاولة يقدروا
+        يبعتوا الحدث من غير الاعتماد على صف المتابعة (اللي ممكن يكون اتشال).
+
+        `transition_status` (Batch 3R-FIX2) = **وصف** الحالة المرصودة (للعرض/التنسيق).
+        `transition_seq` = **هوية** الانتقال الدائمة (عصر الاكتشاف). لو فيه صف انتقال معلّق
+        بنفس (المحادثة، `transition_seq`)، القيد الموحّد بيرفض الصف الجديد وبنرجّع `None`
+        (مفيش ازدواج لنفس الانتقال). انتقال مختلف لنفس الحالة ليه رقم مختلف ⇒ صف منفصل.
+        """
+        return self._insert_inbox(
+            conversation_id, title, kind, message, now,
+            event_key=event_key, chat_id=chat_id,
+            delivery_status=INBOX_DELIVERY_PENDING, delivered_at=None,
+            transition_status=transition_status, transition_seq=transition_seq,
+        )
+
+    def add_inbox_item(
+        self,
+        conversation_id: str,
+        title: str,
+        kind: str,
+        message: str,
+        now: str,
+        *,
+        event_key: str | None = None,
+        chat_id: int | None = None,
+    ) -> int | None:
+        """يسجّل إشعار **اتسلّم فعلًا** (delivery_status='delivered') ويرجّع المعرّف.
+
+        متوافق للخلف: أي كود قديم بيستخدمه لتسجيل تسليم ناجح. الصفوف الجديدة الموصى بيها
+        بقت `add_inbox_event` (حدث أولًا) + تحديث التسليم بعدين.
+        """
+        return self._insert_inbox(
+            conversation_id, title, kind, message, now,
+            event_key=event_key, chat_id=chat_id,
+            delivery_status=INBOX_DELIVERY_DELIVERED, delivered_at=now,
+        )
+
+    def _insert_inbox(
+        self,
+        conversation_id: str,
+        title: str,
+        kind: str,
+        message: str,
+        now: str,
+        *,
+        event_key: str | None,
+        chat_id: int | None,
+        delivery_status: str,
+        delivered_at: str | None,
+        transition_status: str | None = None,
+        transition_seq: int | None = None,
+    ) -> int | None:
+        text = message or ""
+        if len(text) > INBOX_MAX_MESSAGE_CHARS:
+            text = text[:INBOX_MAX_MESSAGE_CHARS]
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = conn.execute(
+                "INSERT INTO notification_inbox"
+                "(conversation_id, title, kind, message, created_at, read_at, event_key, "
+                " delivery_status, delivery_attempts, delivered_at, chat_id, "
+                " transition_status, transition_seq) "
+                "VALUES(?, ?, ?, ?, ?, NULL, ?, ?, 0, ?, ?, ?, ?) "
+                "ON CONFLICT(event_key) WHERE event_key IS NOT NULL DO NOTHING",
+                (conversation_id, title or "", kind or "", text, now, event_key,
+                 delivery_status, delivered_at, chat_id, transition_status, transition_seq),
+            )
+            if cur.rowcount == 0:
+                # نفس الحدث اتسجّل قبل كده (نفس event_key) ⇒ مفيش صف جديد.
+                conn.commit()
+                return None
+            new_id = int(cur.lastrowid)
+            self._prune_inbox(conn, conversation_id)
+            conn.commit()
+            return new_id
+        except sqlite3.IntegrityError:
+            # OHB2-08-05 (Batch 3R-FIX2): القيد الموحّد (المحادثة، `transition_seq`) رفض
+            # صفًا ثانيًا لنفس **الانتقال** (مثلاً المُبلّل لقى نفس الانتقال اللي المراقب
+            # سجّله). مش خطأ: نرجّع None (مفيش حدث جديد). أي IntegrityError تانية (مثلاً
+            # event_key) بتتفشّل عادي من الـ except العام تحت.
+            conn.rollback()
+            if transition_seq is not None and self._has_transition_row(
+                conversation_id, transition_seq
+            ):
+                return None
+            raise
+        except Exception:
+            conn.rollback()
+            raise
+
+    def _has_transition_row(self, conversation_id: str, transition_seq: int) -> bool:
+        """هل فيه صف انتقال **معلّق** بنفس (المحادثة، `transition_seq`)؟ (فحص بعد IntegrityError)."""
+        row = self._conn.execute(
+            "SELECT 1 FROM notification_inbox "
+            "WHERE conversation_id=? AND transition_seq=? AND delivery_status='pending' "
+            "LIMIT 1",
+            (conversation_id, transition_seq),
+        ).fetchone()
+        return row is not None
+
+    def find_pending_transition(
+        self, conversation_id: str, transition_seq: int
+    ) -> InboxItem | None:
+        """أحدث صف انتقال **معلّق** بنفس (المحادثة، `transition_seq`) — هوية الانتقال الموحّدة.
+
+        OHB2-08-05 (Batch 3R-FIX2): بيمكّن العاملين من مشاركة **نفس** صف الحدث لنفس
+        الانتقال (نفس رقم العصر). لو موجود، التاني بيعيد استخدامه (يسترجعه/يعلّمه) بدل ما
+        يسجّل صف تاني. بيطابق قيد التفرّد الجزئي (`delivery_status='pending'`).
+        """
+        if transition_seq is None:
+            return None
+        row = self._conn.execute(
+            f"SELECT {self._INBOX_COLUMNS} FROM notification_inbox "
+            "WHERE conversation_id=? AND transition_seq=? AND delivery_status='pending' "
+            "ORDER BY id DESC LIMIT 1",
+            (conversation_id, int(transition_seq)),
+        ).fetchone()
+        return self._inbox_from_row(row) if row else None
+
+    def find_latest_pending_transition(self, conversation_id: str) -> InboxItem | None:
+        """أحدث صف انتقال **معلّق** لمحادثة، بغض النظر عن عصر `transition_seq`.
+
+        OHB2-08-05 (Batch 3R-FIX2-N2): هوية الانتقال **الكانونية** للمحادثة دلوقتي = أعلى
+        `transition_seq` معلّق. المُبلّل بيستخدمها لتحديد إذا الحدث المعلّق هو *العصر الحالي*
+        (يتولّاه عادي) ولا **متجاوز** (superseded، انتقال أحدث عدّاه) — في الحالة التانية
+        لسه بيتولّاه لو المتابعة **عالقة** (مسار المراقب مش هيعيد المحاولة) عشان ما يعلقش
+        للأبد (عيب N-2). بيرجّع `None` لو مفيش أي صف انتقال معلّق.
+        """
+        row = self._conn.execute(
+            f"SELECT {self._INBOX_COLUMNS} FROM notification_inbox "
+            "WHERE conversation_id=? AND transition_seq IS NOT NULL "
+            "AND delivery_status='pending' "
+            "ORDER BY transition_seq DESC, id DESC LIMIT 1",
+            (conversation_id,),
+        ).fetchone()
+        return self._inbox_from_row(row) if row else None
+
+    def mark_inbox_failed(self, item_id: int, now: str, error: str | None = None) -> bool:
+        """يعلّم حدثًا `failed` **بدون** استهلاك محاولة (استنفاد ميزانية/رفض دائم).
+
+        OHB2-08-05 (Batch 3R-FIX): بيمكّن مسار الاسترجاع من تصنيف الحدث فاشل بشكل صريح
+        (بدل تركه معلّق للأبد) من غير ما يزوّد عدّاد المحاولات (اللي بالفعل وصل الحد).
+        """
+        if error is not None:
+            error = str(error)[:INBOX_MAX_ERROR_CHARS]
+        cur = self._conn.execute(
+            "UPDATE notification_inbox SET delivery_status='failed', "
+            "last_attempt_at=?, last_error=COALESCE(?, last_error), next_retry_at=NULL, "
+            "claim_token=NULL, claim_at=NULL "
+            "WHERE id=?",
+            (now, error, int(item_id)),
+        )
+        self._conn.commit()
+        return bool(cur.rowcount)
+
+    def _prune_inbox(self, conn, conversation_id: str) -> None:
+        """تقليم الصندوق (سياسة صريحة) **داخل معاملة المستدعي**.
+
+        السياسة (OHB2-08-05 Batch 3R-FIX):
+        - الصفوف **المعلّقة** (`pending`) و**غير المقروءة** (`read_at IS NULL`)
+          **مايتقلّمش أبدًا** — إشعار مستني تسليم أو لسه ماتشافش مايتحذفش صامت.
+        - الصفوف **المقروءة** بس هي المؤهّلة للتقليم، الأقدم أولًا (تحديد ثابت: `id ASC`).
+        - السقف لكل محادثة (`INBOX_MAX_PER_CONVERSATION`) والسقف العام (`INBOX_MAX_TOTAL`)
+          بيفضلوا **سقوفًا ناعمة**: لو الصفوف المحمية لوحدها تعدّي السقف، الجدول يتعدّاه
+          (مفيش حذف لصف محمي عشان نرضي سقف). التقليم بيتخطّى الصفوف المحمية باستمرار.
+        """
+        # 1) تقليم لكل محادثة (المقروءة بس).
+        conn.execute(
+            "DELETE FROM notification_inbox "
+            "WHERE conversation_id=? AND delivery_status!='pending' AND read_at IS NOT NULL "
+            "AND id NOT IN ("
+            "SELECT id FROM notification_inbox "
+            "WHERE conversation_id=? AND delivery_status!='pending' AND read_at IS NOT NULL "
+            "ORDER BY id DESC LIMIT ?)",
+            (conversation_id, conversation_id, INBOX_MAX_PER_CONVERSATION),
+        )
+        # 2) تقليم عام (المقروءة بس).
+        conn.execute(
+            "DELETE FROM notification_inbox "
+            "WHERE delivery_status!='pending' AND read_at IS NOT NULL AND id NOT IN ("
+            "SELECT id FROM notification_inbox "
+            "WHERE delivery_status!='pending' AND read_at IS NOT NULL "
+            "ORDER BY id DESC LIMIT ?)",
+            (INBOX_MAX_TOTAL,),
+        )
+
+    _INBOX_COLUMNS = (
+        "id, conversation_id, title, kind, message, created_at, read_at, event_key, "
+        "delivery_status, delivery_attempts, last_attempt_at, delivered_at, last_error, "
+        "next_retry_at, chat_id, transition_status, transition_seq, claim_token, claim_at"
+    )
+
+    @staticmethod
+    def _inbox_from_row(r) -> InboxItem:
+        return InboxItem(
+            r["id"], r["conversation_id"], r["title"], r["kind"], r["message"],
+            r["created_at"], r["read_at"], r["event_key"],
+            r["delivery_status"], r["delivery_attempts"], r["last_attempt_at"],
+            r["delivered_at"], r["last_error"], r["next_retry_at"], r["chat_id"],
+            r["transition_status"], r["transition_seq"], r["claim_token"], r["claim_at"],
+        )
+
+    def list_inbox(
+        self, *, limit: int = INBOX_PAGE_SIZE, offset: int = 0, unread_only: bool = False
+    ) -> list[InboxItem]:
+        """قايمة الصندوق (الأحدث أولًا)، بترقيم محدود على مستوى SQL (payload محدود)."""
+        where = "WHERE read_at IS NULL" if unread_only else ""
+        rows = self._conn.execute(
+            f"SELECT {self._INBOX_COLUMNS} FROM notification_inbox {where} "
+            f"ORDER BY id DESC LIMIT ? OFFSET ?",
+            (int(limit), int(offset)),
+        ).fetchall()
+        return [self._inbox_from_row(r) for r in rows]
+
+    def get_inbox_item(self, item_id: int) -> InboxItem | None:
+        """عنصر صندوق واحد بالمعرّف، أو None لو مش موجود."""
+        row = self._conn.execute(
+            f"SELECT {self._INBOX_COLUMNS} FROM notification_inbox WHERE id=?",
+            (int(item_id),),
+        ).fetchone()
+        return self._inbox_from_row(row) if row else None
+
+    def find_inbox_by_event_key(self, event_key: str) -> InboxItem | None:
+        """يبحث عن حدث بمفتاح الهوية (idempotency)، أو None لو مش موجود."""
+        if not event_key:
+            return None
+        row = self._conn.execute(
+            f"SELECT {self._INBOX_COLUMNS} FROM notification_inbox WHERE event_key=?",
+            (event_key,),
+        ).fetchone()
+        return self._inbox_from_row(row) if row else None
+
+    def count_inbox(self, *, unread_only: bool = False, pending_only: bool = False) -> int:
+        """عدد عناصر الصندوق (كلها / غير المقروءة / المعلّقة)."""
+        clauses = []
+        if unread_only:
+            clauses.append("read_at IS NULL")
+        if pending_only:
+            clauses.append("delivery_status='pending'")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        row = self._conn.execute(
+            f"SELECT COUNT(*) AS n FROM notification_inbox {where}"
+        ).fetchone()
+        return int(row["n"]) if row else 0
+
+    def mark_inbox_read(self, item_id: int, now: str) -> bool:
+        """يعلّم عنصر صندوق كمقروء (idempotent). True لو العنصر موجود (حتى لو مقروء)."""
+        conn = self._conn
+        cur = conn.execute(
+            "UPDATE notification_inbox SET read_at=COALESCE(read_at, ?) WHERE id=?",
+            (now, int(item_id)),
+        )
+        conn.commit()
+        if cur.rowcount and cur.rowcount > 0:
+            return True
+        # rowcount=0 ممكن يعني العنصر موجود ومقروء بالفعل (COALESCE ما غيّرش حاجة).
+        row = conn.execute(
+            "SELECT 1 FROM notification_inbox WHERE id=?", (int(item_id),)
+        ).fetchone()
+        return row is not None
+
+    def mark_all_inbox_read(self, now: str) -> int:
+        """يعلّم كل غير المقروء كمقروء. يرجّع عدد العناصر اللي اتغيّرت."""
+        conn = self._conn
+        cur = conn.execute(
+            "UPDATE notification_inbox SET read_at=? WHERE read_at IS NULL", (now,)
+        )
+        conn.commit()
+        return int(cur.rowcount or 0)
+
+    def mark_inbox_delivered(self, item_id: int, now: str, *, _commit: bool = True) -> bool:
+        """يسجّل نجاح تسليم تليجرام للحدث (delivery_status='delivered'). idempotent.
+
+        `_commit=False` بيخلي الكتابة تنضمّ لمعاملة المستدعي (تسجيل ذرّي مع ماسح/متابعة).
+        """
+        conn = self._conn
+        cur = conn.execute(
+            "UPDATE notification_inbox SET delivery_status='delivered', "
+            "delivered_at=COALESCE(delivered_at, ?), last_attempt_at=?, "
+            "next_retry_at=NULL, last_error=NULL, claim_token=NULL, claim_at=NULL WHERE id=?",
+            (now, now, int(item_id)),
+        )
+        if _commit:
+            conn.commit()
+        return bool(cur.rowcount)
+
+    def record_inbox_attempt(
+        self,
+        item_id: int,
+        now: str,
+        *,
+        error: str | None = None,
+        next_retry_at: str | None = None,
+        mark_failed: bool = False,
+    ) -> int:
+        """يسجّل محاولة تسليم فاشلة للحدث ويرجّع عدّاد المحاولات الجديد.
+
+        `error` = تصنيف آمن (نوع الاستثناء) بيتقصّ عند `INBOX_MAX_ERROR_CHARS`. لو
+        `mark_failed` نعلّمه `failed` (استنفدنا الميزانية) من غير مسح الحدث. لو
+        `next_retry_at` موجود بنسجّل الموعد (RetryAfter) — **من غير** استهلاك عدّاد عادي
+        (المستدعي بيبعت `mark_failed=False` و`next_retry_at` بس).
+        """
+        if error is not None:
+            error = str(error)[:INBOX_MAX_ERROR_CHARS]
+        conn = self._conn
+        conn.execute(
+            "UPDATE notification_inbox SET delivery_attempts=delivery_attempts+1, "
+            "last_attempt_at=?, last_error=COALESCE(?, last_error), next_retry_at=?, "
+            "claim_token=NULL, claim_at=NULL "
+            "WHERE id=?",
+            (now, error, next_retry_at, int(item_id)),
+        )
+        if mark_failed:
+            conn.execute(
+                "UPDATE notification_inbox SET delivery_status='failed' WHERE id=?",
+                (int(item_id),),
+            )
+        row = conn.execute(
+            "SELECT delivery_attempts FROM notification_inbox WHERE id=?", (int(item_id),)
+        ).fetchone()
+        conn.commit()
+        return int(row["delivery_attempts"]) if row else 0
+
+    def set_inbox_retry_deadline(self, item_id: int, next_retry_at: str | None) -> None:
+        """يحدّث موعد إعادة المحاولة للحدث من غير ما يستهلك عدّاد محاولات (RetryAfter).
+
+        OHB2-08-05 (Batch 3R-FIX2-F1): بيشيل رمز الحجز كمان — بعد RetryAfter الحدث لازم
+        يبقى متاح للاسترجاع (لو سيبنا الحجز، الاسترجاع هيتخطّاه للأبد).
+        """
+        self._conn.execute(
+            "UPDATE notification_inbox SET next_retry_at=?, claim_token=NULL, claim_at=NULL WHERE id=?",
+            (next_retry_at, int(item_id)),
+        )
+        self._conn.commit()
+
+    def list_due_pending_inbox(
+        self,
+        now: str,
+        *,
+        limit: int = 20,
+        kinds: tuple[str, ...] | None = None,
+        exclude_watched: bool = True,
+        unclaimed: bool = False,
+        claim_cutoff: str | None = None,
+    ) -> list[InboxItem]:
+        """أحداث تسليم معلّقة **حان وقتها** (next_retry_at فاضي/عدّى)، الأقدم أولًا.
+
+        `kinds` = أنواع الإشعارات المسموحة (لكل مالك تسليم مساحته). `exclude_watched=True`
+        يستثني محادثات المراقب الحالية (اللي المراقب مالك تسليمها في مساره النشط) عشان
+        حلقة الاسترجاع ما تبعتش مكرّر بالتوازي مع مسار المراقب النشط.
+
+        `unclaimed=True` (Batch 3R-FIX2-F1) يستثني الصفوف **المحجوزة** (`claim_token` مش
+        فاضي) — أي حدث بتُحاول تسليمه لحظة كده من عامل تاني — **إلا** الحجز المنتهي
+        (`claim_at` أقدم من `claim_cutoff`، من عملية وقعت) فبيعتبر متاح. بيتقرن دائمًا بـ
+        `claim_pending_inbox` الذرّي عشان القرار ما يبقاش check-then-act.
+        """
+        clauses = [
+            "delivery_status='pending'",
+            "(next_retry_at IS NULL OR next_retry_at<=?)",
+        ]
+        params: list[object] = [now]
+        if kinds is not None:
+            placeholders = ",".join("?" for _ in kinds)
+            clauses.append(f"kind IN ({placeholders})")
+            params.extend(kinds)
+        if exclude_watched:
+            clauses.append("conversation_id NOT IN (SELECT conversation_id FROM watched)")
+        if unclaimed:
+            clauses.append(
+                "(claim_token IS NULL OR (claim_at IS NOT NULL AND claim_at<=?))"
+            )
+            params.append(claim_cutoff)
+        rows = self._conn.execute(
+            f"SELECT {self._INBOX_COLUMNS} FROM notification_inbox "
+            f"WHERE {' AND '.join(clauses)} ORDER BY id ASC LIMIT ?",
+            (*params, int(limit)),
+        ).fetchall()
+        return [self._inbox_from_row(r) for r in rows]
+
+    def claim_pending_inbox(
+        self, item_id: int, token: str, now: str, *, cutoff: str | None = None
+    ) -> bool:
+        """يحجز حدثًا معلّقًا **ذرّيًا** لمحاولة تسليم واحدة (claim lease). True = الحجز نجح.
+
+        OHB2-08-05 (Batch 3R-FIX2-F1): `UPDATE ... WHERE id=? AND delivery_status='pending'
+        AND claim_token IS NULL` بيسجّل الرمز بس لو الصف لسه معلّق **وغير محجوز**، في معاملة
+        ذرّية واحدة. القرار والكتابة في نفس الجملة ⇒ آمن عبر اتصالات SQLite منفصلة (مفيش
+        check-then-act). لو عامل تاني حجز الصف بالفعل، `rowcount=0` ونرجّع False (ما نرسلش).
+
+        `now` = وقت الحجز (بيتسجّل في `claim_at`). `cutoff` (اختياري) = حد انتهاء الصلاحية:
+        لو موجود، الحجز المنتهي (`claim_at<=cutoff`، من عملية وقعت) بيتخطّى ونستولي عليه
+        (بس بنشيل `claim_at` القديم ونسجّل الجديد) — فمافيش حدث يعلق محجوزًا للأبد.
+        الرمز بيتشال في `record_inbox_attempt`/`mark_inbox_delivered`/`mark_inbox_failed`.
+        """
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if cutoff is None:
+                where = "id=? AND delivery_status='pending' AND claim_token IS NULL"
+                args = (token, now, int(item_id))
+            else:
+                where = (
+                    "id=? AND delivery_status='pending' AND "
+                    "(claim_token IS NULL OR (claim_at IS NOT NULL AND claim_at<=?))"
+                )
+                args = (token, now, int(item_id), cutoff)
+            cur = conn.execute(
+                f"UPDATE notification_inbox SET claim_token=?, claim_at=? WHERE {where}",
+                args,
+            )
+            conn.commit()
+            return cur.rowcount == 1
+        except Exception:
+            conn.rollback()
+            raise
+
+    def clear_inbox_claim(self, item_id: int, token: str) -> None:
+        """يشيل رمز الحجز (بس لو مطابق للرمز، أمانًا) — للحالات اللي التسليم فيها مابدأش."""
+        self._conn.execute(
+            "UPDATE notification_inbox SET claim_token=NULL, claim_at=NULL "
+            "WHERE id=? AND claim_token=?",
+            (int(item_id), token),
         )
         self._conn.commit()
 

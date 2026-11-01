@@ -1,7 +1,6 @@
 """أوامر تيليجرام وأزرارها. كل الرسايل عربي، والمستخدم المالك بس يترد عليه."""
 from __future__ import annotations
 
-import asyncio
 import io
 import logging
 import sqlite3
@@ -13,8 +12,15 @@ from telegram.ext import ContextTypes
 
 from . import keyboards as kb
 from . import outbox
-from .errors import ApiError, error_text
+from .errors import ApiError, ResponseTooLargeError, error_text
 from .file_cache import FileCache
+from .files import (
+    CONVERSATION_ERRORS,
+    FileService,
+    FileStatus,
+    authorize_conversation_detailed,
+    file_status_message,
+)
 from .messages import escape_html, format_conversation_view, format_cost, pr_url, state_label
 from .sender import send_copyable, send_long
 
@@ -85,6 +91,49 @@ async def _edit_or_send(query, text: str, chat_id: int, bot, **kwargs) -> bool:
 def _file_cache(context: ContextTypes.DEFAULT_TYPE) -> FileCache:
     """ذاكرة الملفات المؤقتة المحدودة (LRU) من bot_data (بتتعمل مرة واحدة)."""
     return context.bot_data.setdefault("file_cache", FileCache())
+
+
+def _identity_cache(context: ContextTypes.DEFAULT_TYPE):
+    """كاش هوية المالك المشترك على مستوى البوت (OHB2-09-A2-04).
+
+    مربوط بالعميل المشترك الواحد (`bot_data["client"]`) عشان `/users/me` يتنادى مرة
+    واحدة عبر كل مسارات الشات في البوت. الكاش مقيّد بالعميل: لو العميل اتغيّر (بناء
+    جديد) بنعمل كاش جديد، فما يتسرّبش بين اعتمادين/جلسات.
+    """
+    from .files import IdentityCache
+
+    client = context.bot_data["client"]
+    entry = context.bot_data.get("identity_cache")
+    if entry is not None and entry[0] is client:
+        return entry[1]
+    cache = IdentityCache(client)
+    context.bot_data["identity_cache"] = (client, cache)
+    return cache
+
+
+def _files_service(context: ContextTypes.DEFAULT_TYPE) -> FileService:
+    """`FileService` فوق نفس العميل المشترك وكاش الهوية المشترك (مفيش عميل تاني)."""
+    return FileService(context.bot_data["client"], identity=_identity_cache(context))
+
+
+async def _authorized_conversation(client, context: ContextTypes.DEFAULT_TYPE, conversation_id: str):
+    """يفوّض شات عبر **نفس** تنفيذ `FileService` (ملكية/معرّف/فشل مغلق).
+
+    يرجّع `(conv | None, message)`؛ لو `conv` فاضي فـ `message` رسالة عربي آمنة. عند
+    فشل upstream (429/503/مهلة/انقطاع) بنعرض رسالة الخطأ المتنقّحة (زي مسار البوت
+    القديم)، ولسه **مفيش أي جلب بيانات محمية** غير الميتاداتا المتفوَّض عليها.
+    """
+    conv, status, error = await authorize_conversation_detailed(
+        client, _identity_cache(context), conversation_id
+    )
+    if conv is not None:
+        return conv, None
+    if status is FileStatus.UPSTREAM_ERROR and error:
+        return None, error  # رسالة ApiError متنقّحة (نفس سلوك مسار open القديم)
+    _code, _http, message = CONVERSATION_ERRORS.get(
+        status, ("upstream_error", 502, "تعذّر الوصول للشات دلوقتي، جرّب تاني.")
+    )
+    return None, message
 
 
 def _store_exchange(context, conversation_id, user_text, reply):
@@ -286,30 +335,18 @@ async def open_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     conversation_id = q.data.split(":", 1)[1]
     client = context.bot_data["client"]
-    # TASK 55 (G5): نجيب الشات + آخر تبادل مع بعض (طلبين متوازيين بدل متتاليين).
-    # return_exceptions=True عشان نطبّق أولويات الرسايل القديمة بنفسها بالظبط.
-    convs, exchange = await asyncio.gather(
-        client.get_conversations([conversation_id]),
-        client.get_last_exchange(conversation_id),
-        return_exceptions=True,
-    )
-    if isinstance(convs, ApiError):
+    # OHB2-09-06: تفويض ملكية الشات أولًا (نفس عقد FileService)، بعدين نجيب آخر تبادل طازة.
+    # (فتح الشات بيقرا طازة دايماً — مش من كاش copy/full.)
+    conv, message = await _authorized_conversation(client, context, conversation_id)
+    if conv is None:
+        await _edit_or_send(q, message, q.message.chat_id, context.bot)
+        return
+    try:
+        user_text, reply = await client.get_last_exchange(conversation_id)
+    except ApiError as exc:
         # نفس المسار المتسامح لرسالة الخطأ: مفيش توجيه جديد ولا انهيار في الـ callback.
-        await _edit_or_send(q, error_text(convs), q.message.chat_id, context.bot)
+        await _edit_or_send(q, error_text(exc), q.message.chat_id, context.bot)
         return
-    if isinstance(convs, BaseException):
-        raise convs
-    if not convs:
-        # "مش موجود" ليها الأولوية حتى لو طلب الأحداث فشل، عشان نحافظ على الرسالة القديمة.
-        await _edit_or_send(q, "الشات مش موجود.", q.message.chat_id, context.bot)
-        return
-    if isinstance(exchange, ApiError):
-        await _edit_or_send(q, error_text(exchange), q.message.chat_id, context.bot)
-        return
-    if isinstance(exchange, BaseException):
-        raise exchange
-    conv = convs[0]
-    user_text, reply = exchange
     _store_exchange(context, conversation_id, user_text, reply)
     db = context.bot_data["db"]
     watched = db.is_watched(conversation_id)
@@ -333,6 +370,11 @@ async def copy_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     conversation_id = q.data.split(":", 1)[1]
     chat_id = q.message.chat_id
+    # OHB2-09-06: تفويض ملكية الشات قبل قراءة آخر تبادل (نفس عقد FileService).
+    _conv, message = await _authorized_conversation(context.bot_data["client"], context, conversation_id)
+    if _conv is None:
+        await context.bot.send_message(chat_id, escape_html(message), parse_mode=ParseMode.HTML)
+        return
     try:
         _, reply = await _get_exchange(context, conversation_id)
     except ApiError as exc:
@@ -352,6 +394,11 @@ async def full_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     conversation_id = q.data.split(":", 1)[1]
     chat_id = q.message.chat_id
+    # OHB2-09-06: تفويض ملكية الشات قبل قراءة آخر تبادل (نفس عقد FileService).
+    _conv, message = await _authorized_conversation(context.bot_data["client"], context, conversation_id)
+    if _conv is None:
+        await context.bot.send_message(chat_id, escape_html(message), parse_mode=ParseMode.HTML)
+        return
     try:
         _, reply = await _get_exchange(context, conversation_id)
     except ApiError as exc:
@@ -395,13 +442,10 @@ async def watch_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE)
     conversation_id = q.data.split(":", 1)[1]
     client = context.bot_data["client"]
     db = context.bot_data["db"]
-    try:
-        conv = await _conversation(client, conversation_id)
-    except ApiError as exc:
-        await _safe_edit(q, error_text(exc))
-        return
-    if not conv:
-        await _safe_edit(q, "الشات مش موجود.")
+    # OHB2-09-06/A2-02: نفس عقد ملكية الشات قبل الإضافة (مفيش شات غير مملوك للمتابعة).
+    conv, message = await _authorized_conversation(client, context, conversation_id)
+    if conv is None:
+        await _safe_edit(q, message)
         return
     # NTF-19: لو الشات متابَع بالفعل، الضغطة دي إعادة نداء مكرّرة (double-tap) ⇒ نحافظ على
     # المعرّف والعلامة المعلّقة (new_lifecycle=False). لو مش متابَع، الصف مش موجود فالـ INSERT
@@ -450,14 +494,12 @@ async def show_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not _allowed(update, context.bot_data["config"]):
         return
     conversation_id = q.data.split(":", 1)[1]
-    client = context.bot_data["client"]
-    try:
-        conv = await _conversation(client, conversation_id)
-    except ApiError as exc:
-        await _safe_edit(q, error_text(exc))
-        return
-    if not conv:
-        await _safe_edit(q, "الشات مش موجود.")
+    # OHB2-09-06: تفويض الشات عبر نفس عقد FileService (ملكية + فشل مغلق) قبل أي عرض.
+    conv, message = await _authorized_conversation(
+        context.bot_data["client"], context, conversation_id
+    )
+    if conv is None:
+        await _safe_edit(q, message)
         return
     lines = [
         f"العنوان: {conv.get('title') or 'بدون عنوان'}",
@@ -479,11 +521,12 @@ async def show_cost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _allowed(update, context.bot_data["config"]):
         return
     conversation_id = q.data.split(":", 1)[1]
-    client = context.bot_data["client"]
-    try:
-        conv = await _conversation(client, conversation_id)
-    except ApiError as exc:
-        await _safe_edit(q, error_text(exc))
+    # OHB2-09-A2-02: نفس عقد ملكية الشات قبل قراءة المقاييس (بدل get_conversations الخام).
+    conv, message = await _authorized_conversation(
+        context.bot_data["client"], context, conversation_id
+    )
+    if conv is None:
+        await _safe_edit(q, message)
         return
     await _edit_or_send(
         q, format_cost(conv.get("metrics")), q.message.chat_id, context.bot,
@@ -498,8 +541,20 @@ async def export_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     conversation_id = q.data.split(":", 1)[1]
     client = context.bot_data["client"]
+    # OHB2-09-A2-01: تفويض على مستوى الشات **قبل أي تنزيل** — نفس عقد FileService
+    # (المعرّف + هوية المالك من /users/me + `created_by_user_id`، وفشل مغلق). بنستخدم
+    # نفس خدمة الملفات المشتركة عشان مايبقاش فيه نسخة تانية من منطق التفويض.
+    conv, message = await _authorized_conversation(client, context, conversation_id)
+    if conv is None:
+        log.info("export: رفض تفويض الشات (ref=%s)", conversation_id)
+        await _safe_edit(q, message)
+        return
     try:
         data = await client.export_conversation(conversation_id)
+    except ResponseTooLargeError:
+        # OHB2-09-06: التصدير محدود؛ عدّى الحد ⇒ رسالة صريحة (مش خطأ عام)، مفيش مستند.
+        await _safe_edit(q, "التصدير كبير أوي للتنزيل الآمن. جرّب شات أصغر.")
+        return
     except ApiError as exc:
         await _safe_edit(q, error_text(exc))
         return
@@ -526,12 +581,12 @@ async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     except ValueError:
         await _safe_edit(q, _FILES_EXPIRED)
         return
-    client = context.bot_data["client"]
-    try:
-        files = await client.list_files(conversation_id)
-    except ApiError as exc:
-        await _safe_edit(q, error_text(exc))
+    # OHB2-09-06: عبر FileService المشترك (تفويض الملكية + allowlist للمسارات الآمنة).
+    listing = await _files_service(context).list_files(conversation_id)
+    if listing.status is not FileStatus.OK:
+        await _safe_edit(q, file_status_message(listing.status, listing.error))
         return
+    files = list(listing.files)
     if not files:
         await _safe_edit(q, "ما فيهاش ملفات.", reply_markup=kb.conversation_actions(conversation_id))
         return
@@ -570,14 +625,18 @@ async def show_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _safe_edit(q, _FILE_MISSING)
         return
     path = files[index]
-    client = context.bot_data["client"]
-    try:
-        content = await client.read_file(conversation_id, path)
-    except ApiError as exc:
-        await _safe_edit(q, error_text(exc))
+    # OHB2-09-06: قراءة **محدودة** عبر FileService (allowlist + حد صلب + تصنيف نص)،
+    # مش `client.read_file` غير المحدود. يمنع تحميل ملف ضخم في الذاكرة.
+    content = await _files_service(context).read_preview(conversation_id, path)
+    if content.status is not FileStatus.OK:
+        # ثنائي/ترميز غير مدعوم/كبير/مش موجود/غير مصرّح ⇒ رسالة واضحة بدل محتوى مشوّه.
+        await _safe_edit(q, file_status_message(content.status, content.error))
         return
+    body = content.text or ""
     name = path.rsplit("/", 1)[-1] or "file.txt"
-    buffer = io.BytesIO(content.encode("utf-8"))
+    if content.truncated:
+        body += "\n\n… (المعاينة مقصوصة — الملف أكبر من حد العرض الآمن.)"
+    buffer = io.BytesIO(body.encode("utf-8"))
     await context.bot.send_document(
         chat_id=q.message.chat_id, document=InputFile(buffer, filename=name)
     )
@@ -590,6 +649,15 @@ async def reply_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     conversation_id = q.data.split(":", 1)[1]
     db = context.bot_data["db"]
+    # OHB2-09-A2-02/B2-06-04: تفويض ملكية الشات **قبل** أي توجيه لبرومت — نفس عقد
+    # باقي مسارات الشات (ملفات/حالة/تفاصيل/تصدير). كده مايتفتحش توجيه برومت لشات
+    # مش مملوك (فشل مغلق عند غياب/عدم تطابق المالك).
+    conv, message = await _authorized_conversation(
+        context.bot_data["client"], context, conversation_id
+    )
+    if conv is None:
+        await _safe_edit(q, message)
+        return
     db.set_awaiting(update.effective_user.id, conversation_id, "reply")
     await _safe_edit(
         q,
@@ -675,11 +743,6 @@ async def outbox_recover(app) -> None:
 
 async def creation_recover(app) -> None:
     await outbox.creation_recover(app)
-
-
-async def _conversation(client, conversation_id: str) -> dict:
-    convs = await client.get_conversations([conversation_id])
-    return convs[0] if convs else {}
 
 
 async def start_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
