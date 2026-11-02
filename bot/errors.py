@@ -53,6 +53,17 @@ class ApiError(RuntimeError):
         self.status_code = status_code
 
 
+class ResponseTooLargeError(ApiError):
+    """رد upstream أكبر من الحد الآمن المسموح (OHB2-09-01-FIX).
+
+    نوع مخصّص عشان طبقة الملفات تقدر تترجمه لحالة `too_large` بشكل صريح بدل
+    ما تخلطه مع أخطاء upstream العامة.
+    """
+
+    def __init__(self, message: str = "حجم رد الملف كبير أوي للعرض الآمن.") -> None:
+        super().__init__(message)
+
+
 def error_text(exc: BaseException) -> str:
     """نص آمن للمستخدم: رسالة ApiError (متنقّحة)، وأي استثناء تاني ⇒ نص عام بدون تفاصيله."""
     if isinstance(exc, ApiError):

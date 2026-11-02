@@ -25,6 +25,14 @@ class Config:
     mini_app_initdata_max_age: int = 300
     mini_app_session_ttl: int = 3600
     mini_app_cookie_secure: bool = True
+    # OHB2-06: أصول مسموح بيها لطلبات تغيّر الحالة (Origin check). بتتشتق من
+    # MINI_APP_URL لو مش محدّدة صريحة.
+    mini_app_allowed_origins: frozenset[str] = field(default_factory=frozenset)
+    # OHB2-06: حدود المعدّل (نافذة منزلقة، في الذاكرة).
+    mini_app_auth_rate_per_minute: int = 10
+    mini_app_auth_rate_per_hour: int = 30
+    mini_app_api_rate_per_minute: int = 60
+    mini_app_rate_max_keys: int = 4096
 
     @property
     def secrets(self) -> tuple[str, str]:
@@ -88,6 +96,23 @@ def _parse_bool(env, name: str, default: bool) -> bool:
     if raw in _FALSE:
         return False
     return default
+
+
+def _parse_origins(env) -> frozenset[str]:
+    """يقرأ MINI_APP_ALLOWED_ORIGINS (مفصولة بفواصل). كل أصل لازم يكون scheme://host[:port]."""
+    raw = _clean(env, "MINI_APP_ALLOWED_ORIGINS")
+    origins: set[str] = set()
+    for chunk in raw.split(","):
+        value = chunk.strip()
+        if not value:
+            continue
+        parts = urlsplit(value)
+        if parts.scheme not in ("http", "https") or not parts.netloc:
+            raise ConfigError(
+                "MINI_APP_ALLOWED_ORIGINS: كل أصل لازم يكون بالشكل scheme://host[:port]"
+            )
+        origins.add(f"{parts.scheme}://{parts.netloc}")
+    return frozenset(origins)
 
 
 def _parse_ids(raw: str) -> list[int]:
@@ -213,6 +238,19 @@ def load_config(env: dict | None = None) -> Config:
     # كوكي الـ session لازم Secure في الإنتاج؛ ممكن يتقفل للتطوير المحلي على http.
     mini_app_cookie_secure = _parse_bool(env, "MINI_APP_COOKIE_SECURE", True)
 
+    # OHB2-06: أصول مسموح بيها. افتراضيًا أصل MINI_APP_URL (scheme://host[:port]).
+    # ممكن تتوسّع بـ MINI_APP_ALLOWED_ORIGINS (مفصولة بفواصل) للـ localhost أثناء التطوير.
+    allowed_origins = _parse_origins(env)
+    if mini_app_url and not allowed_origins:
+        parts = urlsplit(mini_app_url)
+        allowed_origins = frozenset({f"{parts.scheme}://{parts.netloc}"})
+
+    # OHB2-06: حدود المعدّل (كلها أرقام موجبة).
+    mini_app_auth_rate_per_minute = _positive("MINI_APP_AUTH_RATE_PER_MINUTE", 10)
+    mini_app_auth_rate_per_hour = _positive("MINI_APP_AUTH_RATE_PER_HOUR", 30)
+    mini_app_api_rate_per_minute = _positive("MINI_APP_API_RATE_PER_MINUTE", 60)
+    mini_app_rate_max_keys = _positive("MINI_APP_RATE_MAX_KEYS", 4096)
+
     return Config(
         telegram_bot_token=token,
         openhands_api_key=api_key,
@@ -228,4 +266,9 @@ def load_config(env: dict | None = None) -> Config:
         mini_app_initdata_max_age=mini_app_initdata_max_age,
         mini_app_session_ttl=mini_app_session_ttl,
         mini_app_cookie_secure=mini_app_cookie_secure,
+        mini_app_allowed_origins=allowed_origins,
+        mini_app_auth_rate_per_minute=mini_app_auth_rate_per_minute,
+        mini_app_auth_rate_per_hour=mini_app_auth_rate_per_hour,
+        mini_app_api_rate_per_minute=mini_app_api_rate_per_minute,
+        mini_app_rate_max_keys=mini_app_rate_max_keys,
     )

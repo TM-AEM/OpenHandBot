@@ -1,51 +1,101 @@
 <!doctype html>
 <html lang="ar" dir="rtl">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="color-scheme" content="light dark">
-  <meta name="theme-color" content="#0f172a">
-  <title>OpenHandBot</title>
-  <link rel="stylesheet" href="/mini/styles.css?v=1">
-</head>
-<body>
-  <main class="app" id="app" aria-busy="true">
-    <header class="topbar">
-      <span class="brand">OpenHandBot</span>
-      <span class="badge" id="env-badge" hidden></span>
-    </header>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="color-scheme" content="light dark">
+    <meta name="theme-color" content="#0f172a">
+    <title>OpenHandBot</title>
+    <link rel="stylesheet" href="/mini/styles.css?v=5">
+  </head>
+  <body>
+    <main class="app" id="app" aria-busy="true">
+      <header class="topbar">
+        <span class="brand">OpenHandBot</span>
+        <span class="user" id="user-name" hidden></span>
+      </header>
 
-    <section class="state" id="state-loading" role="status" aria-live="polite">
-      <div class="spinner" aria-hidden="true"></div>
-      <p>بيتم التحميل…</p>
-    </section>
+      <section class="state" id="state-loading" role="status" aria-live="polite">
+        <div class="spinner" aria-hidden="true"></div>
+        <p>بيتم التحميل…</p>
+      </section>
 
-    <section class="state" id="state-error" hidden role="alert">
-      <div class="icon" aria-hidden="true">⚠️</div>
-      <h2 class="state-title">تعذّر فتح التطبيق</h2>
-      <p class="state-msg" id="error-msg">حصل خطأ غير متوقع.</p>
-      <button class="btn" id="retry-btn" type="button">إعادة المحاولة</button>
-    </section>
+      <section class="state" id="state-error" hidden role="alert">
+        <div class="icon" aria-hidden="true">⚠️</div>
+        <h2 class="state-title">تعذّر فتح التطبيق</h2>
+        <p class="state-msg" id="error-msg">حصل خطأ غير متوقع.</p>
+        <button class="btn" id="retry-btn" type="button">إعادة المحاولة</button>
+      </section>
 
-    <section class="state" id="state-empty" hidden>
-      <div class="icon" aria-hidden="true">📭</div>
-      <h2 class="state-title">لسه مفيش حاجة هنا</h2>
-      <p class="state-msg">الواجهة جاهزة، والأقسام هتظهر في التحديثات الجاية.</p>
-    </section>
+      <section class="content" id="state-ready" hidden>
+        <nav class="tabs" role="tablist">
+          <button class="tab" type="button" data-view="chats" role="tab">الشاتات</button>
+          <button class="tab" type="button" data-view="watches" role="tab">المتابعات</button>
+          <button class="tab" type="button" data-view="inbox" role="tab">الإشعارات <span class="badge" id="inbox-badge" hidden></span></button>
+          <button class="tab" type="button" data-view="new" role="tab">شات جديد</button>
+          <button class="tab" type="button" data-view="settings" role="tab">الإعدادات</button>
+        </nav>
 
-    <section class="content" id="state-ready" hidden>
-      <div class="card">
-        <p class="card-label">مسجّل دخول كـ</p>
-        <p class="card-value" id="user-name">—</p>
-      </div>
-      <div class="card row">
-        <span class="card-label">الإشعارات الاستباقية</span>
-        <span class="pill" id="notif-state">—</span>
-      </div>
-      <p class="hint">ده أساس التطبيق بس. باقي الميزات (الشاتات، البرومتات، الملفات) جاية في تحديثات لاحقة.</p>
-    </section>
-  </main>
+        <div class="view" id="view-chats">
+          <div class="toolbar">
+            <button class="btn ghost" type="button" id="chats-refresh">تحديث</button>
+          </div>
+          <ul class="list" id="chats-list"></ul>
+          <div class="more" id="chats-more" hidden>
+            <button class="btn ghost" type="button" id="chats-next">المزيد</button>
+          </div>
+        </div>
 
-  <script src="/mini/app.js?v=1" defer></script>
-</body>
+        <div class="view" id="view-detail" hidden></div>
+
+        <div class="view" id="view-watches" hidden>
+          <div class="toolbar">
+            <button class="btn ghost" type="button" id="watches-refresh">تحديث</button>
+          </div>
+          <ul class="list" id="watches-list"></ul>
+        </div>
+
+        <div class="view" id="view-inbox" hidden>
+          <div class="toolbar">
+            <button class="btn ghost" type="button" id="inbox-refresh">تحديث</button>
+            <button class="btn ghost" type="button" id="inbox-read-all">تعليم الكل كمقروء</button>
+          </div>
+          <ul class="list" id="inbox-list"></ul>
+          <div class="more" id="inbox-more" hidden>
+            <button class="btn ghost" type="button" id="inbox-next">المزيد</button>
+          </div>
+        </div>
+
+        <div class="view" id="view-new" hidden>
+          <div class="field">
+            <input class="input" type="search" id="repo-search" placeholder="ابحث عن مستودع…" autocomplete="off">
+            <button class="btn ghost" type="button" id="repo-search-btn">بحث</button>
+          </div>
+          <ul class="list" id="repo-list"></ul>
+          <div class="newchat-form" id="newchat-form" hidden>
+            <p class="hint" id="newchat-repo"></p>
+            <textarea class="textarea" id="newchat-text" rows="4" placeholder="اكتب البرومت اللي عايز تبدأ بيه الشات…"></textarea>
+            <button class="btn" type="button" id="newchat-send">ابدأ الشات</button>
+            <div class="op-box" id="newchat-op"></div>
+          </div>
+        </div>
+
+        <div class="view" id="view-settings" hidden>
+          <div class="card row">
+            <span class="card-label">الإشعارات الاستباقية</span>
+            <button class="btn small" type="button" id="notif-toggle">—</button>
+          </div>
+          <p class="hint">الإشعارات بتيجي من البوت على تيليجرام لما أي شات يوصل لحالة نهائية.</p>
+        </div>
+      </section>
+
+      <div class="toast" id="toast" hidden role="status" aria-live="polite"></div>
+    </main>
+
+    <script src="/mini/ops.js?v=5" defer></script>
+    <script src="/mini/inbox.js?v=5" defer></script>
+    <script src="/mini/files.js?v=5" defer></script>
+    <script src="/mini/cost.js?v=5" defer></script>
+    <script src="/mini/app.js?v=5" defer></script>
+  </body>
 </html>

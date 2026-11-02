@@ -20,12 +20,22 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from datetime import datetime, timedelta, timezone
 
-from telegram.error import TelegramError
+from telegram.error import RetryAfter, TelegramError
 
+from .db import (
+    INBOX_CLAIM_LEASE,
+    INBOX_DELIVERY_MAX_ATTEMPTS,
+    INBOX_KIND_MISSING,
+    INBOX_KIND_STALE_REPORT,
+    INBOX_KIND_TERMINAL,
+    INBOX_KIND_TIMEOUT,
+)
 from .errors import ApiError
 from .messages import SANDBOX_ERROR, get_status, is_terminal, state_label
+from .notifier import _parse_retry_deadline, _retry_after_seconds
 from .openhands_client import parse_timestamp
 from .sender import send_long
 
@@ -84,9 +94,16 @@ class Watcher:
         self._default_chat_id = chat_id
         self._interval = interval
         self._task: asyncio.Task | None = None
+        # OHB2-08-02R: مواعيد إعادة المحاولة بعد RetryAfter بقت **دائمة لكل محادثة** في
+        # `db.notifier_retry_not_before` (UTC ISO)، مش مؤقّت in-memory. كده الموعد بيفضل
+        # بعد إعادة التشغيل، و429 لمحادثة ما بيوقفش باقي المتابعات.
         # NTF-20: ننسّق التلميح in-memory مع أي دورة متابعة جديدة يبدأها أي مستدعي
         # (`add_watched(new_lifecycle=True)`)، حتى لو المستدعي مايعرفش المراقب.
         db.on_new_watch_lifecycle = self._on_new_watch_lifecycle
+        # OHB2-08-03: ننسّق التلميح in-memory مع أي إزالة متابعة تتم من أي مسار (الـ handlers
+        # أو الـ Mini App fallback `db.remove_watched` لما المراقب مش متاح)، حتى لو المستدعي
+        # مايعرفش المراقب. كده دليل تسليم in-memory مايتسيّبش معلّق ⇒ مايحصلش إشعار مكرّر.
+        db.on_unwatch = self._on_unwatch
 
     def _on_new_watch_lifecycle(self, conversation_id: str) -> None:
         """NTF-20: hook بيتنادى من `Database.add_watched` قبل بدء دورة متابعة جديدة.
@@ -105,6 +122,25 @@ class Watcher:
         if w is not None and hint[1] == w.watch_seq:
             self._db.set_pending_delivery(conversation_id, hint[0])
         self._marker_pending.pop(conversation_id, None)
+
+    def _on_unwatch(self, conversation_id: str) -> None:
+        """OHB2-08-03: hook بيتنادى من `Database.remove_watched*` قبل حذف الصف.
+
+        بيثبّت التلميح in-memory المطابق كعلامة دائمة **قبل** الحذف، فالـ fallback (لما
+        المستدعي بينادي `db.remove_watched` مباشرةً بدل `watcher.unwatch`، أو المراقب مش
+        متاح لحظتها) يلاقي العلامة ويكمّل التسجيل بدل ما يسيبه معلّق ⇒ مايحصلش إشعار مكرّر.
+        التلميح بيتبط بمعرّف دورة المتابعة (`watch_seq`)، فمتابعة اتعملت من جديد (معرّف
+        مختلف) بتتجاهله.
+
+        التلميح **مابيتشالش** هنا: المستدعي اللي بيعرف إن العملية نجحت هو اللي بيشيله
+        (`Watcher.unwatch` / `_on_new_watch_lifecycle`)، فلو الحذف فشل بعد التثبيت الدليل
+        يفضل متاح (retry آمن). لو الكتابة نفسها فشلت، الاستثناء بيطلع فالإزالة ما تتكمّلش
+        (fail-safe، مفيش فقد صامت).
+        """
+        w = self._db.get_watched(conversation_id)
+        hint = self._marker_pending.get(conversation_id)
+        if hint is not None and w is not None and hint[1] == w.watch_seq:
+            self._db.set_pending_delivery(conversation_id, hint[0])
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._run())
@@ -135,6 +171,10 @@ class Watcher:
             await asyncio.sleep(self._interval)
 
     async def tick(self) -> None:
+        # OHB2-08-05 (Batch 3R): نعيد محاولة أحداث الصندوق المعلّقة **قبل** المعالجة
+        # العادية. الأحداث اللي محادثاتها متابَعة بتتخطّى هنا (بتتعامل في مسار المتابعة
+        # النشط)، فبنستهدف اللي اتشالت متابعتها (استنفاد/إلغاء) أو معلّقة عبر إعادة تشغيل.
+        await self._recover_pending_events()
         watched = self._db.list_watched()
         if not watched:
             return
@@ -146,6 +186,22 @@ class Watcher:
             return
 
         for w in watched:
+            # OHB2-08-02R: موعد إعادة محاولة **دائم** للمحادثة دي بعد RetryAfter. لو لسه
+            # ما عدّاش، نتخطّى المحادثة دي بالكامل (بما فيها مسار الشات المفقود) — مش
+            # الدورة كلها. 429 لمحادثة ما بيوقفش باقي المتابعات. موعد منتهي/تالف ⇒ نمسحه
+            # ونكمّل (fail-safe: إعادة محاولة، مش فقد إشعار).
+            raw_deadline = self._db.get_retry_not_before(w.conversation_id)
+            if raw_deadline is not None:
+                deadline = _parse_retry_deadline(raw_deadline)
+                if deadline is not None and self._clock() < deadline:
+                    continue
+                try:
+                    self._db.clear_retry_not_before(w.conversation_id)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "تعذّر مسح موعد إعادة محاولة الشات %s (%s)، هيتخطّى",
+                        w.conversation_id, type(exc).__name__,
+                    )
             conv = convs.get(w.conversation_id)
             if not conv:
                 await self._handle_missing(w)
@@ -169,6 +225,88 @@ class Watcher:
                     "خطأ غير متوقع في متابعة الشات %s (%s)", w.conversation_id, type(exc).__name__
                 )
 
+    _WATCHER_INBOX_KINDS = (
+        INBOX_KIND_TERMINAL,
+        INBOX_KIND_TIMEOUT,
+        INBOX_KIND_MISSING,
+        INBOX_KIND_STALE_REPORT,
+    )
+
+    async def _recover_pending_events(self) -> None:
+        """يعيد محاولة أحداث الصندوق المعلّقة اللي المراقب مالكها (أنواع المتابعة)."""
+        now = self._now_iso()
+        try:
+            due = self._db.list_due_pending_inbox(
+                now,
+                kinds=self._WATCHER_INBOX_KINDS,
+                exclude_watched=True,
+                unclaimed=True,
+                claim_cutoff=(self._clock() - INBOX_CLAIM_LEASE).isoformat(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("تعذّر جلب أحداث الصندوق المعلّقة (%s)", type(exc).__name__)
+            return
+        for item in due:
+            try:
+                await self._deliver_pending_event(item)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.error("خطأ في استرجاع حدث الصندوق %s (%s)", item.id, type(exc).__name__)
+
+    async def _deliver_pending_event(self, item) -> None:
+        """يبعت حدثًا معلّقًا (استرجاع) ويحدّث حالته. الحدث **بيفضل موجود** دايمًا.
+
+        OHB2-08-05 (Batch 3R-FIX2-F1): بيحجز الصف **ذرّيًا** قبل الإرسال (زي مسار المُبلّل)
+        فلو العاملين حاولوا نفس الحدث معًا واحد بس يبعت.
+        """
+        claim = uuid.uuid4().hex
+        now = self._now_iso()
+        cutoff = (self._clock() - INBOX_CLAIM_LEASE).isoformat()
+        if not self._db.claim_pending_inbox(item.id, claim, now, cutoff=cutoff):
+            return  # عامل تاني حجزه/سلّمه لحظة كده ⇒ ما نرسلش
+        dest = item.chat_id if item.chat_id is not None else self._default_chat_id
+        if self._allowed_chats is not None and dest not in self._allowed_chats:
+            dest = self._default_chat_id
+        try:
+            await send_long(dest, item.message, self._bot)
+        except RetryAfter as exc:
+            self._db.set_inbox_retry_deadline(
+                item.id, self._deadline_iso(_retry_after_seconds(exc))
+            )
+            return
+        except TelegramError as exc:
+            exhausted = (item.delivery_attempts + 1) >= INBOX_DELIVERY_MAX_ATTEMPTS
+            self._db.record_inbox_attempt(
+                item.id, now, error=type(exc).__name__, mark_failed=exhausted
+            )
+            return
+        except Exception:
+            self._db.clear_inbox_claim(item.id, claim)
+            raise
+        self._db.mark_inbox_delivered(item.id, now)
+        # OHB2-08-05 (Batch 3R-FIX): لو الحدث المسترجَع ممثّل للانتقال **الحالي** للحالة
+        # (`transition_status`)، ننسّق مع المُبلّل: نسجّل الانتقال "مُبلّغ" عشان مايعملش
+        # إشعار استباقي منافس لنفس الانتقال (إزالة ازدواج عبر العاملين). معزول: أي خطأ
+        # هنا ما يبطّلش التسليم (الحدث اتعلّم delivered بالفعل).
+        # Batch 3R-FIX2: ننسّق بس لو الحدث هو **العصر الحالي** — حدث قديم اتجاوزه انتقال
+        # أحدث (superseded) مايدوسش على `notified_status` الحالي.
+        state = self._db.get_notification_state(item.conversation_id)
+        current_seq = state.transition_seq if state is not None else None
+        if (
+            item.transition_status
+            and item.transition_seq is not None
+            and item.transition_seq == current_seq
+            and self._on_owner_delivery is not None
+        ):
+            try:
+                self._on_owner_delivery(item.conversation_id, item.transition_status, now)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "تعذّر تنسيق تسليم الانتقال %s بعد الاسترجاع (%s)",
+                    item.conversation_id, type(exc).__name__,
+                )
+
     def _refresh_title(self, w, conv: dict) -> None:
         """يخزّن العنوان الطازج للشات المتابَع (لو اتغيّر). معزول: أي خطأ ما يوقفش الدورة."""
         try:
@@ -185,7 +323,7 @@ class Watcher:
         if count < MISSING_LIMIT:
             return
         text = f"الشات «{w.title or 'بدون عنوان'}» لم يعد موجوداً على OpenHands، وتم إيقاف متابعته."
-        if await self._deliver(w, text):
+        if await self._deliver(w, text, kind=INBOX_KIND_MISSING):
             self._misses.pop(w.conversation_id, None)
             self._db.remove_watched_if_seq(w.conversation_id, w.watch_seq)
 
@@ -236,7 +374,7 @@ class Watcher:
                     f"(مرّت أكثر من {int(START_TIMEOUT.total_seconds() // 60)} دقائق). "
                     f"الحالة الحالية: {state_label(state)}. راجع الشات من الموقع."
                 )
-                if await self._deliver(w, text):
+                if await self._deliver(w, text, kind=INBOX_KIND_STALE_REPORT, title=title):
                     self._db.remove_watched_if_seq(w.conversation_id, w.watch_seq)
                 return
             return  # بنستنى تقرير أحدث؛ الحالة المسجّلة تفضل زي ما هي
@@ -251,18 +389,114 @@ class Watcher:
             f"انتهت مهلة متابعة الشات «{title}» (24 ساعة) والشات لسه مش منتهي "
             f"(الحالة: {state_label(state)}). تم إيقاف المتابعة، راجعه من الموقع."
         )
-        if await self._deliver(w, text):
+        if await self._deliver(w, text, kind=INBOX_KIND_TIMEOUT, title=title):
             self._db.remove_watched_if_seq(w.conversation_id, w.watch_seq)
             return True
         return False
 
-    async def _deliver(self, w, text: str) -> bool:
+    async def _deliver(self, w, text: str, *, kind: str = INBOX_KIND_MISSING, title: str = "") -> bool:
+        # OHB2-08-05 (Batch 3R): نسجّل **الحدث** في الصندوق **قبل** أي إرسال (event-first)
+        # عشان مايتفقدش لو تليجرام فشل أو العملية وقعت. حالة التسليم بتتحدّث بعد المحاولة.
+        event_id = self._record_event(w, title, kind, text)
         try:
             await send_long(self._destination(w), text, self._bot)
-        except TelegramError as exc:
-            self._log_delivery_failure(w, exc)
+        except RetryAfter as exc:
+            # OHB2-08-02R: 429 على مسار التسليم (مهلة/شات مفقود): نجدول إعادة محاولة
+            # دائمة للمحادثة (من غير عدّاد، من غير إزالة) ونرجّع False — ما بنصنّفه فشل.
+            self._schedule_retry_after(w.conversation_id, exc)
+            if event_id is not None:
+                self._db.set_inbox_retry_deadline(
+                    event_id, self._deadline_iso(_retry_after_seconds(exc))
+                )
             return False
+        except TelegramError as exc:
+            # فشل التسليم: الحدث باقي `pending` (مايتفقدش)، وبنزوّد ميزانية محاولات
+            # المتابعة (وبنشيلها عند الاستنفاد — والحدث يفضل معلّق للاسترجاع).
+            if event_id is not None:
+                self._db.record_inbox_attempt(
+                    event_id, self._now_iso(), error=type(exc).__name__
+                )
+            self._handle_notify_failure(w, exc)
+            return False
+        if event_id is not None:
+            self._db.mark_inbox_delivered(event_id, self._now_iso())
         return True
+
+    def _now_iso(self) -> str:
+        return self._clock().isoformat()
+
+    def _record_event(
+        self, w, title: str, kind: str, text: str,
+        transition_status: str | None = None, transition_seq: int | None = None,
+    ) -> int | None:
+        """يسجّل الحدث (event-first) ويرجّع معرّفه، أو None لو التسجيل فشل.
+
+        idempotent: نفس الحدث (نفس `event_key`) يرجّع معرّف الصف الموجود بدل ما يعمل صف
+        جديد. معزول: أي خطأ قاعدة بيتسجّل تحذير بس (الإرسال مايتوقفش عليه)، لكن ساعتها
+        بنرجّع None (مفيش ضمان استرجاع — والاسترجاع ما بيتأكّدش كإنه حصل).
+
+        `transition_status` = وصف الحالة المرصودة (ميتاداتا). `transition_seq` (Batch 3R-FIX2)
+        = هوية الانتقال الدائمة (عصر الاكتشاف). لو فيه صف انتقال غير مُسلّم بنفس (المحادثة،
+        الهوية)، القيد الموحّد يرفض الصف وبنرجّع None (مفيش ازدواج لنفس الانتقال بين العاملين).
+        """
+        key = self._inbox_event_key(w, kind, transition_seq)
+        try:
+            event_id = self._db.add_inbox_event(
+                w.conversation_id, title or w.title or "", kind, text,
+                self._now_iso(), event_key=key, chat_id=self._destination(w),
+                transition_status=transition_status, transition_seq=transition_seq,
+            )
+            if event_id is None:
+                existing = self._db.find_inbox_by_event_key(key)
+                return existing.id if existing else None
+            return event_id
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "تعذّر تسجيل حدث الصندوق للشات %s (%s)", w.conversation_id, type(exc).__name__
+            )
+            return None
+
+    def _inbox_event_key(self, w, kind: str, transition_seq: int | None = None) -> str:
+        """OHB2-08-05: مفتاح الهوية المنطقية للحدث (idempotency).
+
+        OHB2-08-05 (Batch 3R-FIX2-N1): لأحداث **الانتقال** (اللي ليها `transition_seq`، زي
+        `terminal`) المفتاح بيستبدل الحقل المتغيّر `last_state` بـ **هوية الانتقال الدائمة**
+        (`transition_seq`) — اللي المُبلّل بيستخدمها كمان. قبل كده كان على `watch_seq` +
+        `last_state`، والاتنين **مش بيتغيّروا** لما التسليم يفشل ⇒ انتقال نهائي تانٍ بنفس
+        الحالة كان يعيد استخدام نفس المفتاح ويتفقد (العيب N-1). دلوقتي `finished→running→
+        finished` بيدي `transition_seq` مختلف ⇒ مفتاح مختلف ⇒ حدث منفصل.
+
+        بنحتفظ بـ `watch_seq` في المفتاح: دورة متابعة جديدة (`watch_seq` جديد) تفضل تعتبر
+        الحدث جديدًا (زي اختبار إعادة المتابعة)، وإعادة الاستطلاع لنفس الدورة + نفس الانتقال
+        تفضل idempotent. الهوية **الموحّدة** بين العاملين هي `transition_seq` (مفروضة بقيد
+        التفرّد الجزئي على `(conversation_id, transition_seq)`)، فده مش تخصيص لسجل مكرّر.
+
+        لباقي الأنواع (timeout/missing/stale_report — من غير `transition_seq`) بنحتفظ
+        بالسلوك القديم على `watch_seq` + الحالة (هوية دورة المتابعة)، عشان ما نغيّرش
+        دلالات الأنواع غير الانتقالية.
+        """
+        if transition_seq is not None:
+            return f"{w.conversation_id}|{kind}|{w.watch_seq}|{transition_seq}"
+        return f"{w.conversation_id}|{kind}|{w.watch_seq}|{w.last_state or ''}"
+
+    def _record_inbox(
+        self, conversation_id: str, title: str, kind: str, text: str, *, event_key: str = ""
+    ) -> None:
+        """متوافق للخلف: يسجّل حدثًا في الصندوق (event-first، `delivery_status='pending'`).
+
+        المسار الأساسي بقى `_record_event`؛ دي بترجّع للسلوك الافتراضي. معزولة: أي خطأ
+        في كتابة الصندوق بيتسجّل تحذير بس ولا يكسر مسار الإشعار.
+        """
+        try:
+            self._db.add_inbox_event(
+                conversation_id, title, kind, text,
+                self._now_iso(),
+                event_key=event_key or None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "تعذّر تسجيل حدث الصندوق للشات %s (%s)", conversation_id, type(exc).__name__
+            )
 
     def _destination(self, w) -> int:
         chat_id = w.chat_id or self._default_chat_id
@@ -273,6 +507,29 @@ class Watcher:
     def _expired(self, since_iso: str | None, limit: timedelta) -> bool:
         since = parse_timestamp(since_iso)
         return since is not None and self._clock() - since > limit
+
+    def _deadline_iso(self, delay_seconds: float) -> str:
+        """موعد إعادة محاولة مطلق (UTC ISO) = ساعة المراقب + المدة (OHB2-08-02R)."""
+        return (self._clock() + timedelta(seconds=delay_seconds)).isoformat()
+
+    def _schedule_retry_after(self, conversation_id: str, exc: RetryAfter) -> None:
+        """يسجّل موعد إعادة محاولة **دائم** للمحادثة بعد RetryAfter (429) (OHB2-08-02R).
+
+        ما بيستهلكش عدّاد محاولات، وما بيشيلش المتابعة، وما بيصنّف 429 فشل دائم. بيوقف
+        المحادثة دي بس لحد الموعد (fail-safe لو الكتابة فشلت: ممكن نحاول بدري، مش نفقد).
+        """
+        delay = _retry_after_seconds(exc)
+        try:
+            self._db.set_retry_not_before(conversation_id, self._deadline_iso(delay))
+        except Exception as exc2:  # noqa: BLE001
+            log.warning(
+                "تعذّر تسجيل موعد إعادة محاولة الشات %s (%s)؛ هنحاول الدورة الجاية",
+                conversation_id, type(exc2).__name__,
+            )
+        log.warning(
+            "تليجرام طلب انتظار %.0f ثانية لإشعار الشات %s (429)، هنعيد بعد كده",
+            delay, conversation_id,
+        )
 
     @staticmethod
     def _log_delivery_failure(w, exc: Exception) -> None:
@@ -302,7 +559,12 @@ class Watcher:
         NTF-23: العدّاد والإزالة مشروطان بمعرّف الدورة الملتقَط (`watch_seq`): لو دورة
         جديدة اتعملت أثناء await، قرار الفشل القديم ما يتطبّقش على الدورة الجديدة
         (ما نزوّدش عدّادها ولا نشيلها).
+        OHB2-08-02R: `RetryAfter` (429) مش فشل دائم — بنجدول موعد إعادة محاولة **دائم**
+        للمحادثة (من غير ما نزوّد العدّاد ولا نصنّفه فشل)، فباقي المتابعات ما بتتأثّرش.
         """
+        if isinstance(exc, RetryAfter):
+            self._schedule_retry_after(w.conversation_id, exc)
+            return
         count = self._db.increment_watched_retry_if_seq(w.conversation_id, w.watch_seq)
         if count == 0:
             return  # الدورة اتغيّرت/الصف مش موجود ⇒ قرار قديم ما يتطبّقش
@@ -337,7 +599,44 @@ class Watcher:
             except ApiError:
                 reply = None
         text = header + ("\n\n" + reply if reply else "")
-        await send_long(self._destination(w), text, self._bot)
+        # OHB2-08-05 (Batch 3R): نسجّل **الحدث** في الصندوق **قبل** أي إرسال (event-first)
+        # عشان مايتفقدش لو تليجرام فشل أو العملية وقعت. حالة التسليم بتتحدّث بعد المحاولة.
+        # Batch 3R-FIX2: الهوية = عصر الانتقال (`note_transition`، idempotent ومشترك مع
+        # المُبلّل)، والوصف `transition_status=state`.
+        seq = self._db.note_transition(
+            w.conversation_id, state, terminal=True, now=self._now_iso()
+        )
+        event_id = self._record_event(
+            w, title, INBOX_KIND_TERMINAL, text, transition_status=state, transition_seq=seq
+        )
+        if event_id is None:
+            # القيد الموحّد رفض صفًا منافسًا: فيه صف انتقال مشترك بنفس الهوية (نفس العصر)
+            # سجّله عامل تاني (المُبلّل). مانبعتش (التاني هيسلّمه مرة واحدة) ومانعلّمش
+            # الحالة مسجّلة (عشان ما نحجبش إشعار انتقال حقيقي). بنرجّع False (مفيش تسليم
+            # مسجّل من هنا) عشان المستدعي ما يشيلش المتابعة.
+            shared = self._db.find_pending_transition(w.conversation_id, seq)
+            if shared is not None:
+                log.info(
+                    "الشات %s: انتقال %s (عصر %d) مسجّل بالفعل من عامل تاني (حدث %d)؛ المراقب هيتخطّى",
+                    w.conversation_id, state, seq, shared.id,
+                )
+                return False
+        try:
+            await send_long(self._destination(w), text, self._bot)
+        except RetryAfter as exc:
+            if event_id is not None:
+                self._db.set_inbox_retry_deadline(
+                    event_id, self._deadline_iso(_retry_after_seconds(exc))
+                )
+            raise
+        except TelegramError as exc:
+            if event_id is not None:
+                self._db.record_inbox_attempt(
+                    event_id, self._now_iso(), error=type(exc).__name__
+                )
+            raise
+        if event_id is not None:
+            self._db.mark_inbox_delivered(event_id, self._now_iso())
         # NTF-13/15: تليجرام أكّد التسليم ⇒ نكتب **علامة التسليم المعلّق** على الصف أول
         # (قبل التسجيل الدائم). لو الكتابة نفسها فشلت، بنسيب المتابعة ونسجّل تلميح in-memory
         # عشان الدورة الجاية تعيد كتابة العلامة **قبل أي إرسال** بدل ما تعيد الإرسال.

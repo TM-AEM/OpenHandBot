@@ -21,6 +21,16 @@ def make_client(handler):
     return OpenHandsClient("https://example.test", "key", transport=httpx.MockTransport(handler))
 
 
+class _RawStream(httpx.AsyncByteStream):
+    """تدفّق بايتات بسيط للاختبار (زي ما الشبكة الحقيقية بترجّع)."""
+
+    def __init__(self, data: bytes):
+        self._data = data
+
+    async def __aiter__(self):
+        yield self._data
+
+
 def test_list_files_malformed_top_level_raises():
     # OHB2-01: جسم مش list ومش dict فيه items ⇒ خطأ API آمن (مش نتيجة فاضية مضلّلة).
     def handler(request):
@@ -66,14 +76,56 @@ def test_export_failure_raises_safe_error_no_body_leak():
     assert "secret" not in str(exc.value)
 
 
-def test_export_large_response_is_returned_intact():
-    # بنثبت إن الاستجابة الكبيرة بتتسلم كاملة (مفيش قص صامت)، ونوثّق إن مفيش حدّ حجم لسه.
+def test_export_under_limit_is_returned_intact():
+    # OHB2-09-03: التنزيل بقى محدود، لكن اللي داخل الحد بيتسلّم كامل (مفيش قص صامت).
     big = b"PK\x03\x04" + b"x" * (2 * 1024 * 1024)
 
     def handler(request):
-        return httpx.Response(200, content=big)
+        return httpx.Response(200, stream=_RawStream(big))
 
     assert asyncio.run(make_client(handler).export_conversation("c1")) == big
+
+
+def test_export_over_limit_raises_too_large():
+    from bot.errors import ResponseTooLargeError
+
+    def handler(request):
+        return httpx.Response(200, stream=_RawStream(b"y" * 4096))
+
+    with pytest.raises(ResponseTooLargeError):
+        asyncio.run(make_client(handler).export_conversation("c1", max_bytes=1024))
+
+
+def test_export_rejects_unexpected_content_encoding():
+    def handler(request):
+        return httpx.Response(
+            200, headers={"content-encoding": "gzip"}, stream=_RawStream(b"x")
+        )
+
+    with pytest.raises(ApiError) as exc:
+        asyncio.run(make_client(handler).export_conversation("c1"))
+    assert "gzip" in str(exc.value)
+
+
+def test_export_declared_length_over_limit_rejected_before_read():
+    def handler(request):
+        return httpx.Response(
+            200, headers={"content-length": str(10 * 1024 * 1024)}, stream=_RawStream(b"tiny")
+        )
+
+    from bot.errors import ResponseTooLargeError
+
+    with pytest.raises(ResponseTooLargeError):
+        asyncio.run(make_client(handler).export_conversation("c1", max_bytes=1024))
+
+
+def test_export_negative_limit_rejected():
+    with pytest.raises(ValueError):
+        asyncio.run(
+            make_client(lambda r: httpx.Response(200, stream=_RawStream(b"x"))).export_conversation(
+                "c1", max_bytes=-1
+            )
+        )
 
 
 # ----------------------------------------------------------------- handler layer
@@ -135,7 +187,8 @@ def test_show_file_without_cache_entry_is_safe(tmp_path):
 
 
 def test_show_file_empty_content_still_sends_document(tmp_path):
-    ctx = _ctx_with(tmp_path, DetailClient({"id": "c1"}, content=""))
+    # OHB2-09-06: القراءة بقت عبر FileService (allowlist) ⇒ الملف لازم يكون في القايمة.
+    ctx = _ctx_with(tmp_path, DetailClient({"id": "c1"}, files=["a.py"], content=""))
     cache = FileCache(); gen = cache.put("c1", ["a.py"]); ctx.bot_data["file_cache"] = cache
     update = _cb_update(1, f"file:c1:{gen}:0")
     asyncio.run(h.show_file(update, ctx))
@@ -159,3 +212,29 @@ def test_export_api_error_is_safe_no_document(tmp_path):
     asyncio.run(h.export_conversation(update, ctx))
     assert ctx.bot.documents == []
     assert update.callback_query.edits
+
+
+def test_export_too_large_is_safe_no_document(tmp_path):
+    # OHB2-09-03: تصدير عدّى الحد ⇒ مفيش مستند، ورسالة آمنة (مفيش تفاصيل خام).
+    from bot.errors import ResponseTooLargeError
+
+    client = FailingFileClient({"id": "c1"}, export_error=ResponseTooLargeError())
+    ctx = _ctx_with(tmp_path, client)
+    update = _cb_update(1, "export:c1")
+    asyncio.run(h.export_conversation(update, ctx))
+    assert ctx.bot.documents == []
+    assert update.callback_query.edits
+
+
+def test_read_file_text_bounded_rejects_unexpected_content_encoding():
+    """M8 (BATCH-C): مسار القراءة المحدودة للملفات (read_file_text_bounded) لازم يرفض
+    content-encoding غير `identity` (السيرفر تجاهل طلبنا) بأمان بدل ما يفكّ ضغط على مسار
+    غير محدود. قبل كده كان الاختبار ده على مسار التصدير بس، مش مسار الملفات الأساسي."""
+    def handler(request):
+        return httpx.Response(
+            200, headers={"content-encoding": "gzip"}, stream=_RawStream(b'"x"')
+        )
+
+    with pytest.raises(ApiError) as exc:
+        asyncio.run(make_client(handler).read_file_text_bounded("c1", "a.py"))
+    assert "gzip" in str(exc.value)

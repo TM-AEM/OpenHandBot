@@ -5,12 +5,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timezone
 from typing import Any
 
 import httpx
 
-from .errors import ApiError, describe_status
+from .errors import ApiError, ResponseTooLargeError, describe_status
 
 EVENTS_PER_PAGE = 20
 SEARCH_LIMIT = 20
@@ -19,6 +20,18 @@ REPOS_PAGE_SIZE = 8
 # MessageEvent لو الـ agent عمل خطوات أدوات كتير، فبنفلتر بالنوع بدل ما نجرّب نلمّ كل حاجة.
 EXCHANGE_MSG_LIMIT = 20
 EXCHANGE_ACTION_LIMIT = 30
+
+# OHB2-09-01-FIX: حد صلب على بايتات جسم رد قراءة الملف (بثّ تراكمي).
+# مطابق لـ `files.MAX_PREVIEW_BYTES` عشان الاتنين يفضلوا متسقين (مفيش استيراد دائري:
+# الملفات بتستورد العميل، فالعميل مايستوردش الملفات). أي تعديل في حد المعاينة لازم
+# يتنعكس هنا برضه.
+MAX_FILE_RESPONSE_BYTES = 256 * 1024
+# حد صلب لجسم رد الأخطاء (تفاصيل `detail`) — منع تخزين جسم خطأ ضخم.
+MAX_ERROR_DETAIL_BYTES = 8 * 1024
+# OHB2-09-03: حد صلب لتنزيل تصدير الشات (zip أحداث+ميتا). التنزيل بيتحمّل في الذاكرة
+# قبل الإرسال على تيليجرام، فبنديه حد. الرد عادةً مضغوط أصلاً (zip)، فبنطلب `identity`
+# وبنقرا الخام عشان نمنع أي تضخيم من ضغط إضافي.
+MAX_EXPORT_BYTES = 16 * 1024 * 1024
 
 
 class OpenHandsClient:
@@ -168,10 +181,140 @@ class OpenHandsClient:
         )
         return data if isinstance(data, str) else ""
 
-    async def export_conversation(self, conversation_id: str) -> bytes:
-        """تصدير الشات كـ zip (events + meta)، مش ملفات الـ workspace."""
-        resp = await self._request("GET", f"/app-conversations/{conversation_id}/download")
-        return resp.content
+    async def read_file_text(self, conversation_id: str, file_path: str) -> str | None:
+        """نص ملف واحد، أو None لو الرد مش نص (شكل غير متوقع — آمن للتمييز عن ملف فاضي).
+
+        (OHB2-09-01) بتفرّق بين ملف فاضي فعلاً (`""`) ورد مش نص: طبقة الملفات الآمنة
+        بتعامل None كخطأ upstream بدل ما تعرض ملف فاضي مضلّل.
+
+        تحذير: دي الطريقة **غير المحدودة** (httpx بيلمّ الجسم كله في الذاكرة). استخدمها
+        بس لمدخلات موثوقة/صغيرة. مسار قراءة الملفات في `FileService` بيستخدم
+        `read_file_text_bounded` بدلها.
+        """
+        data = await self._get(
+            f"/app-conversations/{conversation_id}/file", params={"file_path": file_path}
+        )
+        return data if isinstance(data, str) else None
+
+    async def read_file_text_bounded(
+        self,
+        conversation_id: str,
+        file_path: str,
+        max_response_bytes: int = MAX_FILE_RESPONSE_BYTES,
+    ) -> str | None:
+        """نص ملف واحد مع حد **صلب** على بايتات جسم الرد (OHB2-09-01-FIX/FIX2).
+
+        - بنطلب `Accept-Encoding: identity` وبنقرا من `aiter_raw()` — يعني **مفيش فكّ ضغط**
+          على مستوى التطبيق، فمفيش تضخيم ذاكرة من gzip/deflate قبل العدّ.
+        - لو السيرفر تجاهل الطلب ورجّع `Content-Encoding` غير `identity`، بنرفض الرد
+          بأمان (ApiError) بدل ما نفكّ ضغطه على مسار غير محدود.
+        - العدّ التراكمي بيتطبّق على البايتات الخام **قبل** الإضافة للتراكم؛ أول ما تعدّي
+          الحد ⇒ `ResponseTooLargeError` قبل تجميع الجسم كله وقبل فك JSON.
+        - `Content-Length` (بايتات مشفّرة) مجرّد تحسين؛ العدّ التراكمي هو الضمان.
+        - فك JSON بعد ما الجسم يثبت إنه داخل الحد. `None` لو الرد مش نص.
+        """
+        if max_response_bytes < 0:
+            raise ValueError("max_response_bytes لازم يكون >= 0")
+        limit = int(max_response_bytes)
+        try:
+            async with self._client.stream(
+                "GET",
+                f"/app-conversations/{conversation_id}/file",
+                params={"file_path": file_path},
+                headers={"Accept-Encoding": "identity"},
+            ) as resp:
+                if resp.status_code >= 400:
+                    # قراءة محدودة للتفاصيل؛ لو عدّت الحد بنرميها ونسيب الحالة الأصلية.
+                    # لو القراءة نفسها فشلت (نقل أو حالة تدفّق)، بنسيب الحالة الأصلية برضه
+                    # بدل ما نستبدلها بخطأ اتصال عام (H2) — مفيش فقدان لحالة الـ HTTP.
+                    try:
+                        body = await self._read_capped_or_empty(resp, MAX_ERROR_DETAIL_BYTES)
+                    except (httpx.HTTPError, httpx.StreamError):
+                        body = b""
+                    raise ApiError(
+                        describe_status(resp.status_code, _detail_from_bytes(body)),
+                        resp.status_code,
+                    )
+                encoding = _content_encoding(resp)
+                if encoding is not None and encoding != "identity":
+                    # ترميز مش متوقّع (تجاهل السيرفر `identity`) ⇒ رفض آمن بدون فكّ ضغط.
+                    raise ApiError(f"ترميز محتوى غير متوقّع من OpenHands ({encoding}).")
+                declared = _content_length(resp)
+                if declared is not None and declared > limit:
+                    raise ResponseTooLargeError()
+                body = await self._read_capped(resp, limit)
+        except httpx.HTTPError as exc:
+            raise ApiError(f"تعذّر الاتصال بـ OpenHands ({type(exc).__name__}).") from exc
+        try:
+            data = json.loads(body)
+        except ValueError as exc:
+            raise ApiError("رد غير متوقع من OpenHands") from exc
+        return data if isinstance(data, str) else None
+
+    @staticmethod
+    async def _read_capped(resp: httpx.Response, limit: int) -> bytes:
+        """يقرأ الجسم **الخام** (بدون فكّ ضغط) على قطع مع حد تراكمي صلب.
+
+        العدّ مستقل عن حدود القطع. أي قطع هي اللي هتعدّي الحد **ما بتتضافش** للتراكم.
+        """
+        buf = bytearray()
+        async for chunk in resp.aiter_raw():
+            if len(buf) + len(chunk) > limit:
+                raise ResponseTooLargeError()
+            buf += chunk
+        return bytes(buf)
+
+    @staticmethod
+    async def _read_capped_or_empty(resp: httpx.Response, limit: int) -> bytes:
+        """زي `_read_capped` بس بيرجّع `b""` لو عدّى الحد (لتفاصيل الأخطاء، مافيش رفع)."""
+        try:
+            return await OpenHandsClient._read_capped(resp, limit)
+        except ResponseTooLargeError:
+            return b""
+
+    async def get_current_user(self) -> dict:
+        """هوية المستخدم الحالي (`/users/me`) — بتُستخدم للتحقق من ملكية الشات."""
+        data = await self._get("/users/me")
+        return data if isinstance(data, dict) else {}
+
+    async def export_conversation(
+        self, conversation_id: str, max_bytes: int = MAX_EXPORT_BYTES
+    ) -> bytes:
+        """تصدير الشات كـ zip (events + meta)، مش ملفات الـ workspace.
+
+        OHB2-09-03: قراءة **محدودة** بنفس مسار الملفات الآمن — `Accept-Encoding: identity`
+        + قراءة خام (`aiter_raw`) على قطع مع حد تراكمي صلب. قبل كده كان `resp.content`
+        بيجمّع الجسم كله في الذاكرة بلا حد (ويفكّ ضغط تلقائي لو السيرفر ضغط).
+        """
+        if max_bytes < 0:
+            raise ValueError("max_bytes لازم يكون >= 0")
+        limit = int(max_bytes)
+        try:
+            async with self._client.stream(
+                "GET",
+                f"/app-conversations/{conversation_id}/download",
+                headers={"Accept-Encoding": "identity"},
+            ) as resp:
+                if resp.status_code >= 400:
+                    try:
+                        body = await self._read_capped_or_empty(resp, MAX_ERROR_DETAIL_BYTES)
+                    except (httpx.HTTPError, httpx.StreamError):
+                        body = b""
+                    raise ApiError(
+                        describe_status(resp.status_code, _detail_from_bytes(body)),
+                        resp.status_code,
+                    )
+                encoding = _content_encoding(resp)
+                if encoding is not None and encoding != "identity":
+                    raise ApiError(f"ترميز محتوى غير متوقّع من OpenHands ({encoding}).")
+                declared = _content_length(resp)
+                if declared is not None and declared > limit:
+                    raise ResponseTooLargeError(
+                        "ملف التصدير كبير أوي للتنزيل الآمن."
+                    )
+                return await self._read_capped(resp, limit)
+        except httpx.HTTPError as exc:
+            raise ApiError(f"تعذّر الاتصال بـ OpenHands ({type(exc).__name__}).") from exc
 
     async def send_message(self, conversation_id: str, text: str) -> None:
         body = {"role": "user", "content": [{"type": "text", "text": text}], "run": True}
@@ -324,6 +467,38 @@ def _detail(resp: httpx.Response) -> str:
     """
     try:
         data = resp.json()
+    except ValueError:
+        return ""
+    if isinstance(data, dict) and "detail" in data:
+        return str(data["detail"])[:300]
+    return ""
+
+
+def _content_length(resp: httpx.Response) -> int | None:
+    """طول الجسم المعلن من الهيدر، أو None لو غايب/غير صالح (سالب/غير رقمي)."""
+    raw = resp.headers.get("content-length")
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
+def _content_encoding(resp: httpx.Response) -> str | None:
+    """ترميز المحتوى المُعلن (مصغّر)، أو None لو غايب/فاضي (يعني body مافيهوش ترميز)."""
+    raw = resp.headers.get("content-encoding")
+    if raw is None:
+        return None
+    value = raw.strip().lower()
+    return value or None
+
+
+def _detail_from_bytes(body: bytes) -> str:
+    """نفس سياسة `_detail` بس من بايتات (للردود المبثوثة). آمنة ومحدودة."""
+    try:
+        data = json.loads(body)
     except ValueError:
         return ""
     if isinstance(data, dict) and "detail" in data:

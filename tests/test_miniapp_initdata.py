@@ -128,3 +128,86 @@ def test_non_int_user_id_rejected():
     raw = sign_init_data(fields)
     with pytest.raises(InitDataError):
         validate_init_data(raw, BOT_TOKEN)
+
+
+# ---------------------------------------------------------------- S1 (OHB2-06)
+# التحقق من صيغة `hash` قبل المقارنة: أي قيمة مش 64 حرف hex تترفض كخطأ مصادقة
+# منظّم (مفيش TypeError يوصل لـ Uvicorn).
+def _signed_with_hash(fields: dict[str, str], bad_hash: str) -> str:
+    from urllib.parse import urlencode
+
+    return urlencode({**fields, "hash": bad_hash})
+
+
+_FIELDS = {
+    "auth_date": str(int(time.time())),
+    "query_id": "AAF",
+    "user": '{"id": 555}',
+}
+
+
+def test_non_ascii_hash_rejected():
+    # القيمة دي كانت بتسبب TypeError (500) قبل الإصلاح.
+    raw = _signed_with_hash(_FIELDS, "é" * 64)
+    with pytest.raises(InitDataError):
+        validate_init_data(raw, BOT_TOKEN)
+
+
+def test_empty_hash_rejected():
+    raw = _signed_with_hash(_FIELDS, "")
+    with pytest.raises(InitDataError):
+        validate_init_data(raw, BOT_TOKEN)
+
+
+def test_short_hash_rejected():
+    raw = _signed_with_hash(_FIELDS, "ab" * 10)  # 20 حرف < 64
+    with pytest.raises(InitDataError):
+        validate_init_data(raw, BOT_TOKEN)
+
+
+def test_oversized_hash_rejected():
+    raw = _signed_with_hash(_FIELDS, "a" * 128)
+    with pytest.raises(InitDataError):
+        validate_init_data(raw, BOT_TOKEN)
+
+
+def test_non_hex_hash_rejected():
+    raw = _signed_with_hash(_FIELDS, "z" * 64)
+    with pytest.raises(InitDataError):
+        validate_init_data(raw, BOT_TOKEN)
+
+
+def test_valid_hex_but_wrong_hash_rejected():
+    raw = _signed_with_hash(_FIELDS, "a" * 64)  # صيغة صحيحة لكن توقيع غلط
+    with pytest.raises(InitDataError):
+        validate_init_data(raw, BOT_TOKEN)
+
+
+def test_official_telegram_test_vector():
+    """فيكتور تيليجرام الرسمي (bots/webapps) — لازم يطابق بالظبط."""
+    import hashlib
+    import hmac
+    from urllib.parse import urlencode
+
+    bot_token = "5768337691:AAH5YkoiEuPk8-FZa32hStHTqXiLPtAEhx8"
+    user = (
+        '{"id":279058397,"first_name":"Vladislav","last_name":"Kibenko",'
+        '"username":"vdkfrost","language_code":"ru","is_premium":true}'
+    )
+    fields = {
+        "auth_date": "1662771648",
+        "query_id": "AAHdF6IQAAAAAN0XohDhrOrc",
+        "user": user,
+    }
+    expected = "c501b71e775f74ce10e377dea85a7ea24ecd640b223ea86dfe453e0eaed2e2b2"
+    data_check = "\n".join(f"{k}={fields[k]}" for k in sorted(fields))
+    secret = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
+    assert hmac.new(secret, data_check.encode(), hashlib.sha256).hexdigest() == expected
+
+    raw = urlencode({**fields, "hash": expected})
+    parsed = validate_init_data(raw, bot_token, max_age=0, now=1662771648)
+    assert parsed.id == 279058397
+    assert parsed.display_name == "Vladislav Kibenko"
+    assert parsed.username == "vdkfrost"
+    assert parsed.language_code == "ru"
+    assert parsed.is_premium is True

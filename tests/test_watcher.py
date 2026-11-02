@@ -2,7 +2,7 @@ import asyncio
 import sqlite3
 
 import pytest
-from telegram.error import TelegramError
+from telegram.error import RetryAfter, TelegramError
 
 from bot.db import Database
 from bot.notifier import Notifier
@@ -1157,3 +1157,477 @@ def test_decision_a_watched_notifies_even_when_global_disabled_directly(tmp_path
     )
     asyncio.run(w.tick())
     assert len(bot.sent) == 1 and "انتهى الشات" in bot.sent[0]
+
+
+# =====================================================================
+# OHB2-08-02: التعامل مع Telegram RetryAfter (429) في المراقب
+# =====================================================================
+class _RetryAfterWatcherBot(FakeBot):
+    """أول إرسال يرمي RetryAfter، وبعد كده ينجح."""
+
+    def __init__(self, retry_after):
+        super().__init__()
+        self._retry_after = retry_after
+        self.raised = 0
+
+    async def send_message(self, chat_id=None, text=None, parse_mode=None, **kw):
+        if self.raised == 0:
+            self.raised += 1
+            raise RetryAfter(self._retry_after)
+        await super().send_message(chat_id=chat_id, text=text, parse_mode=parse_mode, **kw)
+
+
+def test_watcher_retry_after_does_not_remove_or_count(tmp_path):
+    """RetryAfter ⇒ مفيش عدّاد، مفيش إزالة، المتابعة باقية (مش فشل دائم)."""
+    db = Database(str(tmp_path / "t.sqlite3"))
+    db.add_watched("c1", "عنوان")
+    client = FakeClient({"c1": {"id": "c1", "title": "عنوان", "execution_status": "finished"}}, reply="تم")
+    bot = _RetryAfterWatcherBot(30)
+    w = Watcher(client, db, bot, chat_id=1)
+
+    asyncio.run(w.tick())
+
+    assert bot.raised == 1
+    assert bot.sent == []  # ما اتبعتش (429)
+    assert db.is_watched("c1")  # المتابعة باقية
+    assert db.get_watched("c1").retry_count == 0  # العدّاد ما اتزوّدش
+    db.close()
+
+
+def test_watcher_retry_after_skips_further_ticks(tmp_path):
+    """جوّه نافذة الانتظار، الدورات بتتخطّى (مفيش محاولة إرسال إضافية)."""
+    db = Database(str(tmp_path / "t.sqlite3"))
+    db.add_watched("c1", "عنوان")
+    client = FakeClient({"c1": {"id": "c1", "title": "عنوان", "execution_status": "finished"}}, reply="تم")
+    bot = _RetryAfterWatcherBot(30)
+    w = Watcher(client, db, bot, chat_id=1)
+
+    asyncio.run(w.tick())  # 429 ⇒ ضبط النافذة
+    asyncio.run(w.tick())  # تخطّي
+
+    assert bot.raised == 1
+    assert db.is_watched("c1")
+    assert db.get_watched("c1").retry_count == 0
+    db.close()
+
+
+def test_watcher_retry_after_window_expiry_allows_delivery(tmp_path):
+    """بعد انتهاء الموعد الدائم، الإشعار يتّبع ويتشال المتابعة (مافيش عدّاد اتاكل)."""
+    db = Database(str(tmp_path / "t.sqlite3"))
+    db.add_watched("c1", "عنوان")
+    client = FakeClient({"c1": {"id": "c1", "title": "عنوان", "execution_status": "finished"}}, reply="تم")
+    bot = _RetryAfterWatcherBot(1)
+    w = Watcher(client, db, bot, chat_id=1)
+
+    asyncio.run(w.tick())  # 429 ⇒ موعد دائم في المستقبل
+    assert db.get_retry_not_before("c1") is not None
+    db.set_retry_not_before("c1", "2000-01-01T00:00:00+00:00")  # موعد منتهي
+    asyncio.run(w.tick())  # الإرسال نجح ⇒ إشعار + إزالة
+
+    assert len(bot.sent) == 1 and "انتهى الشات" in bot.sent[0]
+    assert db.list_watched() == []
+    db.close()
+
+
+# =====================================================================
+# OHB2-08-02R: مواعيد إعادة المحاولة الدائمة في المراقب (restart-safe + لكل محادثة)
+# =====================================================================
+class _AlwaysRetryAfterWatcherBot(FakeBot):
+    """كل إرسال يرمي RetryAfter (429 دائم)."""
+
+    def __init__(self, retry_after):
+        super().__init__()
+        self._retry_after = retry_after
+        self.raised = 0
+
+    async def send_message(self, chat_id=None, text=None, parse_mode=None, **kw):
+        self.raised += 1
+        raise RetryAfter(self._retry_after)
+
+
+def test_watcher_retry_after_deadline_survives_restart(tmp_path):
+    """موعد المراقب الدائم يفضل بعد إعادة التشغيل (ما بيعيدش فورًا)."""
+    path = str(tmp_path / "t.sqlite3")
+    db = Database(path)
+    db.add_watched("c1", "عنوان")
+    client = FakeClient({"c1": {"id": "c1", "title": "عنوان", "execution_status": "finished"}}, reply="تم")
+    bot = _AlwaysRetryAfterWatcherBot(300)
+    w1 = Watcher(client, db, bot, chat_id=1)
+    asyncio.run(w1.tick())  # 429 ⇒ موعد دائم
+    assert bot.raised == 1
+    assert db.get_retry_not_before("c1") is not None
+
+    w2 = Watcher(client, db, bot, chat_id=1)  # إعادة تشغيل: كائن جديد، نفس القاعدة
+    asyncio.run(w2.tick())
+    assert bot.raised == 1  # مفيش محاولة إضافية
+    assert db.is_watched("c1")
+    assert db.get_watched("c1").retry_count == 0
+    db.close()
+
+
+def test_watcher_retry_after_one_conversation_does_not_block_another(tmp_path):
+    """429 لمحادثة ما بيوقفش متابعة تانية (مواعيد لكل محادثة)."""
+    class _OneTitle429Bot(FakeBot):
+        async def send_message(self, chat_id=None, text=None, parse_mode=None, **kw):
+            if "واحدة" in text:
+                raise RetryAfter(300)
+            await super().send_message(chat_id=chat_id, text=text, parse_mode=parse_mode, **kw)
+
+    db = Database(str(tmp_path / "t.sqlite3"))
+    db.add_watched("c1", "واحدة")
+    db.add_watched("c2", "اتنين")
+    client = FakeClient({
+        "c1": {"id": "c1", "title": "واحدة", "execution_status": "finished"},
+        "c2": {"id": "c2", "title": "اتنين", "execution_status": "finished"},
+    }, reply="تم")
+    bot = _OneTitle429Bot()
+    w = Watcher(client, db, bot, chat_id=1)
+
+    asyncio.run(w.tick())
+
+    assert db.get_retry_not_before("c1") is not None  # c1 مؤجّلة
+    assert db.get_retry_not_before("c2") is None  # c2 ما اتأثّرتش
+    assert not db.is_watched("c2")  # c2 اتّبعتت واتشالت
+    assert db.is_watched("c1")  # c1 لسه متابَعة ومؤجّلة
+    db.close()
+
+
+def test_watcher_retry_after_in_deliver_handled(tmp_path):
+    """RetryAfter على مسار `_deliver` (مهلة/شات مفقود): يُجدول، بلا عدّاد، بلا إزالة."""
+    db = Database(str(tmp_path / "t.sqlite3"))
+    db.add_watched("c1", "عنوان")
+    client = FakeClient({"c1": {"id": "c1", "title": "عنوان", "execution_status": "finished"}}, reply="تم")
+    bot = _AlwaysRetryAfterWatcherBot(300)
+    w = Watcher(client, db, bot, chat_id=1)
+    wrec = db.get_watched("c1")
+
+    ok = asyncio.run(w._deliver(wrec, "نص"))
+
+    assert ok is False
+    assert db.get_retry_not_before("c1") is not None  # اتجدول
+    assert db.is_watched("c1")  # ما اتشالتش
+    assert db.get_watched("c1").retry_count == 0  # ما اتزوّدش
+    db.close()
+
+
+def test_watcher_deliver_path_skips_during_window(tmp_path):
+    """جوّه نافذة الانتظار، الدورة بتتخطّى المحادثة (مفيش إرسال إضافي)."""
+    db = Database(str(tmp_path / "t.sqlite3"))
+    db.add_watched("c1", "عنوان")
+    client = FakeClient({"c1": {"id": "c1", "title": "عنوان", "execution_status": "finished"}}, reply="تم")
+    bot = _AlwaysRetryAfterWatcherBot(300)
+    w = Watcher(client, db, bot, chat_id=1)
+
+    asyncio.run(w.tick())  # 429 ⇒ موعد دائم
+    asyncio.run(w.tick())  # جوّه النافذة ⇒ تخطّي
+    assert bot.raised == 1
+    db.close()
+
+# ==================== OHB2-08-03: unwatch reconciliation reliability ====================
+# الدليل in-memory (`_marker_pending`) بيتسجّل لما كتابة العلامة الدائمة نفسها تفشل. قبل
+# الإصلاح، الإزالة من مسار مباشر (`db.remove_watched` بدون المراقب — زي الـ Mini App لما
+# المراقب مش متاح) كانت بتسيبه معلّق ⇒ المُبلّغ يعيد إرسال نفس الحالة النهائية (ازدواج).
+# الـ hook `db.on_unwatch` (المراقب بيسجّله) بيثبّت التلميح كعلامة دائمة قبل الحذف.
+
+
+def test_ohb2_08_03_fallback_unwatch_reconciles_hint_no_duplicate(tmp_path):
+    """OHB2-08-03: إزالة مباشرة (`db.remove_watched`، المراقب مش متاح) مع تلميح in-memory
+    ⇒ التلميح يتثبّت ويتسجّل قبل الحذف، فالمُبلّغ ما يكرّرش الإشعار."""
+    db = _MarkerFailsThenOk(str(tmp_path / "t.sqlite3"))
+    _seed_full(db)
+    bot = FakeBot()
+    w = Watcher(_finished_client(), db, bot, chat_id=1)
+    asyncio.run(w.tick())  # إرسال + فشل كتابة العلامة ⇒ تلميح in-memory فقط
+    assert len(bot.sent) == 1
+    assert "c1" in w._marker_pending
+    assert db.get_watched("c1").pending_delivery_state is None  # مفيش علامة دائمة
+
+    db.remove_watched("c1")  # المسار المباشر (بدون watcher.unwatch)
+    assert not db.is_watched("c1")
+    assert db.get_notification_state("c1").notified_status == "finished"  # الدليل محفوظ
+
+    nbot = FakeBot()
+    asyncio.run(Notifier(_search_finished_client(), db, nbot, chat_id=1).tick())
+    assert nbot.sent == []  # مفيش إشعار مكرّر
+    db.close()
+
+
+def test_ohb2_08_03_direct_delete_without_hook_would_duplicate(tmp_path):
+    """OHB2-08-03 (حرس): بدون ربط الـ hook، الحذف المباشر يفقد دليل التلميح ⇒ إشعار مكرّر.
+    الاختبار ده يثبّت إن الحماية الفعلية مصدرها ربط `on_unwatch`، مش مجرد التلميح."""
+    db = _MarkerFailsThenOk(str(tmp_path / "t.sqlite3"))
+    _seed_full(db)
+    bot = FakeBot()
+    w = Watcher(_finished_client(), db, bot, chat_id=1)
+    asyncio.run(w.tick())
+    assert "c1" in w._marker_pending
+
+    db.on_unwatch = None  # نحاكي غياب الحماية
+    db.remove_watched("c1")
+    assert db.get_notification_state("c1").notified_status == "running"  # الدليل اتفقد
+
+    nbot = FakeBot()
+    asyncio.run(Notifier(_search_finished_client(), db, nbot, chat_id=1).tick())
+    assert len(nbot.sent) == 1  # ازدواج (السلوك قبل الإصلاح)
+    db.close()
+
+
+def test_ohb2_08_03_completing_path_reconciles_hint(tmp_path):
+    """OHB2-08-03: `remove_watched_completing` (المستدعي عارف الحالة المعلّقة) يثبّت التلميح
+    كمان، فالتسجيل يتكمّل والحذف يحصل."""
+    db = _MarkerFailsThenOk(str(tmp_path / "t.sqlite3"))
+    _seed_full(db)
+    w = Watcher(_finished_client(), db, FakeBot(), chat_id=1)
+    asyncio.run(w.tick())
+    assert "c1" in w._marker_pending
+
+    ok = db.remove_watched_completing("c1", "finished")
+    assert ok is True
+    assert not db.is_watched("c1")
+    assert db.get_notification_state("c1").notified_status == "finished"
+    db.close()
+
+
+def test_ohb2_08_03_repeated_unwatch_is_idempotent(tmp_path):
+    """OHB2-08-03: تكرار الإزالة (مباشر ثم عبر المراقب) لا يفسد الحالة ولا يكرّر الأثر."""
+    db = _MarkerFailsThenOk(str(tmp_path / "t.sqlite3"))
+    _seed_full(db)
+    w = Watcher(_finished_client(), db, FakeBot(), chat_id=1)
+    asyncio.run(w.tick())
+
+    db.remove_watched("c1")
+    db.remove_watched("c1")  # تاني: no-op
+    w.unwatch("c1")          # كمان عبر المراقب
+    assert not db.is_watched("c1")
+    assert db.get_notification_state("c1").notified_status == "finished"
+
+    nbot = FakeBot()
+    asyncio.run(Notifier(_search_finished_client(), db, nbot, chat_id=1).tick())
+    assert nbot.sent == []
+    db.close()
+
+
+def test_ohb2_08_03_restart_after_fallback_unwatch_no_duplicate(tmp_path):
+    """OHB2-08-03: إعادة تشغيل بعد إزالة مباشرة ⇒ الحالة تتقارب للقاعدة (مفيش إشعار مكرّر)."""
+    path = str(tmp_path / "t.sqlite3")
+    db = _MarkerFailsThenOk(path)
+    _seed_full(db)
+    w = Watcher(_finished_client(), db, FakeBot(), chat_id=1)
+    asyncio.run(w.tick())
+    db.remove_watched("c1")
+    db.close()
+
+    db2 = Database(path)  # إعادة تشغيل (المراقب الجديد)
+    assert not db2.is_watched("c1")
+    assert db2.get_notification_state("c1").notified_status == "finished"
+    nbot = FakeBot()
+    asyncio.run(Notifier(_search_finished_client(), db2, nbot, chat_id=1).tick())
+    assert nbot.sent == []
+    db2.close()
+
+
+def test_ohb2_08_03_unwatch_preserves_retry_deadline_and_unrelated(tmp_path):
+    """OHB2-08-03: الإزالة ما تلمسش موعد RetryAfter الدائم لمحادثة تانية، وما تشيلهاش."""
+    db = Database(str(tmp_path / "t.sqlite3"))
+    _seed_full(db, "c1")
+    _seed_full(db, "c2")
+    db.set_retry_not_before("c2", "2030-01-01T00:00:00+00:00")
+    # ننشئ مراقب لربط hook التسوية (on_unwatch) قبل الإزالة المباشرة.
+    Watcher(_finished_client(), db, FakeBot(), chat_id=1)
+
+    db.remove_watched("c1")
+
+    assert not db.is_watched("c1")
+    assert db.is_watched("c2")  # محادثة غير مرتبطة ما اتأثّرت
+    assert db.get_retry_not_before("c2") == "2030-01-01T00:00:00+00:00"
+    db.close()
+
+
+def test_ohb2_08_03_rewatch_after_unwatch_clean(tmp_path):
+    """OHB2-08-03: إعادة متابعة بعد إزالة ما بتورّثش حالة قديمة (دورة جديدة نظيفة)."""
+    db = _MarkerFailsThenOk(str(tmp_path / "t.sqlite3"))
+    _seed_full(db)
+    w = Watcher(_finished_client(), db, FakeBot(), chat_id=1)
+    asyncio.run(w.tick())
+    db.remove_watched("c1")
+    assert db.get_notification_state("c1").notified_status == "finished"
+
+    db.add_watched("c1", "t")  # دورة جديدة
+    assert db.is_watched("c1")
+    assert db.get_watched("c1").pending_delivery_state is None
+    assert "c1" not in w._marker_pending
+    db.close()
+
+
+def test_ohb2_08_03_failed_reconcile_blocks_removal(tmp_path):
+    """OHB2-08-03: لو تثبيت التلميح فشل، الإزالة ما تتكمّلش (مفيش فقد صامت ولا نجاح كاذب)."""
+    db = _MarkerAlwaysFails(str(tmp_path / "t.sqlite3"))
+    _seed_full(db)
+    w = Watcher(_finished_client(), db, FakeBot(), chat_id=1)
+    w._marker_pending["c1"] = ("finished", db.get_watched("c1").watch_seq)
+
+    with pytest.raises(sqlite3.OperationalError):
+        db.remove_watched("c1")
+
+    assert db.is_watched("c1")  # لسه متابَع (الإزالة اترجعت)
+    assert "c1" in w._marker_pending  # التلميح محفوظ (retry آمن)
+    db.close()
+
+
+# ==================== OHB2-08-05: تسجيل الإشعارات في الصندوق (history) ====================
+def test_inbox_records_terminal_notification(tmp_path):
+    """إشعار انتهاء متابعة ناجح بيتسجّل في الصندوق بعد التسليم (نوع terminal)."""
+    db = Database(str(tmp_path / "t.sqlite3"))
+    _seed_watch(db)
+    w = Watcher(_finished_client(), db, FakeBot(), chat_id=1)
+
+    asyncio.run(w.tick())
+
+    items = db.list_inbox()
+    assert len(items) == 1
+    assert items[0].kind == "terminal"
+    assert items[0].conversation_id == "c1"
+    assert "انتهى الشات" in items[0].message
+    assert items[0].unread is True
+    db.close()
+
+
+def test_inbox_event_recorded_pending_when_send_fails(tmp_path):
+    """OHB2-08-05 (Batch 3R): الإرسال فشل ⇒ الحدث **لسه يتسجّل** (pending) — مش بيتفقد.
+
+    ده عكس السلوك القديم (delivery-history-only). الحدث بيفضل ظاهر/معلّق لحد ما يتسلّم
+    أو يتصنّف failed، فالحدث مايتفقدش لو تليجرام فشل.
+    """
+    db = Database(str(tmp_path / "t.sqlite3"))
+    _seed_watch(db)
+    w = Watcher(_finished_client(), db, FailBot(), chat_id=1)
+
+    asyncio.run(w.tick())
+
+    items = db.list_inbox()
+    assert len(items) == 1 and items[0].kind == "terminal"
+    assert items[0].delivery_status == "pending"
+    assert items[0].delivery_attempts >= 1
+    db.close()
+
+
+def test_inbox_records_timeout_delivery(tmp_path):
+    """إشعار المهلة (24 ساعة) بيتسجّل بنوع timeout (مسار متابعة بدون برومبت)."""
+    db = Database(str(tmp_path / "t.sqlite3"))
+    db.add_watched("c1", "عنوان")
+    db._conn.execute(
+        "UPDATE watched SET added_at=? WHERE conversation_id=?", ("2020-01-01T00:00:00+00:00", "c1")
+    )
+    db._conn.commit()
+    db.upsert_notification_state("c1", status="running", notified_status="running", updated_at="t")
+    client = FakeClient({"c1": {"id": "c1", "title": "عنوان", "execution_status": "running"}})
+    w = Watcher(client, db, FakeBot(), chat_id=1)
+
+    asyncio.run(w.tick())
+
+    items = db.list_inbox()
+    assert len(items) == 1 and items[0].kind == "timeout"
+    assert not db.is_watched("c1")
+    db.close()
+
+
+def test_inbox_records_missing_delivery(tmp_path):
+    """شات متابَع اختفى بعد MISSING_LIMIT دورة ⇒ إشعار missing في الصندوق."""
+    db = Database(str(tmp_path / "t.sqlite3"))
+    db.add_watched("gone", "اتمسح")
+    w = Watcher(FakeClient({}), db, FakeBot(), chat_id=1)
+
+    for _ in range(MISSING_LIMIT):
+        asyncio.run(w.tick())
+
+    items = db.list_inbox()
+    assert len(items) == 1 and items[0].kind == "missing"
+    assert items[0].conversation_id == "gone"
+    db.close()
+
+
+def test_inbox_write_failure_does_not_break_delivery(tmp_path):
+    """فشل كتابة الصندوق (SQLite) ما يمنعش التسليم ولا إزالة المتابعة (عزل تام)."""
+    class _InboxFailsDb(Database):
+        def add_inbox_event(self, *a, **kw):
+            raise sqlite3.OperationalError("inbox down")
+
+    db = _InboxFailsDb(str(tmp_path / "t.sqlite3"))
+    _seed_watch(db)
+    bot = FakeBot()
+    w = Watcher(_finished_client(), db, bot, chat_id=1)
+
+    asyncio.run(w.tick())
+
+    assert len(bot.sent) == 1          # التسليم حصل
+    assert db.list_watched() == []     # والمتابعة اتشالت عادي
+    assert db.count_inbox() == 0       # بس الصندوق فاضي (الكتابة فشلت)
+    db.close()
+
+
+def test_recovery_delivers_pending_event_after_watch_removed(tmp_path):
+    """OHB2-08-05 (Batch 3R) BLOCKER-1: حدث معلّق (المتابعة اتشالت) بيتسلّم بالاسترجاع.
+
+    محاكاة السيناريو القاتل: إرسال فشل مرّات كفاية ⇒ المتابعة اتشالت، لكن الحدث لسه
+    `pending` في الصندوق. دورة تانية (بمتابعة ناجحة) لازم **تسترجعه وتبعته** — مش تفضل
+    الأحداث مفقودة.
+    """
+    db = Database(str(tmp_path / "t.sqlite3"))
+    _seed_watch(db)
+    fail = FailBot()
+    w_fail = Watcher(_finished_client(), db, fail, chat_id=1)
+    for _ in range(MAX_WATCH_NOTIFY_RETRIES):
+        asyncio.run(w_fail.tick())
+
+    assert not db.is_watched("c1")          # المتابعة اتشالت بعد الاستنفاد
+    items = db.list_inbox()
+    assert len(items) == 1                   # بس الحدث لسه موجود (مش مفقود)
+    assert items[0].delivery_status == "pending"
+
+    # دورة تانية ببوت شغّال: الاسترجاع يبعت الحدث المعلّق ويعلّمه delivered.
+    ok = FakeBot()
+    w_ok = Watcher(FakeClient({}), db, ok, chat_id=1)  # مفيش متابعات
+    asyncio.run(w_ok.tick())
+
+    assert len(ok.sent) == 1
+    assert db.list_inbox()[0].delivery_status == "delivered"
+    db.close()
+
+
+# =====================================================================
+# OHB2-08-05: idempotency الصندوق (مفتاح الحدث) + إعادة المتابعة
+# =====================================================================
+def test_inbox_event_key_stable_across_retry(tmp_path):
+    """نفس الحدث (نفس watch_seq/الحالة) مسجّل مرتين ⇒ صف واحد (مفيش ازدواج)."""
+    db = Database(str(tmp_path / "t.sqlite3"))
+    _seed_watch(db)
+    w = Watcher(_finished_client(), db, FakeBot(), chat_id=1)
+
+    asyncio.run(w.tick())
+
+    items = db.list_inbox()
+    assert len(items) == 1
+    key = items[0].event_key
+    assert key  # المفتاح اتكتب
+    # نحاكي إعادة معالجة نفس الحدث (retry/restart/reconcile) بنفس المفتاح.
+    w._record_inbox("c1", "عنوان", "terminal", "نفس النص", event_key=key)
+    assert db.count_inbox() == 1
+    db.close()
+
+
+def test_inbox_event_key_differs_after_rewatch(tmp_path):
+    """إعادة المتابعة (watch_seq جديد) بتعتبر حدث جديد ⇒ سجل جديد (مش ازدواج)."""
+    db = Database(str(tmp_path / "t.sqlite3"))
+    _seed_watch(db)
+    w = Watcher(_finished_client(), db, FakeBot(), chat_id=1)
+    asyncio.run(w.tick())
+    first_key = db.list_inbox()[0].event_key
+
+    # متابعة جديدة لنفس الشات (دورة جديدة ⇒ watch_seq جديد).
+    _seed_watch(db)
+    asyncio.run(w.tick())
+
+    items = db.list_inbox()
+    assert len(items) == 2
+    assert items[0].event_key != first_key
+    db.close()

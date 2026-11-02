@@ -210,7 +210,7 @@ def _wire_mini_app(application: Application, config: Config, db: Database) -> No
     from .web import build_web_app
     from .web.runner import web_server_lifespan
 
-    web_app = build_web_app(config, db)
+    web_app = build_web_app(config, db, client=application.bot_data.get("client"), application=application)
     application.bot_data["mini_app"] = web_app
 
     original_post_init = application.post_init

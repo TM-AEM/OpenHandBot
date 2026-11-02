@@ -142,7 +142,8 @@ def test_bootstrap_with_forged_cookie_rejected(client):
 def test_logout_revokes_session(client):
     client.post("/api/v1/auth", json={"initData": make_init_data(OWNER)})
     assert client.get("/api/v1/app/bootstrap").status_code == 200
-    r = client.post("/api/v1/auth/logout")
+    # logout بيغيّر حالة ⇒ لازم Origin مطابق (S4).
+    r = client.post("/api/v1/auth/logout", headers={"origin": "http://testserver"})
     assert r.status_code == 200
     # الكوكي اتمسح ⇒ الطلب الجاي غير مصادق.
     client.cookies.clear()

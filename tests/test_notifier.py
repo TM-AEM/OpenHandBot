@@ -2,9 +2,10 @@
 التعطيل، الازدواج مع المراقب، إعادة المحاولة، الترقيم، الأخطاء المؤقتة)."""
 import asyncio
 import sqlite3
+from datetime import datetime, timedelta, timezone
 
 import pytest
-from telegram.error import TelegramError
+from telegram.error import RetryAfter, TelegramError
 
 from bot.db import Database
 from bot.notifier import MAX_NOTIFY_RETRIES, Notifier, get_status, is_terminal
@@ -572,3 +573,574 @@ def test_second_run_is_not_first_run_after_baseline(tmp_path):
     n._client._pages[None] = {"items": [conv("a", "finished")], "next_page_id": None}
     asyncio.run(n.tick())
     assert len(bot.sent) == 1
+
+
+# =====================================================================
+# OHB2-08-01: استرجاع التسليم المعلّق الدائم (notifier_pending)
+# =====================================================================
+class _MarkerFailsDb(Database):
+    """فشل كتابة علامة التسليم المعلّق (write-ahead) فقط — لمحاكاة فشل SQLite."""
+
+    def __init__(self, path, *, fail_writes=999):
+        self._fail_writes = fail_writes
+        self.marker_attempts = 0
+        super().__init__(path)
+
+    def set_notifier_pending(self, conversation_id, state, now):
+        self.marker_attempts += 1
+        if self.marker_attempts <= self._fail_writes:
+            raise sqlite3.OperationalError("disk I/O error (marker)")
+        super().set_notifier_pending(conversation_id, state, now)
+
+
+class _FlakyBot(FakeBot):
+    """بيفشل أول N إرسال بـ TelegramError (خطأ شبكة مؤقّت)."""
+
+    def __init__(self, fails=1):
+        super().__init__()
+        self._fails = fails
+
+    async def send_message(self, chat_id=None, text=None, parse_mode=None, **kw):
+        if self._fails > 0:
+            self._fails -= 1
+            raise TelegramError("boom")
+        await super().send_message(chat_id=chat_id, text=text, parse_mode=parse_mode, **kw)
+
+
+class _RetryAfterBot(FakeBot):
+    """أول إرسال يرمي RetryAfter، وبعد كده ينجح."""
+
+    def __init__(self, retry_after):
+        super().__init__()
+        self._retry_after = retry_after
+        self.raised = 0
+
+    async def send_message(self, chat_id=None, text=None, parse_mode=None, **kw):
+        if self.raised == 0:
+            self.raised += 1
+            raise RetryAfter(self._retry_after)
+        await super().send_message(chat_id=chat_id, text=text, parse_mode=parse_mode, **kw)
+
+
+def test_notifier_marker_persisted_after_successful_send(tmp_path):
+    """OHB2-08-01: بعد إرسال ناجح، العلامة الدائمة بتتكتب ثم تتمسح بالتسجيل الذرّي."""
+    n, db, bot = make_notifier(tmp_path, one_page([conv("c1", "finished")]))
+    seed(db, "c1", "running")
+
+    asyncio.run(n.tick())
+
+    assert len(bot.sent) == 1
+    assert db.get_notification_state("c1").notified_status == "finished"
+    assert db.get_notifier_pending("c1") is None  # اتسوّت واتمسحت
+    db.close()
+
+
+def test_notifier_marker_survives_restart_and_recovers_without_resend(tmp_path):
+    """العلامة تفضل بعد إعادة تشغيل، والدورة الجاية تسوّيها بدون إرسال تاني."""
+    path = str(tmp_path / "t.sqlite3")
+    # الحالة اللي بعد الإرسال الناجح بس التسجيل الدائم لسه معلّق (زي ما لو العملية قفلت).
+    db = Database(path)
+    seed(db, "c1", "running")
+    db.set_notifier_pending("c1", "finished", "t")
+    db.close()
+
+    db2 = Database(path)  # إعادة تشغيل: نفس القاعدة
+    assert db2.get_notifier_pending("c1") == "finished"  # العلامة باقية
+    bot = FakeBot()
+    n = Notifier(FakeSearchClient(one_page([conv("c1", "finished")])), db2, bot, chat_id=1)
+
+    asyncio.run(n.tick())
+
+    assert bot.sent == []  # مفيش إعادة إرسال أعمى
+    assert db2.get_notification_state("c1").notified_status == "finished"  # اتسجّل
+    assert db2.get_notifier_pending("c1") is None  # العلامة اتمسحت
+    db2.close()
+
+
+def test_notifier_reconcile_failure_retains_marker_then_recovers(tmp_path):
+    """فشل التسجيل ⇒ العلامة تفضل ⇒ الدورة الجاية تكمل بدون إرسال تاني (idempotent)."""
+    n, db, bot = make_notifier(tmp_path, one_page([conv("c1", "finished")]))
+    seed(db, "c1", "running")
+    db.set_notifier_pending("c1", "finished", "t")  # علامة معلّقة (تسجيل فشل سابقًا)
+    real = db.reconcile_notifier_pending
+    state = {"fail": True}
+
+    def flaky(cid, now):
+        if state["fail"]:
+            raise sqlite3.OperationalError("disk I/O error (reconcile)")
+        return real(cid, now)
+
+    db.reconcile_notifier_pending = flaky
+
+    asyncio.run(n.tick())  # الاسترجاع فشل ⇒ مفيش إرسال، والعلامة باقية
+    assert bot.sent == []
+    assert db.get_notifier_pending("c1") == "finished"
+
+    state["fail"] = False
+    asyncio.run(n.tick())  # الاسترجاع نجح ⇒ اتسجّل واتمسح، بدون إرسال
+    assert bot.sent == []
+    assert db.get_notification_state("c1").notified_status == "finished"
+    assert db.get_notifier_pending("c1") is None
+    db.close()
+
+
+def test_notifier_recovery_idempotent_repeated_ticks(tmp_path):
+    """تسوية متكررة لنفس العلامة idempotent: مفيش إرسال ولا أثر إضافي."""
+    n, db, bot = make_notifier(tmp_path, one_page([conv("c1", "finished")]))
+    seed(db, "c1", "running")
+    db.set_notifier_pending("c1", "finished", "t")
+
+    for _ in range(3):
+        asyncio.run(n.tick())
+
+    assert bot.sent == []
+    assert db.get_notification_state("c1").notified_status == "finished"
+    assert db.get_notifier_pending("c1") is None
+    db.close()
+
+
+def test_notifier_marker_write_failure_is_acknowledged_window(tmp_path):
+    """لو كتابة العلامة نفسها فشلت: مفيش تسجيل دائم (الحالة تفضل مؤهّلة) — نافذة معترف بيها."""
+    db = _MarkerFailsDb(str(tmp_path / "t.sqlite3"))
+    seed(db, "c1", "running")
+    bot = FakeBot()
+    n = Notifier(FakeSearchClient(one_page([conv("c1", "finished")])), db, bot, chat_id=1)
+
+    asyncio.run(n.tick())  # الإرسال نجح، كتابة العلامة فشلت ⇒ ما اتسجّلش
+    assert len(bot.sent) == 1
+    assert db.get_notification_state("c1").notified_status == "running"  # ما اتسجّلش
+    assert db.get_notifier_pending("c1") is None  # مفيش علامة دائمة (النافذة المعلنة)
+    db.close()
+
+
+def test_notifier_watched_owner_marker_does_not_duplicate(tmp_path):
+    """OHB2-08-01: محادثة مملوكة للمراقب ما بتتكرّرش — المُبلّغ يسجّل اللقطة بدون إرسال."""
+    n, db, bot = make_notifier(tmp_path, one_page([conv("c1", "finished")]))
+    seed(db, "c1", "running")
+    db.add_watched("c1", "عنوان")
+    db.set_last_state("c1", "running")
+
+    asyncio.run(n.tick())
+
+    assert bot.sent == []  # المُبلّغ ما بعتش (ملكية المراقب)
+    assert db.get_notifier_pending("c1") is None  # مفيش علامة معلّقة للمُبلّغ
+    assert db.get_notification_state("c1").notified_status == "finished"
+    db.close()
+
+
+def test_notifier_retry_budget_still_enforced(tmp_path):
+    """ميزانية المحاولات لسه شغالة (ما اتغيّرتش) — بعد الحد مايتحاولش تاني."""
+    n, db, bot = make_notifier(tmp_path, one_page([conv("c1", "finished")]), bot=_FlakyBot(fails=999))
+    seed(db, "c1", "running")
+
+    for _ in range(MAX_NOTIFY_RETRIES):
+        asyncio.run(n.tick())
+    assert len(bot.sent) == 0  # كل المحاولات فشلت (إرسال)
+    assert db.get_notification_state("c1").retry_count == MAX_NOTIFY_RETRIES
+
+    asyncio.run(n.tick())  # استنفدنا الميزانية ⇒ تخطّي وتعليم (مفيش محاولة إضافية)
+    assert db.get_notification_state("c1").notified_status == "finished"
+    db.close()
+
+
+def test_notifier_baseline_first_run_unaffected(tmp_path):
+    """السلوك الأساسي (خط الأساس بلا إشعار) لسه زي ما هو."""
+    n, db, bot = make_notifier(tmp_path, one_page([conv("c1", "finished")]))
+    asyncio.run(n.tick())
+    assert bot.sent == []
+    assert db.get_notification_state("c1").notified_status == "finished"
+    assert db.get_notifier_pending("c1") is None
+    db.close()
+
+
+# =====================================================================
+# OHB2-08-02: التعامل مع Telegram RetryAfter (429)
+# =====================================================================
+def test_retry_after_int_does_not_increment_retry_counter(tmp_path):
+    """RetryAfter(int) ⇒ مفيش استهلاك لميزانية المحاولات، والحالة تفضل مؤهّلة."""
+    bot = _RetryAfterBot(30)
+    n, db, _ = make_notifier(tmp_path, one_page([conv("c1", "finished")]), bot=bot)
+    seed(db, "c1", "running")
+
+    asyncio.run(n.tick())
+
+    assert bot.raised == 1
+    assert bot.sent == []  # ما اتبعتش (تليجرام رفض بـ 429)
+    assert db.get_notification_state("c1").retry_count == 0  # ما اتزوّدش
+    assert db.get_notification_state("c1").notified_status == "running"  # لسه مؤهّلة
+    db.close()
+
+
+def test_retry_after_timedelta_normalized(tmp_path):
+    """RetryAfter(timedelta) بيتعامل معاه صح (مفيش عدّاد، الحالة مؤهّلة)."""
+    from datetime import timedelta
+
+    bot = _RetryAfterBot(timedelta(seconds=12))
+    n, db, _ = make_notifier(tmp_path, one_page([conv("c1", "finished")]), bot=bot)
+    seed(db, "c1", "running")
+
+    asyncio.run(n.tick())
+
+    assert db.get_notification_state("c1").retry_count == 0
+    assert db.get_notification_state("c1").notified_status == "running"
+    db.close()
+
+
+def test_retry_after_skips_further_ticks_until_window(tmp_path):
+    """طالما نافذة الانتظار شغالة، الدورات بتتخطّى (مفيش إرسال ولا استهلاك محاولة)."""
+    bot = _RetryAfterBot(30)
+    n, db, _ = make_notifier(tmp_path, one_page([conv("c1", "finished")]), bot=bot)
+    seed(db, "c1", "running")
+
+    asyncio.run(n.tick())  # 429 ⇒ ضبط النافذة
+    asyncio.run(n.tick())  # جوّه النافذة ⇒ تخطّي
+
+    assert bot.raised == 1  # محاولة إرسال واحدة بس
+    assert db.get_notification_state("c1").retry_count == 0
+    assert db.get_notification_state("c1").notified_status == "running"
+    db.close()
+
+
+def test_retry_after_window_expiry_allows_resend(tmp_path):
+    """بعد ما الموعد الدائم يعدّي، الإرسال يتعاد ويستقرّ (مافيش عدّاد اتاكل)."""
+    bot = _RetryAfterBot(1)
+    n, db, _ = make_notifier(tmp_path, one_page([conv("c1", "finished")]), bot=bot)
+    seed(db, "c1", "running")
+
+    asyncio.run(n.tick())  # 429 ⇒ موعد دائم في المستقبل
+    assert db.get_retry_not_before("c1") is not None
+    db.set_retry_not_before("c1", "2000-01-01T00:00:00+00:00")  # موعد منتهي
+    asyncio.run(n.tick())  # الإرسال نجح
+
+    assert len(bot.sent) == 1
+    assert db.get_notification_state("c1").notified_status == "finished"
+    db.close()
+
+
+# =====================================================================
+# OHB2-08-02R: مواعيد إعادة المحاولة الدائمة (restart-safe + لكل محادثة)
+# =====================================================================
+class _AlwaysRetryAfterBot(FakeBot):
+    """كل إرسال يرمي RetryAfter (429 دائم لمحاكاة نافذة تليجرام)."""
+
+    def __init__(self, retry_after):
+        super().__init__()
+        self._retry_after = retry_after
+        self.raised = 0
+
+    async def send_message(self, chat_id=None, text=None, parse_mode=None, **kw):
+        self.raised += 1
+        raise RetryAfter(self._retry_after)
+
+
+class _DeadlineFailsDb(Database):
+    """فشل كتابة موعد إعادة المحاولة فقط — لمحاكاة فشل SQLite."""
+
+    def __init__(self, path):
+        super().__init__(path)
+
+    def set_retry_not_before(self, conversation_id, not_before_iso):
+        raise sqlite3.OperationalError("disk I/O error (deadline)")
+
+
+def test_retry_after_persists_deadline_utc(tmp_path):
+    """RetryAfter ⇒ موعد دائم UTC في المستقبل يتسجّل (مش in-memory)."""
+    t0 = datetime(2030, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    bot = _RetryAfterBot(30)
+    n, db, _ = make_notifier(
+        tmp_path, one_page([conv("c1", "finished")]), bot=bot, clock=lambda: t0
+    )
+    seed(db, "c1", "running")
+
+    asyncio.run(n.tick())
+
+    assert db.get_retry_not_before("c1") == (t0 + timedelta(seconds=30)).isoformat()  # UTC ISO
+    db.close()
+
+
+def test_retry_after_deadline_survives_restart(tmp_path):
+    """الموعد الدائم يفضل بعد إعادة التشغيل، والدورة الجديدة ما بتحاولش قبل ما يعدّي."""
+    path = str(tmp_path / "t.sqlite3")
+    db = Database(path)
+    seed(db, "c1", "running")
+    bot = _AlwaysRetryAfterBot(300)
+    n1 = Notifier(FakeSearchClient(one_page([conv("c1", "finished")])), db, bot, chat_id=1)
+    asyncio.run(n1.tick())  # 429 ⇒ موعد دائم
+    assert bot.raised == 1
+    assert db.get_retry_not_before("c1") is not None
+
+    # إعادة تشغيل: كائن جديد، نفس القاعدة. الموعد لسه في المستقبل ⇒ تخطّي بدون إرسال.
+    n2 = Notifier(FakeSearchClient(one_page([conv("c1", "finished")])), db, bot, chat_id=1)
+    asyncio.run(n2.tick())
+    assert bot.raised == 1  # مفيش محاولة إضافية
+    assert db.get_notification_state("c1").retry_count == 0
+    db.close()
+
+
+def test_retry_after_remaining_delay_respected_after_restart(tmp_path):
+    """بعد إعادة التشغيل، الموعد يعدّي بالوقت ⇒ الإرسال يتعاد."""
+    path = str(tmp_path / "t.sqlite3")
+    db = Database(path)
+    seed(db, "c1", "running")
+    bot = _RetryAfterBot(30)
+    n1 = Notifier(FakeSearchClient(one_page([conv("c1", "finished")])), db, bot, chat_id=1)
+    asyncio.run(n1.tick())  # 429
+    db.set_retry_not_before("c1", "2000-01-01T00:00:00+00:00")  # نحاكي مرور الوقت
+
+    n2 = Notifier(FakeSearchClient(one_page([conv("c1", "finished")])), db, bot, chat_id=1)
+    asyncio.run(n2.tick())
+    assert len(bot.sent) == 1
+    assert db.get_notification_state("c1").notified_status == "finished"
+    assert db.get_retry_not_before("c1") is None  # اتمسح
+    db.close()
+
+
+def test_retry_after_one_conversation_does_not_block_another(tmp_path):
+    """429 لمحادثة ما بيوقفش محادثة تانية (مواعيد لكل محادثة)."""
+    class _OneCid429Bot(FakeBot):
+        def __init__(self):
+            super().__init__()
+
+        async def send_message(self, chat_id=None, text=None, parse_mode=None, **kw):
+            if "c1" in text:
+                raise RetryAfter(300)
+            await super().send_message(chat_id=chat_id, text=text, parse_mode=parse_mode, **kw)
+
+    pages = one_page([conv("c1", "finished"), conv("c2", "finished")])
+    n, db, bot = make_notifier(tmp_path, pages, bot=_OneCid429Bot())
+    seed(db, "c1", "running")
+    seed(db, "c2", "running")
+
+    asyncio.run(n.tick())
+
+    assert db.get_retry_not_before("c1") is not None  # c1 مؤجّلة
+    assert db.get_retry_not_before("c2") is None  # c2 ما اتأثّرتش
+    assert db.get_notification_state("c2").notified_status == "finished"
+    assert len(bot.sent) == 1  # c2 بس اللي اتبعتت
+    db.close()
+
+
+def test_retry_after_expired_deadline_allows_retry(tmp_path):
+    """موعد منتهي ⇒ إعادة محاولة + مسح الموعد."""
+    bot = _RetryAfterBot(30)
+    n, db, _ = make_notifier(tmp_path, one_page([conv("c1", "finished")]), bot=bot)
+    seed(db, "c1", "running")
+
+    asyncio.run(n.tick())  # 429
+    db.set_retry_not_before("c1", "2000-01-01T00:00:00+00:00")  # منتهي
+    asyncio.run(n.tick())  # الإرسال نجح
+    assert len(bot.sent) == 1
+    assert db.get_retry_not_before("c1") is None
+    db.close()
+
+
+def test_retry_after_invalid_deadline_handled_safely(tmp_path):
+    """موعد تالف ⇒ يتجاهله (fail-safe) ويعيد المحاولة، مش يفقد الإشعار."""
+    bot = _RetryAfterBot(30)
+    n, db, _ = make_notifier(tmp_path, one_page([conv("c1", "finished")]), bot=bot)
+    seed(db, "c1", "running")
+
+    asyncio.run(n.tick())  # 429
+    db.set_retry_not_before("c1", "not-a-timestamp")  # تالف
+    asyncio.run(n.tick())  # الإرسال نجح
+    assert len(bot.sent) == 1
+    assert db.get_notification_state("c1").notified_status == "finished"
+    db.close()
+
+
+def test_retry_after_deadline_write_failure_fail_safe(tmp_path):
+    """لو كتابة الموعد فشلت: مفيش عدّاد، الحالة تفضل مؤهّلة (fail-safe)."""
+    db = _DeadlineFailsDb(str(tmp_path / "t.sqlite3"))
+    seed(db, "c1", "running")
+    bot = _RetryAfterBot(30)
+    n = Notifier(FakeSearchClient(one_page([conv("c1", "finished")])), db, bot, chat_id=1)
+
+    asyncio.run(n.tick())
+    assert db.get_notification_state("c1").retry_count == 0
+    assert db.get_notification_state("c1").notified_status == "running"
+    db.close()
+
+
+def test_retry_after_deadline_does_not_affect_durable_marker(tmp_path):
+    """OHB2-08-01 لسه سليم: الإرسال الناجح يسجّل الحالة رغم وجود موعد قديم منتهي."""
+    bot = FakeBot()
+    n, db, _ = make_notifier(tmp_path, one_page([conv("c1", "finished")]), bot=bot)
+    seed(db, "c1", "running")
+    db.set_retry_not_before("c1", "2000-01-01T00:00:00+00:00")
+
+    asyncio.run(n.tick())
+    assert len(bot.sent) == 1
+    assert db.get_notification_state("c1").notified_status == "finished"
+    assert db.get_notifier_pending("c1") is None
+    db.close()
+
+
+# ==================== OHB2-08-05: تسجيل الإشعارات الاستباقية في الصندوق ====================
+def test_inbox_records_proactive_notification(tmp_path):
+    """إشعار استباقي ناجح بيتسجّل في الصندوق بنوع proactive بعد التسليم."""
+    n, db, bot = make_notifier(tmp_path, one_page([conv("c1", "finished")]))
+    seed(db, "c1", "running")
+
+    asyncio.run(n.tick())
+
+    assert len(bot.sent) == 1
+    items = db.list_inbox()
+    assert len(items) == 1
+    assert items[0].kind == "proactive"
+    assert items[0].conversation_id == "c1"
+    assert items[0].unread is True
+    db.close()
+
+
+def test_inbox_not_recorded_when_disabled(tmp_path):
+    """الإشعارات معطّلة ⇒ مفيش إرسال ومفيش تسجيل في الصندوق (تسليم مكتوم)."""
+    n, db, bot = make_notifier(tmp_path, one_page([conv("c1", "finished")]))
+    seed(db, "c1", "running")
+    db.set_notifications_enabled(False)
+
+    asyncio.run(n.tick())
+
+    assert bot.sent == []
+    assert db.count_inbox() == 0
+    db.close()
+
+
+def test_inbox_not_recorded_when_watched(tmp_path):
+    """شات متابَع ⇒ المُبلّغ ما يبعتش (المراقب هو المالك) ⇒ مفيش تسجيل في الصندوق."""
+    n, db, bot = make_notifier(tmp_path, one_page([conv("c1", "finished")]))
+    seed(db, "c1", "running")
+    db.add_watched("c1", "t")
+
+    asyncio.run(n.tick())
+
+    assert bot.sent == []
+    assert db.count_inbox() == 0
+    db.close()
+
+
+def test_inbox_event_recorded_pending_when_send_fails(tmp_path):
+    """OHB2-08-05 (Batch 3R): فشل الإرسال ⇒ الحدث **لسه يتسجّل** (pending) مش بيتفقد."""
+    bot = FakeBot(fail=True)
+    n, db, _ = make_notifier(tmp_path, one_page([conv("c1", "finished")]), bot=bot)
+    seed(db, "c1", "running")
+
+    asyncio.run(n.tick())
+
+    items = db.list_inbox()
+    assert len(items) == 1 and items[0].kind == "proactive"
+    assert items[0].delivery_status == "pending"
+    assert items[0].delivery_attempts >= 1
+    db.close()
+
+
+def test_inbox_write_failure_does_not_break_notification(tmp_path):
+    """فشل كتابة الصندوق ما يمنعش التسجيل الدائم للتسليم (عزل تام)."""
+    class _InboxFailsDb(Database):
+        def add_inbox_event(self, *a, **kw):
+            raise sqlite3.OperationalError("inbox down")
+
+    db = _InboxFailsDb(str(tmp_path / "t.sqlite3"))
+    bot = FakeBot()
+    n = Notifier(
+        FakeSearchClient(one_page([conv("c1", "finished")])),
+        db, bot, chat_id=1, base_url="https://app.all-hands.dev",
+    )
+    seed(db, "c1", "running")
+
+    asyncio.run(n.tick())
+
+    assert len(bot.sent) == 1
+    assert db.get_notification_state("c1").notified_status == "finished"  # التسجيل حصل
+    assert db.count_inbox() == 0
+    db.close()
+
+
+def test_inbox_event_key_stable_for_same_status(tmp_path):
+    """نفس (المحادثة، النوع، الحالة) ⇒ مفتاح ثابت ⇒ إعادة التسجيل ما بتعملش ازدواج."""
+    n, db, bot = make_notifier(tmp_path, one_page([conv("c1", "finished")]))
+    seed(db, "c1", "running")
+
+    asyncio.run(n.tick())
+
+    items = db.list_inbox()
+    assert len(items) == 1
+    key = items[0].event_key
+    assert key
+    # محاكاة إعادة إرسال لنفس الحالة بعد restart (نافذة OHB2-08-01 المعروفة):
+    # نفس المفتاح ⇒ الصندوق ما ياخدش سجل تاني.
+    n._record_inbox({"id": "c1", "title": "t"}, "c1", "finished")
+    assert db.count_inbox() == 1
+    db.close()
+
+
+def test_inbox_not_duplicated_when_retry_after_then_success(tmp_path):
+    """RetryAfter ثم نجاح ⇒ صف واحد بس في الصندوق (مفيش ازدواج من إعادة المحاولة).
+
+    OHB2-08-05 (Batch 3R): الحدث بيتسجّل مرة واحدة عند الاكتشاف (event-first) ويفضل
+    `pending` خلال الـ 429، وبعد النجاح بيتعلّم `delivered` — نفس الصف، مفيش ازدواج.
+    """
+    bot = _RetryAfterBot(30)
+    n, db, _ = make_notifier(tmp_path, one_page([conv("c1", "finished")]), bot=bot)
+    seed(db, "c1", "running")
+
+    asyncio.run(n.tick())  # 429 ⇒ مفيش إرسال، لكن الحدث اتسجّل pending
+    assert db.count_inbox() == 1
+    assert db.list_inbox()[0].delivery_status == "pending"
+    # نمسح نافذة الانتظار الدائمة ونجدول دورة تانية (المحاولة التانية بتنجح).
+    db.clear_retry_not_before("c1")
+    asyncio.run(n.tick())
+
+    assert len(bot.sent) == 1
+    assert db.count_inbox() == 1
+    assert db.list_inbox()[0].delivery_status == "delivered"
+    db.close()
+
+
+def test_inbox_recorded_on_success_after_transient_failure(tmp_path):
+    """فشل شبكة مؤقّت (TelegramError) ثم نجاح ⇒ نفس الحدث يتعلّم delivered (مفيش ازدواج)."""
+    bot = _FlakyBot(fails=1)
+    n, db, _ = make_notifier(tmp_path, one_page([conv("c1", "finished")]), bot=bot)
+    seed(db, "c1", "running")
+
+    asyncio.run(n.tick())  # فشل مؤقّت ⇒ الحدث مسجّل pending
+    assert db.count_inbox() == 1
+    assert db.list_inbox()[0].delivery_status == "pending"
+    asyncio.run(n.tick())  # نجاح ⇒ نفس الصف بيتعلّم delivered
+
+    assert db.count_inbox() == 1
+    assert db.list_inbox()[0].kind == "proactive"
+    assert db.list_inbox()[0].delivery_status == "delivered"
+    db.close()
+
+
+def test_inbox_records_distinct_events_for_recurring_status(tmp_path):
+    """OHB2-08-05 (Batch 3R) HIGH-1: finished→running→finished ⇒ حدثين منفصلين.
+
+    السلوك القديم كان بيعتمد event_key = (cid, proactive, status)، فالإشعار التاني
+    لـ finished كان بيتحجب (count_inbox=1). دلوقتي الهوية بعدّاد الانتقال الدائم ⇒
+    كل انتقال حقيقي بيسجّل حدث، والاتنين يتسلّموا.
+    """
+    db = Database(str(tmp_path / "t.sqlite3"))
+    bot = FakeBot()
+    page = {"items": [conv("c1", "finished")], "next_page_id": None}
+    client = FakeSearchClient({None: page})
+    n = Notifier(client, db, bot, chat_id=1, base_url="https://app.all-hands.dev")
+    seed(db, "c1", "running")  # المسجّل = running
+
+    # أول finished ⇒ إشعار + حدث (pending⇒delivered).
+    asyncio.run(n.tick())
+    assert len(bot.sent) == 1
+
+    # رجع running (غير مؤهّل) ⇒ بيتسجّل من غير إشعار.
+    client._pages = {None: {"items": [conv("c1", "running")], "next_page_id": None}}
+    asyncio.run(n.tick())
+    assert len(bot.sent) == 1
+
+    # finished تاني ⇒ **انتقال جديد** ⇒ إشعار تاني + حدث تاني (مش محجوب).
+    client._pages = {None: {"items": [conv("c1", "finished")], "next_page_id": None}}
+    asyncio.run(n.tick())
+
+    assert len(bot.sent) == 2
+    assert db.count_inbox() == 2
+    assert all(it.delivery_status == "delivered" for it in db.list_inbox())
+    db.close()
