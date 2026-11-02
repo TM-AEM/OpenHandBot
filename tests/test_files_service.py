@@ -339,4 +339,3 @@ def test_integration_over_real_client_and_mock_transport():
     before = seen["read"]
     assert run(service.read_preview("c1", "/etc/passwd")).status is FileStatus.INVALID_PATH
     assert seen["read"] == before
-

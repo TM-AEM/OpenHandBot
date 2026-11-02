@@ -299,13 +299,20 @@ class Notifier:
         now = self._clock().isoformat()
         claim_cutoff = (self._clock() - _CLAIM_LEASE).isoformat()
         try:
-            due = self._db.list_due_pending_inbox(
-                now,
-                kinds=(INBOX_KIND_PROACTIVE,),
-                exclude_watched=False,
-                unclaimed=True,
-                claim_cutoff=claim_cutoff,
-            )
+            due: list = []
+            # OHB2-N10-02 (M1): الأحداث الاستباقية العامة بتتحكم فيها إعداد الإشعارات، زي
+            # المسار العادي (`_process`: `if not enabled … return`). لو الإشعارات متعطّلة،
+            # ما نسترجعش الأحداث الاستباقية المعلّقة (تفضل `pending` لحد ما تتفعّل تاني).
+            # أحداث الانتقال النهائي (متابعة صريحة) **بتتسترجع دايمًا** — المتابعة الصريحة
+            # مش بتتأثر بمفتاح الإشعارات العام (نفس عقد المسار العادي).
+            if self._db.get_notifications_enabled():
+                due += self._db.list_due_pending_inbox(
+                    now,
+                    kinds=(INBOX_KIND_PROACTIVE,),
+                    exclude_watched=False,
+                    unclaimed=True,
+                    claim_cutoff=claim_cutoff,
+                )
             due += self._db.list_due_pending_inbox(
                 now,
                 kinds=(INBOX_KIND_TERMINAL,),

@@ -1,8 +1,9 @@
 # Notification System (OHB2-08) — Architecture, Data, Reliability, API, Frontend, Ops
 
-Status: reference documentation for the notification subsystem as implemented at
-HEAD `7b6ec25` (uncommitted working tree). It covers OHB2-08-01 through OHB2-08-08
-including the R5-01 pagination-retry correction.
+Status: reference documentation for the notification subsystem as implemented through
+the OHB2 release branch (`release/ohb2-20261101`, superseding the earlier `7b6ec25`
+main baseline). It covers OHB2-08-01 through OHB2-08-08 including the R5-01
+pagination-retry correction.
 
 Scope note: this document is descriptive. It records what the code does today.
 Items marked **[recommendation]** are operational advice, not guarantees the code
@@ -640,7 +641,10 @@ pyflakes bot/ main.py tests/
 git diff --check
 ```
 
-Verified coverage at HEAD `7b6ec25` (working tree, uncommitted):
+Coverage snapshot at the earlier `7b6ec25` baseline (historical; superseded by the
+release branch `release/ohb2-20261101`). Current release-branch gate: pytest
+**1222 pass**, frontend **122 pass / 0 fail**, pyflakes clean, `git diff --check`
+clean (verified 2026-11-02):
 
 | Suite | Count | Notes |
 | --- | --- | --- |

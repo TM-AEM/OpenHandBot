@@ -147,14 +147,6 @@ def _require_ref(value: str | None) -> str:
     return text
 
 
-def _page(value) -> int:
-    try:
-        page = int(value)
-    except (TypeError, ValueError):
-        return 0
-    return max(0, page)
-
-
 def _conversation_dto(conv: dict, watched: bool) -> dict:
     status = get_status(conv)
     return {

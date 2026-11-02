@@ -41,7 +41,7 @@ Telegram WebView ──HTTPS──▶ ingress (TLS) ──HTTP──▶ الحا
     يطلع `OSError` عادي ⇒ **التشغيل كله يفشل بوضوح** (fail-fast).
   - بيعطّل `uvicorn.Server.capture_signals` وقت التشغيل المشترك، عشان **البوت** هو اللي
     يمسك SIGINT/SIGTERM ويعمل إغلاق نظيف.
-  - `proxy_headers=False` (شوف القسم 8 — قرار أمني مقصود).
+  - `proxy_headers=False` (شوف القسم 9 — قرار أمني مقصود).
 - الترتيب في `post_init`: البوت بيعمل تعافيه ويشغّل الـ workers/المراقب **قبل** ما سيرفر الويب
   يبدأ. في `post_shutdown`: السيرفر يقف **قبل** ما البوت يقفل الموارد (`client`, `db`).
 - حرس تكرار: إعادة تهيئة مكرّرة (`post_init` اتنادت مرتين) **ما بتبدأش سيرفر تاني**.
@@ -61,6 +61,9 @@ Telegram WebView ──HTTPS──▶ ingress (TLS) ──HTTP──▶ الحا
 | `/api/v1/conversations` | GET | كوكي | لأ | آخر الشاتات (صفحات، `?page=&refresh=1`) |
 | `/api/v1/conversations/{id}` | GET | كوكي | لأ | تفاصيل شات + آخر برومت/رد + رابط PR |
 | `/api/v1/conversations/{id}/status` | GET | كوكي | لأ | حالة شات بس |
+| `/api/v1/conversations/{id}/cost` | GET | كوكي | لأ | تكلفة/استهلاك شات (من نفس نداء التفاصيل) |
+| `/api/v1/conversations/{id}/files` | GET | كوكي | لأ | قايمة ملفات الشات (allowlist + تصريح) |
+| `/api/v1/conversations/{id}/file` | GET | كوكي | لأ | معاينة نصية محدودة لملف (`?path=`) |
 | `/api/v1/conversations/{id}/prompt` | POST | كوكي | ✔ | `{"text": "...", "client_ref": "..."}` ⇒ يسجّل البرومت في الصندوق |
 | `/api/v1/conversations/{id}/watch` | POST | كوكي | ✔ | يضيف الشات للمتابعة |
 | `/api/v1/conversations/{id}/watch` | DELETE | كوكي | ✔ | يلغي المتابعة |
@@ -68,6 +71,7 @@ Telegram WebView ──HTTPS──▶ ingress (TLS) ──HTTP──▶ الحا
 | `/api/v1/repositories` | GET | كوكي | لأ | بحث المستودعات (`?q=&page=`) |
 | `/api/v1/chats` | POST | كوكي | ✔ | `{"repository": "owner/repo", "text": "...", "client_ref": "..."}` ⇒ شات جديد |
 | `/api/v1/operations/outbox` | GET | كوكي | لأ | حالة عملية برومت (`?id=` أو `?conversation_id=&client_ref=`) |
+| `/api/v1/operations/outbox/reconcile` | POST | كوكي | ✔ | تسوية يدوية لعملية برومت: `{"id": N, "action": "discard"|"mark_sent"}` |
 | `/api/v1/operations/creation` | GET | كوكي | لأ | حالة عملية إنشاء شات (`?id=` أو `?client_ref=`) |
 | `/api/v1/*` (غير معروف) | أي | — | — | `404` JSON موحّد |
 | `/`, `/mini/`, `/mini/<asset>` | GET | لأ | لأ | الواجهة والأصول الثابتة (**بدون تحديد معدّل**) |
@@ -381,4 +385,4 @@ node --test tests/frontend/*.test.js
   "غير المقروء فقط" في الواجهة (الـ API بيدعم `unread=1`)، ولا إشعارات "مقروءة جزئيًا" —
   لو مطلوب نضيفه لاحقًا. **مفيش cleanup worker**: التقليم جوه نفس معاملة الإدراج.
 - تفعيل `MINI_APP_ENABLED` في الإنتاج + تحديث `/app` يشاور على الواجهة الفعلية.
-- معالجة الرابط الثابت (القسم 12).
+- معالجة الرابط الثابت (القسم 13).

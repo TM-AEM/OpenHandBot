@@ -54,8 +54,11 @@ Phase 0 is read-only: **no production code was changed** to produce this documen
 | **Files** | `list_files`, `show_file` | **visible** (F-08) | planned | `is_hidden("files")` |
 
 All four features have complete handler + service code and data and are now **enabled** (entry points
-registered) after the F-08 reactivation; they can be hidden again as a group by setting
-`DEFERRED_FEATURES_HIDDEN = True`. Auto-follow after prompt (`bot/watcher.py`) remains active regardless.
+registered) after the F-08 reactivation. The single key `DEFERRED_FEATURES_HIDDEN` gates **bot entry
+points** and the Mini App `watches`/`watch` surface; the Mini App **files** and **cost** routes are
+always registered and remain reachable when the key is `True` (they are authorization-gated, not
+flag-gated), so setting `DEFERRED_FEATURES_HIDDEN = True` does **not** fully hide the group.
+Auto-follow after prompt (`bot/watcher.py`) remains active regardless.
 
 ## 5. Services and state owners (single-owner, must not be duplicated)
 

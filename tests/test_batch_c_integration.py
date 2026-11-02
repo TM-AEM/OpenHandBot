@@ -511,4 +511,3 @@ def test_telegram_reply_prompt_denied_sets_no_awaiting_and_no_upstream(tmp_path)
     assert conv_id is None and kind is None  # مفيش توجيه برومت
     assert client.list_calls == 0 and client.read_calls == 0  # مفيش أي قراءة محمية
     assert "مش مسموح" in update.callback_query.edits[-1]
-
