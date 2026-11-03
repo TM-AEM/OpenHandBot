@@ -153,9 +153,24 @@
     box.appendChild(status);
     var attempts = 0;
     var maxAttempts = 6;
+    function showUnknown() {
+      // OHB2-N10-05: نحدّث الحالة المعروضة لـ "مش معروف" قبل الإجراءات، عشان ما
+      // تفضلش شايلة "قيد التنفيذ…" الابتدائية (تضاد بصري).
+      status.innerHTML = "";
+      status.appendChild(el("span", "op-label", "حالة العملية: "));
+      status.appendChild(opPill({ state: "unknown" }));
+      if (manager) { manager.resolve(ref, "unknown"); }
+      showOpActions(box, kind, ref, conversationId, "unknown", onAccepted, resend, manager, null);
+    }
     function poll() {
       queryOperation(kind, ref, conversationId).then(function (res) {
-        if (!res.ok) { return; }
+        if (!res.ok) {
+          // OHB2-N10-05: رد غير ناجح (429/5xx/انقطاع) مش حالة نهائية — منسيبش
+          // الصندوق عالق على "قيد التنفيذ" للأبد. نعرض إجراءات صريحة (استعلام/إعادة
+          // محاولة) من غير أي إعادة إرسال تلقائية.
+          showUnknown();
+          return;
+        }
         var op = res.data || {};
         var state = op.state || "unknown";
         // نسجّل الحالة اللي رصدناها: نهائية ⇒ العملية خلصت، فإرسال جديد بنفس
@@ -176,7 +191,11 @@
           return;
         }
         setTimeout(poll, 1500 + attempts * 500);
-      }).catch(function () { /* نتجاهل أخطاء الاستعلام — نعرض آخر حالة معروفة */ });
+      }).catch(function () {
+        // OHB2-N10-05: فشل الاستعلام نفسه (شبكة/انقطاع) — نعرض إجراءات صريحة بدل
+        // ما نسيب الواجهة عالقة على "قيد التنفيذ".
+        showUnknown();
+      });
     }
     setTimeout(poll, 800);
   }

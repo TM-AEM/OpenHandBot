@@ -16,7 +16,7 @@ log = logging.getLogger(__name__)
 #   sent     : اتأكد نجاح الإرسال (رد POST سليم). مايتعادش أبداً.
 #   unknown  : نتيجة الإرسال غامضة (timeout/انقطاع/إلغاء) وماينفعش نأكد إن
 #              الـ server ماخدش البرومت ⇒ مايتعادش تلقائياً (at-most-once).
-#   failed   : رفض نهائي مؤكد (رد 4xx). مايتعادش تلقائياً.
+#   failed   : رفض نهائي مؤكد (رد 4xx **باستثناء 429**). مايتعادش تلقائياً.
 
 OUTBOX_PENDING = "pending"
 OUTBOX_CLAIMED = "claimed"
@@ -34,7 +34,7 @@ OUTBOX_DISCARDED = "discarded"
 #               لو فيه task_id محفوظ ⇒ الاستطلاع (GET آمن) بس هو اللي يتعاود.
 #   done      : اتأكد بدء الشات واتعرف conversation_id. مايتعادش أبداً.
 #   unknown   : نتيجة البدء غامضة (timeout/انقطاع/إلغاء/بدون task_id) ⇒ مايتعادش تلقائياً.
-#   failed    : رفض نهائي مؤكد (4xx) أو فشل مهمة مؤكد ⇒ مايتعادش تلقائياً.
+#   failed    : رفض نهائي مؤكد (4xx **باستثناء 429**) أو فشل مهمة مؤكد ⇒ مايتعادش تلقائياً.
 CREATION_PENDING = "pending"
 CREATION_CLAIMED = "claimed"
 CREATION_STARTING = "starting"

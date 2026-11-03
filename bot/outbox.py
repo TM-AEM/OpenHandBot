@@ -31,8 +31,14 @@ from .errors import ApiError, describe_status, error_text
 
 log = logging.getLogger(__name__)
 
-# فشل مؤكّد (4xx) مش هينجح بإعادة المحاولة؛ غيره (شبكة/مهلة/5xx) ممكن يتعاود لو الإرسال مابدأش.
+# فشل مؤكّد (4xx) مش هينجح بإعادة المحاولة؛ غيره (شبكة/مهلة/5xx/429) ممكن يتعاود لو الإرسال مابدأش.
 PERMANENT_STATUS = 400
+# OHB2-N10-05: 429 (rate limit) **مش** رفض دائم — هو إشارة إعادة محاولة (`errors.describe_status`
+# بتقول «جرّب تاني بعد شوية»، والـ Runbook كمان). تصنيفه 'failed' نهائي كان بيسيب البرومت/الشات
+# مايتبعتش أبدًا عند rate limit عابر. الغموض عند مرحلة الـ POST (sending ⇒ unknown) هو اللي بيحمي
+# at-most-once، مش تصنيف الفشل — فأول ما الـ POST يبدأ، 429 كمان بيتسجّل 'unknown' (مش إعادة تلقائية).
+# ملاحظة: بنستثني 429 بس حسب دليل OpenHands؛ لو اتأكد إن الـ API بيرجّع 408/425 كمان، يتضافوا هنا.
+RETRYABLE_STATUSES = frozenset({429})
 
 # حد إعادة المحاولة الآمنة (TASK 53): كل مرة إرسال مابدأش فيها (sandbox مش جاهز أو فشل
 # قبل الـ POST) بتزوّد attempts. بعد ما attempts يوصل الحد ده، بنوقف المحاولات ونعلّم
@@ -95,8 +101,15 @@ def safe_error_label(exc: ApiError) -> str:
 
 
 def is_permanent(exc: ApiError) -> bool:
-    """رفض نهائي مؤكد؟ (4xx) — غير كده غامض/مؤقت."""
-    return exc.status_code is not None and PERMANENT_STATUS <= exc.status_code < 500
+    """رفض نهائي مؤكد؟ (4xx) — غير كده غامض/مؤقت.
+
+    استثناء: 429 (rate limit) مؤقت/قابل لإعادة المحاولة، فمش نهائي (OHB2-N10-05).
+    """
+    return (
+        exc.status_code is not None
+        and PERMANENT_STATUS <= exc.status_code < 500
+        and exc.status_code not in RETRYABLE_STATUSES
+    )
 
 
 async def get_conversation(client, conversation_id: str) -> dict:

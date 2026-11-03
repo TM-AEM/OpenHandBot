@@ -40,12 +40,14 @@ function findButtonByText(root, text) {
 }
 
 // يفتح تفاصيل شات ويرجّع عناصر مطلوبة.
-async function openChat(env, { opState, reconcile }) {
+// `opStatus` اختياري: رد مخصّص لاستعلام حالة العملية (GET /operations/outbox) — للاختبار
+// تحت فشل شبكة/429 (OHB2-N10-05).
+async function openChat(env, { opState, reconcile, opStatus }) {
   const { doc, fetch } = env;
   fetch.route((c) => c.path.startsWith("/conversations?"), () => ({ status: 200, data: { items: [{ id: "c1", title: "T", status: "running" }], has_more: false } }));
   fetch.route((c) => c.path === "/conversations/c1", () => ({ status: 200, data: { id: "c1", title: "T", watched: false } }));
   fetch.route((c) => c.path === "/conversations/c1/prompt", () => ({ status: 200, data: { outbox_id: 7, operation: { kind: "prompt", id: 7, state: "pending" } } }));
-  fetch.route((c) => c.path.indexOf("/operations/outbox") === 0 && c.method === "GET", () => ({ status: 200, data: { kind: "prompt", id: 7, conversation_id: "c1", state: opState } }));
+  fetch.route((c) => c.path.indexOf("/operations/outbox") === 0 && c.method === "GET", () => (opStatus ? opStatus() : { status: 200, data: { kind: "prompt", id: 7, conversation_id: "c1", state: opState } }));
   fetch.route((c) => c.path === "/operations/outbox/reconcile", () => (reconcile || { status: 200, data: { kind: "prompt", id: 7, state: "accepted" } }));
   doc.getElementById("tab-chats").click();
   await flush();
@@ -108,4 +110,35 @@ test("409 من التسوية مايغيّرش الحالة المعروضة (ت
   // الحالة المعروضة لسه "مش متأكدين" (مفيش تحديث بعد الفشل).
   const pill = descendants(detail).find((n) => n.className === "op-pill");
   assert.ok(pill && pill.textContent === "مش متأكدين", "الحالة ما اتغيّرتش بعد 409");
+});
+
+// OHB2-N10-05 (F9a): ضعف الشبكة أثناء استعلام حالة العملية لازم ما يسبش الواجهة
+// عالقة "قيد التنفيذ" للأبد. لازم تظهر إجراءات صريحة (استعلام/إعادة محاولة).
+test("429 أثناء استعلام الحالة ⇒ مفيش علوق: إجراءات صريحة تظهر", async () => {
+  const env = await mkEnv();
+  const detail = await openChat(env, { opStatus: () => ({ status: 429, ok: false, data: {} }) });
+  assert.ok(findButtonByText(detail, "استعلام عن الحالة"), "لازم يظهر زر استعلام بدل ما نعلّق");
+  assert.ok(findButtonByText(detail, "إعادة المحاولة"), "لازم يظهر زر إعادة المحاولة");
+  // الحالة المعروضة لازم تبقى "مش معروف" مش "قيد التنفيذ…" العالقة.
+  const pill = descendants(detail).find((n) => n.className === "op-pill");
+  assert.ok(pill && pill.textContent === "مش معروف", "الحالة تبقى مش معروف مش قيد التنفيذ");
+  // OHB2-N10-05: ضمان "مفيش إعادة إرسال تلقائية" — إرسال واحد بس (الضغطة الصريحة)،
+  // مفيش POST إضافي لـ /prompt بعد ما الاستعلام رجع 429.
+  assert.equal(
+    env.fetch.all((c) => c.method === "POST" && c.path === "/conversations/c1/prompt").length,
+    1,
+    "429 لازم ما يعملش إعادة إرسال تلقائية (إرسال واحد بس)",
+  );
+});
+
+test("5xx أثناء استعلام الحالة ⇒ مفيش علوق: إجراءات صريحة تظهر", async () => {
+  const env = await mkEnv();
+  const detail = await openChat(env, { opStatus: () => ({ status: 503, ok: false, data: {} }) });
+  assert.ok(findButtonByText(detail, "استعلام عن الحالة"));
+});
+
+test("فشل شبكة (رمي) أثناء استعلام الحالة ⇒ مفيش علوق", async () => {
+  const env = await mkEnv();
+  const detail = await openChat(env, { opStatus: () => { throw new Error("network"); } });
+  assert.ok(findButtonByText(detail, "استعلام عن الحالة"), "لازم نعرض إجراءات حتى مع فشل الشبكة");
 });
