@@ -159,6 +159,7 @@
       status.innerHTML = "";
       status.appendChild(el("span", "op-label", "حالة العملية: "));
       status.appendChild(opPill({ state: "unknown" }));
+      if (manager) { manager.resolve(ref, "unknown"); }
       showOpActions(box, kind, ref, conversationId, "unknown", onAccepted, resend, manager, null);
     }
     function poll() {
