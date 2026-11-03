@@ -160,7 +160,7 @@ python -m pytest -q tests/test_watcher.py tests/test_u01_watcher.py
 | `sending` | بدأ الـ POST والنتيجة مش محسومة | **`unknown`** (ما يتعاودش تلقائيًا) |
 | `sent` | نجاح مؤكّد | نهائي |
 | `unknown` | نتيجة غامضة (timeout/انقطاع/إلغاء) | نهائي (ما يتعاودش) |
-| `failed` | رفض نهائي مؤكّد (4xx) | نهائي |
+| `failed` | رفض نهائي مؤكّد (4xx **باستثناء 429**) | نهائي |
 | `discarded` | شال المالك السجل يدويًا | نهائي |
 
 - حد إعادة المحاولة الآمنة: **`MAX_OUTBOX_ATTEMPTS = 5`** (`bot/outbox.py`). كل فشل
@@ -178,7 +178,7 @@ python -m pytest -q tests/test_watcher.py tests/test_u01_watcher.py
 | `starting` | بدأ POST البدء (أو استطلاع مهمة معروفة) | بـ `task_id` ⇒ استطلاع GET آمن؛ من غيره ⇒ `unknown` |
 | `done` | اتأكد البدء واتعرف `conversation_id` | نهائي |
 | `unknown` | نتيجة غامضة | نهائي |
-| `failed` | رفض نهائي (4xx) أو فشل مهمة | نهائي |
+| `failed` | رفض نهائي (4xx **باستثناء 429**) أو فشل مهمة | نهائي |
 | `discarded` | شال المالك السجل يدويًا | نهائي |
 
 ### المراقب (`watcher`) وإشعارات الانتهاء
