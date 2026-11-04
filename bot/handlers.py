@@ -855,7 +855,11 @@ async def _start_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, re
 
 
 async def _create_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int, repo: str | None, text: str) -> None:
-    """مسار متزامن مباشر (للاستخدام من الاختبارات): يسجّل job وينفّذه فوراً."""
+    """مسار متزامن مباشر (للاستخدام من الاختبارات): يسجّل job وينفّذه فوراً.
+
+    (الحماية الذرّية لحدّ الإلغاء بتحصل جوه `_start_conversation`: CAS 'pending'/'claimed'
+    ⇒ 'starting' قبل الـ POST، فأي شطب متزامن يوقف الإرسال الفعلي.)
+    """
     client = context.bot_data["client"]
     db = context.bot_data["db"]
     bot = context.bot
@@ -1019,12 +1023,30 @@ async def outbox_discard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"{label} {kind}:{rid} خلاص في حالة نهائية ({record.status}) — مفيش تغيير."
         )
         return
+    # OHB2-N10-28C: شطب **ذرّي** مع حدّ إلغاء واضح. الشطب بيتنفّذ بس لو لسه مؤهّل قبل
+    # الإرسال (pending/claimed). لو الـ POST ممكن يكون بدأ (sending/unknown) ما بنشطبش
+    # وما بندّعيش إلغاء — بنبلّغ إن الإلغاء غير مؤكد ونسيب السجل للاستعلام/التسوية.
     if kind == "prompt":
-        db.set_outbox_status(rid, "discarded", outbox.now_iso(), "اتشال يدوياً")
+        outcome = db.discard_outbox(rid, outbox.now_iso(), "اتشال يدوياً")
     else:
-        db.set_creation_status(rid, "discarded", outbox.now_iso(), "اتشال يدوياً")
-    log.info("discard: ref=%s:%s status=discarded", kind, rid)
-    await update.message.reply_text(f"تم تعليم {label} {kind}:{rid} كـ 'discarded'.")
+        outcome = db.discard_creation_job(rid, outbox.now_iso(), "اتشال يدوياً")
+    if outcome == "discarded":
+        log.info("discard: ref=%s:%s status=discarded", kind, rid)
+        await update.message.reply_text(f"تم تعليم {label} {kind}:{rid} كـ 'discarded'.")
+        return
+    if outcome == "not_confirmed":
+        # الشطب بعد ما الـ POST ممكن يكون بدأ ⇒ مفيش ادّعاء إلغاء (C2 Case 3).
+        await update.message.reply_text(
+            f"{label} {kind}:{rid} ممكن يكون بدأ الإرسال بالفعل — الإلغاء غير مؤكد.\n"
+            "استعلم عن الحالة من الموقع، ولو مش متأكد استخدم /outbox_status أو /outbox_mark_sent."
+        )
+        return
+    # بين القراءة والشطب حد تاني حسم السجل (نهائي) ⇒ مفيش تغيير.
+    current = _get_record(db, ref)
+    status_now = current.status if current is not None else "؟"
+    await update.message.reply_text(
+        f"{label} {kind}:{rid} خلاص في حالة نهائية ({status_now}) — مفيش تغيير."
+    )
 
 
 async def outbox_mark_sent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1052,13 +1074,31 @@ async def outbox_mark_sent(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     if record.status == "unknown":
         # 'unknown' → حالة نهائية (sent/done): تفضل نهائية ومستحيل ترجع 'pending'،
-        # فمفيش إعادة إرسال أو إنشاء تلقائي (at-most-once محفوظ).
+        # فمفيش إعادة إرسال أو إنشاء تلقائي (at-most-once محفوظ). OHB2-N10-28C: CAS ذرّي
+        # من 'unknown' بس، عشان ما نقلبش حالة أحدث حسمها حد تاني (مفيش read-then-write).
         if kind == "prompt":
-            db.set_outbox_status(rid, "sent", outbox.now_iso(), "أكّده المالك")
+            changed = db.set_outbox_status_if_in(
+                rid, "sent", outbox.now_iso(), {"unknown"}, "أكّده المالك"
+            )
             final = "sent"
         else:
-            db.set_creation_status(rid, "done", outbox.now_iso(), "أكّده المالك")
+            changed = db.set_creation_status_if_in(
+                rid, "done", outbox.now_iso(), {"unknown"}, "أكّده المالك"
+            )
             final = "done"
+        if not changed:
+            # سبقنا كاتب تاني وحسم السجل بين القراءة والكتابة ⇒ ما نغيّرش حاجة.
+            current = _get_record(db, ref)
+            status_now = current.status if current is not None else "؟"
+            if status_now == final:
+                await update.message.reply_text(
+                    f"{label} {kind}:{rid} معَلّم '{final}' بالفعل — مفيش تغيير."
+                )
+            else:
+                await update.message.reply_text(
+                    f"{label} {kind}:{rid} حالته '{status_now}' — الأمر ده لـ 'unknown' بس."
+                )
+            return
         log.info("mark_sent: ref=%s:%s unknown->%s", kind, rid, final)
         await update.message.reply_text(
             f"تم تعليم {label} {kind}:{rid} كـ '{final}' (تأكيد منك — مش إثبات من OpenHands)."

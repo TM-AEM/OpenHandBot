@@ -130,23 +130,29 @@ async def wait_running(client, conversation_id: str, interval: float, timeout: f
 
 
 async def deliver_outbox(client, db, bot, outbox_id: int) -> None:
-    """مسار مباشر: لو العنصر 'pending' نجرّب الإرسال عبر _post_claimed.
+    """مسار مباشر: لو العنصر 'pending' نحاول نحجزه ذرّياً ثم نرسله عبر _post_claimed.
 
-    (الـ worker بيحجز ذرّياً بنفسه عبر db.claim_outbox وبيستخدم _post_claimed.)
+    OHB2-N10-28C: بنحجز ذرّياً (`claim_outbox` بحجز أقدم pending) بدل read-then-write،
+    عشان ما نتنافسش مع الـ worker على نفس السجل. لو الحجز رجّع سجل تاني، نكمّل بيه
+    (نفس ترتيب الأقدم-أولاً)، وبكده ما نكرّرش معالجة سجل واحد من مسارين.
     """
     item = db.get_outbox(outbox_id)
     if item is None or item.status != OUTBOX_PENDING:
         return
-    await _post_claimed(client, db, bot, item)
+    claimed = db.claim_outbox(now_iso())
+    if claimed is None:
+        return
+    await _post_claimed(client, db, bot, claimed)
 
 
 async def _post_claimed(client, db, bot, item) -> None:
-    """يحاول الـ POST لعنصر محجوز (claimed/pending) ولسه الإرسال مابدأش.
+    """يحاول الـ POST لعنصر محجوز (claimed) ولسه الإرسال مابدأش.
 
-    at-most-once: بنسجّل 'sending' بثبات فوراً قبل الـ POST بالظبط. أي إلغاء/انقطاع
-    قبل كده (مرحلة التحضير: قراءة الشات/تشغيل الـ sandbox) بيسيب الحالة 'claimed'
-    أو 'pending' ⇒ يتعافى 'pending' (آمن، لأن الـ POST مابدأش). أي إلغاء/انقطاع بعد
-    كده بيسيب 'sending' ⇒ يتعافى 'unknown' (غامض، مايتعادش تلقائياً أبداً).
+    at-most-once: بنسجّل 'sending' بـ **CAS ذرّي** (`claimed`⇒`sending`) فوراً قبل الـ POST
+    بالظبط. لو المستخدم شطب العنصر أثناء التحضير (قراءة الشات/تشغيل الـ sandbox)، الـ CAS
+    هيفشل (rowcount=0) وما بنبعتش الـ POST خالص — فمفيش إرسال بعد إلغاء، ومفيش ادّعاء إلغاء
+    وهمي. أي إلغاء/انقطاع قبل كده بيسيب 'claimed' ⇒ يتعافى 'pending' (آمن، الـ POST مابدأش).
+    أي إلغاء/انقطاع بعد الـ CAS بيسيب 'sending' ⇒ يتعافى 'unknown' (غامض، مايتعادش تلقائياً).
     """
     outbox_id = item.id
     conversation_id = item.conversation_id
@@ -164,31 +170,54 @@ async def _post_claimed(client, db, bot, item) -> None:
 
         if status != "RUNNING":
             # البرومت ماتبعتش خالص ⇒ آمن يتعاود — بس بحد (TASK 53). بنزوّد attempts
-            # ذرّياً؛ أول محاولة بتبلّغ (مؤقّت)، وبعد استنفاد الحد نعلّمه 'failed' مرة واحدة.
+            # ذرّياً (بس لو لسه 'claimed'، ما نحييش سجل اتشطب)؛ أول محاولة بتبلّغ (مؤقّت)،
+            # وبعد استنفاد الحد نعلّمه 'failed' مرة واحدة (CAS من 'claimed').
             attempts = db.bump_outbox_attempt(outbox_id, now_iso(), "sandbox غير جاهز")
+            if attempts == 0:
+                # السجل مش مملوك لينا دلوقتي (اتشطب/اتغيّر) ⇒ ما نلمسش حاجة.
+                return
             if attempts >= MAX_OUTBOX_ATTEMPTS:
-                db.set_outbox_status(
-                    outbox_id, OUTBOX_FAILED, now_iso(),
+                db.set_outbox_status_if_in(
+                    outbox_id, OUTBOX_FAILED, now_iso(), {OUTBOX_CLAIMED},
                     f"استنفد {attempts} محاولات (sandbox غير جاهز)",
                 )
                 await safe_send(bot, chat_id, _OUTBOX_EXHAUSTED_NOTICE)
-            elif attempts == 1:
-                await safe_send(bot, chat_id, _SANDBOX_NOT_READY_NOTICE)
+            else:
+                # محاولة آمنة فاشلة (قبل الـ POST) ⇒ نرجّع السجل مؤهّل 'pending' بـ CAS
+                # (الـ worker ياخده تاني بعد backoff). CAS من 'claimed' بس.
+                db.set_outbox_status_if_in(
+                    outbox_id, OUTBOX_PENDING, now_iso(), {OUTBOX_CLAIMED},
+                    "sandbox غير جاهز",
+                )
+                if attempts == 1:
+                    await safe_send(bot, chat_id, _SANDBOX_NOT_READY_NOTICE)
             return
 
-        # الإرسال هيبدأ حالاً: نسجّل 'sending' بثبات قبل الـ POST مباشرة (الـ commit
-        # جوّه set_outbox_status). ده آخر حد آمن: بعده النتيجة غامضة.
+        # الإرسال هيبدأ حالاً: CAS 'claimed'⇒'sending' بثبات قبل الـ POST مباشرة (الـ commit
+        # جوّه set_outbox_status_if_in). ده آخر حد آمن: بعده النتيجة غامضة. لو الـ CAS
+        # فشل (المستخدم شطب العنصر في الأثناء) ⇒ مفيش POST خالص.
         submitted_at = now_iso()  # قبل الـ POST: أي حدث للـ run الجديد لازم يكون أحدث منه
-        db.set_outbox_status(outbox_id, OUTBOX_SENDING, submitted_at)
+        if not db.set_outbox_status_if_in(
+            outbox_id, OUTBOX_SENDING, submitted_at, {OUTBOX_CLAIMED}
+        ):
+            log.info("تخطّي الإرسال: السجل %s مش مملوك (اتشطب/اتغيّر قبل الـ POST)", outbox_id)
+            return
         try:
             await client.send_message(conversation_id, text)
         except ApiError as exc:
-            # رفض مؤكد (4xx) ⇒ 'failed'؛ غير كده (شبكة/مهلة/5xx) ⇒ 'unknown' — مش إعادة تلقائية.
+            # رفض مؤكد (4xx) ⇒ 'failed'؛ غير كده (شبكة/مهلة/5xx) ⇒ 'unknown' — مش إعادة
+            # تلقائية. CAS من 'sending' بس: لو حالة أحدث (نهائية) حسمت السجل، ما نلخبطهاش.
             if is_permanent(exc):
-                db.set_outbox_status(outbox_id, OUTBOX_FAILED, now_iso(), f"HTTP {exc.status_code}")
+                db.set_outbox_status_if_in(
+                    outbox_id, OUTBOX_FAILED, now_iso(), {OUTBOX_SENDING},
+                    f"HTTP {exc.status_code}",
+                )
                 await safe_send(bot, chat_id, f"البرومت اترفض: {describe_status(exc.status_code)}")
             else:
-                db.set_outbox_status(outbox_id, OUTBOX_UNKNOWN, now_iso(), safe_error_label(exc))
+                db.set_outbox_status_if_in(
+                    outbox_id, OUTBOX_UNKNOWN, now_iso(), {OUTBOX_SENDING},
+                    safe_error_label(exc),
+                )
                 await safe_send(
                     bot, chat_id,
                     "مش قادرين نتأكد إن البرومت وصل. راجعه من الموقع قبل ما تعيد الإرسال.",
@@ -196,10 +225,15 @@ async def _post_claimed(client, db, bot, item) -> None:
             return
         except asyncio.CancelledError:
             # اتقطع أثناء الإرسال (shutdown) ⇒ النتيجة غامضة، مايتعادش تلقائياً.
-            db.set_outbox_status(outbox_id, OUTBOX_UNKNOWN, now_iso(), "اتقطع أثناء الإرسال")
+            db.set_outbox_status_if_in(
+                outbox_id, OUTBOX_UNKNOWN, now_iso(), {OUTBOX_SENDING}, "اتقطع أثناء الإرسال"
+            )
             raise
 
-        db.set_outbox_status(outbox_id, OUTBOX_SENT, now_iso())
+        if not db.set_outbox_status_if_in(outbox_id, OUTBOX_SENT, now_iso(), {OUTBOX_SENDING}):
+            # حالة أحدث حسمت السجل (نظرياً) ⇒ ما نعلنش نجاح فوق حسم أحدث.
+            log.info("السجل %s اتحسم بحالة أحدث قبل تسجيل 'sent'", outbox_id)
+            return
         await safe_send(bot, chat_id, "اتبعت ✅ الشات اتضاف للمتابعة.")
         # نبدأ المتابعة من الحالة الفعلية المرصودة للشات، مش من "running" مفترضة.
         # الـ API مابيرجّعش أي معرّف (run id / event id) يربط البرومت الجديد بالـ run
@@ -214,15 +248,25 @@ async def _post_claimed(client, db, bot, item) -> None:
         db.mark_submitted(conversation_id, submitted_at)
     except ApiError as exc:
         # فشل قبل الـ POST (قراءة الشات / تشغيل الـ sandbox): الإرسال مابدأش ⇒ آمن يتعاود،
-        # بس بحد (TASK 53): أول محاولة بتبلّغ (مؤقّت)، وبعد استنفاد الحد نعلّمه 'failed' مرة واحدة.
+        # بس بحد (TASK 53): أول محاولة بتبلّغ (مؤقّت)، وبعد استنفاد الحد نعلّمه 'failed'
+        # مرة واحدة. بنزوّد attempts بس لو لسه مملوك (claimed) — عشان ما نحييش سجل اتشطب.
         attempts = db.bump_outbox_attempt(outbox_id, now_iso(), safe_error_label(exc))
+        if attempts == 0:
+            return
         if attempts >= MAX_OUTBOX_ATTEMPTS:
-            db.set_outbox_status(
-                outbox_id, OUTBOX_FAILED, now_iso(), f"استنفد {attempts} محاولات"
+            db.set_outbox_status_if_in(
+                outbox_id, OUTBOX_FAILED, now_iso(), {OUTBOX_CLAIMED},
+                f"استنفد {attempts} محاولات",
             )
             await safe_send(bot, chat_id, _OUTBOX_EXHAUSTED_NOTICE)
-        elif attempts == 1:
-            await safe_send(bot, chat_id, f"فشل الإرسال: {error_text(exc)}")
+        else:
+            # محاولة آمنة فاشلة (قبل الـ POST) ⇒ نرجّع السجل 'pending' بـ CAS من 'claimed'.
+            db.set_outbox_status_if_in(
+                outbox_id, OUTBOX_PENDING, now_iso(), {OUTBOX_CLAIMED},
+                safe_error_label(exc),
+            )
+            if attempts == 1:
+                await safe_send(bot, chat_id, f"فشل الإرسال: {error_text(exc)}")
 
 
 async def outbox_recover(app) -> None:
@@ -440,29 +484,56 @@ async def _start_conversation(client, db, bot, job, base_url: str) -> None:
         try:
             conversation_id = await client.wait_for_start(job.task_id)
         except ApiError as exc:
-            db.set_creation_status(job_id, CREATION_UNKNOWN, now_iso(), safe_error_label(exc))
+            # CAS من الحالات غير النهائية بس: لو المستخدم شطب الطلب أثناء الاستطلاع،
+            # ما نعلّمش 'unknown' فوق شطب أحدث (مفيش clobber).
+            db.set_creation_status_if_in(
+                job_id, CREATION_UNKNOWN, now_iso(),
+                {CREATION_CLAIMED, CREATION_STARTING}, safe_error_label(exc),
+            )
             await safe_send(bot, chat_id, _UNKNOWN_CREATION_NOTICE)
             return
         await _finish_creation(client, db, bot, job_id, chat_id, repo, conversation_id, base_url)
         return
 
-    # مفيش task_id معروف ⇒ إحنا (بإذن الله) أول من يعمل POST. نسجّل 'starting' أولاً.
-    db.set_creation_starting(job_id, now_iso())
+    # مفيش task_id معروف ⇒ إحنا (بإذن الله) أول من يعمل POST. نسجّل 'starting' أولاً
+    # بـ CAS من 'claimed': لو المستخدم شطب الطلب بين الحجز والـ POST، الـ CAS يفشل
+    # وما بنبعتش الـ POST خالص (at-most-once: الشطب قبل الإرسال الفعلي بيوقف الإرسال).
+    if not db.claim_creation_starting(job_id, now_iso()):
+        log.info("تخطّي POST البدء: الطلب %s مش مملوك (اتشطب/اتغيّر قبل الـ POST)", job_id)
+        return
     try:
         task_id = await client.start_conversation(text, repo)
     except ApiError as exc:
         if is_permanent(exc):
-            db.set_creation_status(job_id, CREATION_FAILED, now_iso(), f"HTTP {exc.status_code}")
+            db.set_creation_status_if_in(
+                job_id, CREATION_FAILED, now_iso(), {CREATION_STARTING},
+                f"HTTP {exc.status_code}",
+            )
             await safe_send(bot, chat_id, f"فشل بدء الشات: {describe_status(exc.status_code)}")
         else:
             # فشل قبل ما نتأكد إن الـ POST اتعمل ⇒ غامض، مايتعادش تلقائياً.
-            db.set_creation_status(job_id, CREATION_UNKNOWN, now_iso(), safe_error_label(exc))
+            db.set_creation_status_if_in(
+                job_id, CREATION_UNKNOWN, now_iso(), {CREATION_STARTING},
+                safe_error_label(exc),
+            )
             await safe_send(bot, chat_id, _UNKNOWN_CREATION_NOTICE)
         return
     except asyncio.CancelledError:
         # اتقطع أثناء POST البدء ⇒ غامض، مايتعادش تلقائياً.
-        db.set_creation_status(job_id, CREATION_UNKNOWN, now_iso(), "اتقطع أثناء POST البدء")
+        db.set_creation_status_if_in(
+            job_id, CREATION_UNKNOWN, now_iso(), {CREATION_STARTING}, "اتقطع أثناء POST البدء"
+        )
         raise
+    except ValueError:
+        # OHB2-N10-28D: رد بدء مش JSON (جسم HTML/نص) كان بيرمي ValueError خام من غير
+        # ما يعدّي حدود الأخطاء المتوقّعة ⇒ الطلب يفضل 'starting' للأبد لحد restart.
+        # الـ client المفروض يحوّل ده لـ ApiError دلوقتي، بس كحماية مزدوجة بنعامله زي
+        # أي فشل غامض: 'unknown' (مفيش إعادة POST تلقائية، مفيش ادّعاء فشل/نجاح).
+        db.set_creation_status_if_in(
+            job_id, CREATION_UNKNOWN, now_iso(), {CREATION_STARTING}, "رد بدء غير متوقّع"
+        )
+        await safe_send(bot, chat_id, _UNKNOWN_CREATION_NOTICE)
+        return
 
     # الـ task_id اترجّع فعلاً ⇒ نسجّله (مش مخترع). لو التسجيل فشل (قاعدة مقفولة/انقطاع)،
     # الحالة تفضل 'starting' بلا task_id ⇒ التعافي يتعامل معاها كغامضة (مايعملش POST تاني).
@@ -471,11 +542,17 @@ async def _start_conversation(client, db, bot, job, base_url: str) -> None:
     try:
         conversation_id = await client.wait_for_start(task_id)
     except ApiError as exc:
-        db.set_creation_status(job_id, CREATION_UNKNOWN, now_iso(), safe_error_label(exc))
+        db.set_creation_status_if_in(
+            job_id, CREATION_UNKNOWN, now_iso(),
+            {CREATION_CLAIMED, CREATION_STARTING}, safe_error_label(exc),
+        )
         await safe_send(bot, chat_id, _UNKNOWN_CREATION_NOTICE)
         return
     except asyncio.CancelledError:
-        db.set_creation_status(job_id, CREATION_UNKNOWN, now_iso(), "اتقطع أثناء استطلاع البدء")
+        db.set_creation_status_if_in(
+            job_id, CREATION_UNKNOWN, now_iso(),
+            {CREATION_CLAIMED, CREATION_STARTING}, "اتقطع أثناء استطلاع البدء",
+        )
         raise
 
     await _finish_creation(client, db, bot, job_id, chat_id, repo, conversation_id, base_url)
@@ -484,8 +561,14 @@ async def _start_conversation(client, db, bot, job, base_url: str) -> None:
 async def _finish_creation(
     client, db, bot, job_id: int, chat_id: int, repo, conversation_id: str, base_url: str
 ) -> None:
-    """اتأكد بدء الشات: نسجّل 'done' + نتابع الشات + نبلّغ الرابط."""
-    db.set_creation_done(job_id, now_iso(), conversation_id)
+    """اتأكد بدء الشات: نسجّل 'done' (CAS) + نتابع الشات + نبلّغ الرابط.
+
+    OHB2-N10-28C: التسجيل بـ CAS من حالة غير نهائية؛ لو المستخدم شطب الطلب أثناء
+    الاستطلاع، ما نعلّمش 'done' فوق شطب أحدث (مفيش نجاح وهمي).
+    """
+    if not db.finish_creation_done(job_id, now_iso(), conversation_id):
+        log.info("الطلب %s اتحسم بحالة أحدث قبل تسجيل 'done'", job_id)
+        return
     db.add_watched(conversation_id, repo or "", chat_id)
     db.set_last_state(conversation_id, "running")
     link = f"{base_url.rstrip('/')}/canvas/conversations/{conversation_id}"

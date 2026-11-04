@@ -52,7 +52,7 @@ _OUTBOX_STATES = {
     db_module.OUTBOX_SENT: "accepted",
     db_module.OUTBOX_FAILED: "failed",
     db_module.OUTBOX_UNKNOWN: "ambiguous",
-    db_module.OUTBOX_DISCARDED: "failed",
+    db_module.OUTBOX_DISCARDED: "discarded",
 }
 _CREATION_STATES = {
     db_module.CREATION_PENDING: "pending",
@@ -61,18 +61,16 @@ _CREATION_STATES = {
     db_module.CREATION_DONE: "accepted",
     db_module.CREATION_FAILED: "failed",
     db_module.CREATION_UNKNOWN: "ambiguous",
-    db_module.CREATION_DISCARDED: "failed",
+    db_module.CREATION_DISCARDED: "discarded",
 }
 # OHB2-09-05: الحالات النهائية للصندوق (نفس مجموعة البوت في handlers). التسوية اليدوية
 # على سجل نهائي ⇒ 409 (مفيش تغيير)، عشان ما نلخبطش حالة محسومة.
 _TERMINAL_OUTBOX = {db_module.OUTBOX_SENT, db_module.OUTBOX_FAILED, db_module.OUTBOX_DISCARDED}
-# الحالات غير النهائية اللي `discard` يقدر يحوّلها (شرط CAS الذرّي — OHB2-09-05-R1).
-_NON_TERMINAL_OUTBOX = {
-    db_module.OUTBOX_PENDING,
-    db_module.OUTBOX_CLAIMED,
-    db_module.OUTBOX_SENDING,
-    db_module.OUTBOX_UNKNOWN,
-}
+# OHB2-N10-28C: `discard` مسموح بس للسجلات المؤهّلة **قبل الإرسال** (pending/claimed).
+# لو الـ POST ممكن يكون بدأ (sending/unknown) ما بنشطبش وما بندّعيش إلغاء — بنرجّع الحالة
+# الحالية بعلامة "الإلغاء غير مؤكد" (حدّ الإلغاء C2). ده يمنع ادّعاء إلغاء وهمي.
+_DISCARDABLE_OUTBOX = {db_module.OUTBOX_PENDING, db_module.OUTBOX_CLAIMED}
+_NOT_CONFIRMED_OUTBOX = {db_module.OUTBOX_SENDING, db_module.OUTBOX_UNKNOWN}
 
 
 class ValidationError(ValueError):
@@ -578,18 +576,34 @@ class MiniAppService:
         if action == "discard":
             if status in _TERMINAL_OUTBOX:
                 raise CodedApiError("already_terminal", "العملية خلاص في حالة نهائية.", 409)
+            if status in _NOT_CONFIRMED_OUTBOX:
+                # OHB2-N10-28C: الـ POST ممكن يكون بدأ ⇒ مفيش ادّعاء إلغاء. نرجّع الحالة
+                # الحالية بعلامة "الإلغاء غير مؤكد" (مفيش تغيير في القاعدة).
+                log.info("reconcile: outbox=%s discard not confirmed (state=%s)", outbox_id, status)
+                dto = self._outbox_dto(item)
+                dto["cancellation"] = "not_confirmed"
+                return dto
             # CAS ذرّي: شرط الحالة جوّه الـ UPDATE نفسه، فلو سجل تاني سبقنا وحسم الحالة
             # بين القراءة والكتابة، الـ rowcount=0 ⇒ ما بنغيّرش حاجة (مفيش سباق read-then-write).
             changed = self._db.set_outbox_status_if_in(
                 outbox_id,
                 db_module.OUTBOX_DISCARDED,
                 outbox.now_iso(),
-                _NON_TERMINAL_OUTBOX,
+                _DISCARDABLE_OUTBOX,
                 "اتشال يدوياً",
             )
             if not changed:
+                # حد تاني حسم السجل بين القراءة والـ CAS ⇒ نرجّع الحالة الحقيقية.
+                current = self._db.get_outbox(outbox_id)
+                if current is not None and current.status in _NOT_CONFIRMED_OUTBOX:
+                    dto = self._outbox_dto(current)
+                    dto["cancellation"] = "not_confirmed"
+                    return dto
                 raise CodedApiError("already_terminal", "العملية خلاص في حالة نهائية.", 409)
             log.info("reconcile: outbox=%s discard", outbox_id)
+            result = self._outbox_dto(self._db.get_outbox(outbox_id))
+            result["cancellation"] = "discarded"
+            return result
         else:  # mark_sent
             if status == db_module.OUTBOX_SENT:
                 return self._outbox_dto(item)  # idempotent: معَلّم sent بالفعل

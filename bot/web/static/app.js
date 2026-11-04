@@ -117,13 +117,14 @@
   var filesDeduper = FILES.createDeduper();
   function opKey(parts) { return OPS.identityKey(parts); }
 
-  // حالات العملية اللي السيرفر بيرجّعها: pending/accepted/failed/ambiguous/unknown.
+  // حالات العملية اللي السيرفر بيرجّعها: pending/accepted/failed/ambiguous/unknown/discarded.
   var OP_TEXT = {
     pending: "قيد التنفيذ…",
     accepted: "وصل ✅",
     failed: "فشل",
     ambiguous: "مش متأكدين",
-    unknown: "مش معروف"
+    unknown: "مش معروف",
+    discarded: "اتلغت"
   };
 
   function opPill(op) {
@@ -204,7 +205,8 @@
     ambiguous: "النتيجة غامضة (ممكن يكون وصل). استعلم عن الحالة الأول قبل أي إعادة إرسال.",
     failed: "العملية فشلت بشكل مؤكد.",
     pending: "لسه قيد التنفيذ. استعلم تاني بعد شوية.",
-    unknown: "حالة العملية مش معروفة. استعلم عنها."
+    unknown: "حالة العملية مش معروفة. استعلم عنها.",
+    discarded: "اتلغت قبل ما تتبعت. مفيش أي إرسال حصل."
   };
 
   // عند نتيجة غامضة/فاشلة/لسه معلّقة: نعرض إجراءات صريحة — استعلام (قراءة) وإعادة
@@ -275,12 +277,19 @@
         reconcileOperation(op.id, "discard").then(function (res) {
           discard.disabled = false;
           if (!res.ok) { toast(friendlyMessage(res.status, res.data)); return; }
-          toast("اتشالت العملية.");
-          if (manager && res.data) { manager.resolve(ref, res.data.state || "failed"); }
+          var data = res.data || {};
+          // OHB2-N10-28C: لو الإلغاء مش مؤكد (الـ POST ممكن يكون بدأ)، ما نغيّرش الحالة
+          // لـ "اتلغت" — نبلّغ إن الإلغاء غير مؤكد ونسيب الحالة زي ما هي.
+          if (data.cancellation === "not_confirmed") {
+            toast("الإلغاء غير مؤكد — الإرسال ممكن يكون بدأ. استعلم عن الحالة.");
+            return;
+          }
+          toast("اتلغت قبل الإرسال ✅");
+          if (manager) { manager.resolve(ref, data.state || "discarded"); }
           box.querySelectorAll(".op-status, .op-actions, .op-note").forEach(function (n) { n.remove(); });
           var line = el("div", "op-status");
           line.appendChild(el("span", "op-label", "حالة العملية: "));
-          line.appendChild(opPill(res.data));
+          line.appendChild(opPill(data));
           box.appendChild(line);
         }).catch(function () { discard.disabled = false; toast("مش قادر أوصل للسيرفر."); });
       });

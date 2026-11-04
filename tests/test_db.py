@@ -178,14 +178,18 @@ def test_outbox_attempts_defaults_zero_and_bumps(tmp_path):
 
 
 def test_bump_outbox_attempt_is_atomic_and_returns_new_count(tmp_path):
-    # TASK 53: bump_outbox_attempt بترجّع العدّاد الفعلي بعد الزيادة (RETURNING)،
-    # وبتسيب الحالة 'pending' (محاولة مابدأتش ⇒ آمنة)، وبتحفظ الخطأ.
+    # OHB2-N10-28C: bump_outbox_attempt بترجّع العدّاد الفعلي بعد الزيادة (RETURNING)،
+    # **ما بتغيّرش الحالة** (الحالة بتتظبط بنداء CAS صريح)، وبتحفظ الخطأ. بتشتغل بس على
+    # سجل مملوك ('claimed') — عشان ما تلمسش سجل 'pending' لسه ما اتحجزش أو سجل اتشطب.
     db = make_db(tmp_path)
     oid = db.add_outbox("c1", 9, "x", "t")
+    # مش 'claimed' ⇒ مفيش لمس (0).
+    assert db.bump_outbox_attempt(oid, "t0", "سبب") == 0
+    db.claim_outbox("t0")
     assert db.bump_outbox_attempt(oid, "t1", "سبب") == 1
     assert db.bump_outbox_attempt(oid, "t2", "سبب") == 2
     item = db.get_outbox(oid)
-    assert item.status == "pending"
+    assert item.status == "claimed"  # الحالة ماتغيّرتش (بيفضل مملوك)
     assert item.attempts == 2
     assert item.error == "سبب"
 

@@ -67,8 +67,22 @@ def test_discard_pending_marks_discarded_terminal(tmp_path):
     oid = db.add_or_group_outbox("c1", OWNER, "x", "t", client_ref="r1")
     c = _authed(tmp_path, db)
     r = _post(c, {"id": oid, "action": "discard"})
-    assert r.status_code == 200 and r.json()["state"] == "failed"
+    assert r.status_code == 200 and r.json()["state"] == "discarded"
+    assert r.json()["cancellation"] == "discarded"
     assert db.get_outbox(oid).status == "discarded"
+
+
+def test_discard_after_send_may_have_started_not_confirmed(tmp_path):
+    # OHB2-N10-28C: لو الـ POST ممكن يكون بدأ (sending/unknown)، ما بندّعيش إلغاء —
+    # بنرجّع الحالة الحالية + علامة not_confirmed، والقاعدة ماتتغيّرش.
+    db = Database(str(tmp_path / "d.sqlite3"))
+    oid = db.add_or_group_outbox("c1", OWNER, "x", "t", client_ref="r1")
+    db.set_outbox_status(oid, "unknown", "t2")
+    c = _authed(tmp_path, db)
+    r = _post(c, {"id": oid, "action": "discard"})
+    assert r.status_code == 200 and r.json()["state"] == "ambiguous"
+    assert r.json()["cancellation"] == "not_confirmed"
+    assert db.get_outbox(oid).status == "unknown"  # مفيش تغيير
 
 
 def test_discard_already_terminal_conflicts(tmp_path):
@@ -204,9 +218,15 @@ def test_reconcile_discard_uses_atomic_cas_under_concurrency(tmp_path):
 
 
 def test_reconcile_mark_sent_never_clobbers_a_discard(tmp_path):
-    """سباق discard/mark_sent: اللي يخسر مايقدرش يقلب النتيجة (مفيش read-then-write).
+    """سباق discard/mark_sent على سجل غامض (unknown): اللي ممكن يكون اتبعت مايتلغيش.
 
-    زي فوق: اتصال SQLite مستقل لكل ثريد عشان نختبر الـ CAS عبر اتصالين حقيقيين.
+    OHB2-N10-28C: discard على سجل ممكن يكون بدأ الإرسال (unknown) **مش** بيلغيه.
+    التزامن حقيقي (اتصال SQLite مستقل لكل ثريد)، فترتيب الوصول مش مضمون؛ والنتيجتين
+    المشروعتين الاتنين مقبولتين:
+    - mark_sent يسبق ⇒ unknown→sent؛ الشطب بعده على سجل نهائي ⇒ 409 already_terminal.
+    - discard يسبق ⇒ لسه unknown ⇒ 200 not_confirmed (مفيش تغيير)؛ وبعدها mark_sent
+      يحسمه sent.
+    في الحالتين الحالة النهائية 'sent'، ومستحيل ترجع 'discarded' (سجل غامض مايتلغيش).
     """
     import threading
 
@@ -218,11 +238,11 @@ def test_reconcile_mark_sent_never_clobbers_a_discard(tmp_path):
     c1 = _authed(tmp_path, db)
     c2 = _authed(tmp_path, db2)
     barrier = threading.Barrier(2)
-    codes = {}
+    results = {}
 
     def worker(c, action):
         barrier.wait()
-        codes[action] = _post(c, {"id": oid, "action": action}).status_code
+        results[action] = _post(c, {"id": oid, "action": action})
 
     ts = [
         threading.Thread(target=worker, args=(c1, "discard")),
@@ -232,10 +252,20 @@ def test_reconcile_mark_sent_never_clobbers_a_discard(tmp_path):
         t.start()
     for t in ts:
         t.join()
-    final = db.get_outbox(oid).status
-    assert final in ("discarded", "sent")
-    assert 200 in codes.values()
-    if final == "discarded":
-        assert codes.get("mark_sent") == 409
+
+    # في كل الترتيبات المشروعة، mark_sent بيكسب في الآخر ⇒ الحالة النهائية 'sent'
+    # ومستحيل تبقى 'discarded' (discard على سجل غامض مايغيّرش الحالة).
+    assert db.get_outbox(oid).status == "sent"
+    assert results["mark_sent"].status_code == 200
+    assert results["mark_sent"].json()["state"] == "accepted"
+
+    # النتيجة المشروعة الوحيدة للشطب على سجل غامض: 200 (not_confirmed، الشطب سبق
+    # mark_sent) أو 409 (already_terminal، mark_sent سبق). أي حالة تانية = فشل.
+    discard = results["discard"]
+    if discard.status_code == 200:
+        # الشطب سبق mark_sent: مفيش تغيير، ومفيش ادّعاء إلغاء وهمي.
+        assert discard.json().get("cancellation") == "not_confirmed"
+        assert discard.json()["state"] == "ambiguous"
     else:
-        assert codes.get("discard") == 409
+        assert discard.status_code == 409
+        assert discard.json()["error"] == "already_terminal"

@@ -112,6 +112,35 @@ test("409 من التسوية مايغيّرش الحالة المعروضة (ت
   assert.ok(pill && pill.textContent === "مش متأكدين", "الحالة ما اتغيّرتش بعد 409");
 });
 
+// OHB2-N10-28C: الشطب لما الإلغاء مش مؤكد (الـ POST ممكن يكون بدأ) ما لازمش يغيّر
+// الحالة لـ "اتلغت" — لازم يبلّغ إن الإلغاء غير مؤكد ويسيب الحالة زي ما هي.
+test("discard مع not_confirmed ⇒ الحالة ما بتتحوّلش لـ اتلغت", async () => {
+  const env = await mkEnv();
+  const detail = await openChat(env, {
+    opState: "ambiguous",
+    reconcile: { status: 200, data: { kind: "prompt", id: 7, state: "ambiguous", cancellation: "not_confirmed" } },
+  });
+  findButtonByText(detail, "شطب العملية").click();
+  await flush();
+  const texts = descendants(detail).filter((n) => n.className === "op-pill").map((n) => n.textContent);
+  assert.ok(texts.includes("مش متأكدين"), "الحالة تفضل مش متأكدين");
+  assert.ok(!texts.includes("اتلغت"), "مايتضافش حالة اتلغت لما الإلغاء مش مؤكد");
+  const toast = env.doc.getElementById("toast");
+  assert.ok(toast && (toast.textContent || "").includes("غير مؤكد"), "لازم تظهر رسالة إن الإلغاء غير مؤكد");
+});
+
+test("discard مؤكد ⇒ الحالة بتتحوّل لـ اتلغت", async () => {
+  const env = await mkEnv();
+  const detail = await openChat(env, {
+    opState: "ambiguous",
+    reconcile: { status: 200, data: { kind: "prompt", id: 7, state: "discarded", cancellation: "discarded" } },
+  });
+  findButtonByText(detail, "شطب العملية").click();
+  await flush();
+  const texts = descendants(detail).filter((n) => n.className === "op-pill").map((n) => n.textContent);
+  assert.ok(texts.includes("اتلغت"), "الشطب المؤكد ⇒ حالة اتلغت تظهر");
+});
+
 // OHB2-N10-05 (F9a): ضعف الشبكة أثناء استعلام حالة العملية لازم ما يسبش الواجهة
 // عالقة "قيد التنفيذ" للأبد. لازم تظهر إجراءات صريحة (استعلام/إعادة محاولة).
 test("429 أثناء استعلام الحالة ⇒ مفيش علوق: إجراءات صريحة تظهر", async () => {

@@ -1131,17 +1131,21 @@ class Database:
         return changed
 
     def bump_outbox_attempt(self, outbox_id: int, now: str, error: str | None = None) -> int:
-        """يزوّد attempts ذرّياً ويسيب الحالة 'pending' (محاولة إرسال مابدأتش ⇒ آمنة).
+        """يزوّد attempts ذرّياً من غير ما يغيّر الحالة، ويرجّع العدّاد الجديد (0 لو مش 'claimed').
 
         الـ UPDATE والقراءة في جملة واحدة (RETURNING)، فالقيمة الراجعة هي العدّاد الفعلي
         بعد الزيادة — حتى لو أكتر من caller نادوها. ده بيخلّي قرار "وصلنا الحد؟" مبني على
         عدّاد حقيقي مش على snapshot قديم، فمستحيل يتخطّى الحد أو يتكرّر الإشعار النهائي.
-        بترجّع العدّاد الجديد.
+
+        OHB2-N10-28C: (1) ما بنغيّرش الحالة (مفيش رجوع ضمني لـ 'pending' — الحالة بتتظبط
+        بنداء CAS صريح من الـ caller). (2) الشرط `status=claimed` بيمنع الـ worker من
+        "إحياء" سجل المستخدم شطبه (أو حسمه) بين الحجز والـ POST — لو مش 'claimed'،
+        rowcount=0 وبنرجّع 0 (مفيش لمس، ومفيش إعادة إرسال).
         """
         row = self._conn.execute(
-            "UPDATE outbox SET status=?, error=?, updated_at=?, attempts=attempts+1 "
-            "WHERE id=? RETURNING attempts",
-            (OUTBOX_PENDING, error, now, outbox_id),
+            "UPDATE outbox SET error=?, updated_at=?, attempts=attempts+1 "
+            "WHERE id=? AND status=? RETURNING attempts",
+            (error, now, outbox_id, OUTBOX_CLAIMED),
         ).fetchone()
         self._conn.commit()
         return int(row["attempts"]) if row else 0
@@ -1347,8 +1351,40 @@ class Database:
             )
         self._conn.commit()
 
-    def set_creation_starting(self, job_id: int, now: str, task_id: str | None = None) -> None:
-        """يسجّل 'starting' فوراً قبل POST البدء. الـ task_id يتسجّل بس لو الـ API رجّعه."""
+    def set_creation_status_if_in(
+        self,
+        job_id: int,
+        new_status: str,
+        now: str,
+        allowed_statuses,
+        error: str | None = None,
+    ) -> bool:
+        """تحويل حالة طلب شات **ذرّي مشروط** (CAS) — نظير `set_outbox_status_if_in`.
+
+        القرار والكتابة في جملة SQL واحدة؛ لو سبقنا كاتب تاني، الـ rowcount=0 ومفيش
+        تغيير. بترجّع True لو الحالة اتغيّرت فعلاً.
+        """
+        allowed = tuple(allowed_statuses)
+        if not allowed:
+            return False
+        placeholders = ", ".join("?" for _ in allowed)
+        cur = self._conn.execute(
+            f"UPDATE creation_jobs SET status=?, error=?, updated_at=? "
+            f"WHERE id=? AND status IN ({placeholders})",
+            (new_status, error, now, job_id, *allowed),
+        )
+        changed = cur.rowcount == 1
+        self._conn.commit()
+        return changed
+
+    def set_creation_starting(
+        self, job_id: int, now: str, task_id: str | None = None
+    ) -> None:
+        """يسجّل 'starting' فوراً قبل POST البدء. الـ task_id يتسجّل بس لو الـ API رجّعه.
+
+        (setter منخفض المستوى — بيسجّل الحالة بغضّ النظر عن الحالة الحالية. الحماية
+        الذرّية لحدّ الإلغاء بتحصل في `claim_creation_starting` اللي الـ worker بيستخدمه.)
+        """
         if task_id:
             self._conn.execute(
                 "UPDATE creation_jobs SET status=?, task_id=?, updated_at=? WHERE id=?",
@@ -1361,12 +1397,97 @@ class Database:
             )
         self._conn.commit()
 
+    def claim_creation_starting(
+        self, job_id: int, now: str, task_id: str | None = None
+    ) -> bool:
+        """CAS: (pending/claimed) ⇒ 'starting' (مع task_id لو مُتاح). بترجّع True لو نجح.
+
+        OHB2-N10-28C: الشرط على حالة غير منتهية وقبل الإرسال (`pending`/`claimed`) — لو
+        المستخدم شطب الطلب بين الحجز والـ POST، الـ rowcount=0 وبنرجّع False عشان الـ caller
+        ما يبعتش الـ POST أصلاً (الشطب قبل الإرسال الفعلي بيوقف الإرسال، at-most-once).
+        `pending` مسموح عشان المسار المباشر المتزامن (الاختبارات) بيسجّل ثم يبدأ فوراً.
+        """
+        if task_id:
+            cur = self._conn.execute(
+                "UPDATE creation_jobs SET status=?, task_id=?, updated_at=? "
+                "WHERE id=? AND status IN (?, ?)",
+                (CREATION_STARTING, task_id, now, job_id, CREATION_PENDING, CREATION_CLAIMED),
+            )
+        else:
+            cur = self._conn.execute(
+                "UPDATE creation_jobs SET status=?, updated_at=? WHERE id=? AND status IN (?, ?)",
+                (CREATION_STARTING, now, job_id, CREATION_PENDING, CREATION_CLAIMED),
+            )
+        changed = cur.rowcount == 1
+        self._conn.commit()
+        return changed
+
     def set_creation_done(self, job_id: int, now: str, conversation_id: str) -> None:
         self._conn.execute(
             "UPDATE creation_jobs SET status=?, conversation_id=?, updated_at=? WHERE id=?",
             (CREATION_DONE, conversation_id, now, job_id),
         )
         self._conn.commit()
+
+    def finish_creation_done(self, job_id: int, now: str, conversation_id: str) -> bool:
+        """CAS: (claimed/starting) ⇒ 'done' مع معرّف المحادثة. بترجّع True لو نجح.
+
+        OHB2-N10-28C: CAS على حالة غير نهائية — لو المستخدم شطب الطلب (أو حسمه) أثناء
+        الاستطلاع، الـ rowcount=0 (مفيش clobber) وبنرجّع False (مفيش نجاح وهمي).
+        """
+        cur = self._conn.execute(
+            "UPDATE creation_jobs SET status=?, conversation_id=?, updated_at=? "
+            "WHERE id=? AND status IN (?, ?)",
+            (CREATION_DONE, conversation_id, now, job_id, CREATION_CLAIMED, CREATION_STARTING),
+        )
+        changed = cur.rowcount == 1
+        self._conn.commit()
+        return changed
+
+    def discard_outbox(self, outbox_id: int, now: str, reason: str | None = None) -> str:
+        """شطب ذرّي لسجل صندوق مع تمييز حدّ الإلغاء (C2).
+
+        بترجّع:
+        - `"discarded"`   : كان مؤهّل قبل الإرسال (pending/claimed) واتشطب فوراً.
+        - `"not_confirmed"`: الـ POST ممكن يكون بدأ (sending/unknown) ⇒ **مفيش** شطب
+          ولا ادّعاء إلغاء؛ الحالة تفضل زي ما هي والـ caller يبلّغ إن الإلغاء غير مؤكد.
+        - `"terminal"`    : خلاص في حالة نهائية (sent/failed/discarded) ⇒ مفيش تغيير.
+        """
+        cur = self._conn.execute(
+            "UPDATE outbox SET status=?, error=?, updated_at=? WHERE id=? AND status IN (?, ?)",
+            (OUTBOX_DISCARDED, reason, now, outbox_id, OUTBOX_PENDING, OUTBOX_CLAIMED),
+        )
+        if cur.rowcount == 1:
+            self._conn.commit()
+            return "discarded"
+        row = self._conn.execute("SELECT status FROM outbox WHERE id=?", (outbox_id,)).fetchone()
+        self._conn.commit()
+        if row is None:
+            return "terminal"
+        if row["status"] in (OUTBOX_SENDING, OUTBOX_UNKNOWN):
+            return "not_confirmed"
+        return "terminal"
+
+    def discard_creation_job(self, job_id: int, now: str, reason: str | None = None) -> str:
+        """شطب ذرّي لطلب شات مع تمييز حدّ الإلغاء — نفس دلالات `discard_outbox`."""
+        cur = self._conn.execute(
+            "UPDATE creation_jobs SET status=?, error=?, updated_at=? "
+            "WHERE id=? AND status IN (?, ?)",
+            (CREATION_DISCARDED, reason, now, job_id, CREATION_PENDING, CREATION_CLAIMED),
+        )
+        if cur.rowcount == 1:
+            self._conn.commit()
+            return "discarded"
+        row = self._conn.execute(
+            "SELECT status FROM creation_jobs WHERE id=?", (job_id,)
+        ).fetchone()
+        self._conn.commit()
+        if row is None:
+            return "terminal"
+        if row["status"] in (CREATION_STARTING, CREATION_UNKNOWN):
+            return "not_confirmed"
+        return "terminal"
+
 
     @staticmethod
     def _row_to_creation(row: sqlite3.Row) -> CreationJob:

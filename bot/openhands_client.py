@@ -62,6 +62,11 @@ class OpenHandsClient:
             resp = await self._client.request(method, url, **kwargs)
         except httpx.HTTPError as exc:
             raise ApiError(f"تعذّر الاتصال بـ OpenHands ({type(exc).__name__}).") from exc
+        # OHB2-N10-28D: 3xx إعادة توجيه **مش** نجاح — كل endpoints الـ API بترجّع 2xx
+        # مباشر، وأي redirect (301/302/303/307/308) معناه رد غير متوقّع (proxy/login)
+        # وممنوع نعتبره عملية ناجحة أو نتبع وجهته (مفيش forward لهيدر Authorization).
+        if 300 <= resp.status_code < 400:
+            raise ApiError("رد إعادة توجيه غير متوقّع من OpenHands.", resp.status_code)
         if resp.status_code >= 400:
             raise ApiError(describe_status(resp.status_code, _detail(resp)), resp.status_code)
         return resp
@@ -333,10 +338,20 @@ class OpenHandsClient:
             body["selected_repository"] = repository
         if branch:
             body["selected_branch"] = branch
-        data = await self._request("POST", "/app-conversations", json=body)
-        payload = data.json()
+        resp = await self._request("POST", "/app-conversations", json=body)
+        # OHB2-N10-28D: فك JSON آمن — جسم HTML/نص (بروكسي/صفحة خطأ) كان بيرمي ValueError
+        # خام من غير ما يعدّي حدود الأخطاء المتوقّعة، فساب طلب الشات عالق 'starting'.
+        # بنحوّله لـ ApiError غامض (بلا status_code) زي أي رد غير متوقّع.
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            raise ApiError("رد غير متوقّع من OpenHands") from exc
+        if not isinstance(payload, dict):
+            raise ApiError("رد غير متوقّع من OpenHands")
         task_id = payload.get("id")
-        if not task_id:
+        # معرّف البدء لازم يكون نص غير فاضي. أي نوع تاني (رقم/None) أو نص فاضي ⇒ خطأ
+        # آمن، مفيش استبدال صامت بقيمة مفقودة.
+        if not isinstance(task_id, str) or not task_id.strip():
             raise ApiError("الـ API ما رجّعش معرّف مهمة البدء")
         return task_id
 
@@ -359,7 +374,9 @@ class OpenHandsClient:
                 status = str(task.get("status", "")).upper()
                 if status == "READY":
                     app_id = task.get("app_conversation_id")
-                    if not app_id:
+                    # OHB2-N10-28D: لازم معرّف نصي غير فاضي؛ أي نوع تاني ⇒ خطأ آمن
+                    # (ما نمرّرش معرّف مشوّه كأنه صالح).
+                    if not isinstance(app_id, str) or not app_id.strip():
                         raise ApiError("المهمة جاهزة بس ما فيهاش app_conversation_id")
                     return app_id
                 # "ERROR" هي القيمة الوحيدة الموثّقة للفشل في enum الـ API (مفيش "FAILED").

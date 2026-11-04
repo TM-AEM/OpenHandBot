@@ -205,12 +205,24 @@ def test_discard_requires_confirmation(tmp_path):
 
 def test_discard_confirmed_marks_discarded(tmp_path):
     ctx = make_ctx(tmp_path)
+    oid = ctx.bot_data["db"].add_outbox("c1", 99, SECRET, "t")  # pending (قبل الإرسال)
+    ctx.args = ["prompt:1", "confirm"]
+    update = make_update(1)
+    run(h.outbox_discard(update, ctx))
+    assert ctx.bot_data["db"].get_outbox(oid).status == "discarded"
+
+
+def test_discard_after_send_may_have_started_is_not_confirmed(tmp_path):
+    # OHB2-N10-28C: لو الـ POST ممكن يكون بدأ (unknown)، ما بندّعيش إلغاء — الحالة تفضل
+    # زي ما هي والمالك ياخد تحذير.
+    ctx = make_ctx(tmp_path)
     oid = ctx.bot_data["db"].add_outbox("c1", 99, SECRET, "t")
     ctx.bot_data["db"].set_outbox_status(oid, "unknown", "t")
     ctx.args = ["prompt:1", "confirm"]
     update = make_update(1)
     run(h.outbox_discard(update, ctx))
-    assert ctx.bot_data["db"].get_outbox(oid).status == "discarded"
+    assert ctx.bot_data["db"].get_outbox(oid).status == "unknown"  # مفيش تغيير
+    assert "غير مؤكد" in update.message.replies[-1]
 
 
 def test_discard_is_idempotent_on_terminal(tmp_path):
@@ -227,8 +239,7 @@ def test_discard_is_idempotent_on_terminal(tmp_path):
 def test_discard_creation_job(tmp_path):
     ctx = make_ctx(tmp_path)
     db = ctx.bot_data["db"]
-    jid = db.add_creation_job(99, "o/r", SECRET, "t")
-    db.set_creation_status(jid, "unknown", "t")
+    jid = db.add_creation_job(99, "o/r", SECRET, "t")  # pending (قبل الـ POST)
     ctx.args = ["creation:1", "confirm"]
     update = make_update(1)
     run(h.outbox_discard(update, ctx))
@@ -346,14 +357,12 @@ def test_status_routes_collision_to_exact_record(tmp_path):
 
 def test_discard_collision_mutates_only_selected(tmp_path):
     ctx = make_ctx(tmp_path)
-    db, pid, cid = _seed_collision(ctx)
-    db.set_outbox_status(pid, "unknown", "t")
-    db.set_creation_status(cid, "unknown", "t")
+    db, pid, cid = _seed_collision(ctx)  # الاتنين pending (قبل الإرسال)
 
     ctx.args = ["prompt:1", "confirm"]
     run(h.outbox_discard(make_update(1), ctx))
     assert db.get_outbox(pid).status == "discarded"   # البرومت بس
-    assert db.get_creation_job(cid).status == "unknown"  # الشات ماتغيرش
+    assert db.get_creation_job(cid).status == "pending"  # الشات ماتغيرش
 
     ctx.args = ["creation:1", "confirm"]
     run(h.outbox_discard(make_update(1), ctx))
@@ -450,8 +459,7 @@ def test_mark_sent_then_worker_never_resubmits(tmp_path):
 def test_discard_never_resubmits(tmp_path):
     ctx = make_ctx(tmp_path)
     db = ctx.bot_data["db"]
-    oid = db.add_outbox("c1", 99, SECRET, "t")
-    db.set_outbox_status(oid, "unknown", "t")
+    oid = db.add_outbox("c1", 99, SECRET, "t")  # pending (قبل الإرسال) ⇒ شطب آمن
     ctx.args = ["prompt:1", "confirm"]
     run(h.outbox_discard(make_update(1), ctx))
     client = SendClient()
