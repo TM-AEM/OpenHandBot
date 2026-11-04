@@ -36,7 +36,10 @@ def test_main_configures_drop_pending_updates(monkeypatch, tmp_path):
 
     fake_app = _RecordingApp()
     # نعترض بناء التطبيق عند نقطة استخدام main، ونرجّع تطبيق وهمي.
-    monkeypatch.setattr(main_mod, "build_application", lambda config: fake_app)
+    # OHB2-N10-25: main ينادي build_application(config) — بنقبل **kwargs للأمان.
+    monkeypatch.setattr(
+        main_mod, "build_application", lambda config, **kwargs: fake_app
+    )
 
     rc = main_mod.main()
 

@@ -1,35 +1,44 @@
-"""نقطة تشغيل بوت OpenHandBot (long polling)."""
+"""نقطة تشغيل بوت OpenHandBot (long polling) — مع طبقة إقلاع Zero-Touch.
+
+الترتيب: لوج مبكر ← إقلاع آمن (فحص متطلبات + تحقق إعداد + تجهيز مجلدات) ← بناء التطبيق ← polling.
+مفيش عملية تانية ومفيش exec: نفس العملية بتفضل العملية الرئيسية (ملك polling واحد).
+"""
 from __future__ import annotations
 
 import logging
 import sys
 
 from bot.app import build_application
-from bot.config import ConfigError, load_config
-from bot.errors import RedactingFilter, register_secrets
+from bot.bootstrap import BootstrapError, prepare_runtime, setup_logging
+from bot.config import ConfigError
 
 
 def _setup_logging(level: str, secrets: tuple[str, ...] = ()) -> None:
-    register_secrets(*secrets)
-    logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-    # فلتر التنقيح على كل الـ handlers: أي سر يظهر في رسالة أو traceback يتخفّى.
-    for handler in logging.getLogger().handlers:
-        handler.addFilter(RedactingFilter())
-    # httpx/httpcore بتسجّل URL كامل، وURL تيليجرام فيه التوكن.
-    for noisy in ("httpx", "httpcore", "telegram", "apscheduler"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
+    """توافق خلفي: يفوّض لإعداد اللوج الموحّد في طبقة الإقلاع."""
+    setup_logging(level, secrets)
 
 
 def main() -> int:
+    # OHB2-N10-18 (HIGH-1): لوج مبكر قبل أي فحص، عشان رسالة حالة الإقلاع (وتنقيح
+    # الأسرار) تظهر فعلاً في اللوجز بدل ما تتوه قبل إعداد الـ logging.
+    setup_logging()
+
+    # إقلاع آمن: فحص المتطلبات، تحقق الإعداد، وتجهيز مجلدات التشغيل. أي حاجز ⇒
+    # رسالة واضحة وخروج غير صفري (مفيش متابعة صامتة بعد فشل إعداد إلزامي).
     try:
-        config = load_config()
+        bootstrap = prepare_runtime()
     except ConfigError as exc:
+        logging.getLogger("main").error("فشل الإعداد: %s", exc)
         print(f"خطأ في الإعداد: {exc}", file=sys.stderr)
         return 1
-    _setup_logging(config.log_level, config.secrets)
+    except BootstrapError as exc:
+        logging.getLogger("main").error("فشل الإقلاع: %s", exc)
+        print(f"فشل الإقلاع: {exc}", file=sys.stderr)
+        return 1
+
+    config = bootstrap.config
+    # إعادة تطبيق اللوج بمستوى `LOG_LEVEL` المحلول + تسجيل الأسرار للتنقيح.
+    setup_logging(config.log_level, config.secrets)
 
     app = build_application(config)
     # القرار (OHB2-02): `drop_pending_updates=True` **مقصود**. بعد أي restart/انقطاع،

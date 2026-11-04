@@ -26,8 +26,10 @@ def test_mini_app_defaults_are_off_and_safe():
 
 
 def test_mini_app_enabled_parsed():
-    assert load_config(env(MINI_APP_ENABLED="1")).mini_app_enabled is True
-    assert load_config(env(MINI_APP_ENABLED="true")).mini_app_enabled is True
+    # OHB2-N10-22: التفعيل بقى يتطلّب رابط عام صالح (الرابط إعداد مطلوب للميزة).
+    url = "https://example.test/mini/"
+    assert load_config(env(MINI_APP_ENABLED="1", MINI_APP_URL=url)).mini_app_enabled is True
+    assert load_config(env(MINI_APP_ENABLED="true", MINI_APP_URL=url)).mini_app_enabled is True
     assert load_config(env(MINI_APP_ENABLED="no")).mini_app_enabled is False
     assert load_config(env(MINI_APP_ENABLED="garbage")).mini_app_enabled is False
 
@@ -106,3 +108,27 @@ def test_allowed_origins_rejects_invalid():
 
 def test_allowed_origins_empty_when_no_url():
     assert load_config(env()).mini_app_allowed_origins == frozenset()
+
+
+# OHB2-N10-22: الرابط العام إعداد مطلوب لما الميزة مفعّلة — نفشل عند التحقق من الإعداد
+# (ConfigError) بدل الفشل المتأخر عند بناء التطبيق (RuntimeError).
+
+
+def test_mini_app_enabled_requires_url_at_config():
+    with pytest.raises(ConfigError):
+        load_config(env(MINI_APP_ENABLED="1", MINI_APP_URL=""))
+
+
+def test_mini_app_disabled_ignores_empty_url():
+    # مقفولة + رابط فاضي ⇒ عادي (مفيش كسر للتشغيل العادي).
+    cfg = load_config(env(MINI_APP_ENABLED="0", MINI_APP_URL=""))
+    assert cfg.mini_app_enabled is False
+
+
+def test_mini_app_enabled_with_url_is_ok():
+    cfg = load_config(
+        env(MINI_APP_ENABLED="1", MINI_APP_URL="https://example.test/mini/")
+    )
+    assert cfg.mini_app_enabled is True
+    assert cfg.mini_app_url == "https://example.test/mini/"
+

@@ -213,6 +213,14 @@ def load_config(env: dict | None = None) -> Config:
 
     # OHB2-05: خلفية الـ Mini App (ASGI). مقفولة افتراضيًا.
     mini_app_enabled = _parse_bool(env, "MINI_APP_ENABLED", False)
+    # OHB2-N10-22: لو الميزة مفعّلة، الرابط العام بقى إعداد **مطلوب** — نفشل هنا برسالة
+    # واضحة (ConfigError) بدل ما نفشل متأخر عند بناء التطبيق بـ RuntimeError. لو الميزة
+    # مقفولة، الرابط مالوش أي تأثير (مفيش كسر لأي تشغيل مش بيستخدم الـ Mini App).
+    if mini_app_enabled and not mini_app_url:
+        raise ConfigError(
+            "MINI_APP_ENABLED=1 لكن MINI_APP_URL فاضي — لازم رابط https عام للـ Mini App "
+            "(أو اقفل الميزة بـ MINI_APP_ENABLED=0)"
+        )
     port_raw = _clean(env, "MINI_APP_PORT", "12000")
     try:
         mini_app_port = int(port_raw)
