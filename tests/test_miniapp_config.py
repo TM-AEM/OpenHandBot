@@ -31,7 +31,9 @@ def test_mini_app_enabled_parsed():
     assert load_config(env(MINI_APP_ENABLED="1", MINI_APP_URL=url)).mini_app_enabled is True
     assert load_config(env(MINI_APP_ENABLED="true", MINI_APP_URL=url)).mini_app_enabled is True
     assert load_config(env(MINI_APP_ENABLED="no")).mini_app_enabled is False
-    assert load_config(env(MINI_APP_ENABLED="garbage")).mini_app_enabled is False
+    # OHB2-POST-PUB-01/F05: قيمة منطقية غير معروفة تُرفض صراحةً (قبل كده كانت بتتجاهل بصمت).
+    with pytest.raises(ConfigError):
+        load_config(env(MINI_APP_ENABLED="garbage"))
 
 
 def test_mini_app_port_validation():

@@ -55,17 +55,18 @@ def test_successful_bootstrap_emits_visible_readiness(caplog, tmp_path):
     text = "\n".join(r.getMessage() for r in caplog.records)
     assert "bootstrap status" in text
     assert "bootstrap=READY" in text
-    assert "database=READY" in text
+    # OHB2-POST-PUB-01/F06: الاقلاع مابيفتحش القاعدة => القيمة الصادقة UNVERIFIED.
+    assert "database=UNVERIFIED" in text
 
 
-def test_readiness_log_is_backup_neutral(caplog, tmp_path):
-    # OHB2-N10-25: حالة الإقلاع ما بتدّعيش أي جاهزية نسخ (مفيش backup=... خالص).
+def test_readiness_log_is_feature_neutral(caplog, tmp_path):
+    # حالة الإقلاع ما بتدّعيش أي جاهزية ميزة خارج النواة (مفيش backup=... خالص).
     boot.setup_logging("INFO")
     with caplog.at_level(logging.INFO, logger="bootstrap"):
         boot.prepare_runtime(_env(tmp_path), version_info=(3, 13, 0))
     text = "\n".join(r.getMessage() for r in caplog.records)
     assert "bootstrap=READY" in text
-    assert "database=READY" in text
+    assert "database=UNVERIFIED" in text
     assert "backup" not in text
 
 
@@ -85,7 +86,7 @@ def test_backup_env_does_not_change_readiness_log(caplog, tmp_path):
     assert res.ready is True
     text = "\n".join(r.getMessage() for r in caplog.records)
     assert "bootstrap=READY" in text
-    assert "backup" not in text  # مفيش أي ادعاء نسخ حتى لو إعداد SFTP موجود
+    assert "backup" not in text  # مفيش أي ادّعاء ميزة خارج النواة حتى لو إعداد SFTP موجود
 
 
 def test_readiness_log_has_no_secret_values(caplog, tmp_path):

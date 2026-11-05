@@ -135,6 +135,18 @@ def _require_repo(value: str | None) -> str:
     return text
 
 
+def _optional_repo(value: str | None) -> str | None:
+    """مستودع اختياري (OHB2: شات بمستودع أو بدونه).
+
+    فاضي/غايب ⇒ None (شات بدون مستودع). لو فيه قيمة ⇒ نفس تحقق `_require_repo`
+    الصارم (شكل owner/repo). كده ما بنسمحش بمستودع مشوّه، وبنسمح صريحًا ببدونه.
+    """
+    text = (value or "").strip()
+    if not text:
+        return None
+    return _require_repo(text)
+
+
 def _require_ref(value: str | None) -> str:
     """يتحقّق من معرّف العملية اللي العميل يولّده (idempotency) أو يرجّع فاضي."""
     text = (value or "").strip()
@@ -454,6 +466,37 @@ class MiniAppService:
         conv = await self._authorize_conversation(cid)
         return _conversation_dto(conv, cid in self._watched_ids())
 
+    async def associate_repository(self, conversation_id: str, repository: str) -> dict:
+        """يربط مستودع بشات موجود (OHB2: إدارة الشاتات).
+
+        تفويض ملكية الشات أولاً (نفس عقد كل مسارات الشات)، ثم PATCH على نفس الشات.
+        المستودع لازم يكون بالشكل owner/repo؛ مفيش إنشاء شات جديد ولا أي كتابة محلية.
+        """
+        cid = _require_id(conversation_id)
+        repo = _require_repo(repository)
+        await self._authorize_conversation(cid)
+        client = self._require_client()
+        await client.update_conversation_repository(cid, repo)
+        conv = await self._authorize_conversation(cid)
+        return _conversation_dto(conv, cid in self._watched_ids())
+
+    async def delete_conversation(self, conversation_id: str) -> dict:
+        """حذف محلي آمن لشات (OHB2-C7): إزالة كل الأثر المحلي، بلا حذف بعيد.
+
+        التفويض أولاً (نفس عقد كل مسارات الشات: معرّف صالح ⇒ ملكية الشات)، وبعدين حذف
+        محلي ذرّي. **مفيش أي نداء حذف بعيد لـ OpenHands** — الشات على الخدمة يفضل زي ما
+        هو؛ إحنا بنشيل بس السجلات المحلية (متابعة/صندوق/إكمال/إشعارات/توجيه).
+        """
+        cid = _require_id(conversation_id)
+        if self._db is None:
+            raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
+        await self._authorize_conversation(cid)
+        summary = self._db.delete_conversation(cid, outbox.now_iso())
+        # نبلّغ أي worker مالك (نفس العملية) إن فيه تغيير — من غير إنشاء worker جديد.
+        for key in ("outbox_worker", "creation_worker", "completion_worker", "watcher", "notifier"):
+            self._wake(key)
+        return {"ok": True, "deleted": True, "conversation_id": cid, "local_only": True, "summary": summary}
+
     async def get_cost(self, conversation_id: str) -> dict:
         """OHB2-09-04: تكلفة/استهلاك شات واحد (من نفس نداء التفاصيل — مفيش نداء إضافي)."""
         cid = _require_id(conversation_id)
@@ -525,7 +568,7 @@ class MiniAppService:
         await self._authorize_conversation(cid)
         chat_id = self._config.owner_id
         outbox_id = self._db.add_or_group_outbox(
-            cid, chat_id, body, outbox.now_iso(), client_ref=ref or None
+            cid, chat_id, body, outbox.now_iso(), client_ref=ref or None, reengage=True
         )
         self._drop_list_cache()
         self._wake("outbox_worker")
@@ -703,7 +746,7 @@ class MiniAppService:
             raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
         # OHB2-09-A2-02: نفس عقد الملكية قبل إضافة الشات للمتابعة (مفيش شات غير مملوك).
         conv = await self._authorize_conversation(cid)
-        self._db.add_watched(cid, conv.get("title", ""), self._config.owner_id, new_lifecycle=False)
+        self._db.add_watched(cid, conv.get("title", ""), self._config.owner_id, new_lifecycle=False, reengage=True)
         self._db.set_last_state(cid, conv.get("execution_status") or "")
         return {"ok": True, "watched": True}
 
@@ -762,7 +805,7 @@ class MiniAppService:
         `client_ref` (OHB2-07): معرّف عملية من العميل. لو نفس الطلب اتبعت تاني
         (double-tap/إعادة محاولة)، بنرجّع نفس الطلب بدل ما نبدأ شات مكرّر.
         """
-        repo = _require_repo(repository)
+        repo = _optional_repo(repository)
         body = _require_text(text)
         ref = _require_ref(client_ref)
         if self._db is None:

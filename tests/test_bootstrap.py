@@ -53,8 +53,10 @@ def test_prepare_runtime_first_run_creates_dirs(tmp_path):
     assert res.config.db_path == str(tmp_path / "sub" / "bot_state.sqlite3")
     assert (tmp_path / "sub").is_dir()  # مجلد الأب اتعمل
     assert res.status()["bootstrap"] == "READY"
-    assert res.status()["database"] == "READY"
-    # OHB2-N10-25: الإقلاع محايد للنسخ — مفيش أي ادعاء جاهزية نسخ.
+    # OHB2-POST-PUB-01/F06: الإقلاع مابيفتحش القاعدة، فالقيمة الصادقة UNVERIFIED — مش
+    # ادّعاء READY. الجاهزية المرجعية بتيجي من Database.run_startup_maintenance.
+    assert res.status()["database"] == "UNVERIFIED"
+    # الإقلاع مايدّعيش جاهزية أي ميزة خارج نواة التشغيل.
     assert "backup" not in res.status()
 
 
@@ -123,11 +125,11 @@ def test_prepare_runtime_db_parent_creation_failure(tmp_path, monkeypatch):
         boot.prepare_runtime(env, version_info=(3, 13, 0))
 
 
-# ---------------------------------------------------------------- backup independence
+# ---------------------------------------------------------------- unknown env vars
 
 
-def test_backup_env_vars_are_ignored_by_bootstrap(tmp_path):
-    # OHB2-N10-25: إعداد النسخ (SFTP) مش جزء من نواة الإقلاع — وجوده مايغيّرش أي حاجة.
+def test_unknown_env_vars_are_ignored_by_bootstrap(tmp_path):
+    # إعداد أي ميزة خارج نواة الإقلاع — وجوده مايغيّرش أي حاجة.
     env = _env(tmp_path, SFTP_HOST="example.invalid", SFTP_USER="u")
     res = boot.prepare_runtime(env, version_info=(3, 13, 0))
     assert res.ready is True

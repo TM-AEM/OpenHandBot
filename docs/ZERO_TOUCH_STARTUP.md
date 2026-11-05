@@ -1,12 +1,12 @@
-# OHB2-N10-22/25 — Zero-Touch Startup Contract (backup-free core)
+# OHB2-N10-22 — Zero-Touch Startup Contract
 
 > **Scope:** application readiness for a genuinely zero-touch startup (upload project files +
 > configured runtime environment → the app validates, prepares, initializes, and starts by itself).
 > **NOT** a deployment. This document is the *explicit* contract derived from the actual repository —
 > it describes what the code does and the exact boundaries of it.
 >
-> **OHB2-N10-25:** the runtime core is **independent of backup**. No backup module is imported or
-> invoked on the startup path; backup is not part of the published core release.
+> The runtime core has **no backup subsystem**: there is no backup module, no backup config, and no
+> backup component anywhere in the tree.
 
 ---
 
@@ -88,11 +88,11 @@ Derived from `bot/config.py::load_config`. "Required" = startup fails cleanly if
 | `MINI_APP_ALLOWED_ORIGINS` | (derived) | comma list of `scheme://host[:port]`. |
 | `MINI_APP_AUTH_RATE_PER_MINUTE` / `_PER_HOUR` / `MINI_APP_API_RATE_PER_MINUTE` / `MINI_APP_RATE_MAX_KEYS` | `10` / `30` / `60` / `4096` | positive ints. |
 
-### 2.4 Backup configuration — not part of the core
+### 2.4 No backup configuration
 
 The core reads **no** backup configuration. `BACKUP_*` / `SFTP_*` / `GDRIVE_*` variables are ignored by
-the startup path (their presence or absence cannot affect startup). Backup source files remain in the
-repository locally but are **not part of the published core release** (OHB2-N10-25).
+the startup path (their presence or absence cannot affect startup), and no backup source exists in the
+repository.
 
 ### 2.5 Unsupported / intentionally deferred
 
@@ -141,11 +141,11 @@ When `MINI_APP_ENABLED=1`, `bot.app._wire_mini_app` runs a Uvicorn task inside t
 (`bot/web/runner.py`), sharing the same DB; it never starts a second `main.py`. When disabled
 (default), no server task is created. Verified: `tests/test_miniapp_integration.py`.
 
-### 3.7 Core independence from backup (OHB2-N10-25)
+### 3.7 No backup subsystem in the core
 `main.py`, `bot/bootstrap.py`, and `bot/app.py` import **no** backup module and construct **no**
-backup component. Startup succeeds with the backup modules entirely absent. Verified by an
-import-blocking check (`tests/test_zero_touch_contract.py::test_core_has_no_backup_references`) and
-the isolated manifest test (`tests/test_deploy_manifest.py`).
+backup component, and the repository contains no backup source at all. Verified by an
+import-check (`tests/test_zero_touch_contract.py::test_core_has_no_backup_references`) and the
+isolated manifest test (`tests/test_deploy_manifest.py`).
 
 ---
 
@@ -168,7 +168,7 @@ one process. Distinguish carefully:
 - Safe DB init + WAL + busy_timeout (§3.2).
 - No reliance on persistent storage for correctness of startup (a fresh DB is initialized if absent).
 - No second process for the Mini App.
-- Core startup does not depend on backup modules (§3.7).
+- Core startup has no backup subsystem (§3.7).
 
 ### 5.2 Hosting configuration — DOCUMENTED (operator-facing)
 - Upload list and env vars: `docs/DEPLOY_KATABUMP.md`.
@@ -203,16 +203,15 @@ bot/            (all *.py + bot/web/static/)
 docs/           (reference only)
 ```
 
-Excluded: `.env`, `.venv/`, `*.sqlite3` (+ `-wal`/`-shm`), `.git/`, `tools/` (backup tooling — not
-part of the core), `tests/`, `automation*/`, `automations/`, `__pycache__/`, `.github/`,
-`.openhands/`.
+Excluded: `.env`, `.venv/`, `*.sqlite3` (+ `-wal`/`-shm`), `.git/`, `tests/`, `automation*/`,
+`automations/`, `__pycache__/`, `.github/`, `.openhands/`.
 
 ---
 
 ## 7. Verification (this task)
 
 - Full pytest, pyflakes, Node tests — see the publication report for exact commands/results.
-- Key tests: `tests/test_zero_touch_contract.py` (fresh env-only startup, backup-neutral status,
+- Key tests: `tests/test_zero_touch_contract.py` (fresh env-only startup, feature-neutral status,
   core has no backup references, single app/no second process, Mini App off, DB preserved, secrets
   safe), `tests/test_zero_touch_lifecycle.py` (core worker lifecycle + shutdown), and
-  `tests/test_deploy_manifest.py` (import closure is sufficient **without** `tools/`).
+  `tests/test_deploy_manifest.py` (import closure is sufficient).

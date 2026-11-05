@@ -1,0 +1,137 @@
+/* OHB2-C7 — اختبارات انحدار واجهة حذف الشات (Mini App).
+ *
+ * بتشتغل بـ Node المدمج: `node --test tests/frontend/delete.test.js`
+ * بتشغّل **نفس** app.js جوه بيئة DOM/شبكة مصغّرة (dom_stub.js).
+ */
+"use strict";
+
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const { loadApp, descendants, FakeFetch } = require("./dom_stub.js");
+
+const flush = async (n = 14) => { for (let i = 0; i < n; i++) { await new Promise((r) => setImmediate(r)); } };
+
+function bootResponse() {
+  return {
+    status: 200,
+    data: {
+      user: { display_name: "مستخدم" },
+      settings: { notifications_enabled: true },
+      features: { watches: true },
+      inbox: { unread_count: 0 },
+    },
+  };
+}
+
+async function mkEnv() {
+  const fake = new FakeFetch();
+  const env = loadApp({ fetch: fake });
+  const { doc } = env;
+  fake.route("/auth", () => ({ status: 200, data: { ok: true } }));
+  fake.route("/app/bootstrap", () => bootResponse());
+  fake.route((c) => c.path.startsWith("/conversations?"), () => ({ status: 200, data: { items: [], has_more: false } }));
+  fake.route((c) => c.path.startsWith("/watches"), () => ({ status: 200, data: { items: [], has_more: false } }));
+  fake.route((c) => c.path.startsWith("/notifications"), () => ({ status: 200, data: { page: 0, has_more: false, unread_count: 0, items: [] } }));
+  await flush();
+  return env;
+}
+
+function findButton(root, text) {
+  return descendants(root).find((n) => n.tagName === "BUTTON" && n.textContent === text) || null;
+}
+
+async function openDetail(env, detail) {
+  const { doc, fetch } = env;
+  fetch.route((c) => c.path.startsWith("/conversations?"), () => ({
+    status: 200, data: { items: [{ id: "c1", title: "T", status: "running" }], has_more: false },
+  }));
+  fetch.route((c) => c.path === "/conversations/c1", () => ({ status: 200, data: detail }));
+  fetch.route((c) => c.path === "/conversations/c1/files", () => ({ status: 200, data: { conversation_id: "c1", files: [] } }));
+  doc.getElementById("tab-chats").click();
+  await flush();
+  doc.getElementById("chats-refresh").click();
+  await flush();
+  const rows = doc.getElementById("chats-list").children.filter((c) => c.className.split(" ").includes("row"));
+  rows[0].click();
+  await flush();
+  return env;
+}
+
+test("زر الحذف ظاهر ويطلب تأكيد قبل التنفيذ (مفيش حذف فوري)", async () => {
+  const env = await mkEnv();
+  await openDetail(env, { id: "c1", title: "T", watched: false });
+  const { doc, fetch } = env;
+
+  const delBtn = findButton(doc.getElementById("view-detail"), "🗑 حذف الشات");
+  assert.ok(delBtn, "لازم يظهر زر الحذف");
+  delBtn.click();
+  await flush();
+
+  // لسه مفيش أي نداء DELETE اتبعت.
+  assert.equal(fetch.all((c) => c.method === "DELETE").length, 0, "الضغطة الأولى ما بتحذفش");
+  const confirm = findButton(doc.getElementById("view-detail"), "🗑 أكّد الحذف");
+  assert.ok(confirm && confirm.hidden === false, "لازم يظهر زر التأكيد");
+});
+
+test("التأكيد يبعت DELETE ويرجّع لقايمة الشاتات", async () => {
+  const env = await mkEnv();
+  await openDetail(env, { id: "c1", title: "T", watched: false });
+  const { doc, fetch } = env;
+
+  findButton(doc.getElementById("view-detail"), "🗑 حذف الشات").click();
+  await flush();
+  findButton(doc.getElementById("view-detail"), "🗑 أكّد الحذف").click();
+  await flush();
+
+  const call = fetch.last((c) => c.method === "DELETE" && c.path === "/conversations/c1");
+  assert.ok(call, "لازم يبعت DELETE على مسار الشات");
+  assert.equal(doc.getElementById("view-detail").hidden, true, "نرجع لقايمة الشاتات");
+  assert.equal(doc.getElementById("view-chats").hidden, false);
+});
+
+test("إلغاء التأكيد مايبعتش أي DELETE", async () => {
+  const env = await mkEnv();
+  await openDetail(env, { id: "c1", title: "T", watched: false });
+  const { doc, fetch } = env;
+
+  findButton(doc.getElementById("view-detail"), "🗑 حذف الشات").click();
+  await flush();
+  findButton(doc.getElementById("view-detail"), "إلغاء").click();
+  await flush();
+
+  assert.equal(fetch.all((c) => c.method === "DELETE").length, 0, "الإلغاء مايحذفش");
+  assert.ok(findButton(doc.getElementById("view-detail"), "🗑 حذف الشات").hidden === false, "زر الحذف رجع ظاهر");
+});
+
+test("الضغط المزدوج على التأكيد مايبعتش DELETE مرتين", async () => {
+  const env = await mkEnv();
+  await openDetail(env, { id: "c1", title: "T", watched: false });
+  const { doc, fetch } = env;
+
+  findButton(doc.getElementById("view-detail"), "🗑 حذف الشات").click();
+  await flush();
+  const confirm = findButton(doc.getElementById("view-detail"), "🗑 أكّد الحذف");
+  confirm.click();
+  confirm.click();  // ضغط مزدوج
+  await flush();
+
+  const dels = fetch.all((c) => c.method === "DELETE" && c.path === "/conversations/c1");
+  assert.equal(dels.length, 1, "الحذف مرة واحدة بس (منع التكرار)");
+});
+
+test("فشل الحذف (403) يعرض رسالة ويفضل على الشاشة (retryable)", async () => {
+  const env = await mkEnv();
+  await openDetail(env, { id: "c1", title: "T", watched: false });
+  const { doc, fetch } = env;
+
+  fetch.route((c) => c.method === "DELETE", () => ({ status: 403, data: { error: "unauthorized" } }));
+  findButton(doc.getElementById("view-detail"), "🗑 حذف الشات").click();
+  await flush();
+  findButton(doc.getElementById("view-detail"), "🗑 أكّد الحذف").click();
+  await flush();
+
+  assert.equal(doc.getElementById("view-detail").hidden, false, "نفضل على التفاصيل عند الفشل");
+  const toast = doc.getElementById("toast");
+  assert.equal(toast.hidden, false, "لازم تبان رسالة خطأ");
+  assert.ok(toast.textContent.indexOf("مش مسموح") !== -1, "رسالة عربية واضحة (مش تفاصيل خام)");
+});

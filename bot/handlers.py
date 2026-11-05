@@ -451,7 +451,8 @@ async def watch_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # المعرّف والعلامة المعلّقة (new_lifecycle=False). لو مش متابَع، الصف مش موجود فالـ INSERT
     # بيعمل دورة جديدة بمعرّف جديد تلقائيًا.
     db.add_watched(
-        conversation_id, conv.get("title", ""), q.message.chat_id, new_lifecycle=False
+        conversation_id, conv.get("title", ""), q.message.chat_id,
+        new_lifecycle=False, reengage=True,
     )
     db.set_last_state(conversation_id, conv.get("execution_status") or "")
     await _safe_edit(
@@ -486,6 +487,55 @@ async def unwatch_conversation(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
     await _safe_edit(q, "تمام، اتشال من المتابعة.")
+
+
+async def delete_conversation_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """OHB2-C7: يعرض تأكيد حذف الشات (محلي). تفويض الملكية قبل أي حذف."""
+    q = update.callback_query
+    await q.answer()
+    if not _allowed(update, context.bot_data["config"]):
+        return
+    conversation_id = q.data.split(":", 1)[1]
+    conv, message = await _authorized_conversation(
+        context.bot_data["client"], context, conversation_id
+    )
+    if conv is None:
+        await _safe_edit(q, message)
+        return
+    title = conv.get("title") or "بدون عنوان"
+    await _safe_edit(
+        q,
+        f"متأكد إنك عايز تحذف الشات «{title}» من هنا؟\n"
+        "ده حذف محلي بس (المتابعة/السجل المحلي) — مش بيمسح الشات من OpenHands نفسه.",
+        reply_markup=kb.delete_confirm_menu(conversation_id),
+    )
+
+
+async def delete_conversation_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """OHB2-C7: تأكيد حذف الشات محليًا. تفويض الملكية إلزامي قبل أي حذف (مفيش IDOR)."""
+    q = update.callback_query
+    await q.answer()
+    if not _allowed(update, context.bot_data["config"]):
+        return
+    conversation_id = q.data.split(":", 1)[1]
+    client = context.bot_data["client"]
+    db = context.bot_data["db"]
+    # تفويض الملكية **قبل** أي حذف — العميل بيبعت المعرّف بس، والملكية بتتأكد server-side.
+    conv, message = await _authorized_conversation(client, context, conversation_id)
+    if conv is None:
+        await _safe_edit(q, message)
+        return
+    try:
+        db.delete_conversation(conversation_id, outbox.now_iso())
+    except sqlite3.Error:
+        log.exception("تعذّر حذف الشات %s", conversation_id)
+        await _safe_edit(q, "تعذّر الحذف دلوقتي (خطأ مؤقت في قاعدة البيانات). جرّب تاني.")
+        return
+    await _safe_edit(
+        q,
+        "تمام، اتشال من هنا ✅ (حذف محلي — الشات لسه موجود على OpenHands).",
+        reply_markup=kb.main_menu(_mini_app_url(context)),
+    )
 
 
 async def show_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -721,7 +771,7 @@ async def _send_prompt(
     chat_id = update.effective_chat.id
     # نسجّل 'pending' قبل ما نبدأ أي إرسال، عشان البرومت مايضيعش لو العملية اتقطعت.
     # القرار 2: لو فيه برومت لنفس الوجهة اتسجّل خلال 1.5 ثانية، بيتجمّع معاه في سجل واحد.
-    db.add_or_group_outbox(conversation_id, chat_id, text, outbox.now_iso())
+    db.add_or_group_outbox(conversation_id, chat_id, text, outbox.now_iso(), reengage=True)
     # TASK 55 (C): ترتيب القايمة بيتغيّر بعد البرومت ⇒ نبطّل كاش القايمة.
     context.bot_data.pop("list_cache", None)
     # تأكيد الحفظ بيذكر الشات المستهدف (القرار 1) عشان رسالة ماتروحش لشات غلط من غير ما تلاحظ.
@@ -804,7 +854,11 @@ async def _show_repos(
     start = page * REPOS_PAGE_SIZE
     chunk = repos[start : start + REPOS_PAGE_SIZE]
     if not chunk:
-        await _safe_edit(q, "ما لقيتش مستودعات.", reply_markup=kb.main_menu(_mini_app_url(context)))
+        await _safe_edit(
+            q,
+            "ما لقيتش مستودعات. تقدر تبدأ شات بدون مستودع.",
+            reply_markup=kb.repos_empty_menu(),
+        )
         return
     # الأسماء الكاملة والبحث بيتخزّنوا هنا؛ الأزرار بتحمل رقم النسخة والفهرس بس (حد 64 بايت).
     gen = context.bot_data["repo_gen"] = context.bot_data.get("repo_gen", 0) + 1
@@ -839,6 +893,19 @@ async def pick_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     repo = names[idx]
     context.bot_data["db"].set_awaiting(update.effective_user.id, repo, "newchat")
     await _safe_edit(q, f"المستودع: {repo}\nابعت البرومت اللي عايز تبدأ بيه الشات (بعد 10 دقايق من غير رد هتتلغي).")
+
+
+async def new_chat_no_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """شات جديد من غير مستودع (المهمة OHB2: إنشاء شات بمستودع أو بدونه)."""
+    q = update.callback_query
+    await q.answer()
+    if not _allowed(update, context.bot_data["config"]):
+        return
+    context.bot_data["db"].set_awaiting(update.effective_user.id, None, "newchat")
+    await _safe_edit(
+        q,
+        "شات من غير مستودع.\nابعت البرومت اللي عايز تبدأ بيه الشات (بعد 10 دقايق من غير رد هتتلغي).",
+    )
 
 
 async def _start_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, repo: str | None, text: str) -> None:

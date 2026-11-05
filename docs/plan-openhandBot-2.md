@@ -462,7 +462,7 @@ OpenHandBot 2 is complete only when all of the following are true:
 - The Mini App is served over HTTPS from a proven hosting configuration.
 - Weak-network budgets and throttled-network tests pass or have explicitly approved, measured exceptions.
 - Existing and new tests, static checks, and CI pass.
-- Deployment, rollback, backup, and recovery instructions are complete.
+- Deployment and recovery instructions are complete.
 - Dead-code removal is evidence-based; no deferred feature, migration, recovery path, or operational tool is deleted by guesswork.
 
 ## 8. Agent Execution Rules

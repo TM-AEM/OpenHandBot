@@ -8,7 +8,7 @@
 3. يبني مجلد مؤقت فيه **بس** الملفات المطلوبة للتشغيل ويستورد `main` جواه — إثبات إن
    القائمة كافية من غير باقي المستودع (fixture معزول، مفيش لمس لشجرة العمل الحقيقية).
 
-الاختبار ده هو اللي كان هيصطاد N10-17 CRITICAL-1 (`tools/` ناقصة من الدليل).
+الاختبار ده هو اللي كان هيصطاد N10-17 CRITICAL-1 (حزمة جذرية ناقصة من الدليل).
 """
 
 from __future__ import annotations
@@ -95,7 +95,7 @@ def test_runtime_imports_all_resolve():
 
 
 def test_deploy_doc_covers_runtime_roots():
-    """الدليل لازم يذكر كل حزمة جذرية مطلوبة للتشغيل (والنواة مش محتاجة `tools/`)."""
+    """الدليل لازم يذكر كل حزمة جذرية مطلوبة للتشغيل."""
     _, tops = _import_closure(ROOT / "main.py")
     doc = DEPLOY_DOC.read_text()
     # المدخلات الجذرية المطلوبة = حزم الاستيراد المحلية + ملف الإقلاع.
@@ -107,15 +107,10 @@ def test_deploy_doc_covers_runtime_roots():
             f"دليل النشر ناقص مدخل مطلوب للتشغيل: {entry!r} — "
             "حدّث قائمة الرفع في docs/DEPLOY_KATABUMP.md"
         )
-    # OHB2-N10-25: النواة مستقلة عن النسخ ⇒ `tools/` **مش** مطلوبة للتشغيل، والدليل
-    # لازم يذكر إنها **مستبعدة** صريحًا.
-    assert "tools/" not in required
-    assert "tools/" in doc
-    assert "tools/" in doc.split("ما ترفعش")[1]
 
 
 def _copy_runtime(tmp_path: Path) -> None:
-    """ينسخ بس الملفات المطلوبة للتشغيل (النواة، بدون `tools/`) لمجلد معزول."""
+    """ينسخ بس الملفات المطلوبة للتشغيل (النواة) لمجلد معزول."""
     ignore = shutil.ignore_patterns("__pycache__", "*.pyc")
     shutil.copy2(ROOT / "main.py", tmp_path / "main.py")
     shutil.copytree(ROOT / "bot", tmp_path / "bot", ignore=ignore)
@@ -123,11 +118,10 @@ def _copy_runtime(tmp_path: Path) -> None:
 
 
 def test_documented_manifest_is_import_sufficient(tmp_path):
-    """نسخة فيها الملفات المطلوبة بس (بدون `tools/`) لازم تستورد `main`."""
+    """نسخة فيها الملفات المطلوبة بس لازم تستورد `main`."""
     _copy_runtime(tmp_path)
     # نتأكد إن المستودع الحقيقي مش على sys.path (الاختبار لازم يكون معزول فعلاً).
     assert not (tmp_path / "tests").exists()
-    assert not (tmp_path / "tools").exists()  # النواة مش محتاجة أدوات النسخ
     proc = subprocess.run(
         [sys.executable, "-c", "import main"],
         cwd=str(tmp_path),
@@ -141,12 +135,6 @@ def test_documented_manifest_is_import_sufficient(tmp_path):
         timeout=120,
     )
     assert proc.returncode == 0, f"استيراد main فشل:\n{proc.stdout}\n{proc.stderr}"
-
-
-def test_manifest_does_not_require_tools():
-    """OHB2-N10-25: النواة مستقلة عن النسخ ⇒ `tools/` **مش** جزء من إغلاق استيراد main."""
-    files, _ = _import_closure(ROOT / "main.py")
-    assert not any(f.startswith("tools/") for f in files), "المفروض tools/ مش مطلوبة للتشغيل"
 
 
 def test_static_assets_are_documented():

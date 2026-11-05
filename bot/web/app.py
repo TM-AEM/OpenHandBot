@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -21,7 +22,7 @@ from starlette.routing import Route
 
 from ..config import Config
 from ..errors import ApiError, error_text
-from .clientip import resolve_client_ip
+from .clientip import parse_trusted_proxies, resolve_client_ip
 from .initdata import DEFAULT_MAX_AGE, InitDataError, TelegramUser, validate_init_data
 from .ratelimit import api_limiter, auth_limiter
 from .services import MiniAppService, ValidationError
@@ -89,6 +90,7 @@ class MiniApp:
     def __init__(self, config: Config, db=None, client=None, application=None) -> None:
         self._config = config
         self._db = db
+        self._application = application
         self._service = MiniAppService(config, db, client, application)
         self.sessions = SessionStore(config.mini_app_session_ttl)
         self.max_age = config.mini_app_initdata_max_age or DEFAULT_MAX_AGE
@@ -96,7 +98,73 @@ class MiniApp:
         self.allowed_origins = set(config.mini_app_allowed_origins)
         self.auth_limiter = auth_limiter(config)
         self.api_limiter = api_limiter(config)
+        # OHB2-POST-PUB-01/F07: شبكات البروكسيات الموثوقة (فاضية افتراضيًا). بتتمرّر
+        # لاستخراج IP العميل؛ من غيرها ما بنصدّقش أي هيدر تحويل.
+        self.trusted_proxies = parse_trusted_proxies(
+            ",".join(config.mini_app_trusted_proxies)
+        )
         self.router = Starlette(routes=self._routes())
+
+    def _client_ip(self, request) -> str:
+        return resolve_client_ip(request, self.trusted_proxies)
+
+    # ---------------------------------------------------------- health/ready
+    def _startup_failed(self) -> str | None:
+        """سبب فشل الإقلاع الحاجز (أو None). من غير كشف أي تفاصيل حساسة."""
+        app = self._application
+        if app is None:
+            return None
+        return getattr(app, "bot_data", {}).get("startup_failed")
+
+    def readiness(self) -> tuple[bool, dict]:
+        """OHB2-STABILIZATION-F06: هل الخدمة جاهزة لاستقبال عملها الفعلي؟
+
+        الجاهزية بتحقّق: (1) تكامل قاعدة البيانات اتفحص ونجح، (2) مفيش فشل إقلاع حاجز،
+        (3) الـ workers/المراقب/المُبلّغ اللي مطلوبين اشتغلوا فعلًا. من غير أي فحص مكلف
+        للقاعدة (قراءة أعلام بس). بترجّع (ready, payload) — الـ payload بلا محتوى حساس.
+        """
+        app = self._application
+        if app is None:
+            # بدون سياق تطبيق (استخدام مستقل/اختبار) ⇒ جاهز (مافيش فشل معروف).
+            return True, {"status": "ready", "checks": {}}
+        checks: dict[str, str] = {}
+        ready = True
+
+        failed = self._startup_failed()
+        if failed:
+            checks["startup"] = "failed"
+            ready = False
+        else:
+            checks["startup"] = "ok"
+
+        db = self._db
+        if db is not None and hasattr(db, "is_healthy"):
+            if db.is_healthy():
+                checks["database"] = "ok"
+            else:
+                checks["database"] = "not_ready"
+                ready = False
+
+        bot_data = getattr(app, "bot_data", {})
+        workers = (
+            "outbox_worker", "creation_worker", "completion_worker", "watcher", "notifier",
+        )
+        for label in workers:
+            checks[label] = "running" if bot_data.get(label) is not None else "not_started"
+            if bot_data.get(label) is None:
+                ready = False
+
+        # تفاصيل الإكمال (عدّادات محدودة، بلا محتوى حساس). المستنفد لا يمنع الجاهزية لكنه ظاهر.
+        completion_worker = bot_data.get("completion_worker")
+        if completion_worker is not None and hasattr(completion_worker, "health"):
+            try:
+                stats = completion_worker.health()
+                checks["completion"] = "action_required" if stats.get("exhausted") else "ok"
+            except Exception:  # noqa: BLE001 — الرصد مايكسرش الجاهزية
+                checks["completion"] = "unknown"
+
+        payload = {"status": "ready" if ready else "not_ready", "checks": checks}
+        return ready, payload
 
     # ------------------------------------------------------------- helpers
     def _allowed(self, user_id: int) -> bool:
@@ -117,6 +185,16 @@ class MiniApp:
         )
 
     async def _read_body(self, request) -> dict:
+        """يقرأ جسم الطلب بحد صلب `MAX_BODY_BYTES` مع **استهلاك متدفّق محدود** (F01).
+
+        - بنستهلك `request.stream()` قطعة قطعة وبنعدّ تراكميًا؛ أول ما نتعدّى الحد
+          بنتوقف عن القراءة فورًا ونرفض (`_BodyTooLarge`) — مش بنجمّع الجسم كله الأول.
+        - `Content-Length` تحسين بس: لو معلن وأكبر من الحد نرفض فورًا، لكن ما بنعتمدش
+          عليه كحماية وحيدة (بيكون غايب أو مغلوط أو أصغر من الحقيقة).
+        - أي `Content-Length` مش رقم صالح ⇒ `_BadJson` (نفس دلالة الرفض الحالية).
+        - لو انقطع العميل أثناء الإرسال قبل/بعد تجاوز الحد ⇒ `_BadJson` (طلب ناقص)،
+          بدون ما نفكّك جسم ناقص.
+        """
         length = request.headers.get("content-length")
         if length is not None:
             try:
@@ -125,9 +203,23 @@ class MiniApp:
                 raise _BadJson() from None
             if declared > MAX_BODY_BYTES:
                 raise _BodyTooLarge()
-        raw = await request.body()
-        if len(raw) > MAX_BODY_BYTES:
-            raise _BodyTooLarge()
+        buf = bytearray()
+        try:
+            async for chunk in request.stream():
+                if not chunk:
+                    continue
+                if len(buf) + len(chunk) > MAX_BODY_BYTES:
+                    # تجاوزنا الحد ⇒ نتوقف عن الاستهلاك فورًا (مفيش تجميع للجسم كله).
+                    raise _BodyTooLarge()
+                buf += chunk
+        except _BodyTooLarge:
+            raise
+        except Exception as exc:  # noqa: BLE001 — انقطاع/خطأ في قناة الـ ASGI
+            # جسم غير مكتمل/غير صالح ⇒ نفس دلالة الرفض (400) بدل خطأ 500.
+            if isinstance(exc, (asyncio.CancelledError,)):
+                raise
+            raise _BadJson() from exc
+        raw = bytes(buf)
         if not raw:
             return {}
         try:
@@ -173,6 +265,8 @@ class MiniApp:
     def _routes(self) -> list[Route]:
         return [
             Route("/health", self.health, methods=["GET"]),
+            Route("/ready", self.ready, methods=["GET"]),
+            Route("/status", self.status, methods=["GET"]),
             Route(f"{API_PREFIX}/auth", self.auth, methods=["POST"]),
             Route(f"{API_PREFIX}/auth/logout", self.logout, methods=["POST"]),
             Route(f"{API_PREFIX}/app/bootstrap", self.bootstrap, methods=["GET"]),
@@ -219,6 +313,16 @@ class MiniApp:
                 self.conversation_prompt,
                 methods=["POST"],
             ),
+            Route(
+                f"{API_PREFIX}/conversations/{{conversation_id}}/repository",
+                self.conversation_repository,
+                methods=["PATCH"],
+            ),
+            Route(
+                f"{API_PREFIX}/conversations/{{conversation_id}}",
+                self.conversation_delete,
+                methods=["DELETE"],
+            ),
             Route(f"{API_PREFIX}/operations/outbox", self.outbox_operation, methods=["GET"]),
             Route(f"{API_PREFIX}/operations/creation", self.creation_operation, methods=["GET"]),
             Route(
@@ -256,7 +360,7 @@ class MiniApp:
         ترتيب الفحص: حد المعدّل (قبل أي شغل) ⇒ الجلسة ⇒ Origin (لو طلب بيغيّر الحالة).
         """
         session = self._session_from_cookie(request)
-        key = session.token if session is not None else f"ip:{resolve_client_ip(request)}"
+        key = session.token if session is not None else f"ip:{self._client_ip(request)}"
         limited = self._rate_limited(self.api_limiter, key)
         if limited is not None:
             return None, limited
@@ -271,11 +375,47 @@ class MiniApp:
 
     # -------------------------------------------------------------- health
     async def health(self, request):
+        """LIVENESS: العملية/الـ event loop عايشة. **مش** ادّعاء جاهزية قاعدة/workers،
+        وبدون أي فحص مكلف للقاعدة. (رد ثابت 200 طول ما السيرفر بيردّ.)"""
         return _json({"status": "ok", "service": "openhandbot-mini", "version": 1})
+
+    async def ready(self, request):
+        """READINESS: الخدمة اتّهيّأت فعلًا وآمنة تستقبل عملها (قاعدة متحقّقة + workers).
+
+        بترجّع 200 لما تكون جاهزة و503 لما لأ (من غير أي تفاصيل حساسة). بلا تحديد معدّل.
+        """
+        ready, payload = self.readiness()
+        return _json(payload, status=200 if ready else 503)
+
+    async def status(self, request):
+        """رصد محدود (liveness + readiness + ملخّص الإكمال). بلا محتوى/أسرار/معرّفات داخلية."""
+        ready, payload = self.readiness()
+        completion = {}
+        cw = getattr(self._application, "bot_data", {}).get("completion_worker") if self._application else None
+        if cw is not None and hasattr(cw, "health"):
+            try:
+                completion = cw.health()
+            except Exception:  # noqa: BLE001
+                completion = {}
+        if self._db is not None and hasattr(self._db, "count_legacy_unresolved_completions"):
+            try:
+                completion["legacy_unresolved"] = self._db.count_legacy_unresolved_completions()
+            except Exception:  # noqa: BLE001
+                pass
+        return _json(
+            {
+                "service": "openhandbot-mini",
+                "version": 1,
+                "liveness": "ok",
+                "readiness": payload,
+                "completion": completion,
+            },
+            status=200 if ready else 503,
+        )
 
     # ---------------------------------------------------------------- auth
     async def auth(self, request):
-        limited = self._rate_limited(self.auth_limiter, resolve_client_ip(request))
+        limited = self._rate_limited(self.auth_limiter, self._client_ip(request))
         if limited is not None:
             return limited
         try:
@@ -595,6 +735,42 @@ class MiniApp:
             return err
         try:
             data = self._service.unwatch(request.path_params.get("conversation_id", ""))
+        except ValidationError as exc:
+            return _error(400, "bad_request", str(exc))
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json(data)
+
+    async def conversation_delete(self, request):
+        """حذف محلي لشات (OHB2-C7). تفويض ملكية + تغيير حالة (CSRF/origin) قبل أي حذف."""
+        session, err = await self._guarded(request, state_changing=True)
+        if err is not None:
+            return err
+        try:
+            data = await self._service.delete_conversation(
+                request.path_params.get("conversation_id", "")
+            )
+        except ValidationError as exc:
+            return _error(400, "bad_request", str(exc))
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json(data)
+
+    async def conversation_repository(self, request):
+        session, err = await self._guarded(request, state_changing=True)
+        if err is not None:
+            return err
+        try:
+            body = await self._read_body(request)
+        except _BodyTooLarge:
+            return _error(413, "payload_too_large", "الطلب كبير أوي.")
+        except _BadJson:
+            return _error(400, "bad_request", "صيغة الطلب غير صحيحة.")
+        try:
+            data = await self._service.associate_repository(
+                request.path_params.get("conversation_id", ""),
+                body.get("repository", ""),
+            )
         except ValidationError as exc:
             return _error(400, "bad_request", str(exc))
         except ApiError as exc:

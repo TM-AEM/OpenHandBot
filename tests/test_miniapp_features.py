@@ -82,7 +82,7 @@ class FakeDb:
 
         return [W(d) for d in self.watched.values()]
 
-    def add_watched(self, cid, title, chat_id, new_lifecycle=True):
+    def add_watched(self, cid, title, chat_id, new_lifecycle=True, reengage=False):
         self.watched[cid] = {"id": cid, "title": title}
 
     def set_last_state(self, cid, state):
@@ -93,7 +93,7 @@ class FakeDb:
         self.removed.append(cid)
         self.watched.pop(cid, None)
 
-    def add_or_group_outbox(self, cid, chat_id, text, now, window=None, client_ref=None):
+    def add_or_group_outbox(self, cid, chat_id, text, now, window=None, client_ref=None, reengage=False):
         # idempotency: نفس (cid, chat_id, client_ref) ⇒ نفس السجل، مفيش برومت مكرّر.
         if client_ref:
             for item in self.outbox:
@@ -431,9 +431,22 @@ def test_create_chat_rejects_bad_repository():
     c = TestClient(build_web_app(make_config(), FakeDb(), client=FakeClient()),
                    raise_server_exceptions=False)
     c.post("/api/v1/auth", json={"initData": make_init_data(OWNER)})
-    for bad in ("justname", "a/b/c", "", "a b/c"):
+    # مستودع مشوّه (مش owner/repo) ⇒ 400. الفاضي مش ضمنهم: الشات بدون مستودع مسموح.
+    for bad in ("justname", "a/b/c", "a b/c"):
         r = c.post("/api/v1/chats", json={"repository": bad, "text": "x"}, headers={"origin": ORIGIN})
         assert r.status_code == 400
+
+
+def test_create_chat_without_repository_is_allowed():
+    db = FakeDb()
+    c = TestClient(build_web_app(make_config(), db, client=FakeClient()),
+                   raise_server_exceptions=False)
+    c.post("/api/v1/auth", json={"initData": make_init_data(OWNER)})
+    # بدون مستودع (حقل غايب أو فاضي) ⇒ مقبول، والطلب بيتسجّل بمستودع فاضي.
+    for payload in ({"text": "x"}, {"repository": "", "text": "x"}):
+        r = c.post("/api/v1/chats", json=payload, headers={"origin": ORIGIN})
+        assert r.status_code == 200
+        assert r.json()["ok"] is True
 
 
 def test_repositories_listed():

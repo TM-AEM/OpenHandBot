@@ -30,6 +30,7 @@ BACK = "رجوع"
 REPLY = "رد"
 REFRESH = "تحديث"
 NEW_CHAT = "شات جديد"
+NO_REPO = "🚫 بدون مستودع"
 MY_CHATS = "شاتاتي"
 MORE = "المزيد"
 STATUS = "الحالة"
@@ -37,6 +38,9 @@ FILES = "الملفات"
 COST = "التكلفة"
 EXPORT = "تصدير"
 WATCHES = "متابعاتي"
+DELETE = "🗑 حذف الشات"
+DELETE_CONFIRM = "🗑 أكّد الحذف"
+DELETE_CANCEL = "إلغاء"
 WATCH = "تابع"
 UNWATCH = "إلغاء"
 CANCEL_ROUTE = "إلغاء التوجيه"
@@ -166,7 +170,20 @@ def conversation_actions(
             _btn(CANCEL_ROUTE, callback_data="cancelroute"),
         ]
     )
+    # OHB2-C7: زر حذف الشات (محلي فقط) — منفصل في صف لوحده عشان مايتضغطش بالغلط،
+    # والحذف الفعلي محتاج تأكيد صريح (`delete_confirm_menu`).
+    rows.append([_btn(DELETE, callback_data=f"delete:{conversation_id}")])
     return InlineKeyboardMarkup(rows)
+
+
+def delete_confirm_menu(conversation_id: str) -> InlineKeyboardMarkup:
+    """تأكيد حذف الشات (OHB2-C7): زر تأكيد صريح + زر إلغاء. الحذف محلي فقط."""
+    return InlineKeyboardMarkup(
+        [
+            [_btn(DELETE_CONFIRM, callback_data=f"deleteok:{conversation_id}")],
+            [_btn(DELETE_CANCEL, callback_data=f"open:{conversation_id}")],
+        ]
+    )
 
 
 def files_menu(
@@ -205,6 +222,19 @@ def repositories_menu(items: list[dict], page: int, has_more: bool, gen: int, st
         nav.append(_btn(MORE, callback_data=f"repos:{gen}:{page + 1}"))
     if nav:
         rows.append(nav)
+    # شات بدون مستودع: الخيار متاح دايماً في صفحة المستودعات (مش مربوط بمستودع معيّن).
+    rows.append([_btn(NO_REPO, callback_data="norepo")])
     rows.append([_btn("بحث", callback_data="reposearch")])
     rows.append([_btn(BACK, callback_data="menu")])
     return InlineKeyboardMarkup(rows)
+
+
+def repos_empty_menu() -> InlineKeyboardMarkup:
+    """لوحة قايمة المستودعات الفاضية: نفضل نسمح بشات بدون مستودع + بحث + رجوع."""
+    return InlineKeyboardMarkup(
+        [
+            [_btn(NO_REPO, callback_data="norepo")],
+            [_btn("بحث", callback_data="reposearch")],
+            [_btn(BACK, callback_data="menu")],
+        ]
+    )

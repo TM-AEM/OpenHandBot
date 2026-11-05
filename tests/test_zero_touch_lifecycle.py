@@ -1,7 +1,7 @@
-"""OHB2-N10-25: دورة حياة التطبيق الأساسية — **بدون أي نسخ**.
+"""OHB2-N10-25: دورة حياة التطبيق الأساسية.
 
 مفيش شبكة ولا polling حقيقي. بنعترض بدء الـ workers (بتعمل tasks) عشان الاختبار يبقى
-مركّز على دورة حياة النواة + ملكية واحدة + الإغلاق النظيف. النسخ خارج النواة تمامًا.
+مركّز على دورة حياة النواة + ملكية واحدة + الإغلاق النظيف.
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ def _config(tmp_path) -> Config:
 
 
 def test_build_application_has_no_backup_state(tmp_path):
-    # OHB2-N10-25: التطبيق النووي مايعرّفش ولا يستدعي أي مكوّن نسخ.
+    # التطبيق النووي مايعرّفش ولا يستدعي أي مكوّن نسخ.
     app = build_application(_config(tmp_path))
     assert "backup_config" not in app.bot_data
     assert "backup_lifecycle" not in app.bot_data

@@ -24,12 +24,15 @@ from .db import (
     OUTBOX_FAILED,
     OUTBOX_PENDING,
     OUTBOX_SENDING,
-    OUTBOX_SENT,
     OUTBOX_UNKNOWN,
 )
 from .errors import ApiError, describe_status, error_text
 
 log = logging.getLogger(__name__)
+
+# OHB2-POST-PUB-01/F02: أنواع مراجع أعمال الإكمال المحلي المعلّقة (جدول completion_pending).
+COMPLETION_KIND_OUTBOX = "outbox"
+COMPLETION_KIND_CREATION = "creation"
 
 # فشل مؤكّد (4xx) مش هينجح بإعادة المحاولة؛ غيره (شبكة/مهلة/5xx/429) ممكن يتعاود لو الإرسال مابدأش.
 PERMANENT_STATUS = 400
@@ -58,6 +61,15 @@ _SANDBOX_NOT_READY_NOTICE = "الـ sandbox مش قادر يشتغل، جرّب 
 _OUTBOX_EXHAUSTED_NOTICE = (
     "تعذّر إرسال البرومت بعد عدة محاولات. جرّب تفتح الشات من الموقع وابعت البرومت من هناك."
 )
+
+# OHB2-POST-PUB-01/F02: نصوص الإكمال المحلي (ثابتة ⇒ الإشعار القابل للتعافي يعيد نفس النص).
+_OUTBOX_SENT_NOTICE = "اتبعت ✅ الشات اتضاف للمتابعة."
+_CREATION_DONE_LINK_TEMPLATE = "بدأ الشات ✅\n{link}"
+
+
+def _creation_done_notice(base_url: str, conversation_id: str) -> str:
+    link = f"{base_url.rstrip('/')}/canvas/conversations/{conversation_id}"
+    return _CREATION_DONE_LINK_TEMPLATE.format(link=link)
 
 
 def now_iso() -> str:
@@ -93,6 +105,21 @@ async def safe_send(bot, chat_id: int, text: str) -> None:
         log.warning("فشل إرسال رسالة تيليجرام (%s)", type(exc).__name__)
 
 
+async def safe_send_checked(bot, chat_id: int, text: str) -> bool:
+    """OHB2-POST-PUB-01/F02: زي `safe_send` بس **بترجّع** هل الإرسال نجح.
+
+    بنستخدمها في مسار الإكمال المحلي القابل للتعافي: لو الإرسال فشل، بنسيب العمل المعلّق
+    عشان يتعافى (بدون إعادة أي عملية خارجية). عقد «مفيش exactly-once»: نجاح الإرسال هنا
+    معناه إن تيليجرام قبل الرسالة، مش ضمان عدم التكرار لو انقطع بين الإرسال والتسجيل.
+    """
+    try:
+        await bot.send_message(chat_id=chat_id, text=text)
+        return True
+    except TelegramError as exc:
+        log.warning("فشل إرسال رسالة تيليجرام (%s)", type(exc).__name__)
+        return False
+
+
 def safe_error_label(exc: ApiError) -> str:
     """وصف مختصر آمن للخطأ (من غير نص الاستثناء أو جسم الرد الخام)."""
     if exc.status_code is not None:
@@ -115,6 +142,56 @@ def is_permanent(exc: ApiError) -> bool:
 async def get_conversation(client, conversation_id: str) -> dict:
     convs = await client.get_conversations([conversation_id])
     return convs[0] if convs else {}
+
+
+# ------------------------------------------------------------- F02 completion
+async def _complete_outbox(db, bot, item, base_url: str = "") -> None:
+    """إكمال الأثر المحلي للـ outbox (إشعار + تسجيل متابعة) — idempotent وقابل للتعافي.
+
+    بيفترض إن صف `completion_pending` (kind=outbox) مسجّل بالفعل. الترتيب:
+    1) نسجّل المتابعة/الحالة (idempotent)، 2) نبعت الإشعار عبر `safe_send_checked`،
+    3) لو الإرسال نجح **بس** نشيل العمل المعلّق. لو الإرسال فشل (TelegramError)، بنسيب
+    العمل المعلّق ⇒ تعافٍ لاحق. فشل خطوة التسجيل (1) بيطلع استثناء ويسيب العمل المعلّق
+    كمان (يتعافى). الإكمال المحلي **ما بيعملش** أي POST خارجي (at-most-once محفوظ).
+    """
+    # OHB2-C7: حرس عدم الإحياء — لو الشات اتحذف محليًا (صف الإكمال اتشال في نفس معاملة
+    # الحذف)، ما نعيدش إنشاء المتابعة ولا نبعت إشعار لشات ملغي. الفحص + الكتابة في نفس
+    # البلوك المتزامن (مفيش await بينهم)، فالحذف ما يقدرش يتخلّل بينهم.
+    # OHB2-C7 (RESURRECTION-FIX): لو `item is None` فده معناه إن intent الإكمال اتمنع لأن
+    # الشات متشاهد حذف (POST نجح خارجيًا بس مفيش عمل محلي) ⇒ مفيش حاجة نعملها.
+    if item is None or db.get_completion_pending(COMPLETION_KIND_OUTBOX, item.ref_id) is None:
+        return
+    if db.is_deleted(item.conversation_id):
+        return
+    db.add_watched(item.conversation_id, item.title or "", item.chat_id)
+    db.set_last_state(item.conversation_id, item.last_state or "")
+    db.mark_submitted(item.conversation_id, item.submitted_at or now_iso())
+    notice = item.notice_text or _OUTBOX_SENT_NOTICE
+    delivered = await safe_send_checked(bot, item.chat_id, notice)
+    if delivered:
+        db.clear_completion_pending(COMPLETION_KIND_OUTBOX, item.ref_id)
+
+
+async def _complete_creation(db, bot, item, base_url: str = "") -> None:
+    """إكمال الأثر المحلي لطلب الشات الجديد (إشعار الرابط + تسجيل متابعة).
+
+    زي `_complete_outbox` بالظبط: idempotent، بيسيب العمل المعلّق لو الإشعار فشل،
+    وما بيعملش أي POST خارجي (ما بيعيدش إنشاء الشات أبدًا — الرابط/المعرّف محفوظين).
+    لو `notice_text` فاضي (صف مسترجع من تسوية قديمة) بنبني الرابط من معرّف المحادثة.
+    """
+    # OHB2-C7: حرس عدم الإحياء (زي `_complete_outbox`) — شات اتحذف محليًا مايتعادش
+    # إنشاء متابعته ولا يتبعتله إشعار.
+    # OHB2-C7 (RESURRECTION-FIX): `item is None` ⇒ intent الإكمال اتمنع لشات متشاهد ⇒ تخطّي.
+    if item is None or db.get_completion_pending(COMPLETION_KIND_CREATION, item.ref_id) is None:
+        return
+    if db.is_deleted(item.conversation_id):
+        return
+    db.add_watched(item.conversation_id, item.title or "", item.chat_id)
+    db.set_last_state(item.conversation_id, item.last_state or "running")
+    notice = item.notice_text or _creation_done_notice(base_url, item.conversation_id)
+    delivered = await safe_send_checked(bot, item.chat_id, notice)
+    if delivered:
+        db.clear_completion_pending(COMPLETION_KIND_CREATION, item.ref_id)
 
 
 async def wait_running(client, conversation_id: str, interval: float, timeout: float) -> str:
@@ -230,22 +307,28 @@ async def _post_claimed(client, db, bot, item) -> None:
             )
             raise
 
-        if not db.set_outbox_status_if_in(outbox_id, OUTBOX_SENT, now_iso(), {OUTBOX_SENDING}):
+        if not db.complete_outbox_sent(
+            outbox_id,
+            now_iso(),
+            chat_id=chat_id,
+            conversation_id=conversation_id,
+            title=conv.get("title", ""),
+            last_state=conv.get("execution_status") or "",
+            submitted_at=submitted_at,
+            notice_text=_OUTBOX_SENT_NOTICE,
+        ):
             # حالة أحدث حسمت السجل (نظرياً) ⇒ ما نعلنش نجاح فوق حسم أحدث.
             log.info("السجل %s اتحسم بحالة أحدث قبل تسجيل 'sent'", outbox_id)
             return
-        await safe_send(bot, chat_id, "اتبعت ✅ الشات اتضاف للمتابعة.")
-        # نبدأ المتابعة من الحالة الفعلية المرصودة للشات، مش من "running" مفترضة.
-        # الـ API مابيرجّعش أي معرّف (run id / event id) يربط البرومت الجديد بالـ run
-        # بتاعه، فمفيش طريقة نأكد بيها إن الـ run الجديد بدأ. لو الشات كان منتهي قبل
-        # الإرسال وحالته لسه "finished" (الـ run الجديد ماتحدّثش بعد)، تسجيل "running"
-        # كان هيدّي المراقب انتقال وهمي ويسلّم تقرير قديم. بتسجيل الحالة الفعلية
-        # بنسيب المراقب يسلّم بس لما يشوف انتقال حقيقي من حالة مش منتهية لحالة منتهية
-        # (fail closed). التفاصيل في تقرير TASK 04A-3.
-        db.add_watched(conversation_id, conv.get("title", ""), chat_id)
-        db.set_last_state(conversation_id, conv.get("execution_status") or "")
-        # U01: المراقب مابيعلنش الانتهاء غير بتقرير أحدث من وقت الإرسال ده.
-        db.mark_submitted(conversation_id, submitted_at)
+        # OHB2-POST-PUB-01/F02 + OHB2-STABILIZATION-F02: الانتقال 'sent' وintent الإكمال
+        # المحلي اتسجّلوا في **معاملة واحدة** (مستحيل يبقى 'sent' من غير intent). دلوقتي
+        # ننفّذ الإكمال المحلي (إشعار + متابعة) — idempotent وقابل للتعافي، وبدون أي POST
+        # خارجي (at-most-once محفوظ). نبدأ المتابعة من الحالة الفعلية المرصودة للشات، مش
+        # "running" مفترضة (السبب في تقرير TASK 04A-3): الـ API مابيرجّعش معرّف run يربط
+        # البرومت الجديد بالـ run بتاعه، فتسجيل "running" ممكن يدّي المراقب انتقال وهمي.
+        await _complete_outbox(
+            db, bot, db.get_completion_pending(COMPLETION_KIND_OUTBOX, outbox_id)
+        )
     except ApiError as exc:
         # فشل قبل الـ POST (قراءة الشات / تشغيل الـ sandbox): الإرسال مابدأش ⇒ آمن يتعاود،
         # بس بحد (TASK 53): أول محاولة بتبلّغ (مؤقّت)، وبعد استنفاد الحد نعلّمه 'failed'
@@ -285,6 +368,12 @@ async def outbox_recover(app) -> None:
         db.set_outbox_status(item.id, OUTBOX_PENDING, now_iso(), "ملكية متروكة من restart")
     for item in db.list_outbox_by_status(OUTBOX_SENDING):
         db.set_outbox_status(item.id, OUTBOX_UNKNOWN, now_iso(), "اتقطع قبل ما نأكد الإرسال")
+        # OHB2-C7-F1: تعافي الحالة ('sending'⇒'unknown') **لازم** ومابيتخطّاش، بس إشعار
+        # التعافي للمستخدم اختياري. لو الشات عليه شاهد حذف دائم (الحذف سايب صف 'sending'
+        # عن قصد، عشان الغموض) ما نبعتش إشعار لشات ملغي. مفيش هنا إعادة POST (الحالة
+        # 'unknown' مش مؤهّلة أصلاً) ولا أي إحياء محلي.
+        if db.is_deleted(item.conversation_id):
+            continue
         await safe_send(
             bot, item.chat_id,
             "فيه برومت ممكن يكون اتبعت قبل إعادة التشغيل بس مش متأكدين. "
@@ -561,18 +650,25 @@ async def _start_conversation(client, db, bot, job, base_url: str) -> None:
 async def _finish_creation(
     client, db, bot, job_id: int, chat_id: int, repo, conversation_id: str, base_url: str
 ) -> None:
-    """اتأكد بدء الشات: نسجّل 'done' (CAS) + نتابع الشات + نبلّغ الرابط.
+    """اتأكد بدء الشات: نسجّل 'done' (CAS) + نتابع الشات + نبلّغ الرابط (قابل للتعافي).
 
     OHB2-N10-28C: التسجيل بـ CAS من حالة غير نهائية؛ لو المستخدم شطب الطلب أثناء
     الاستطلاع، ما نعلّمش 'done' فوق شطب أحدث (مفيش نجاح وهمي).
+
+    OHB2-STABILIZATION-F02: الانتقال 'done' وintent الإكمال المحلي (إشعار الرابط + تسجيل
+    المتابعة) بيتسجّلوا في **معاملة واحدة** — مستحيل يبقى 'done' من غير intent محفوظ.
+    الإكمال المحلي ما بيعملش أي POST خارجي (الرابط/المعرّف محفوظين، ما فيش إنشاء شات مكرّر).
     """
-    if not db.finish_creation_done(job_id, now_iso(), conversation_id):
+    notice = _creation_done_notice(base_url, conversation_id)
+    if not db.complete_creation_done(
+        job_id, now_iso(), conversation_id,
+        chat_id=chat_id, title=repo or "", last_state="running", notice_text=notice,
+    ):
         log.info("الطلب %s اتحسم بحالة أحدث قبل تسجيل 'done'", job_id)
         return
-    db.add_watched(conversation_id, repo or "", chat_id)
-    db.set_last_state(conversation_id, "running")
-    link = f"{base_url.rstrip('/')}/canvas/conversations/{conversation_id}"
-    await safe_send(bot, chat_id, f"بدأ الشات ✅\n{link}")
+    await _complete_creation(
+        db, bot, db.get_completion_pending(COMPLETION_KIND_CREATION, job_id), base_url
+    )
 
 
 async def creation_recover(app) -> None:
@@ -596,6 +692,12 @@ async def creation_recover(app) -> None:
             db.set_creation_status(job.id, CREATION_PENDING, now_iso(), "استكمال استطلاع البدء")
         else:
             db.set_creation_status(job.id, CREATION_UNKNOWN, now_iso(), "بدء غامض بدون task_id")
+            # OHB2-C7-F1: الانتقال لـ 'unknown' (غامض) **لازم** ومابيتخطّاش (مافيهوش إعادة
+            # POST)، بس إشعار التعافي اختياري. لو الشات عليه شاهد حذف دائم ما نبعتش إشعار
+            # لشات ملغي. (شات 'starting' بلا task_id نادرًا ما بيحمل conversation_id، بس
+            # الفحص آمن حتى لو None.)
+            if db.is_deleted(job.conversation_id):
+                continue
             await safe_send(bot, job.chat_id, _UNKNOWN_CREATION_NOTICE)
 
 
@@ -620,3 +722,126 @@ class CreationWorker(_BaseWorker):
     def _is_retry_pending(self, item) -> bool:
         after = self._db.get_creation_job(item.id)
         return after is not None and after.status == CREATION_PENDING
+
+
+# OHB2-POST-PUB-01/F02 + OHB2-STABILIZATION-F02: أقصى عدد محاولات لإكمال الأثر المحلي قبل
+# ما نعلّمه «مستنفد/مطلوب تدخّل» (`exhausted=1`). الإكمال المحلي **ما بيعملش** أي عملية
+# خارجية، فالفشل هنا مجرد فشل إشعار (TelegramError) مش خطر ازدواج. العنصر المستنفد بيتسيب
+# ظاهر (مايتشالش) ومستبعد من العناصر المؤهّلة ⇒ مايعطّلش العناصر السليمة.
+COMPLETION_MAX_ATTEMPTS = 5
+# backoff أسّي محدود بين محاولات الإكمال (ثواني): 5، 10، 20، 40 (ثم يثبت عند الحد).
+COMPLETION_BASE_BACKOFF_SECONDS = 5.0
+COMPLETION_MAX_BACKOFF_SECONDS = 300.0
+# إجارة حجز قصيرة: الصف المحجوز يبقى غير مؤهّل للمدة دي، فمستحيل اتنين ياخدوه في نفس اللحظة.
+COMPLETION_CLAIM_LEASE_SECONDS = 30.0
+
+
+def _completion_backoff_seconds(attempts: int) -> float:
+    """backoff أسّي محدود: 5، 10، 20، 40… لحد الحد. مستقل عن العشوائية (اختبار حتمي)."""
+    exp = max(0, attempts - 1)
+    return min(COMPLETION_BASE_BACKOFF_SECONDS * (2 ** exp), COMPLETION_MAX_BACKOFF_SECONDS)
+
+
+def _completion_retry_at(now: str, attempts: int) -> str:
+    base = datetime.fromisoformat(now)
+    return (base + timedelta(seconds=_completion_backoff_seconds(attempts))).isoformat()
+
+
+async def completion_recover(app) -> None:
+    """تعافي الإكمال المحلي عند بدء التشغيل (idempotent).
+
+    العناصر المؤجّلة اللي انتهت إجارتها تبقى مؤهّلة تلقائيًا (شرط `next_attempt_at <= now`)،
+    والمستنفدة تفضل مستنفدة. **الصفوف القديمة** (`sent`/`done` من غير intent) **ما تتسوّاش
+    تلقائيًا**: مستحيل نفرّق بأمان بين صف اكتمل فعلًا (الإكمال اتشال بعد النجاح) وصف وقع في
+    نافذة الـ crash القديمة، فالتسوية التلقائية كانت هتبعت إشعارات مكرّرة. بدل كده بنسيبهم
+    **ظاهرين للمشغّل** (عدّاد غير محلول) مع تسوية يدوية صريحة لكل مرجع (`reconcile_legacy_completion`).
+    بدون أي POST خارجي في كل الحالات.
+    """
+    db = app.bot_data["db"]
+    try:
+        n = db.count_legacy_unresolved_completions()
+        if n:
+            log.warning(
+                "إكمال محلي: %s صف قديم (sent/done) من غير intent — غير محلول، يحتاج "
+                "تسوية يدوية صريحة (بدون أي إعادة POST)", n,
+            )
+    except Exception as exc:  # noqa: BLE001
+        # فشل الرصد مايمنعش الإقلاع، بس يتسجّل بوضوح.
+        log.error("فشل فحص الصفوف القديمة غير المحلولة (%s)", type(exc).__name__)
+
+
+class CompletionWorker(_BaseWorker):
+    """worker واحد مالك لإكمال الآثار المحلية المعلّقة (F02 + STABILIZATION-F02).
+
+    بيعالج جدول `completion_pending` **بس**: مفيش أي عملية خارجية هنا (مفيش POST خارجي).
+    - الحجز ذرّي (`claim_completion_due`): أقدم عنصر **مؤهّل** (غير مستنفد وموعد محاولته حان)
+      ⇒ مستحيل اتنين ياخدوا نفس الصف (safe concurrent claiming + إجارة قصيرة للتعافي).
+    - الفشل ⇒ جدولة إعادة محاولة دائمة (backoff أسّي محدود) + زيادة العدّاد. عند
+      `COMPLETION_MAX_ATTEMPTS` نعلّمه `exhausted=1` (ظاهر للمشغّل، مستبعد من المؤهّل) بدل
+      ما نلفّ عليه للأبد ⇒ **مايعطّلش** العناصر السليمة (fairness).
+    - العناصر المستنفدة تتسيب ظاهرة (مايتشالش) ويقدر المشغّل يعيد تأهيلها (`rearm`).
+    """
+
+    def __init__(
+        self, client, db, bot, base_url: str = "",
+        poll_interval: float = 2.0, max_idle: float = 30.0,
+    ) -> None:
+        super().__init__(client, db, bot, poll_interval=poll_interval, max_idle=max_idle)
+        self._base_url = base_url
+        self._last_success_at: str | None = None
+        self._last_failure_at: str | None = None
+
+    def _claim(self):
+        now = now_iso()
+        lease_until = (
+            datetime.fromisoformat(now)
+            + timedelta(seconds=COMPLETION_CLAIM_LEASE_SECONDS)
+        ).isoformat()
+        return self._db.claim_completion_due(now, lease_until)
+
+    async def _process(self, item) -> None:
+        try:
+            if item.ref_kind == COMPLETION_KIND_OUTBOX:
+                await _complete_outbox(self._db, self._bot, item, self._base_url)
+            else:
+                await _complete_creation(self._db, self._bot, item, self._base_url)
+        except Exception as exc:  # noqa: BLE001
+            # فشل خطوة التسجيل المحلي (مش الإشعار) ⇒ جدولة إعادة محاولة وزيادة العدّاد.
+            self._record_failure(item, type(exc).__name__)
+            return
+        # لو الإشعار فشل (العمل لسه موجود)، نجدوله كمان (backoff) — مايتشالش.
+        if self._db.get_completion_pending(item.ref_kind, item.ref_id) is not None:
+            self._record_failure(item, "إشعار فشل")
+        else:
+            self._last_success_at = now_iso()
+
+    def _record_failure(self, item, error: str) -> None:
+        now = now_iso()
+        attempts = self._db.bump_completion_attempt(
+            item.ref_kind, item.ref_id, now,
+            error=error,
+            next_attempt_at=_completion_retry_at(now, item.attempts + 1),
+            max_attempts=COMPLETION_MAX_ATTEMPTS,
+        )
+        self._last_failure_at = now
+        if attempts >= COMPLETION_MAX_ATTEMPTS:
+            log.warning(
+                "إكمال محلي %s/%s استنفد %s محاولات — مستنفد/مطلوب تدخّل (سايبه ظاهر، "
+                "مستبعد من المؤهّل)", item.ref_kind, item.ref_id, attempts,
+            )
+
+    def _is_retry_pending(self, item) -> bool:
+        # مؤقّت (لسه غير مستنفد) ⇒ backoff؛ مستنفد ⇒ حالة نهائية ⇒ reset.
+        row = self._db.get_completion_pending(item.ref_kind, item.ref_id)
+        return row is not None and not row.exhausted
+
+    def _idle_delay(self) -> float:
+        # مفيش عمل مؤهّل ⇒ خمول طويل (مفيش لفّ فاضي). العناصر المؤجّلة/المستنفدة مايتلكّش عليها.
+        return self._max_idle
+
+    def health(self) -> dict:
+        """ملخّص صحة الـ worker (بلا محتوى حساس) للرصد/الجاهزية."""
+        stats = self._db.completion_stats(now_iso())
+        stats["last_success_at"] = self._last_success_at
+        stats["last_failure_at"] = self._last_failure_at
+        return stats

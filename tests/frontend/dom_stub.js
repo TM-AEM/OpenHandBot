@@ -159,7 +159,7 @@ const IDS = [
   "watches-list", "watches-refresh",
   "inbox-list", "inbox-more", "inbox-next", "inbox-refresh", "inbox-read-all", "inbox-badge",
   "repo-search", "repo-search-btn", "repo-list",
-  "newchat-form", "newchat-repo", "newchat-text", "newchat-send", "newchat-op",
+  "newchat-form", "newchat-repo", "newchat-text", "newchat-send", "newchat-op", "newchat-norepo",
   "notif-toggle", "toast",
 ];
 const TABS = [

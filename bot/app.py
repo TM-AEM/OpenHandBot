@@ -18,7 +18,7 @@ from .config import Config
 from .db import Database
 from .notifier import Notifier
 from .openhands_client import OpenHandsClient
-from .outbox import CreationWorker, OutboxWorker
+from .outbox import CompletionWorker, CreationWorker, OutboxWorker, completion_recover
 from .watcher import Watcher
 
 log = logging.getLogger(__name__)
@@ -61,6 +61,9 @@ def build_application(config: Config) -> Application:
     app.bot_data["config"] = config
     app.bot_data["client"] = client
     app.bot_data["db"] = db
+    # OHB2-POST-PUB-01/F06: سبب فشل الإقلاع الحاجز (أو None). بيتحدّد في _post_init؛
+    # الـ readiness بيقراه عشان يعلن الحالة الحقيقية.
+    app.bot_data["startup_failed"] = None
 
     app.add_handler(CommandHandler("start", handlers.start))
     app.add_handler(CommandHandler("cancel", handlers.cancel_route))
@@ -83,6 +86,10 @@ def build_application(config: Config) -> Application:
     app.add_handler(CallbackQueryHandler(handlers.show_status, pattern=r"^status:"))
     app.add_handler(CallbackQueryHandler(handlers.reply_prompt, pattern=r"^reply:"))
     app.add_handler(CallbackQueryHandler(handlers.start_new_chat, pattern=r"^newchat$"))
+    app.add_handler(CallbackQueryHandler(handlers.new_chat_no_repo, pattern=r"^norepo$"))
+    # OHB2-C7: حذف محلي لشات — تأكيد صريح مطلوب (delete ⇒ prompt، deleteok ⇒ تنفيذ).
+    app.add_handler(CallbackQueryHandler(handlers.delete_conversation_prompt, pattern=r"^delete:"))
+    app.add_handler(CallbackQueryHandler(handlers.delete_conversation_confirm, pattern=r"^deleteok:"))
     app.add_handler(CallbackQueryHandler(handlers.repos_page, pattern=r"^repos:"))
     app.add_handler(CallbackQueryHandler(handlers.repo_search_prompt, pattern=r"^reposearch$"))
     app.add_handler(CallbackQueryHandler(handlers.pick_repo, pattern=r"^pickrepo:"))
@@ -104,8 +111,22 @@ def build_application(config: Config) -> Application:
 
     async def _post_init(application: Application) -> None:
         # 0) صيانة تشغيل آمنة: فحص سريع للتكامل + تحسين + checkpoint للـ WAL.
-        #    لو القاعدة تالفة بنسجّل تحذير واضح بس البوت يفضل شغّال (ما بيرميش).
-        db.run_startup_maintenance()
+        #    OHB2-POST-PUB-01/F06: نتيجة الفحص **مرجعية**. لو القاعدة تالفة/غير مؤكدة،
+        #    **ما بنشغّلش** أي worker/مراقب/مُبلّغ وبنعلن الحالة الحقيقية. مفيش حذف/إعادة
+        #    بناء تلقائية لقاعدة تالفة.
+        #    لو `main()` عمل الفحص بالفعل (قبل polling) بنعيد استخدام نتيجته بدل تكراره.
+        if application.bot_data.get("db_checked"):
+            db_ok = db.is_healthy()
+        else:
+            db_ok = db.run_startup_maintenance()
+            application.bot_data["db_checked"] = True
+        if not db_ok:
+            application.bot_data["startup_failed"] = "database_integrity"
+            log.error(
+                "إقلاع متوقف: فحص تكامل قاعدة البيانات فشل — مفيش workers ولا polling. "
+                "راجع القاعدة يدويًا (مفيش إصلاح/حذف تلقائي)."
+            )
+            return
         # 0.1) OHB2-03: سجّل قائمة الأوامر في واجهة تيليجرام + ثبّت زر «الأوامر».
         #      فشل الشبكة هنا ما يمنعش تشغيل البوت (الأوامر نفسها لسه شغالة بالكتابة).
         try:
@@ -115,6 +136,9 @@ def build_application(config: Config) -> Application:
         # 1) تعافي الصندوق (يحوّل 'sending'/'starting' المتروك لـ 'unknown') قبل أي معالجة.
         await handlers.outbox_recover(application)
         await handlers.creation_recover(application)
+        # 1.1) OHB2-STABILIZATION-F02: تسوية/تعافي الإكمال المحلي (صفوف قديمة sent/done من
+        #      غير intent + إعادة تأهيل العناصر منتهية الإجارة). بدون أي POST خارجي.
+        await completion_recover(application)
         # 2) worker واحد مالك لكل جدول — يبدأوا بعد ما التعافي يخلص (عشان مايعالجوش
         #    سجل 'sending'/'starting' قبل ما يتحوّل 'unknown'). الحرس ده يمنع worker
         #    تاني لو اتنادت _post_init تاني (إعادة تهيئة مكرّرة).
@@ -128,6 +152,14 @@ def build_application(config: Config) -> Application:
             )
             application.bot_data["creation_worker"] = creation_worker
             creation_worker.start()
+        # F02: worker الإكمال المحلي القابل للتعافي. ما بيعملش أي عملية خارجية (إشعارات
+        # + تسجيل متابعة بس). يبدأ بعد التعافي عشان يكمل الآثار المعلّقة من إعادة تشغيل.
+        if application.bot_data.get("completion_worker") is None:
+            completion_worker = CompletionWorker(
+                client, db, application.bot, config.openhands_base_url
+            )
+            application.bot_data["completion_worker"] = completion_worker
+            completion_worker.start()
         # حرس زي باقي الـ workers: إعادة تهيئة مكرّرة ما تعملش task مراقب تاني.
         if application.bot_data.get("watcher") is None:
             watcher = Watcher(
@@ -174,6 +206,9 @@ def build_application(config: Config) -> Application:
         creation_worker: CreationWorker | None = application.bot_data.get("creation_worker")
         if creation_worker:
             await creation_worker.stop()
+        completion_worker: CompletionWorker | None = application.bot_data.get("completion_worker")
+        if completion_worker:
+            await completion_worker.stop()
         watcher: Watcher | None = application.bot_data.get("watcher")
         if watcher:
             await watcher.stop()

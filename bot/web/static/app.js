@@ -600,6 +600,55 @@
       });
       box.appendChild(watchBtn);
 
+      // OHB2-C7: حذف محلي للشات (بتأكيد صريح). ما بنحذفش الشات من OpenHands — إحنا
+      // بنشيل بس السجل المحلي (المتابعة/الصندوق/الإشعارات). حرس الضغط المزدوج عبر
+      // `deleting` + تعطيل الأزرار، والحالة الغامضة (انقطاع) تفضل retryable.
+      var delRow = el("div", "toolbar");
+      var delBtn = el("button", "btn danger small", "🗑 حذف الشات");
+      var confirmBtn = el("button", "btn danger small", "🗑 أكّد الحذف");
+      var cancelBtn = el("button", "btn ghost small", "إلغاء");
+      confirmBtn.hidden = true;
+      cancelBtn.hidden = true;
+      var deleting = false;
+      delBtn.addEventListener("click", function () {
+        delBtn.hidden = true;
+        confirmBtn.hidden = false;
+        cancelBtn.hidden = false;
+      });
+      cancelBtn.addEventListener("click", function () {
+        confirmBtn.hidden = true;
+        cancelBtn.hidden = true;
+        delBtn.hidden = false;
+      });
+      confirmBtn.addEventListener("click", function () {
+        if (deleting) { return; }  // منع الحذف المكرّر من الضغط المزدوج
+        deleting = true;
+        confirmBtn.disabled = true;
+        cancelBtn.disabled = true;
+        del("/conversations/" + encodeURIComponent(id)).then(function (res) {
+          if (res.ok) {
+            toast("اتشال من هنا ✅ (حذف محلي — الشات لسه على OpenHands).");
+            showView("view-chats");
+            loadChats(true);
+          } else {
+            deleting = false;
+            confirmBtn.disabled = false;
+            cancelBtn.disabled = false;
+            toast(friendlyMessage(res.status, res.data));
+          }
+        }).catch(function () {
+          // انقطاع الشبكة: النتيجة غامضة ⇒ نسمح بإعادة المحاولة (idempotent).
+          deleting = false;
+          confirmBtn.disabled = false;
+          cancelBtn.disabled = false;
+          toast("مش قادر أوصل للسيرفر — جرّب تاني.");
+        });
+      });
+      delRow.appendChild(delBtn);
+      delRow.appendChild(confirmBtn);
+      delRow.appendChild(cancelBtn);
+      box.appendChild(delRow);
+
       // OHB2-09-02: قسم الملفات (قايمة + معاينة). كل حاجة عبر الـ Files API المصادَق،
       // والواجهة ما بتفترضش إن ملف قابل للقراءة لمجرد ظهوره في القايمة.
       box.appendChild(renderFilesSection(id));
@@ -756,21 +805,30 @@
     if (form) { form.hidden = false; }
   }
 
+  // شات بدون مستودع: نفس تدفّق الإنشاء بس من غير مستودع مختار.
+  function pickNoRepo() {
+    state.selectedRepo = null;
+    var label = $("newchat-repo");
+    if (label) { label.textContent = "بدون مستودع"; }
+    var form = $("newchat-form");
+    if (form) { form.hidden = false; }
+  }
+
   // إنشاء شات جديد: نسجّل في طابور الإنشاء المتين، وبعدها نتابع حالة العملية
   // (pending/accepted/failed/ambiguous). عند النجاح ننتقل لصفحة تفاصيل الشات.
-  // المفتاح بيشمل المستودع + النص: نفس البرومت في مستودع مختلف = عملية جديدة.
+  // المفتاح بيشمل المستودع + النص: نفس البرومت في مستودع مختلف = عملية جديدة،
+  // وشات بدون مستودع مفتاحه مختلف (مستودع فاضي) فمابيتجمّعش مع شات مستودع.
   var createOps = OPS.createRefManager();
-  function createKey(repo, text) { return opKey([repo, text]); }
+  function createKey(repo, text) { return opKey([repo || "", text]); }
   function resendCreate(ref) {
     return post("/chats", {
-      repository: state.selectedRepo,
+      repository: state.selectedRepo || "",
       text: createOps.payload(),
       client_ref: ref
     });
   }
   function createChat() {
     var text = ($("newchat-text").value || "").trim();
-    if (!state.selectedRepo) { toast("اختار مستودع الأول."); return; }
     if (!text) { toast("اكتب البرومت الأول."); return; }
     var btn = $("newchat-send");
     if (btn.disabled) { return; }
@@ -847,6 +905,7 @@
     $("repo-search-btn").addEventListener("click", function () { loadRepos($("repo-search").value); });
     $("repo-search").addEventListener("keydown", function (e) { if (e.key === "Enter") { loadRepos($("repo-search").value); } });
     $("newchat-send").addEventListener("click", createChat);
+    $("newchat-norepo").addEventListener("click", pickNoRepo);
     $("notif-toggle").addEventListener("click", toggleNotif);
     $("retry-btn").addEventListener("click", start);
     // OHB2-08-07: نربط رؤية الصفحة (تبويب المتصفح/الخلفية) + نبدأ الحالة الابتدائية.

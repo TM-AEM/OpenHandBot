@@ -154,6 +154,9 @@ html, body {
 .btn.small { padding: 6px 12px; font-size: 13px; }
 .btn.ghost { background: transparent; border: 1px solid #334155; color: inherit; }
 .btn.on { background: #15803d; }
+/* OHB2-C7: زر خطر (حذف) + صف أزرار الحذف (تأكيد/إلغاء) — RTL آمن. */
+.btn.danger { background: #b91c1c; color: #fff; }
+.toolbar { gap: 8px; }
 .link { color: #60a5fa; font-size: 13px; }
 .more { display: flex; justify-content: center; margin-top: 10px; }
 .toast { position: fixed; inset-inline: 0; bottom: 18px; margin: 0 auto; width: fit-content; max-width: 90%; padding: 10px 16px; border-radius: 999px; background: #0f172a; color: #f8fafc; font-size: 14px; box-shadow: 0 6px 20px rgba(0,0,0,.35); }

@@ -33,6 +33,9 @@ class Config:
     mini_app_auth_rate_per_hour: int = 30
     mini_app_api_rate_per_minute: int = 60
     mini_app_rate_max_keys: int = 4096
+    # OHB2-POST-PUB-01/F07: شبكات البروكسيات الموثوقة (IPs/CIDRs). فاضية افتراضيًا ⇒
+    # ما بنصدّقش أي هيدر تحويل، وبنستخدم IP الاتصال الفعلي (fail closed).
+    mini_app_trusted_proxies: tuple[str, ...] = ()
 
     @property
     def secrets(self) -> tuple[str, str]:
@@ -89,13 +92,42 @@ _FALSE = {"0", "false", "no", "off", "n"}
 
 
 def _parse_bool(env, name: str, default: bool) -> bool:
-    """يقرأ متغير بيئة منطقي (1/true/yes/on). غايب/فاضي/غير معروف ⇒ القيمة الافتراضية."""
+    """يقرأ متغير بيئة منطقي بصرامة (OHB2-POST-PUB-01/F05).
+
+    - غايب أو **فاضي صراحةً** ⇒ القيمة الافتراضية الموثّقة (سلوك متوافق للخلف).
+    - قيم صحيحة معروفة (`1/true/yes/on/y` و `0/false/no/off/n`، غير حسّاسة لحالة الأحرف
+      ومع تجاهل المسافات) ⇒ مقبولة.
+    - أي قيمة **غير فاضية وغير معروفة** ⇒ `ConfigError`. الرسالة بتذكر اسم المتغيّر بس
+      والقيم المقبولة، **مش** القيمة المزوّدة (ممكن تكون سر اتلزق بالغلط).
+    """
     raw = (env.get(name) or "").strip().lower()
+    if raw == "":
+        return default
     if raw in _TRUE:
         return True
     if raw in _FALSE:
         return False
-    return default
+    raise ConfigError(
+        f"{name} لازم يكون قيمة منطقية معروفة (1/0, true/false, yes/no, on/off)"
+    )
+
+
+def _parse_trusted_proxies(env) -> tuple[str, ...]:
+    """يقرأ MINI_APP_TRUSTED_PROXIES (IPs/CIDRs مفصولة بفواصل). قيمة غير صالحة تُرفض.
+
+    بنستخدم `clientip.parse_trusted_proxies` للتحقق، وبنرجّع النص المطبَّع (كـ tuple) عشان
+    الـ Config يفضل قابل للتمثيل/المقارنة. الرسالة بتذكر اسم المتغيّر بس (بدون القيمة).
+    """
+    from .web.clientip import parse_trusted_proxies
+
+    raw = _clean(env, "MINI_APP_TRUSTED_PROXIES")
+    if not raw:
+        return ()
+    try:
+        networks = parse_trusted_proxies(raw)
+    except ValueError as exc:
+        raise ConfigError(f"MINI_APP_TRUSTED_PROXIES فيه شبكة غير صالحة ({exc})") from exc
+    return tuple(str(net) for net in networks)
 
 
 def _parse_origins(env) -> frozenset[str]:
@@ -259,6 +291,11 @@ def load_config(env: dict | None = None) -> Config:
     mini_app_api_rate_per_minute = _positive("MINI_APP_API_RATE_PER_MINUTE", 60)
     mini_app_rate_max_keys = _positive("MINI_APP_RATE_MAX_KEYS", 4096)
 
+    # OHB2-POST-PUB-01/F07: بروكسيات موثوقة صريحة (IPs/CIDRs مفصولة بفواصل). فاضية =
+    # مفيش ثقة في أي هيدر تحويل. قيمة غير صالحة ⇒ ConfigError (نرفض الإعداد الغلط بدل
+    # ما نتجاهله بصمت، وإلا نفتح باب تزوير IP).
+    mini_app_trusted_proxies = _parse_trusted_proxies(env)
+
     return Config(
         telegram_bot_token=token,
         openhands_api_key=api_key,
@@ -279,4 +316,5 @@ def load_config(env: dict | None = None) -> Config:
         mini_app_auth_rate_per_hour=mini_app_auth_rate_per_hour,
         mini_app_api_rate_per_minute=mini_app_api_rate_per_minute,
         mini_app_rate_max_keys=mini_app_rate_max_keys,
+        mini_app_trusted_proxies=mini_app_trusted_proxies,
     )

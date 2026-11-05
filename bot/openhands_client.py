@@ -228,6 +228,13 @@ class OpenHandsClient:
                 params={"file_path": file_path},
                 headers={"Accept-Encoding": "identity"},
             ) as resp:
+                # OHB2-POST-PUB-01 (F03): 3xx إعادة توجيه **مش** محتوى — بنرفضها صراحةً
+                # قبل أي قراءة جسم، فمفيش متابعة لإعادة التوجيه ومفيش تفسير لجسم الـ redirect
+                # كمحتوى ملف. (زي `_request`: كل الـ endpoints بترجّع 2xx مباشر.)
+                if 300 <= resp.status_code < 400:
+                    raise ApiError(
+                        "رد إعادة توجيه غير متوقّع من OpenHands.", resp.status_code
+                    )
                 if resp.status_code >= 400:
                     # قراءة محدودة للتفاصيل؛ لو عدّت الحد بنرميها ونسيب الحالة الأصلية.
                     # لو القراءة نفسها فشلت (نقل أو حالة تدفّق)، بنسيب الحالة الأصلية برضه
@@ -300,6 +307,12 @@ class OpenHandsClient:
                 f"/app-conversations/{conversation_id}/download",
                 headers={"Accept-Encoding": "identity"},
             ) as resp:
+                # OHB2-POST-PUB-01 (F03): نفس سياسة إعادة التوجيه الصارمة — 3xx مرفوضة
+                # صراحةً قبل أي قراءة، فمفيش متابعة ومفيش تفسير لجسم الـ redirect كتصدير.
+                if 300 <= resp.status_code < 400:
+                    raise ApiError(
+                        "رد إعادة توجيه غير متوقّع من OpenHands.", resp.status_code
+                    )
                 if resp.status_code >= 400:
                     try:
                         body = await self._read_capped_or_empty(resp, MAX_ERROR_DETAIL_BYTES)
@@ -327,6 +340,16 @@ class OpenHandsClient:
 
     async def resume_sandbox(self, sandbox_id: str) -> None:
         await self._request("POST", f"/sandboxes/{sandbox_id}/resume")
+
+    async def update_conversation_repository(self, conversation_id: str, repository: str) -> dict:
+        """يربط/يغيّر مستودع شات موجود (PATCH آمن على نفس الشات).
+
+        OpenHands: `PATCH /app-conversations/{id}` بـ `selected_repository`. بترجّع
+        الميتاداتا المحدّثة (مش بتعمل شات جديد ولا بتلمس أي بيانات محمية).
+        """
+        body: dict[str, Any] = {"selected_repository": repository}
+        resp = await self._request("PATCH", f"/app-conversations/{conversation_id}", json=body)
+        return _decode_json(resp)
 
     async def start_conversation(
         self, initial_message: str, repository: str | None, branch: str | None = None

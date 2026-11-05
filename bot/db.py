@@ -26,6 +26,16 @@ OUTBOX_UNKNOWN = "unknown"
 OUTBOX_FAILED = "failed"
 OUTBOX_DISCARDED = "discarded"
 
+# OHB2-POST-PUB-01/F02: حالة إكمال الأثر المحلي (الإشعار/المتابعة) — منفصلة عن نتيجة
+# العملية الخارجية (status). العقد: `status` بتقول هل الـ POST الخارجي اتأكد (sent) أم
+# لأ؛ `notify_state` بتقول هل **الأثر المحلي** (إشعار المستخدم + تسجيل المتابعة) خلص.
+#   ""        : لسه محتاج إكمال محلي (أو مالوش أثر محلي مطلوب).
+#   "pending" : عملية محلية بدأت (إشعار write-ahead) ولسه ماتأكدتش — تتعافى بعد restart.
+#   "sent"    : الأثر المحلي خلص (الإشعار اتسلّم + المتابعة اتسجّلت).
+NOTIFY_NONE = ""
+NOTIFY_PENDING = "pending"
+NOTIFY_SENT = "sent"
+
 # حالات طلب الشات الجديد (creation job) — الجدول منفصل عن outbox عشان الطلب
 # مالوش conversation_id لسه وقت التسجيل. نفس منطق الحجز/الغموض:
 #   pending   : اتسجّل بثبات ولسه POST البدء مابدأش. آمن يتعاود بعد restart.
@@ -42,6 +52,19 @@ CREATION_DONE = "done"
 CREATION_UNKNOWN = "unknown"
 CREATION_FAILED = "failed"
 CREATION_DISCARDED = "discarded"
+
+# OHB2-POST-PUB-01/F02: حالة إكمال الأثر المحلي لطلب الشات الجديد (إشعار الرابط +
+# تسجيل المتابعة). نفس عقد الـ outbox: `status=done` = الـ POST الخارجي اتأكد، و
+# `notify_state` = الأثر المحلي خلص. الـ watcher وقاعدة «مايتعادش الـ POST أبدًا» بيفضلوا
+# على `status` (done نهائي) — الإكمال المحلي مستقل تمامًا.
+CREATION_NOTIFY_NONE = ""
+CREATION_NOTIFY_PENDING = "pending"
+CREATION_NOTIFY_SENT = "sent"
+
+# OHB2-STABILIZATION-F02: أنواع مراجع أعمال الإكمال المحلي المعلّقة (جدول completion_pending).
+# معرّفة هنا عشان طبقة الـ DB تقدر تبني استعلامات التسوية/الرصد من غير اعتماد دائري على outbox.
+COMPLETION_KIND_OUTBOX = "outbox"
+COMPLETION_KIND_CREATION = "creation"
 
 # OHB2-08-05: صندوق الإشعارات (history) — سجل **تراكمي** للإشعارات اللي اتسلّمت فعلًا
 # على تيليجرام، عشان المستخدم يرجع يشوفها من الـ Mini App بعد ما الرسالة تتوه في الشات.
@@ -159,6 +182,10 @@ class OutboxItem:
     attempts: int = 0
     # OHB2-07: معرّف العملية اللي العميل يولّده لمنع الازدواج عند إعادة المحاولة.
     client_ref: str | None = None
+    # OHB2-POST-PUB-01/F02: حالة إكمال الأثر المحلي (إشعار/متابعة) — منفصلة عن نتيجة
+    # العملية الخارجية (`status`). "" = لسه محتاج إكمال، "pending" = بدأ ولسه ماتأكدش
+    # (يتعافى)، "sent" = خلص.
+    notify_state: str = NOTIFY_NONE
 
 
 @dataclass
@@ -176,6 +203,41 @@ class CreationJob:
     attempts: int = 0
     # OHB2-07: معرّف العملية اللي العميل يولّده لمنع ازدواج إنشاء الشات عند إعادة المحاولة.
     client_ref: str | None = None
+    # OHB2-POST-PUB-01/F02: حالة إكمال الأثر المحلي لطلب الشات الجديد (إشعار الرابط +
+    # تسجيل المتابعة). نفس عقد الـ outbox.
+    notify_state: str = CREATION_NOTIFY_NONE
+
+
+@dataclass
+class CompletionPending:
+    """عمل إكمال محلي معلّق (إشعار/تسجيل متابعة) بعد نجاح العملية الخارجية (F02).
+
+    منفصل تمامًا عن نتيجة العملية الخارجية: وجود صف هنا يعني «الـ POST الخارجي اتأكد،
+    ولسه فيه أثر محلي (إشعار المستخدم + تسجيل المتابعة) محتاج إكمال». الإكمال المحلي
+    ما بيعملش أي POST خارجي، فالتكرار/التعافي آمن.
+    """
+
+    ref_kind: str
+    ref_id: int
+    chat_id: int
+    conversation_id: str
+    title: str = ""
+    last_state: str | None = None
+    submitted_at: str | None = None
+    notice_text: str = ""
+    attempts: int = 0
+    last_error: str | None = None
+    # OHB2-STABILIZATION-F02: موعد المحاولة التالية (ISO). NULL/'' = مؤهّل حالًا. بيسمح
+    # بجدولة إعادة محاولة دائمة (backoff) فاللي فشل مايفضلش أول عنصر مؤهّل للأبد.
+    next_attempt_at: str | None = None
+    # OHB2-STABILIZATION-F02: عدد المرات اللي العنصر فشل فيها (مستقل عن `attempts` اللي
+    # بيتصفّر عند الجدولة) — بيفرّق بين «مؤجّل» و«مستنفد» بشكل واضح للرصد.
+    failures: int = 0
+    # OHB2-STABILIZATION-F02: علم «مستنفد/مطلوب تدخّل» (0/1). بيتحدّد لما نوصل
+    # COMPLETION_MAX_ATTEMPTS؛ بيبقى ظاهر للمشغّل ومستبعد من العناصر المؤهّلة افتراضيًا.
+    exhausted: int = 0
+    created_at: str = ""
+    updated_at: str = ""
 
 
 @dataclass
@@ -249,7 +311,15 @@ class Database:
         # التلميح بدل ما يسيبه معلّق ⇒ مايحصلش إشعار مكرّر. اختياري: لو None (استخدام
         # مستقل) السلوك زي ما هو. بيرمي لو فشل، فالإزالة ما تتكمّلش (fail-safe).
         self.on_unwatch = None
+        # OHB2-POST-PUB-01/F06: نتيجة فحص التكامل عند بدء التشغيل. None = لسه ماتفحصش،
+        # True = سليم، False = فشل/غير مؤكد. الـ readiness بيعتمد عليها (ما بيعلنش READY
+        # قبل ما الفحص المطلوب ينجح فعلاً).
+        self.integrity_ok: bool | None = None
         self._init_schema()
+
+    def is_healthy(self) -> bool:
+        """هل القاعدة اجتازت فحص التكامل المطلوب عند البدء؟ (False قبل الفحص أو بعده)."""
+        return self.integrity_ok is True
 
     def _init_schema(self) -> None:
         self._conn.executescript(
@@ -282,7 +352,8 @@ class Database:
                 created_at      TEXT NOT NULL,
                 updated_at      TEXT NOT NULL,
                 attempts        INTEGER NOT NULL DEFAULT 0,
-                client_ref      TEXT
+                client_ref      TEXT,
+                notify_state    TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox(status);
             CREATE TABLE IF NOT EXISTS creation_jobs (
@@ -297,9 +368,32 @@ class Database:
                 created_at      TEXT NOT NULL,
                 updated_at      TEXT NOT NULL,
                 attempts        INTEGER NOT NULL DEFAULT 0,
-                client_ref      TEXT
+                client_ref      TEXT,
+                notify_state    TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_creation_jobs_status ON creation_jobs(status);
+            -- OHB2-POST-PUB-01/F02: أعمال الإكمال المحلي المعلّقة (إشعار + تسجيل متابعة)
+            -- بعد نجاح العملية الخارجية. بتُسجَّل write-ahead، وبتتعافى بعد restart،
+            -- وبتتشال بعد ما تخلص. منفصلة تمامًا عن نتيجة العملية الخارجية (outbox/creation
+            -- .status) ⇒ الإكمال المحلي ما بيعملش POST خارجي أبدًا (at-most-once محفوظ).
+            CREATE TABLE IF NOT EXISTS completion_pending (
+                ref_kind        TEXT NOT NULL,
+                ref_id          INTEGER NOT NULL,
+                chat_id         INTEGER NOT NULL,
+                conversation_id TEXT NOT NULL,
+                title           TEXT NOT NULL DEFAULT '',
+                last_state      TEXT,
+                submitted_at    TEXT,
+                notice_text     TEXT NOT NULL DEFAULT '',
+                attempts        INTEGER NOT NULL DEFAULT 0,
+                last_error      TEXT,
+                next_attempt_at TEXT,
+                failures        INTEGER NOT NULL DEFAULT 0,
+                exhausted       INTEGER NOT NULL DEFAULT 0,
+                created_at      TEXT NOT NULL,
+                updated_at      TEXT NOT NULL,
+                PRIMARY KEY (ref_kind, ref_id)
+            );
             CREATE TABLE IF NOT EXISTS settings (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -352,6 +446,15 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_inbox_unread ON notification_inbox(read_at);
             CREATE INDEX IF NOT EXISTS idx_inbox_conversation
                 ON notification_inbox(conversation_id, id);
+            -- OHB2-C7 (RESURRECTION-FIX): شاهد حذف **دائم** (tombstone). بيتكتب في نفس
+            -- معاملة الحذف، وبيفضل بعد إعادة التشغيل. أي مسار بيعيد إنشاء حالة شات نشطة
+            -- (متابعة/إكمال/إشعار/طلب) لازم يرفض معرّف متشاهد (إلا لو المستخدم أعاد
+            -- التفاعل صريح ⇒ الـ tombstone يتشال). `CREATE TABLE IF NOT EXISTS` ⇒ القواعد
+            -- القديمة بتاخده تلقائيًا (إضافي وغير مدمّر — مفيش فقد بيانات).
+            CREATE TABLE IF NOT EXISTS deleted_conversations (
+                conversation_id TEXT PRIMARY KEY,
+                deleted_at      TEXT
+            );
             """
         )
         self._migrate()
@@ -400,9 +503,35 @@ class Database:
         # والصفوف القديمة بتاخد NULL (مفيش فقد بيانات، والسلوك القديم زي ما هو).
         if outbox_cols and "client_ref" not in outbox_cols:
             self._conn.execute("ALTER TABLE outbox ADD COLUMN client_ref TEXT")
+        # OHB2-POST-PUB-01/F02: حالة إكمال الأثر المحلي (nullable ⇒ الصفوف القديمة بتاخد
+        # '' = لسه محتاج إكمال محلي لو الـ POST نجح؛ غير مدمّر).
+        if outbox_cols and "notify_state" not in outbox_cols:
+            self._conn.execute(
+                "ALTER TABLE outbox ADD COLUMN notify_state TEXT NOT NULL DEFAULT ''"
+            )
         creation_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(creation_jobs)")}
         if creation_cols and "client_ref" not in creation_cols:
             self._conn.execute("ALTER TABLE creation_jobs ADD COLUMN client_ref TEXT")
+        if creation_cols and "notify_state" not in creation_cols:
+            self._conn.execute(
+                "ALTER TABLE creation_jobs ADD COLUMN notify_state TEXT NOT NULL DEFAULT ''"
+            )
+        # OHB2-STABILIZATION-F02: أعمدة جدولة إعادة المحاولة/الاستنفاد لجدول الإكمال
+        # المعلّق. قواعد قديمة (بعد F02 الأصلي) بتاخدها إضافيًا وغير مدمّر — الصفوف القديمة
+        # بتاخد NULL/0 = مؤهّلة حالًا ولسه ماتستنفدتش.
+        completion_cols = {
+            r["name"] for r in self._conn.execute("PRAGMA table_info(completion_pending)")
+        }
+        if completion_cols and "next_attempt_at" not in completion_cols:
+            self._conn.execute("ALTER TABLE completion_pending ADD COLUMN next_attempt_at TEXT")
+        if completion_cols and "failures" not in completion_cols:
+            self._conn.execute(
+                "ALTER TABLE completion_pending ADD COLUMN failures INTEGER NOT NULL DEFAULT 0"
+            )
+        if completion_cols and "exhausted" not in completion_cols:
+            self._conn.execute(
+                "ALTER TABLE completion_pending ADD COLUMN exhausted INTEGER NOT NULL DEFAULT 0"
+            )
         # بعد ضمان وجود العمودين (للجداول القديمة كمان)، نعمل فهارس معرّف العملية.
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_outbox_client_ref ON outbox(client_ref)"
@@ -542,7 +671,7 @@ class Database:
     # ----------------------------------------------------------------- watched
     def add_watched(
         self, conversation_id: str, title: str = "", chat_id: int | None = None,
-        *, new_lifecycle: bool = True,
+        *, new_lifecycle: bool = True, reengage: bool = False,
     ) -> None:
         # TASK 54: إضافة/تحديث المتابعة = بداية دورة إشعار جديدة ⇒ نصفّر عدّاد المحاولات
         # عشان الإشعار الجديد ياخد ميزانية كاملة (مش ميزانية محاولات إشعار قديم).
@@ -564,6 +693,15 @@ class Database:
         conn = self._conn
         conn.execute("BEGIN IMMEDIATE")
         try:
+            # OHB2-C7 (RESURRECTION-FIX): منع الإحياء. لو الشات عليه شاهد حذف دائم، أي
+            # مسار إنشاء/تحديث متابعة (worker/outbox/استرجاع) بيترفض — إلا لو المستخدم
+            # أعاد التفاعل صريح (`reengage=True`، من مسار watch/prompt) فبنشيل الشاهد
+            # ونكمل دورة نظيفة. الفحص جوه BEGIN IMMEDIATE ⇒ محصّن ضد حذف متزامن.
+            if self.is_deleted(conversation_id):
+                if not reengage:
+                    conn.rollback()
+                    return
+                self._clear_tombstone_nocommit(conversation_id)
             if new_lifecycle:
                 row = conn.execute(
                     "SELECT pending_delivery_state FROM watched WHERE conversation_id=?",
@@ -787,6 +925,120 @@ class Database:
             conn.rollback()
             raise
 
+    # ------------------------------------------- deletion tombstone (OHB2-C7)
+    def is_deleted(self, conversation_id: str) -> bool:
+        """هل الشات عليه شاهد حذف دائم؟ (بيستخدمه كل مسار إعادة إنشاء/إحياء)."""
+        row = self._conn.execute(
+            "SELECT 1 FROM deleted_conversations WHERE conversation_id=?",
+            (conversation_id,),
+        ).fetchone()
+        return row is not None
+
+    def _tombstone_nocommit(self, conversation_id: str, now: str) -> None:
+        """يسجّل شاهد الحذف **داخل معاملة المستدعي** (idempotent: أول مرة بس تحفظ وقت الحذف)."""
+        self._conn.execute(
+            "INSERT OR IGNORE INTO deleted_conversations(conversation_id, deleted_at) "
+            "VALUES(?, ?)",
+            (conversation_id, now),
+        )
+
+    def _clear_tombstone_nocommit(self, conversation_id: str) -> None:
+        """يشيل شاهد الحذف **داخل معاملة المستدعي** (إعادة تفاعل صريح من المستخدم)."""
+        self._conn.execute(
+            "DELETE FROM deleted_conversations WHERE conversation_id=?",
+            (conversation_id,),
+        )
+
+    def delete_conversation(self, conversation_id: str, now: str) -> dict:
+        """حذف محلي آمن لشات في **معاملة ذرّية واحدة** (OHB2-C7).
+
+        يشيل كل الأثر المحلي المرتبط بالشات من غير أي نداء خارجي (مفيش حذف بعيد):
+        - `watched`: المتابعة + أي علامة تسليم معلّقة (ننسّقها عبر `on_unwatch` أولاً حتى
+          ما يتفقدش دليل تسليم اتّبعت فعلًا ⇒ مفيش إشعار مكرّر بعد الحذف).
+        - `outbox` غير المنتهي (`pending`/`claimed`): نشطبه كـ `discarded` (CAS من حالتين)
+          فمستحيل يتبعت بعده. حالات `sending`/`unknown` (الـ POST ممكن يكون بدأ) **مابنلمسهاش**
+          — احترامًا للغموض (مفيش إدّعاء إلغاء، ومفيش إعادة POST تلقائية).
+        - `creation_jobs` غير المنتهي (`pending`/`claimed`): نشطبه كـ `discarded` بنفس المنطق.
+        - `completion_pending` (كل الأنواع): يتحذف (الآثار المحلية المعلّقة للشات الملغي).
+        - `notification_state` / `notifier_pending` / `notifier_retry_not_before`:
+          يتحذفوا عشان المُبلّل/المراقب ما يكتشفوش الشات المحذوف كـ «جديد» ويبعتوا إشعار.
+        - `notification_inbox`: بيتسيب **كأثر** (تدقيق) — بيتم وسم تسليمه المعلّق كـ `superseded`
+          ومسح الحجز/موعد الإعادة عشان مايتسلّمش بعد الحذف، من غير حذف الصفوف.
+        - `user_state` (توجيه برومت معلّق لنفس الشات): يتفكّك (عشان مايتوجّهش لشات ملغي).
+        - `watcher` hints in-memory: تتنضّف عبر `on_unwatch`.
+
+        بترجّع ملخّص عددّي (للأثر). idempotent: شات محذوف مسبقًا ⇒ أصفار (مفيش خطأ).
+        """
+        if self.on_unwatch is not None:
+            self.on_unwatch(conversation_id)
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT pending_delivery_state FROM watched WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()
+            if row is not None and row["pending_delivery_state"]:
+                self.record_notification_sent(
+                    conversation_id, row["pending_delivery_state"], now, _commit=False
+                )
+            watched_deleted = conn.execute(
+                "DELETE FROM watched WHERE conversation_id=?", (conversation_id,)
+            ).rowcount
+            outbox_discarded = conn.execute(
+                "UPDATE outbox SET status=?, error=?, updated_at=? WHERE conversation_id=? "
+                "AND status IN (?, ?)",
+                (OUTBOX_DISCARDED, "اتحذف مع الشات", now, conversation_id,
+                 OUTBOX_PENDING, OUTBOX_CLAIMED),
+            ).rowcount
+            creation_discarded = conn.execute(
+                "UPDATE creation_jobs SET status=?, error=?, updated_at=? WHERE conversation_id=? "
+                "AND status IN (?, ?)",
+                (CREATION_DISCARDED, "اتحذف مع الشات", now, conversation_id,
+                 CREATION_PENDING, CREATION_CLAIMED),
+            ).rowcount
+            completion_deleted = conn.execute(
+                "DELETE FROM completion_pending WHERE conversation_id=?", (conversation_id,)
+            ).rowcount
+            notif_state_deleted = conn.execute(
+                "DELETE FROM notification_state WHERE conversation_id=?", (conversation_id,)
+            ).rowcount
+            conn.execute(
+                "DELETE FROM notifier_pending WHERE conversation_id=?", (conversation_id,)
+            )
+            conn.execute(
+                "DELETE FROM notifier_retry_not_before WHERE conversation_id=?", (conversation_id,)
+            )
+            inbox_superseded = conn.execute(
+                "UPDATE notification_inbox SET delivery_status='superseded', claim_token=NULL, "
+                "claim_at=NULL, next_retry_at=NULL WHERE conversation_id=? "
+                "AND delivery_status IN ('pending', 'failed')",
+                (conversation_id,),
+            ).rowcount
+            conn.execute(
+                "UPDATE user_state SET awaiting_conversation_id=NULL, awaiting_kind=NULL, "
+                "awaiting_at=NULL, awaiting_title=NULL WHERE awaiting_conversation_id=?",
+                (conversation_id,),
+            )
+            # OHB2-C7 (RESURRECTION-FIX): شاهد الحذف الدائم يُكتب **آخر** حاجة في نفس
+            # المعاملة، بعد إزالة كل الأثر المحلي. ترتيبه آخرًا مقصود: خلال المعاملة نفسها
+            # (`record_notification_sent` بتتنادى جوّه المعاملة قبل كده) لازم الشات يبان
+            # لسه غير محذوف عشان التسجيل الداخلي يكمّل؛ وبعد الـ commit الشاهد فعّال
+            # لأي مسار لاحق (ساعتها مستحيل يتخلّل بين الكتابة والـ commit — قفل الكتابة).
+            self._tombstone_nocommit(conversation_id, now)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return {
+            "watched_deleted": int(watched_deleted),
+            "outbox_discarded": int(outbox_discarded),
+            "creation_discarded": int(creation_discarded),
+            "completion_deleted": int(completion_deleted),
+            "notif_state_deleted": int(notif_state_deleted),
+            "inbox_superseded": int(inbox_superseded),
+        }
+
     def list_watched(self) -> list[Watched]:
         rows = self._conn.execute(
             "SELECT conversation_id, title, last_state, chat_id, submitted_at, added_at, "
@@ -1006,6 +1258,7 @@ class Database:
         now: str,
         window: timedelta | None = None,
         client_ref: str | None = None,
+        reengage: bool = False,
     ) -> int:
         """تجميع (القرار 2): لو فيه برومت 'pending' لنفس الوجهة اتحدّث خلال `window`،
 
@@ -1023,6 +1276,15 @@ class Database:
         conn = self._conn
         conn.execute("BEGIN IMMEDIATE")
         try:
+            # OHB2-C7 (RESURRECTION-FIX): إرسال برومت = إعادة تفاعل صريح من المستخدم ⇒
+            # يشيل شاهد الحذف (نبدأ دورة نظيفة). المسارات غير الصريحة (retry/recovery)
+            # بتبلّغ `reengage=False` فلو الشات متشاهد تُرفض — ده اللي يمنع الـ POST المتأخّر
+            # من إحياء شات محذوف. الفحص جوه المعاملة ⇒ محصّن ضد حذف متزامن.
+            if self.is_deleted(conversation_id):
+                if not reengage:
+                    conn.rollback()
+                    return 0
+                self._clear_tombstone_nocommit(conversation_id)
             if client_ref:
                 existing = conn.execute(
                     "SELECT id FROM outbox "
@@ -1255,6 +1517,7 @@ class Database:
             updated_at=row["updated_at"],
             attempts=row["attempts"],
             client_ref=row["client_ref"],
+            notify_state=row["notify_state"],
         )
 
     # ----------------------------------------------------------- creation jobs
@@ -1504,10 +1767,369 @@ class Database:
             updated_at=row["updated_at"],
             attempts=row["attempts"],
             client_ref=row["client_ref"],
+            notify_state=row["notify_state"],
         )
 
     def close(self) -> None:
         self._conn.close()
+
+    # ------------------------------------------- completion (local effects) F02
+    def _upsert_completion_pending_nocommit(
+        self,
+        ref_kind: str,
+        ref_id: int,
+        chat_id: int,
+        conversation_id: str,
+        now: str,
+        title: str = "",
+        last_state: str | None = None,
+        submitted_at: str | None = None,
+        notice_text: str = "",
+    ) -> None:
+        """كتابة intent الإكمال المحلي **بدون commit** (يستخدمها المستدعي في معاملته).
+
+        idempotent: نفس (ref_kind, ref_id) ⇒ تحديث البيانات الوصفية بس، مع **الحفاظ** على
+        حالة الجدولة/الاستنفاد (attempts/failures/next_attempt_at/exhausted) — إعادة
+        التسجيل مش محاولة جديدة ولا بتصفّر تعافي معلّق.
+
+        OHB2-C7 (RESURRECTION-FIX): لو الشات عليه شاهد حذف دائم ⇒ **مايتعملش intent إكمال**
+        (لا إدراج ولا تحديث). ده نقطة الحماية المركزية: `complete_outbox_sent`/
+        `complete_creation_done` بيفضلوا يثبّتوا الحالة النهائية للـ POST الناجح (خارجيًا
+        تم فعلًا) بس **ما بيخلقوش عمل إكمال محلي** لشات محذوف ⇒ مفيش إحياء ولا إشعار قديم.
+        الفحص جوه معاملة المستدعي (BEGIN IMMEDIATE) ⇒ محصّن ضد حذف متزامن.
+        """
+        if self.is_deleted(conversation_id):
+            return
+        self._conn.execute(
+            "INSERT INTO completion_pending"
+            "(ref_kind, ref_id, chat_id, conversation_id, title, last_state, submitted_at,"
+            " notice_text, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(ref_kind, ref_id) DO UPDATE SET "
+            "chat_id=excluded.chat_id, conversation_id=excluded.conversation_id, "
+            "title=excluded.title, last_state=excluded.last_state, "
+            "submitted_at=excluded.submitted_at, notice_text=excluded.notice_text, "
+            "updated_at=excluded.updated_at",
+            (
+                ref_kind, ref_id, chat_id, conversation_id, title, last_state,
+                submitted_at, notice_text, now, now,
+            ),
+        )
+
+    def add_completion_pending(
+        self,
+        ref_kind: str,
+        ref_id: int,
+        chat_id: int,
+        conversation_id: str,
+        now: str,
+        title: str = "",
+        last_state: str | None = None,
+        submitted_at: str | None = None,
+        notice_text: str = "",
+    ) -> None:
+        """يسجّل عمل إكمال محلي معلّق (write-ahead، idempotent).
+
+        مسار مستقل (مش جزء من انتقال الحالة الذرّي) — بيتستخدم للتعافي/الاختبارات. المسار
+        الإنتاجي للانتقال النهائي بيستخدم `complete_outbox_sent`/`complete_creation_done`
+        (انتقال + intent في معاملة واحدة).
+        """
+        self._upsert_completion_pending_nocommit(
+            ref_kind, ref_id, chat_id, conversation_id, now,
+            title=title, last_state=last_state, submitted_at=submitted_at,
+            notice_text=notice_text,
+        )
+        self._conn.commit()
+
+    def complete_outbox_sent(
+        self,
+        outbox_id: int,
+        now: str,
+        *,
+        chat_id: int,
+        conversation_id: str,
+        title: str = "",
+        last_state: str | None = None,
+        submitted_at: str | None = None,
+        notice_text: str = "",
+    ) -> bool:
+        """OHB2-STABILIZATION-F02: انتقال `sending`⇒`sent` **و** تسجيل intent الإكمال
+        المحلي في **معاملة ذرّية واحدة** (BEGIN IMMEDIATE). يا الاتنين يثبتوا أو ولا واحد.
+
+        ده بيقفل فجوة الـ crash: مستحيل يبقى فيه صف `sent` من غير intent إكمال محفوظ.
+        لو الـ CAS فشل (حالة أحدث حسمت السجل) بنرجّع False من غير أي كتابة (مفيش نجاح وهمي).
+        """
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = conn.execute(
+                "UPDATE outbox SET status=?, error=?, updated_at=? "
+                "WHERE id=? AND status=?",
+                (OUTBOX_SENT, None, now, outbox_id, OUTBOX_SENDING),
+            )
+            if cur.rowcount != 1:
+                conn.rollback()
+                return False
+            self._upsert_completion_pending_nocommit(
+                COMPLETION_KIND_OUTBOX, outbox_id, chat_id, conversation_id, now,
+                title=title, last_state=last_state, submitted_at=submitted_at,
+                notice_text=notice_text,
+            )
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+
+    def complete_creation_done(
+        self,
+        job_id: int,
+        now: str,
+        conversation_id: str,
+        *,
+        chat_id: int,
+        title: str = "",
+        last_state: str | None = "running",
+        notice_text: str = "",
+    ) -> bool:
+        """OHB2-STABILIZATION-F02: انتقال طلب الشات (claimed/starting)⇒`done` **و** تسجيل
+        intent الإكمال المحلي في **معاملة ذرّية واحدة**. نفس ضمان `complete_outbox_sent`.
+
+        بيرجّع False لو الـ CAS فشل (المستخدم شطب الطلب أو حسمه) — مفيش clobber ولا نجاح وهمي.
+        """
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = conn.execute(
+                "UPDATE creation_jobs SET status=?, conversation_id=?, updated_at=? "
+                "WHERE id=? AND status IN (?, ?)",
+                (CREATION_DONE, conversation_id, now, job_id, CREATION_CLAIMED, CREATION_STARTING),
+            )
+            if cur.rowcount != 1:
+                conn.rollback()
+                return False
+            self._upsert_completion_pending_nocommit(
+                COMPLETION_KIND_CREATION, job_id, chat_id, conversation_id, now,
+                title=title, last_state=last_state, notice_text=notice_text,
+            )
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+
+    def get_completion_pending(self, ref_kind: str, ref_id: int) -> CompletionPending | None:
+        row = self._conn.execute(
+            "SELECT * FROM completion_pending WHERE ref_kind=? AND ref_id=?",
+            (ref_kind, ref_id),
+        ).fetchone()
+        return self._row_to_completion(row) if row else None
+
+    def list_completion_pending(self) -> list[CompletionPending]:
+        rows = self._conn.execute(
+            "SELECT * FROM completion_pending ORDER BY created_at, ref_kind, ref_id"
+        ).fetchall()
+        return [self._row_to_completion(r) for r in rows]
+
+    def claim_completion_due(self, now: str, lease_until: str) -> CompletionPending | None:
+        """يحجز **ذرّياً** أقدم عنصر إكمال مؤهّل (غير مستنفد وموعد محاولته حان) وياخده.
+
+        - `exhausted=1` **مستبعد** (مايفضلش يعطّل العناصر السليمة).
+        - `next_attempt_at` في المستقبل ⇒ مؤجّل، مش مؤهّل (backoff دائم).
+        - الحجز = كتابة `next_attempt_at=lease_until` (إجارة قصيرة) في نفس الجملة، فمستحيل
+          اتنين worker/دورة ياخدوا نفس الصف (safe concurrent claiming). لو العملية وقعت
+          قبل الإكمال، الإجارة بتنتهي والصف يرجع مؤهّل (تعافٍ آمن).
+        بترجّع العنصر بعد الحجز أو None لو مفيش مؤهّل.
+        """
+        row = self._conn.execute(
+            "UPDATE completion_pending SET next_attempt_at=? "
+            "WHERE (ref_kind, ref_id) = ("
+            "  SELECT ref_kind, ref_id FROM completion_pending "
+            "  WHERE exhausted=0 AND (next_attempt_at IS NULL OR next_attempt_at <= ?) "
+            "  ORDER BY COALESCE(next_attempt_at, created_at), created_at, ref_kind, ref_id "
+            "  LIMIT 1) "
+            "RETURNING *",
+            (lease_until, now),
+        ).fetchone()
+        self._conn.commit()
+        return self._row_to_completion(row) if row else None
+
+    def bump_completion_attempt(
+        self,
+        ref_kind: str,
+        ref_id: int,
+        now: str,
+        error: str | None = None,
+        next_attempt_at: str | None = None,
+        max_attempts: int | None = None,
+    ) -> int:
+        """يزوّد عدّاد المحاولات/الفشل، يجدول إعادة المحاولة، ويرجّع عدد المحاولات الجديد
+        (0 لو الصف اتشال).
+
+        لو `max_attempts` اتحدّد ووصلنا له ⇒ نعلّم الصف `exhausted=1` (حالة ظاهرة للمشغّل،
+        مايتشالش). الفشل مش بيتحوّل لنجاح أبدًا.
+        """
+        row = self._conn.execute(
+            "UPDATE completion_pending SET attempts=attempts+1, failures=failures+1, "
+            "last_error=?, next_attempt_at=?, updated_at=?, "
+            "exhausted=CASE WHEN ? IS NOT NULL AND attempts+1 >= ? THEN 1 ELSE exhausted END "
+            "WHERE ref_kind=? AND ref_id=? RETURNING attempts",
+            (error, next_attempt_at, now, max_attempts, max_attempts, ref_kind, ref_id),
+        ).fetchone()
+        self._conn.commit()
+        return int(row["attempts"]) if row else 0
+
+    def clear_completion_pending(self, ref_kind: str, ref_id: int) -> None:
+        self._conn.execute(
+            "DELETE FROM completion_pending WHERE ref_kind=? AND ref_id=?",
+            (ref_kind, ref_id),
+        )
+        self._conn.commit()
+
+    def rearm_completion_pending(self, ref_kind: str, ref_id: int, now: str) -> bool:
+        """يعيد تأهيل عنصر مستنفد (يرجّعه مؤهّل للمحاولة) — تدخّل المشغّل الصريح.
+
+        بيصفّر `exhausted` و`next_attempt_at` و`attempts` (محاولة جديدة) من غير أي عملية
+        خارجية. بترجّع True لو فيه صف اتغيّر.
+        """
+        cur = self._conn.execute(
+            "UPDATE completion_pending SET exhausted=0, next_attempt_at=NULL, attempts=0, "
+            "last_error=NULL, updated_at=? WHERE ref_kind=? AND ref_id=?",
+            (now, ref_kind, ref_id),
+        )
+        self._conn.commit()
+        return cur.rowcount == 1
+
+    def list_completion_exhausted(self) -> list[CompletionPending]:
+        rows = self._conn.execute(
+            "SELECT * FROM completion_pending WHERE exhausted=1 "
+            "ORDER BY updated_at, ref_kind, ref_id"
+        ).fetchall()
+        return [self._row_to_completion(r) for r in rows]
+
+    def count_completion_pending(self) -> int:
+        """عدد أعمال الإكمال المحلي المعلّقة (لإعلان الحالة الصادقة عند عدم اليقين)."""
+        row = self._conn.execute("SELECT COUNT(*) AS n FROM completion_pending").fetchone()
+        return int(row["n"])
+
+    def completion_stats(self, now: str) -> dict:
+        """ملخّص حالة الإكمال المحلي (محدود، بلا محتوى حساس) للرصد/الجاهزية.
+
+        بيرجّع: pending (الكل)، eligible (غير مستنفد وموعد محاولته حان)، deferred
+        (غير مستنفد لكن مجدول لمستقبل)، exhausted (مطلوب تدخّل)، oldest_pending_at.
+        """
+        row = self._conn.execute(
+            "SELECT "
+            " COUNT(*) AS pending, "
+            " SUM(CASE WHEN exhausted=0 AND (next_attempt_at IS NULL OR next_attempt_at <= ?)"
+            "          THEN 1 ELSE 0 END) AS eligible, "
+            " SUM(CASE WHEN exhausted=0 AND next_attempt_at IS NOT NULL AND next_attempt_at > ?"
+            "          THEN 1 ELSE 0 END) AS deferred, "
+            " SUM(CASE WHEN exhausted=1 THEN 1 ELSE 0 END) AS exhausted, "
+            " MIN(created_at) AS oldest "
+            "FROM completion_pending",
+            (now, now),
+        ).fetchone()
+        return {
+            "pending": int(row["pending"] or 0),
+            "eligible": int(row["eligible"] or 0),
+            "deferred": int(row["deferred"] or 0),
+            "exhausted": int(row["exhausted"] or 0),
+            "oldest_pending_at": row["oldest"],
+        }
+
+    def count_legacy_unresolved_completions(self) -> int:
+        """عدد الصفوف القديمة اللي **مستحيل** نحدّد بأمان إن إكمالها المحلي ضاع.
+
+        `outbox` في حالة `sent` أو `creation_jobs` في `done` من غير صف إكمال محفوظ.
+        دول ممكن يكونوا (أ) اكتملوا فعلًا قبل الإصلاح الذرّي (الإكمال اتشال بعد النجاح)،
+        أو (ب) وقعوا في نافذة الـ crash القديمة. **مفيش أي علامة دائمة تفرّق بينهم**، فبدل
+        ما نخترع إشعارات مكرّرة لصفوف مكتملة، بنسيبهم ظاهرين للمشغّل (حالة غير محلولة
+        صريحة) مع إمكانية تسوية يدوية لكل مرجع. **مافيش POST خارجي ولا اختلاق نجاح.**
+        """
+        row = self._conn.execute(
+            "SELECT ("
+            "  (SELECT COUNT(*) FROM outbox o "
+            "     LEFT JOIN completion_pending c ON c.ref_kind=? AND c.ref_id=o.id "
+            "   WHERE o.status=? AND c.ref_kind IS NULL "
+            "     AND o.chat_id IS NOT NULL AND o.conversation_id IS NOT NULL "
+            "     AND o.conversation_id != '' "
+            "     AND o.conversation_id NOT IN (SELECT conversation_id FROM deleted_conversations)) + "
+            "  (SELECT COUNT(*) FROM creation_jobs j "
+            "     LEFT JOIN completion_pending c ON c.ref_kind=? AND c.ref_id=j.id "
+            "   WHERE j.status=? AND c.ref_kind IS NULL "
+            "     AND j.conversation_id IS NOT NULL AND j.chat_id IS NOT NULL "
+            "     AND j.conversation_id NOT IN (SELECT conversation_id FROM deleted_conversations)) "
+            ") AS n",
+            (COMPLETION_KIND_OUTBOX, OUTBOX_SENT, COMPLETION_KIND_CREATION, CREATION_DONE),
+        ).fetchone()
+        return int(row["n"] or 0)
+
+    def reconcile_legacy_completion(self, ref_kind: str, ref_id: int, now: str) -> bool:
+        """تسوية **يدوية صريحة** لصف قديم واحد (تدخّل المشغّل): ينشئ intent إكمال محلي.
+
+        بتشتغل بس على صف `sent`/`done` من غير intent موجود (وإلا False). بتشتقّ البيانات من
+        الحقول الموجودة فعلًا (chat_id، conversation_id، title) — **مفيش POST خارجي**. بعد
+        التسوية، الإكمال بيتنفّذ بأمان (idempotent). بترجّع True لو اتسوّى.
+        """
+        if ref_kind == COMPLETION_KIND_OUTBOX:
+            row = self._conn.execute(
+                "SELECT o.id, o.conversation_id, o.chat_id, o.updated_at, w.title "
+                "FROM outbox o LEFT JOIN watched w ON w.conversation_id = o.conversation_id "
+                "WHERE o.id=? AND o.status=? AND o.chat_id IS NOT NULL "
+                "  AND o.conversation_id IS NOT NULL AND o.conversation_id != ''",
+                (ref_id, OUTBOX_SENT),
+            ).fetchone()
+            if row is None:
+                return False
+            # OHB2-C7 (RESURRECTION-FIX): شات متشاهد حذف ⇒ مفيش تسوية (مفيش إحياء).
+            if self.is_deleted(row["conversation_id"]):
+                return False
+            self._upsert_completion_pending_nocommit(
+                COMPLETION_KIND_OUTBOX, int(row["id"]), int(row["chat_id"]),
+                row["conversation_id"], now, title=row["title"] or "",
+                last_state="", submitted_at=row["updated_at"], notice_text="",
+            )
+        elif ref_kind == COMPLETION_KIND_CREATION:
+            row = self._conn.execute(
+                "SELECT j.id, j.conversation_id, j.chat_id, j.repo FROM creation_jobs j "
+                "WHERE j.id=? AND j.status=? AND j.conversation_id IS NOT NULL "
+                "  AND j.chat_id IS NOT NULL",
+                (ref_id, CREATION_DONE),
+            ).fetchone()
+            if row is None:
+                return False
+            # OHB2-C7 (RESURRECTION-FIX): شات متشاهد حذف ⇒ مفيش تسوية (مفيش إحياء).
+            if self.is_deleted(row["conversation_id"]):
+                return False
+            self._upsert_completion_pending_nocommit(
+                COMPLETION_KIND_CREATION, int(row["id"]), int(row["chat_id"]),
+                row["conversation_id"], now, title=row["repo"] or "",
+                last_state="running", notice_text="",
+            )
+        else:
+            return False
+        self._conn.commit()
+        return True
+
+    @staticmethod
+    def _row_to_completion(row: sqlite3.Row) -> CompletionPending:
+        return CompletionPending(
+            ref_kind=row["ref_kind"],
+            ref_id=row["ref_id"],
+            chat_id=row["chat_id"],
+            conversation_id=row["conversation_id"],
+            title=row["title"] or "",
+            last_state=row["last_state"],
+            submitted_at=row["submitted_at"],
+            notice_text=row["notice_text"] or "",
+            attempts=row["attempts"],
+            last_error=row["last_error"],
+            next_attempt_at=row["next_attempt_at"],
+            failures=row["failures"] if "failures" in row.keys() else 0,
+            exhausted=row["exhausted"] if "exhausted" in row.keys() else 0,
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
 
     # ------------------------------------------------------------- preferences
     # إعدادات عامة مفاتيح/قيم. منفصلة عن الأسرار (الأسرار متغيرات بيئة بس). تفضيل
@@ -1597,6 +2219,11 @@ class Database:
         `_commit=False` بيخلي النداء ينضمّ لمعاملة المستدعي بدل ما يعمل commit خاص بيه
         (مستخدم في `remove_watched` عشان التسجيل والحذف يبقوا معاملة واحدة).
         """
+        # OHB2-C7 (RESURRECTION-FIX): شات متشاهد حذف ⇒ ما نعملش/نحدّثش لقطة إشعار
+        # (منع إشعار قديم عن شات ملغي). محصّن ضد حذف متزامن: الحذف بيكتب الشاهد داخل
+        # BEGIN IMMEDIATE، والقراءة دي بتشوفه بمجرد الـ commit.
+        if self.is_deleted(conversation_id):
+            return
         self._conn.execute(
             "INSERT OR IGNORE INTO notification_state(conversation_id) VALUES(?)",
             (conversation_id,),
@@ -1661,6 +2288,11 @@ class Database:
         conn = self._conn
         conn.execute("BEGIN IMMEDIATE")
         try:
+            # OHB2-C7 (RESURRECTION-FIX): مفيش إعادة إنشاء لقطة إشعار لشات متشاهد حذف
+            # (سباق ممكن: المُبلّل قرأ لقطة قديمة قبل الحذف ثم نادى note_transition بعده).
+            if self.is_deleted(conversation_id):
+                conn.rollback()
+                return 0
             row = conn.execute(
                 "SELECT transition_seq, discovered_status FROM notification_state "
                 "WHERE conversation_id=?",
@@ -1935,6 +2567,11 @@ class Database:
         conn = self._conn
         conn.execute("BEGIN IMMEDIATE")
         try:
+            # OHB2-C7 (RESURRECTION-FIX): مفيش إدراج حدث إشعار لشات متشاهد حذف (منع إشعار
+            # قديم عن شات ملغي). الفحص جوه المعاملة ⇒ محصّن ضد حذف متزامن.
+            if self.is_deleted(conversation_id):
+                conn.rollback()
+                return None
             cur = conn.execute(
                 "INSERT INTO notification_inbox"
                 "(conversation_id, title, kind, message, created_at, read_at, event_key, "
@@ -2335,16 +2972,20 @@ class Database:
     def run_startup_maintenance(self) -> bool:
         """صيانة تشغيل آمنة: فحص سريع ثم تحسين + checkpoint.
 
-        بيرجّع True لو الفحص السريع سليم، وFalse لو القاعدة تالفة (وبيسجّل تحذير).
-        ما بيرميش: أي خطأ فحص/صيانة بيتسجّل بس عشان البوت يشتغل لو القاعدة سليمة.
+        OHB2-POST-PUB-01/F06: نتيجة الفحص السريع بقت **مرجعية** — بتتخزّن في
+        `integrity_ok` وبتتحكم في الجاهزية وبدء الـ workers. بترجّع True لو الفحص السريع
+        سليم، وFalse لو القاعدة تالفة أو الفحص نفسه رمى (وبتسجّل سبب واضح).
+        ما بتحذفش/تعيد بناء قاعدة تالفة (مفيش إصلاح تلقائي)، وما بترميش.
         """
         try:
             healthy = self.quick_check()
         except sqlite3.DatabaseError as exc:
             log.error("فحص قاعدة البيانات فشل (%s)", type(exc).__name__)
+            self.integrity_ok = False
             return False
         if not healthy:
             log.error("قاعدة البيانات فحصها فشل (quick_check != ok)")
+            self.integrity_ok = False
             return False
         try:
             self.optimize()
@@ -2352,4 +2993,5 @@ class Database:
         except sqlite3.Error as exc:
             # الصيانة مش حرجة: القاعدة سليمة، فمنعطّلش البوت عشانها.
             log.warning("صيانة قاعدة البيانات اتخطّت (%s)", type(exc).__name__)
+        self.integrity_ok = True
         return True

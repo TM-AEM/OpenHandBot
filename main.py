@@ -41,6 +41,24 @@ def main() -> int:
     setup_logging(config.log_level, config.secrets)
 
     app = build_application(config)
+    # OHB2-POST-PUB-01/F06: فحص تكامل القاعدة **قبل** أي polling — نتيجة الفحص مرجعية.
+    # لو القاعدة تالفة/غير مؤكدة، بنرفض الإقلاع كله (مفيش polling، مفيش workers، مفيش
+    # ادّعاء جاهزية). بنخزّن النتيجة على التطبيق عشان `_post_init` يعيد استخدامها بدل
+    # تكرار الفحص. مفيش حذف/إعادة بناء تلقائية لقاعدة تالفة.
+    # (دفاعي: التطبيق الحقيقي دايمًا عنده bot_data["db"]؛ ده يحمي نقاط اعتراض الاختبار.)
+    db = getattr(app, "bot_data", {}).get("db")
+    if db is not None and not db.run_startup_maintenance():
+        app.bot_data["db_checked"] = True
+        app.bot_data["startup_failed"] = "database_integrity"
+        logging.getLogger("main").error(
+            "إقلاع متوقف: فحص تكامل قاعدة البيانات فشل (%s). "
+            "راجع القاعدة يدويًا — مفيش إصلاح/حذف تلقائي.",
+            config.db_path,
+        )
+        print("فشل الإقلاع: فحص تكامل قاعدة البيانات فشل — مفيش تشغيل.", file=sys.stderr)
+        return 1
+    if db is not None:
+        app.bot_data["db_checked"] = True
     # القرار (OHB2-02): `drop_pending_updates=True` **مقصود**. بعد أي restart/انقطاع،
     # التحديثات القديمة المتراكمة بتترمي بدل ما تتنفّذ كلها مرة واحدة. النتيجة التشغيلية:
     # أوامر/رسائل اتبعتت وقت البوت واقف مش هتتعالج. ده مقبول للاستخدام الفردي (المالك

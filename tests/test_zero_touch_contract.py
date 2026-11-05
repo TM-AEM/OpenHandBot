@@ -1,8 +1,7 @@
-"""OHB2-N10-22/25: عقد الإقلاع Zero-Touch — تأكيدات موحّدة (بدون شبكة/بوت/نسخ).
+"""OHB2-N10-22: عقد الإقلاع Zero-Touch — تأكيدات موحّدة (بدون شبكة/بوت).
 
 بيغطّي المسار الحقيقي: تحقق الإعداد → تجهيز المجلدات → بناء التطبيق → دورة حياة الـ workers →
-إغلاق نظيف. OHB2-N10-25: النسخ **خارج النواة تمامًا** — مفيش أي ادعاء جاهزية نسخ ولا استدعاء
-لمكوّن نسخ. مفيش polling ولا شبكة.
+إغلاق نظيف. مفيش polling ولا شبكة.
 """
 
 from __future__ import annotations
@@ -76,8 +75,8 @@ def test_fresh_env_only_startup_is_ready(tmp_path):
     assert not Path(res.config.db_path).exists()  # مفيش قاعدة مُنشأة قبل التطبيق
 
 
-def test_bootstrap_status_has_no_backup_claim(tmp_path):
-    # OHB2-N10-25: غياب النسخ مالوش أي أثر — الإقلاع مايدّعيش ولا يذكر جاهزية نسخ.
+def test_bootstrap_status_is_feature_neutral(tmp_path):
+    # الإقلاع مايدّعيش جاهزية أي ميزة خارج نواة التشغيل.
     res = boot.prepare_runtime(_required_env(tmp_path), version_info=(3, 13, 0))
     assert res.ready is True
     assert "backup" not in res.status()
@@ -178,7 +177,7 @@ def test_existing_db_preserved_across_restart(tmp_path, quiet_app):
 
 
 def test_core_has_no_backup_references():
-    """OHB2-N10-25: النواة (main/bootstrap/app) مابتلمسش النسخ ولا بتدّعي جاهزيته."""
+    """النواة (main/bootstrap/app) مابتلمسش أي مكوّن نسخ ولا بتدّعي جاهزيته."""
     import ast
 
     for rel in ("main.py", "bot/bootstrap.py", "bot/app.py"):

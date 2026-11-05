@@ -75,7 +75,7 @@ def test_bootstrap_status_has_no_secret(tmp_path):
 
 
 def test_core_modules_do_not_import_backup():
-    """OHB2-N10-25: نواة التشغيل مابتستوردش أي وحدة نسخ (فحص AST مش نص)."""
+    """نواة التشغيل مابتستوردش أي وحدة نسخ (فحص AST مش نص)."""
     for rel in ("main.py", "bot/app.py", "bot/bootstrap.py"):
         tree = ast.parse(_src(rel))
         for node in ast.walk(tree):
