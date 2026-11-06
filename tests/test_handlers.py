@@ -1404,3 +1404,57 @@ def test_delete_then_list_cannot_show_deleted_end_to_end(tmp_path):
     second = _t55_cb_update(CQ("list:0"))
     asyncio.run(h.list_conversations(second, ctx))
     assert _shown_ids(second) == ["keep"]
+
+
+# ========================================= OHB2-AUDIT-FIX-05: bot list pagination
+class PagedClient:
+    """عميل وهمي بيدعم البحث بصفحات عبر next_page_id (لاختبار لمّ كل الصفحات)."""
+
+    def __init__(self, pages):
+        self._pages = pages
+        self.calls = []
+
+    async def search_conversations(self, limit=100, page_id=None):
+        self.calls.append(page_id)
+        return self._pages[page_id]
+
+
+def test_list_conversations_collects_all_pages(tmp_path):
+    """البوت لازم يجمع **كل** الصفحات (مش أول صفحة بس) — 15 شات على صفحتين."""
+    pages = {
+        None: {
+            "items": [
+                {"id": f"c{i}", "title": f"شات {i}", "execution_status": "running"}
+                for i in range(10)
+            ],
+            "next_page_id": "p2",
+        },
+        "p2": {
+            "items": [
+                {"id": f"c{i}", "title": f"شات {i}", "execution_status": "running"}
+                for i in range(10, 15)
+            ],
+            "next_page_id": None,
+        },
+    }
+    client = PagedClient(pages)
+    ctx = make_context(1, tmp_path, client=client)
+    asyncio.run(h.list_conversations(_list_update(1, 0), ctx))
+    # الصفحة الثانية من الـ 15 (c10..c14) لازم تكون موجودة (يعني اتلمّت كل الصفحات).
+    upd = _list_update(1, 1)
+    asyncio.run(h.list_conversations(upd, ctx))  # نفس السياق ⇒ من الكاش
+    assert "صفحة 2" in upd.callback_query.edits[-1]
+    assert client.calls == [None, "p2"]  # اتلمّت كل الصفحات مرة واحدة
+
+
+def test_list_conversations_flags_truncation(tmp_path):
+    """لو القايمة أطول من الحد، نعلن إننا بنعرض جزء (مش إخفاء صامت)."""
+    class AlwaysMore:
+        async def search_conversations(self, limit=100, page_id=None):
+            return {"items": [{"id": f"c{page_id}", "title": "x",
+                               "execution_status": "running"}], "next_page_id": "more"}
+
+    ctx = make_context(1, tmp_path, client=AlwaysMore())
+    upd = _list_update(1, 0)
+    asyncio.run(h.list_conversations(upd, ctx))
+    assert "القايمة طويلة" in upd.callback_query.edits[-1]

@@ -506,3 +506,48 @@ def test_outbox_recover_concurrent_delete_no_new_notice_but_inflight_may_arrive(
     assert db.get_watched(CID) is None
     assert db.is_deleted(CID) is True
     assert db.get_completion_pending(COMPLETION_KIND_OUTBOX, first) is None
+
+
+# ================================ 6) OHB2-AUDIT-FIX-01: سباق برومت الـ Mini App
+def test_miniapp_ref_prompt_cannot_resurrect_tombstoned(tmp_path):
+    """عمليات الـ Mini App (بحمل `client_ref`) مستحيل تحيي شات متشاهد.
+
+    ده الـ race الحقيقي: الـ POST بدأ قبل الحذف وخلص بعده (await شبكة). الـ client_ref
+    كان بيشيل الشاهد الأول قبل فحص الـ idempotency ⇒ إحياء. دلوقتي مرفوض بلا أثر.
+    """
+    db = _db(tmp_path)
+    now = outbox.now_iso()
+    db.add_watched(CID, "شات", chat_id=OWNER)
+    db.delete_conversation(CID, now)
+    assert db.is_deleted(CID) is True
+
+    # نفس العملية (client_ref) بحمل/بدون reengage ⇒ مرفوضة دايمًا، بلا أي كتابة.
+    assert db.add_or_group_outbox(CID, OWNER, "نص", now, client_ref="r1") == 0
+    assert db.add_or_group_outbox(CID, OWNER, "نص", now, client_ref="r1", reengage=True) == 0
+    assert db.is_deleted(CID) is True      # الشاهد ما اتشالش
+    assert db.count_outbox() == 0          # مفيش صف صندوق اتخلق
+    assert db.get_watched(CID) is None     # مفيش إحياء
+
+
+def test_client_ref_prompt_on_active_conversation_still_queues(tmp_path):
+    """تحكّم موجب: على شات نشِط (مفيش شاهد)، برومت الـ Mini App يشتغل عادي."""
+    db = _db(tmp_path)
+    now = outbox.now_iso()
+    oid = db.add_or_group_outbox(CID, OWNER, "نص", now, client_ref="r1")
+    assert oid > 0
+    assert db.count_outbox() == 1
+    assert db.is_deleted(CID) is False
+
+
+def test_bot_no_ref_explicit_reengagement_still_clears_tombstone(tmp_path):
+    """مسار البوت (من غير client_ref) لسه بيتصرف كإعادة تفاعل صريح (مش مكسور)."""
+    db = _db(tmp_path)
+    now = outbox.now_iso()
+    db.add_watched(CID, "شات", chat_id=OWNER)
+    db.delete_conversation(CID, now)
+    oid = db.add_or_group_outbox(CID, OWNER, "نص", now, reengage=True)
+    assert oid > 0 and db.is_deleted(CID) is False
+    # وغير الصريح (retry/recovery) لسه مرفوض.
+    db.delete_conversation(CID, now)
+    assert db.add_or_group_outbox(CID, OWNER, "نص", now) == 0
+    assert db.is_deleted(CID) is True

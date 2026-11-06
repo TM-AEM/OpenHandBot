@@ -14,6 +14,7 @@ from . import keyboards as kb
 from . import outbox
 from .errors import ApiError, ResponseTooLargeError, error_text
 from .file_cache import FileCache
+from .openhands_client import collect_conversations
 from .files import (
     CONVERSATION_ERRORS,
     FileService,
@@ -293,15 +294,20 @@ def _without_deleted(db, items: list[dict]) -> list[dict]:
     """يشيل الشاتات المحذوفة محليًا (tombstone) من قايمة شاتات البوت (OHB2-F1).
 
     القايمة بتيجي من بحث بعيد مش عارف بالحذف المحلي، فبندمجها مع شاهد الحذف قبل الترقيم
-    عشان الشات المحذوف ما يظهرش لا من كاش قديم ولا من بحث جديد. قاعدة غير متاحة ⇒ ما
-    نكسرش القايمة (نرجّع زي ما هي).
+    عشان الشات المحذوف ما يظهرش لا من كاش قديم ولا من بحث جديد.
+
+    OHB2-AUDIT-FIX-04 (فشل مغلق): لو تعذّر قراءة شواهد الحذف (قاعدة غير متاحة)، بنرجّع
+    قايمة **فاضية** بدل القايمة غير المفلترة. الادّعاء إن شات «مش محذوف» لما إحنا مش قادرين
+    نتأكّد أسوأ من إظهار «مفيش شاتات» مؤقتًا — الإظهار بالغلط أثر أمني/خصوصية (شات اتحذف
+    بيبان تاني)، بينما الإخفاء بالغلط transient وبيتحلّ بمجرد رجوع القاعدة.
     """
     if not items:
         return items
     try:
         return [c for c in items if not db.is_deleted(c.get("id") or "")]
-    except Exception:  # noqa: BLE001 — قاعدة غير متاحة ⇒ ما نكسرش القايمة
-        return items
+    except Exception:  # noqa: BLE001 — قاعدة غير متاحة ⇒ نفشل مقفولين (مفيش إظهار بالغلط)
+        log.warning("تعذّر قراءة شواهد الحذف؛ بنخفي القايمة مؤقتًا (فشل مغلق).")
+        return []
 
 
 async def list_conversations(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -312,21 +318,23 @@ async def list_conversations(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.bot_data["db"].clear_awaiting(update.effective_user.id)  # تنقّل = خروج من أي توجيه
     page = int(q.data.split(":", 1)[1])
     client = context.bot_data["client"]
-    # نجيب لحد 100 شات مرة واحدة ونرتّبهم إحنا، عشان الترتيب الخام من الـ API
-    # مش مضمون وبيكسر الترقيم لو رتّبنا كل صفحة لوحدها.
+    # نجيب كل صفحات البحث (نتبع next_page_id بحد أقصى) ونرتّبهم إحنا، عشان الترتيب الخام
+    # من الـ API مش مضمون وبيكسر الترقيم لو رتّبنا كل صفحة لوحدها.
     # TASK 55 (G4): كاش قصير للقايمة عشان الضغط على «المزيد» ما يعملش طلب API كل مرة.
     cache = context.bot_data.get("list_cache")
     if cache and time.monotonic() - cache[0] < LIST_TTL:
         items = cache[1]
+        truncated = cache[2] if len(cache) > 2 else False
     else:
         try:
-            result = await client.search_conversations(limit=100)
+            collected = await collect_conversations(client)
         except ApiError as exc:
             await _safe_edit(q, error_text(exc))
             return
-        items = result["items"]
+        items = collected["items"]
+        truncated = collected["truncated"]
         if items:
-            context.bot_data["list_cache"] = (time.monotonic(), items)
+            context.bot_data["list_cache"] = (time.monotonic(), items, truncated)
     # OHB2-F1: الشاتات المحذوفة محليًا لازم تختفي من القايمة قبل الترقيم — سواء جاية من
     # كاش قديم أو من بحث بعيد جديد (البحث مش عارف بالحذف المحلي).
     items = _without_deleted(context.bot_data["db"], items)
@@ -339,9 +347,13 @@ async def list_conversations(update: Update, context: ContextTypes.DEFAULT_TYPE)
         page, start = 0, 0
         chunk = items[:PAGE_SIZE]
     has_more = len(items) > start + PAGE_SIZE
+    header = f"آخر الشاتات (صفحة {page + 1}):"
+    if truncated:
+        # OHB2-AUDIT-FIX-05: القايمة أطول من الحد المسموح ⇒ نعلن ده بدل إخفاء صامت.
+        header += f"\n(القايمة طويلة — بنعرض أحدث {len(items)} شات.)"
     await _safe_edit(
         q,
-        f"آخر الشاتات (صفحة {page + 1}):",
+        header,
         reply_markup=kb.conversations_menu(chunk, page, has_more),
     )
 

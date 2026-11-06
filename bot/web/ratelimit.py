@@ -54,8 +54,9 @@ class SlidingWindowLimiter:
     def allow(self, key: str, now: float | None = None) -> tuple[bool, float]:
         """يسجّل حدث للمفتاح لو مسموح. يرجّع (مسموح، retry_after ثواني).
 
-        لو اتمنع، ما بيتسجّلش أي حدث و`retry_after` = الوقت المتبقي لحد ما أقدم حدث
-        في أكثر قاعدة متجاوزة يخرج من النافذة.
+        كل قاعدة بتتحسب على نافذتها **بمفردها** (عدد الأحداث اللي جوه نافذتها بس).
+        لو أكثر من قاعدة متجاوزة، `retry_after` = أطول انتظار مطلوب (لحد ما كل
+        النوافذ المتجاوزة تبقى سليمة). لو اتمنع، ما بيتسجّلش أي حدث.
         """
         current = self._clock() if now is None else now
         bucket = self._events.get(key)
@@ -66,11 +67,9 @@ class SlidingWindowLimiter:
         else:
             self._prune(bucket, current)
 
-        for lim in self._limits:
-            if len(bucket) >= lim.max_events:
-                oldest = bucket[0]
-                retry = max(0.0, oldest + lim.window_seconds - current)
-                return False, retry
+        blocked = self._blocked_retry(bucket, current)
+        if blocked is not None:
+            return False, blocked
 
         bucket.append(current)
         return True, 0.0
@@ -82,11 +81,37 @@ class SlidingWindowLimiter:
         if not bucket:
             return 0.0
         self._prune(bucket, current)
-        wait = 0.0
+        return self._blocked_retry(bucket, current) or 0.0
+
+    def _blocked_retry(self, bucket: deque[float], current: float) -> float | None:
+        """أطول انتظار مطلوب لو أي نافذة متجاوزة، أو None لو كل النوافذ سليمة.
+
+        لكل نافذة متجاوزة، الانتظار = الوقت المتبقي لحد ما **أقدم حدث جوه النافذة دي**
+        يخرج منها. النتيجة مش بتخلط نوافذ غير متعلّقة.
+        """
+        wait: float | None = None
         for lim in self._limits:
-            if len(bucket) >= lim.max_events:
-                wait = max(wait, max(0.0, bucket[0] + lim.window_seconds - current))
+            in_window = self._events_within(bucket, current, lim.window_seconds)
+            if in_window >= lim.max_events:
+                earliest = self._earliest_within(bucket, current, lim.window_seconds)
+                window_wait = max(0.0, earliest + lim.window_seconds - current)
+                wait = window_wait if wait is None else max(wait, window_wait)
         return wait
+
+    @staticmethod
+    def _events_within(bucket: deque[float], current: float, window_seconds: float) -> int:
+        """عدد الأحداث اللي جوه النافذة المحدّدة (أحدث من `current - window`)."""
+        cutoff = current - window_seconds
+        return sum(1 for t in bucket if t > cutoff)
+
+    @staticmethod
+    def _earliest_within(bucket: deque[float], current: float, window_seconds: float) -> float:
+        """أقدم حدث جوه النافذة المحدّدة (أول واحد بيخرج منها)."""
+        cutoff = current - window_seconds
+        for t in bucket:
+            if t > cutoff:
+                return t
+        return current  # نظريًا ما يوصلش: بيتنادى بس لما النافذة متجاوزة
 
     def reset(self) -> None:
         self._events.clear()

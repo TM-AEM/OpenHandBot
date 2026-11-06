@@ -655,3 +655,123 @@ def test_miniapp_list_cache_refresh_still_hides_deleted(tmp_path):
     # من غير refresh (من الكاش) برضه لازم يختفي.
     r = tc.get("/api/v1/conversations")
     assert "c1" not in [i["id"] for i in r.json()["items"]]
+
+
+# ===================================== OHB2-AUDIT-FIX-04: fail-closed tombstone filter
+class _RaisingDB:
+    """قاعدة وهمية: `is_deleted` بترمي (محاكاة قاعدة غير متاحة/تالفة)."""
+
+    def is_deleted(self, conversation_id):
+        raise RuntimeError("database unavailable")
+
+
+def test_bot_without_deleted_fails_closed_on_db_error():
+    """handlers._without_deleted: خطأ قاعدة ⇒ قايمة فاضية (مش القايمة غير المفلترة)."""
+    items = [{"id": "c1"}, {"id": "c2"}]
+    assert h._without_deleted(_RaisingDB(), items) == []
+
+
+def test_bot_without_deleted_empty_input_short_circuits():
+    """مدخل فاضي ⇒ فاضي (مفيش نداء للقاعدة أصلًا)."""
+    assert h._without_deleted(_RaisingDB(), []) == []
+
+
+def test_miniapp_without_deleted_fails_closed_on_db_error(tmp_path):
+    """MiniAppService._without_deleted: خطأ قاعدة ⇒ قايمة فاضية (فشل مغلق)."""
+    from bot.web.services import MiniAppService
+
+    svc = MiniAppService(make_config(), _RaisingDB())
+    items = [{"id": "c1"}, {"id": "c2"}]
+    assert svc._without_deleted(items) == []
+
+
+def test_miniapp_list_hides_all_on_db_error(tmp_path):
+    """تكاملي: قاعدة بتفشل في is_deleted ⇒ الـ API يرجّع قايمة فاضية (مفيش إظهار بالغلط)."""
+    db = _db(tmp_path)
+    items = [
+        {"id": "c1", "title": "واحد", "execution_status": "running", "created_by_user_id": OWNER_UUID},
+        {"id": "c2", "title": "اتنين", "execution_status": "running", "created_by_user_id": OWNER_UUID},
+    ]
+    app = _FakeApp()
+    client = _ListClient(items)
+    tc = TestClient(
+        build_web_app(make_config(), db, client=client, application=app),
+        raise_server_exceptions=False,
+    )
+    login(tc)
+    assert tc.get("/api/v1/conversations?refresh=1").status_code == 200  # يملأ الكاش
+
+    # نخرّب قراءة الشواهد فقط (بعد ما الكاش اتملى) ⇒ الفلترة تفشل ⇒ فشل مغلق.
+    def _boom(_cid):
+        raise RuntimeError("db down")
+
+    db.is_deleted = _boom  # type: ignore[assignment]
+    r = tc.get("/api/v1/conversations?refresh=1")
+    assert r.status_code == 200
+    assert r.json()["items"] == [], "لازم نخفي القايمة كلها بدل ما نعرّض شات محذوف"
+
+
+# ================================== OHB2-AUDIT-FIX-05: Mini App list collects all pages
+class _PagedListClient:
+    """عميل وهمي بيدعم البحث بصفحات عبر next_page_id."""
+
+    def __init__(self, pages):
+        self._pages = pages
+        self.calls = []
+
+    async def search_conversations(self, limit=100, page_id=None):
+        self.calls.append(page_id)
+        return self._pages[page_id]
+
+    async def get_current_user(self):
+        return {"id": OWNER_UUID}
+
+
+def _conv(cid):
+    return {"id": cid, "title": cid, "execution_status": "running",
+            "created_by_user_id": OWNER_UUID}
+
+
+def test_miniapp_list_collects_all_pages(tmp_path):
+    """الـ Mini App لازم يجمع كل الصفحات — الشات الأقدم (صفحة 2) يبقى قابل للوصول."""
+    pages = {
+        None: {"items": [_conv(f"c{i}") for i in range(10)], "next_page_id": "p2"},
+        "p2": {"items": [_conv("c99")], "next_page_id": None},
+    }
+    client = _PagedListClient(pages)
+    tc = TestClient(
+        build_web_app(make_config(), _db(tmp_path), client=client, application=_FakeApp()),
+        raise_server_exceptions=False,
+    )
+    login(tc)
+    r = tc.get("/api/v1/conversations?refresh=1")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # اتلمّت 11 شات (10 + c99) ⇒ الصفحة الأولى فيها 10 وhas_more=true (c99 على الصفحة 2).
+    assert len(body["items"]) == 10
+    assert body["has_more"] is True
+    assert body["truncated"] is False
+    assert client.calls == [None, "p2"]  # اتلمّت كل الصفحات
+    r2 = tc.get("/api/v1/conversations?page=1")
+    assert r2.status_code == 200, r2.text
+    assert "c99" in [i["id"] for i in r2.json()["items"]]  # مش مخفي بعد أول صفحة
+
+
+def test_miniapp_list_flags_truncation(tmp_path):
+    """لو فيه صفحات أكتر من الحد ⇒ `truncated=true` (إعلان صريح، مش إخفاء صامت)."""
+
+    class AlwaysMore:
+        async def search_conversations(self, limit=100, page_id=None):
+            return {"items": [_conv("c1")], "next_page_id": "more"}
+
+        async def get_current_user(self):
+            return {"id": OWNER_UUID}
+
+    tc = TestClient(
+        build_web_app(make_config(), _db(tmp_path), client=AlwaysMore(), application=_FakeApp()),
+        raise_server_exceptions=False,
+    )
+    login(tc)
+    r = tc.get("/api/v1/conversations?refresh=1")
+    assert r.status_code == 200, r.text
+    assert r.json()["truncated"] is True

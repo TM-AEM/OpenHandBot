@@ -17,6 +17,7 @@ import time
 
 from ..errors import ApiError
 from ..messages import get_status, pr_url, state_label, truncate
+from ..openhands_client import collect_conversations
 from .. import features
 from .. import outbox
 from .. import db as db_module
@@ -290,9 +291,9 @@ class MiniAppService:
             return None
         return self._application.bot_data.get("list_cache")
 
-    def _set_list_cache(self, items) -> None:
+    def _set_list_cache(self, items, truncated: bool = False) -> None:
         if self._application is not None:
-            self._application.bot_data["list_cache"] = (time.monotonic(), items)
+            self._application.bot_data["list_cache"] = (time.monotonic(), items, truncated)
 
     def _drop_list_cache(self) -> None:
         if self._application is not None:
@@ -403,11 +404,15 @@ class MiniAppService:
         # TASK 55 (G4): نفس كاش البوت القصير — مشارك بين البوت والـ Mini App.
         if not refresh and cache and time.monotonic() - cache[0] < 45.0:
             items = cache[1]
+            truncated = cache[2] if len(cache) > 2 else False
         else:
-            result = await client.search_conversations(limit=100)
-            items = result.get("items", [])
+            # OHB2-AUDIT-FIX-05: نتبع كل صفحات البحث (next_page_id بحد أقصى) بدل صفحة
+            # واحدة، فالشاتات الأقدم تبقى قابلة للوصول (مش إخفاء صامت بعد أول 100).
+            collected = await collect_conversations(client)
+            items = collected["items"]
+            truncated = collected["truncated"]
             if items:
-                self._set_list_cache(items)
+                self._set_list_cache(items, truncated)
         # OHB2-C7: الشاتات المحذوفة محليًا (tombstone) لازم تختفي من القايمة فورًا.
         # مصدر القايمة بعيد (search) فمش عارف بالحذف المحلي؛ نفلترها قبل الترقيم عشان
         # الشات المحذوف ما يظهرش تاني بعد refresh (من غير انتظار دورة البوت).
@@ -421,17 +426,24 @@ class MiniAppService:
         return {
             "page": page,
             "has_more": len(items) > start + PAGE_SIZE,
+            "truncated": truncated,
             "items": [self._list_item(c, watched) for c in chunk],
         }
 
     def _without_deleted(self, items: list[dict]) -> list[dict]:
-        """يشيل أي شات عليه شاهد حذف محلي (OHB2-C7) من قايمة الـ Mini App."""
+        """يشيل أي شات عليه شاهد حذف محلي (OHB2-C7) من قايمة الـ Mini App.
+
+        OHB2-AUDIT-FIX-04 (فشل مغلق): لو تعذّر قراءة شواهد الحذف (قاعدة غير متاحة)،
+        بنرجّع قايمة **فاضية** بدل القايمة غير المفلترة — ما نعرّضش شات محذوف للظهور
+        بالغلط. الإخفاء المؤقت أأمن من الإظهار الخاطئ.
+        """
         if self._db is None or not items:
             return items
         try:
             return [c for c in items if not self._db.is_deleted(c.get("id") or "")]
-        except Exception:  # noqa: BLE001 — قاعدة غير متاحة ⇒ ما نكسرش القايمة
-            return items
+        except Exception:  # noqa: BLE001 — قاعدة غير متاحة ⇒ نفشل مقفولين
+            log.warning("تعذّر قراءة شواهد الحذف؛ بنخفي القايمة مؤقتًا (فشل مغلق).")
+            return []
 
     def _list_item(self, conv: dict, watched: set[str]) -> dict:
         status = get_status(conv)
@@ -580,9 +592,15 @@ class MiniAppService:
         # (مش المالك) مايقدرش يوجّه برومت لشات مش بتاعه. مفيش أي أثر (سجل صندوق) قبل القرار.
         await self._authorize_conversation(cid)
         chat_id = self._config.owner_id
+        # OHB2-AUDIT-FIX-01: `reengage=False` — مسار الـ Mini App **مش** إعادة تفاعل صريح
+        # (إعادة المتابعة عند الـ Mini App بتحصل عبر `watch`، مش عبر إرسال برومت). كده أي
+        # برومت لشات متشاهد يُرفض (سواء بحمل `client_ref` أو لأ)، ومستحيل يحيي شات اتحذف.
         outbox_id = self._db.add_or_group_outbox(
-            cid, chat_id, body, outbox.now_iso(), client_ref=ref or None, reengage=True
+            cid, chat_id, body, outbox.now_iso(), client_ref=ref or None
         )
+        # 0 = التسجيل اترفض (الشات اتحذف). ما نرجّعش «queued: true» كاذبة — خطأ واضح.
+        if not outbox_id:
+            raise CodedApiError("conversation_deleted", "الشات اتحذف — مش ممكن نبعت له.", 409)
         self._drop_list_cache()
         self._wake("outbox_worker")
         return {

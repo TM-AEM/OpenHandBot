@@ -122,3 +122,155 @@ def test_reset_clears_state():
     assert lim.allow("k")[0]
     lim.reset()
     assert lim.allow("k")[0]
+
+
+# ============================================ OHB2-AUDIT-FIX-03: independent windows
+# الباگ المؤكَّد: المحدّد كان بيحسب عدد الأحداث في **أوسع** نافذة ويقارنه بكل حد،
+# فحد الدقيقة كان بيتصرف زي حد الساعة. الإصلاح: كل نافذة تتقيس لوحدها.
+
+MINUTE_HOUR = [Limit(10, 60.0), Limit(30, 3600.0)]
+
+
+def test_minute_limit_independent_of_hour_window():
+    """10 محاولات موزّعة على دقايق مختلفة خلال ساعة، ثم الـ11 جوه نفس الدقيقة ⇒ مسموح."""
+    clock = FakeClock()
+    lim = SlidingWindowLimiter(MINUTE_HOUR, clock=clock)
+    for i in range(10):  # محاولة واحدة كل دقيقة: t=0,60,...,540
+        clock.now = i * 60.0
+        assert lim.allow("k")[0] is True, f"محاولة {i} لازم تنجح"
+    clock.now = 541.0  # جوه نفس دقيقة المحاولة العاشرة (540)
+    allowed, retry = lim.allow("k")
+    assert allowed is True, "الدقيقة فيها حدثين بس ⇒ مش المفروض تتحجب"
+    assert retry == 0.0
+
+
+def test_eleventh_attempt_in_same_minute_blocked():
+    """11 محاولة جوه دقيقة واحدة ⇒ الـ11 تتحجب بحد الدقيقة (retry≈60)."""
+    clock = FakeClock()
+    lim = SlidingWindowLimiter(MINUTE_HOUR, clock=clock)
+    for _ in range(10):
+        assert lim.allow("k")[0] is True
+    allowed, retry = lim.allow("k")
+    assert allowed is False
+    assert retry == pytest.approx(60.0)
+
+
+def test_thirtieth_within_hour_allowed_thirty_first_blocked():
+    """30 محاولة خلال ساعة (دقيقة كل مرة) ⇒ الـ31 تتحجب بحد الساعة فقط."""
+    clock = FakeClock()
+    lim = SlidingWindowLimiter(MINUTE_HOUR, clock=clock)
+    for i in range(30):  # t=0,60,...,1740
+        clock.now = i * 60.0
+        assert lim.allow("k")[0] is True, f"محاولة {i} لازم تنجح"
+    clock.now = 1741.0
+    allowed, retry = lim.allow("k")
+    assert allowed is False
+    # الدقيقة فيها حدثين بس ⇒ الحجب من الساعة، والـretry من أقدم حدث جوه الساعة (t=0).
+    assert retry == pytest.approx(3600.0 - 1741.0)
+
+
+def test_minute_events_expire_while_hourly_remain():
+    """أحداث الدقيقة تخرج بينما أحداث الساعة باقية ⇒ المفتاح يرجع مسموح."""
+    clock = FakeClock()
+    lim = SlidingWindowLimiter(MINUTE_HOUR, clock=clock)
+    for _ in range(10):
+        assert lim.allow("k")[0] is True  # كلهم عند t=0
+    assert lim.allow("k")[0] is False  # الدقيقة متجاوزة
+    clock.advance(60.1)  # خرجت أحداث الدقيقة (لكن العشرة لسه جوه الساعة)
+    allowed, retry = lim.allow("k")
+    assert allowed is True, "أحداث الدقيقة خرجت ⇒ مسموح (الساعة لسه 10 < 30)"
+    assert retry == 0.0
+    assert lim.retry_after("k") == 0.0
+
+
+def test_hourly_events_expire_and_recover():
+    """أحداث الساعة تخرج ⇒ المفتاح يرجع مسموح."""
+    clock = FakeClock()
+    lim = SlidingWindowLimiter(MINUTE_HOUR, clock=clock)
+    for i in range(30):  # محاولة كل دقيقة (t=0,60,...,1740) ⇒ الدقيقة عمرها ما تتجاوز
+        clock.now = i * 60.0
+        assert lim.allow("k")[0] is True
+    clock.now = 1741.0
+    allowed, retry = lim.allow("k")
+    assert allowed is False
+    assert retry == pytest.approx(3600.0 - 1741.0)  # من أقدم حدث جوه الساعة (t=0)
+    clock.advance(3600.1)  # خرجت كل أحداث الساعة
+    assert lim.allow("k")[0] is True
+
+
+def test_retry_after_reflects_each_exceeded_window():
+    """Retry-After بيتحسب من النافذة المتجاوزة نفسها، مش من نافذة غير متعلّقة."""
+    # حد الدقيقة بس متجاوز ⇒ retry من الدقيقة.
+    clock = FakeClock()
+    minute_only = SlidingWindowLimiter([Limit(10, 60.0)], clock=clock)
+    for _ in range(10):
+        minute_only.allow("k")
+    clock.advance(15.0)
+    allowed, retry = minute_only.allow("k")
+    assert allowed is False and retry == pytest.approx(45.0)
+
+    # حد الساعة بس متجاوز (والدقيقة فيها حدث واحد) ⇒ retry من الساعة.
+    clock2 = FakeClock()
+    hour_only = SlidingWindowLimiter([Limit(1, 3600.0)], clock=clock2)
+    hour_only.allow("k")
+    clock2.advance(15.0)
+    allowed2, retry2 = hour_only.allow("k")
+    assert allowed2 is False and retry2 == pytest.approx(3585.0)
+
+
+def test_two_windows_retry_is_longest_required():
+    """لو النافذتين متجاوزتين، retry = أطول انتظار مطلوب (مش الأقصر)."""
+    clock = FakeClock()
+    # نافذتان قصيرتان عشان نبني الحالة بسرعة: 2/10s و4/100s.
+    lim = SlidingWindowLimiter([Limit(2, 10.0), Limit(4, 100.0)], clock=clock)
+    assert lim.allow("k")[0] is True   # t=0
+    assert lim.allow("k")[0] is True   # t=0 ⇒ النافذة القصيرة متجاوزة (2)
+    clock.now = 20.0                   # النافذة القصيرة (10s) فضيت، الطويلة لسه فيها الـ2
+    assert lim.allow("k")[0] is True   # t=20 (short=1, long=3)
+    assert lim.allow("k")[0] is True   # t=20 (short=2, long=4)
+    # عند t=20 الاتنين متجاوزتين: انتظار القصيرة = 10، انتظار الطويلة = 80 ⇒ الأطول يحكم.
+    allowed, retry = lim.allow("k")
+    assert allowed is False
+    assert retry == pytest.approx(80.0)
+
+
+def test_windows_independent_across_keys():
+    """مفاتيح مستقلة: حجب مفتاح مايحجبش مفتاح تاني بأي نافذة."""
+    clock = FakeClock()
+    lim = SlidingWindowLimiter(MINUTE_HOUR, clock=clock)
+    for _ in range(10):
+        lim.allow("a")
+    assert lim.allow("a")[0] is False  # a محجوب بالدقيقة
+    assert lim.allow("b")[0] is True   # b مستقل تمامًا
+    assert lim.allow("b")[0] is True
+
+
+def test_boundary_event_exactly_at_window_edge_is_expired():
+    """حدث عند حد النافذة بالظبط (t = now - window) يُعدّ خارجًا (سلوك حدّي دقيق)."""
+    clock = FakeClock()
+    lim = SlidingWindowLimiter([Limit(1, 60.0)], clock=clock)
+    assert lim.allow("k")[0] is True  # t=0
+    clock.now = 59.999
+    assert lim.allow("k")[0] is False  # لسه جوه النافذة
+    clock.now = 60.0
+    assert lim.allow("k")[0] is True   # عند الحد بالظبط ⇒ خرج
+
+
+def test_auth_limiter_enforces_both_windows_independently():
+    """auth_limiter (10/دقيقة + 30/ساعة) بيطبّق النافذتين مستقلتين."""
+    from bot.web.ratelimit import auth_limiter
+
+    class _Cfg:
+        mini_app_auth_rate_per_minute = 10
+        mini_app_auth_rate_per_hour = 30
+        mini_app_rate_max_keys = 100
+
+    clock = FakeClock()
+    lim = auth_limiter(_Cfg(), clock=clock)
+    # 10 محاولات عبر دقايق مختلفة ⇒ كلها مسموحة (الدقيقة فيها حدث واحد).
+    for i in range(10):
+        clock.now = i * 60.0
+        assert lim.allow("ip")[0] is True
+    # الـ11 عند t=541 (نفس دقيقة الـ10) ⇒ مسموحة (الدقيقة فيها حدثين، الساعة 11<30).
+    clock.now = 541.0
+    assert lim.allow("ip")[0] is True

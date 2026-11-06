@@ -511,3 +511,58 @@ def test_telegram_reply_prompt_denied_sets_no_awaiting_and_no_upstream(tmp_path)
     assert conv_id is None and kind is None  # مفيش توجيه برومت
     assert client.list_calls == 0 and client.read_calls == 0  # مفيش أي قراءة محمية
     assert "مش مسموح" in update.callback_query.edits[-1]
+
+
+# --------------------------- 18) OHB2-AUDIT-FIX-01: prompt race cannot resurrect
+def test_prompt_after_local_delete_returns_409_and_no_outbox(tmp_path):
+    """برومت الـ Mini App (بحمل client_ref) لشات اتحذف محليًا ⇒ 409، مفيش صف، مفيش إحياء.
+
+    ده سباق حقيقي: الـ POST ممكن يوصل بعد الحذف المحلي (الشات لسه موجود بعيدًا، فالتفويض
+    البعيد بينجح). الـ client_ref كان بيشيل الشاهد الأول ⇒ إحياء. دلوقتي مرفوض.
+    """
+    api = MockAPI()
+    db = Database(str(tmp_path / "s18.sqlite3"))
+    tc = make_app(api, db=db)
+    login(tc)
+    db.add_watched(CID, "شات", chat_id=OWNER)
+    # حذف محلي (يكتب الشاهد) — الشات لسه ظاهر في الـ MockAPI البعيد.
+    assert tc.delete(f"/api/v1/conversations/{CID}",
+                     headers={"origin": ORIGIN}).status_code == 200
+    assert db.is_deleted(CID) is True
+
+    r = tc.post(f"/api/v1/conversations/{CID}/prompt",
+                json={"text": "برومت متأخّر", "client_ref": "ref-race"},
+                headers={"origin": ORIGIN})
+    assert r.status_code == 409, r.text
+    assert r.json()["error"] == "conversation_deleted"
+    assert db.count_outbox() == 0        # مفيش صف صندوق اتخلق
+    assert db.is_deleted(CID) is True    # الشاهد ما اتشالش (مفيش إحياء)
+    assert db.get_watched(CID) is None
+
+
+def test_prompt_after_local_delete_without_ref_also_409(tmp_path):
+    """نفس الحالة من غير client_ref ⇒ 409 برضه (مسار الـ Mini App مش إعادة تفاعل صريح)."""
+    api = MockAPI()
+    db = Database(str(tmp_path / "s18b.sqlite3"))
+    tc = make_app(api, db=db)
+    login(tc)
+    db.add_watched(CID, "شات", chat_id=OWNER)
+    assert tc.delete(f"/api/v1/conversations/{CID}",
+                     headers={"origin": ORIGIN}).status_code == 200
+    r = tc.post(f"/api/v1/conversations/{CID}/prompt", json={"text": "x"},
+                headers={"origin": ORIGIN})
+    assert r.status_code == 409 and r.json()["error"] == "conversation_deleted"
+    assert db.count_outbox() == 0 and db.is_deleted(CID) is True
+
+
+def test_prompt_before_delete_still_queues_normally(tmp_path):
+    """تحكّم موجب: برومت على شات نشِط (مفيش شاهد) عبر الـ route الحقيقي ⇒ 200 وصف واحد."""
+    api = MockAPI()
+    db = Database(str(tmp_path / "s18c.sqlite3"))
+    tc = make_app(api, db=db)
+    login(tc)
+    r = tc.post(f"/api/v1/conversations/{CID}/prompt",
+                json={"text": "اعمل حاجة", "client_ref": "ref-ok"},
+                headers={"origin": ORIGIN})
+    assert r.status_code == 200 and r.json()["queued"] is True
+    assert db.count_outbox("pending") == 1

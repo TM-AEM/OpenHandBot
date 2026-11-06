@@ -79,7 +79,9 @@ python -m pytest -q
 - **الصيانة عند بدء التشغيل (`run_startup_maintenance`):** فحص سريع (`PRAGMA
   quick_check`) ثم `PRAGMA optimize` + `incremental_vacuum` (لو متاح) + `wal_checkpoint(TRUNCATE)`.
   - لو القاعدة سليمة: البوت يكمل.
-  - لو الفحص فشل: **البوت بيفضل شغّال** بس بيسجّل `ERROR` واضح (ما بيرميش استثناء).
+  - لو الفحص فشل: **البوت مابيبدأش** — `main.py` يخرج بكود غير صفري (1) قبل أي polling، ومفيش
+    workers ولا ادّعاء جاهزية. **مفيش إصلاح/حذف تلقائي** — راجع القاعدة يدويًا. (لو الفشل حصل
+    جوه `_post_init` بعد الإقلاع، بيتسجّل `startup_failed` وبيتمنع التشغيل برضه.)
   - لو الصيانة نفسها فشلت (مش حرجة): بيسجّل `WARNING` ويكمل.
 - **الإغلاق النظيف (`app._post_shutdown`):** يوقف الـ workers/المراقب، يقفل عميل httpx،
   يعمل `wal_checkpoint(TRUNCATE)` تاني، وبعدين `db.close()`. لو الـ checkpoint فشل،
