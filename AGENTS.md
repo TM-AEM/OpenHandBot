@@ -5,12 +5,12 @@ Priorities when rules conflict: (1) do not break what already works, (2) verifie
 
 1. Project commands and environment
 
-- Install:
-- Build:
-- Test:
-- Lint / typecheck:
-- Run:
-- CI (workflow name, how to read its results):
+- Install: `pip install -r requirements-dev.txt` (also installs requirements.txt)
+- Build: none - pure Python app; no build step
+- Test: `python -m pytest -q` (Python) and `node --test tests/frontend/*.test.js` (frontend)
+- Lint / typecheck: `python -m pyflakes bot/ main.py tests/`
+- Run: `python main.py` (or `sh start.sh`); needs a real .env (TELEGRAM_BOT_TOKEN, OPENHANDS_API_KEY, ALLOWED_TELEGRAM_ID)
+- CI (workflow name, how to read its results): GitHub Actions workflow `CI` (.github/workflows/ci.yml), Python 3.11 & 3.13; inspect with `gh run list --repo TM-AEM/OpenHandBot --workflow ci.yml` and `gh run view --log-failed`
 If this section is empty: discover the real commands from package.json, Makefile, pyproject.toml, build.gradle, .github/workflows and the README, run them to confirm they work, then write them here. Never guess commands.
 
 Environment (edit if different): the user works from an Android tablet (Termux / Linux containers) with no PC or Mac. Never tell the user to use Android Studio, an emulator, a desktop, or any tool that is not available there. Every instruction, command and workflow must work from the terminal and from CI (GitHub Actions). Heavy builds go through CI. Avoid long-running background processes and memory-hungry commands locally.
