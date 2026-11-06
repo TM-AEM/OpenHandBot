@@ -18,6 +18,7 @@ from starlette.testclient import TestClient
 
 from bot.config import Config
 from bot.db import Database
+from bot import outbox
 from bot.openhands_client import OpenHandsClient
 from bot.web import build_web_app
 from bot.web.app import MiniApp
@@ -525,9 +526,9 @@ def test_prompt_after_local_delete_returns_409_and_no_outbox(tmp_path):
     tc = make_app(api, db=db)
     login(tc)
     db.add_watched(CID, "شات", chat_id=OWNER)
-    # حذف محلي (يكتب الشاهد) — الشات لسه ظاهر في الـ MockAPI البعيد.
-    assert tc.delete(f"/api/v1/conversations/{CID}",
-                     headers={"origin": ORIGIN}).status_code == 200
+    # شات محذوف محليًا (شاهد + حذف محلي) — الشات لسه ظاهر في الـ MockAPI البعيد.
+    # (بنحضّر الحالة مباشرة: الهدف هنا سباق البرومت بعد الحذف، مش سلوك الحذف نفسه.)
+    db.delete_conversation(CID, outbox.now_iso())
     assert db.is_deleted(CID) is True
 
     r = tc.post(f"/api/v1/conversations/{CID}/prompt",
@@ -547,8 +548,7 @@ def test_prompt_after_local_delete_without_ref_also_409(tmp_path):
     tc = make_app(api, db=db)
     login(tc)
     db.add_watched(CID, "شات", chat_id=OWNER)
-    assert tc.delete(f"/api/v1/conversations/{CID}",
-                     headers={"origin": ORIGIN}).status_code == 200
+    db.delete_conversation(CID, outbox.now_iso())
     r = tc.post(f"/api/v1/conversations/{CID}/prompt", json={"text": "x"},
                 headers={"origin": ORIGIN})
     assert r.status_code == 409 and r.json()["error"] == "conversation_deleted"

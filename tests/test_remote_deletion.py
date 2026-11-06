@@ -28,16 +28,19 @@ class FakeClient:
 
     `delete_behaviour`:
       - "ok": 200 {"success": true}
-      - "404": ApiError(status=404)
+      - "404": ApiError(status=404)  (مبهم: ممكن غياب أو فشل خدمة داخلي)
       - ("status", N): ApiError(status=N)
       - "unknown": ApiError بلا status (محاكاة انقطاع/رد مشوّه)
-    `exists`: نتيجة conversation_exists، أو ApiError لو `exists_error=True`.
+    `exists`/`exists_error`: نتيجة conversation_exists الثابتة، أو خطأ.
+    `exists_seq`: سلسلة نتائج متتالية للتحقق من الغياب (القيمة الأخيرة تتكرّر)، و"error"
+      يعني ApiError. تُستخدم لاختبار «الغياب لازم يثبت من أكتر من قراءة».
     """
 
-    def __init__(self, delete_behaviour="ok", exists=False, exists_error=False):
+    def __init__(self, delete_behaviour="ok", exists=False, exists_error=False, exists_seq=None):
         self.delete_behaviour = delete_behaviour
         self.exists = exists
         self.exists_error = exists_error
+        self.exists_seq = list(exists_seq) if exists_seq is not None else None
         self.delete_calls = 0
         self.exists_calls = 0
 
@@ -56,6 +59,12 @@ class FakeClient:
 
     async def conversation_exists(self, conversation_id):
         self.exists_calls += 1
+        if self.exists_seq is not None:
+            idx = min(self.exists_calls - 1, len(self.exists_seq) - 1)
+            val = self.exists_seq[idx]
+            if val == "error":
+                raise ApiError("تعذّر الاتصال بـ OpenHands.", None)
+            return val
         if self.exists_error:
             raise ApiError("تعذّر الاتصال بـ OpenHands.", None)
         return self.exists
@@ -76,12 +85,79 @@ def test_confirmed_success_marks_confirmed_and_deletes_locally(tmp_path):
     assert db.remote_deletion_state(CID) == db.REMOTE_CONFIRMED
 
 
-def test_404_is_treated_as_success_idempotent(tmp_path):
+def test_404_with_conversation_present_is_failure(tmp_path):
+    """404 مبهم + الشات لسه موجود فعلًا ⇒ فشل صريح (مفيش حذف محلي، مفيش نجاح كاذب)."""
     db = _db(tmp_path)
     db.add_watched(CID, "شات", chat_id=1)
-    res = _run(FakeClient("404"), db)
+    client = FakeClient("404", exists=True)
+    res = _run(client, db)
+    assert res.status == deletion.STATUS_FAILED
+    assert db.get_watched(CID) is not None  # ما اتحذفش محليًا
+    assert db.is_deleted(CID) is False  # الحالة المحلية رجعت
+    assert db.remote_deletion_state(CID) is None
+    assert client.exists_calls >= 1
+
+
+def test_404_with_confirmed_absence_is_success(tmp_path):
+    """404 + غياب مؤكّد (قراءات متتالية فاضية) ⇒ نجاح idempotent مؤكّد."""
+    db = _db(tmp_path)
+    db.add_watched(CID, "شات", chat_id=1)
+    client = FakeClient("404", exists=False)
+    res = _run(client, db)
     assert res.status == deletion.STATUS_DELETED
+    assert db.get_watched(CID) is None
     assert db.remote_deletion_state(CID) == db.REMOTE_CONFIRMED
+    assert client.exists_calls == deletion._ABSENCE_CONFIRMATIONS  # غياب مؤكّد بأكتر من قراءة
+
+
+def test_404_with_inconclusive_check_is_pending(tmp_path):
+    """404 + تعذّر التحقق (فشل القراءة) ⇒ 'pending' (مش نجاح ومش فشل)، والحالة 'uncertain'."""
+    db = _db(tmp_path)
+    db.add_watched(CID, "شات", chat_id=1)
+    res = _run(FakeClient("404", exists_error=True), db)
+    assert res.status == deletion.STATUS_PENDING
+    assert db.is_deleted(CID) is True  # لسه متشاهد محليًا (مفيش تأكيد ولا رجوع)
+    assert db.remote_deletion_state(CID) == db.REMOTE_UNCERTAIN
+
+
+def test_404_with_stale_absence_needs_confirmation(tmp_path):
+    """غياب عارض/قديم (أول قراءة غياب، تاني قراءة موجود) ⇒ ممنوع التأكيد ⇒ فشل + رجوع محلي."""
+    db = _db(tmp_path)
+    db.add_watched(CID, "شات", chat_id=1)
+    client = FakeClient("404", exists_seq=[False, True])
+    res = _run(client, db)
+    assert res.status == deletion.STATUS_FAILED
+    assert db.is_deleted(CID) is False  # رجع محليًا (الغياب ما كانش مؤكّد)
+    assert client.exists_calls == 2  # القراءة التانية كشفت إنه لسه موجود
+
+
+def test_404_absence_retry_exhausted_is_pending(tmp_path):
+    """غياب متكرّر لكن قراءة لاحقة فشلت ⇒ تعذّر التأكيد ⇒ 'pending' (مفيش تخمين)."""
+    db = _db(tmp_path)
+    db.add_watched(CID, "شات", chat_id=1)
+    client = FakeClient("404", exists_seq=[False, "error"])
+    res = _run(client, db)
+    assert res.status == deletion.STATUS_PENDING
+    assert db.remote_deletion_state(CID) == db.REMOTE_UNCERTAIN
+    assert client.exists_calls == 2
+
+
+def test_404_pending_survives_restart_and_reconciles(tmp_path):
+    """حذف معلّق منشؤه 404 ينجو من restart، والتسوية تحسمه (غياب ⇒ تأكيد)."""
+    path = os.path.join(str(tmp_path), "restart404.sqlite3")
+    db = Database(path)
+    db.add_watched(CID, "شات", chat_id=1)
+    # محاولة أولى: 404 + تعذّر التحقق ⇒ 'uncertain' دائم.
+    res = _run(FakeClient("404", exists_error=True), db)
+    assert res.status == deletion.STATUS_PENDING
+    db.close()
+    # إعادة فتح (restart): الحالة المعلّقة لسه موجودة.
+    db2 = Database(path)
+    assert db2.remote_deletion_state(CID) == db2.REMOTE_UNCERTAIN
+    assert CID in db2.list_pending_remote_deletions()
+    # تسوية بعد restart: الشات غايب فعلاً ⇒ تأكيد الحذف.
+    asyncio.run(deletion.reconcile_pending_deletions(FakeClient(exists=False), db2))
+    assert db2.remote_deletion_state(CID) == db2.REMOTE_CONFIRMED
 
 
 # --------------------------------------------------------------- definite failures
@@ -194,6 +270,23 @@ def test_reconcile_present_restores_local(tmp_path):
     db.begin_remote_deletion(CID, outbox.now_iso())
     asyncio.run(deletion.reconcile_pending_deletions(FakeClient(exists=True), db))
     assert db.is_deleted(CID) is False  # رجع محليًا (الحذف البعيد ما حصلش)
+    assert db.remote_deletion_state(CID) is None  # اتصفّرت الحالة (مفيش 'deleting' عالق)
+
+
+def test_reconcile_present_is_idempotent(tmp_path):
+    """التسوية المتكرّرة (موجود ⇒ رجوع) ما تنتجش حالة متناقضة، ومسارات الإحياء تشتغل."""
+    db = _db(tmp_path)
+    db.add_watched(CID, "شات", chat_id=1)
+    db.begin_remote_deletion(CID, outbox.now_iso())
+    client = FakeClient(exists=True)
+    asyncio.run(deletion.reconcile_pending_deletions(client, db))
+    asyncio.run(deletion.reconcile_pending_deletions(client, db))
+    assert db.is_deleted(CID) is False
+    assert db.remote_deletion_state(CID) is None
+    assert db.list_pending_remote_deletions() == []
+    # بعد التسوية، إضافة متابعة عادية (دورة حياة جديدة) لازم تنجح (مفيش شاهد عالق).
+    db.add_watched(CID, "شات", chat_id=1)
+    assert db.get_watched(CID) is not None
 
 
 def test_reconcile_unverifiable_keeps_pending(tmp_path):

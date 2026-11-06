@@ -306,3 +306,33 @@ Out of scope: Enzonic deployment, GitHub push/PR, production calls, Autopush, Ba
 - Tests added: tests/test_remote_deletion.py (17), client delete tests (5),
   miniapp activation tests (4), frontend remote-delete UX (2); existing local-only tests updated.
 - VERIFIED: pytest 1602 passed; node --test 145 pass/0 fail; pyflakes 0; compileall 0.
+
+## OHB2-REMOTE-DELETE-404-SEMANTICS — DONE (branch agent/ohb2-miniapp-remote-delete)
+
+Goal: 404 من `DELETE /app-conversations/{id}` **مبهم** (غياب أو فشل خدمة داخلي) ⇒ ممنوع
+اعتباره حذفًا مؤكّدًا. لازم يمرّ بتسوية التحقق من الوجود.
+
+Acceptance criteria (كلها متحققة):
+1. 404 مش نجاح تلقائي. 2. مدعوم بسلوك upstream موثّق. 3. المبهم يفضل pending/uncertain.
+4. الوجود المؤكّد مايؤدّيش لحذف محلي. 5. المعمارية/الضمانات سليمة. 6. كل الاختبارات/الفحوص تمر.
+7. المراجعة المستقلة معلّقة (مفيش backend reviewer) + handoff جاهز. 8. مفيش نشر/حذف حقيقي.
+
+Evidence (upstream, OpenHands/enterprise@main):
+- `app_conversation_router.py` DELETE: 404 في حالتين — `'Conversation not found'` (مش موجود)
+  و`'Failed to delete conversation'` (فشل داخلي). ⇒ 404 مش دليل حذف.
+- `GET /app-conversations?ids=`: نفس جلسة الكتابة (مفيش replica)، soft-delete بيتفلتر
+  (`deleted_at IS NULL`)، الكتابة commit قبل الرد ⇒ قراءة قوية.
+
+Changes:
+- bot/deletion.py: 404 اتشال من auto-success و`_is_definite_failure` استثناه؛ أضفنا
+  `_establish_absence` (قراءتين متتاليتين، bounded) و`_reconcile` المشترك؛ التسوية استخدمت
+  `_establish_absence`. الحالات: غايب⇒confirmed+حذف محلي، موجود⇒failed+رجوع، تعذّر⇒uncertain.
+- bot/openhands_client.py, bot/web/services.py: توثيق 404 المبهم.
+- tests: test_remote_deletion.py (+6 حالات 404/reconcile)، test_conversation_deletion.py
+  (+4 عبر المسار الحقيقي)، test_batch_c_integration.py (تحضير حذف محلي مباشرة)،
+  tests/frontend/delete.test.js (local_only→remote_deleted).
+- docs: README, docs/API_NOTES.md, docs/MINI_APP.md.
+
+VERIFIED: pytest 1612 passed; node 145/145; pyflakes 0; compileall 0; focused deletion 252 passed.
+NOT VERIFIED: live behavior against real OpenHands (no real API calls). Independent review pending.
+No commit/push/PR/deploy/real deletion.

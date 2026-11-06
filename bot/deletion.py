@@ -6,18 +6,22 @@ Mini App — نفس الشواهد ونفس حالات الحذف البعيد �
 
 العقد (مطابق لـ `DELETE /api/v1/app-conversations/{id}` الموثّق):
 - 200 `{"success": true}` ⇒ OpenHands أكّد الحذف ⇒ نثبّت 'confirmed' ونسجّل الحذف المحلي.
-- 404 ⇒ الشات مش موجود بعيدًا ⇒ نعتبرها نجاح (idempotent).
+- 404 ⇒ نتيجة **مبهمة**: المصدر الرسمي بيرجّع 404 في حالتين مختلفتين — (أ) الشات مش موجود
+  فعلًا (`'Conversation not found'`)، و(ب) الخدمة فشلت داخليًا (`'Failed to delete
+  conversation'`). فممنوع نعتبر 404 نجاحًا تلقائيًا ⇒ بيمر بنفس تسوية الحذف البعيد:
+  نتحقق من الوجود (GET) قبل ما نقرر.
 - 401/403/422 ⇒ فشل مؤكّد (الحذف البعيد **ما حصلش**) ⇒ مفيش نجاح كاذب، ومسار إعادة محاولة.
-- 429/5xx/انقطاع/إعادة توجيه/رد مش متوقع ⇒ نتيجة **مجهولة** ⇒ نسوّي بالتحقق من الوجود
-  (GET) قبل ما نقرر: مش موجود ⇒ نجاح، موجود ⇒ فشل، تعذّر التحقق ⇒ 'uncertain' (مش نجاح).
+- 429/5xx/انقطاع/إعادة توجيه/رد مش متوقع ⇒ نتيجة **مجهولة** ⇒ نفس التسوية (تحقق من الوجود).
 
 قواعد غير قابلة للتفاوض:
-- مفيش «نجاح» غير لما OpenHands يأكّد (أو التحقق يثبت الغياب).
+- مفيش «نجاح» غير لما OpenHands يأكّد (200) أو التحقق يثبت الغياب بدرجة كافية.
+- الغياب لازم يثبت من **أكتر من قراءة** (bounded retry) — القراءة الواحدة مش دليل قاطع.
 - مفيش fallback صامت لحذف محلي فقط.
 - الملكية بتتفوّض **قبل** النداء (عند المستدعي)، والنتيجة المجهولة تفضل 'uncertain' (تنجو من restart).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 
@@ -37,6 +41,31 @@ PENDING_MESSAGE = (
     "الشات متقفل محليًا؛ جرّب تاني بعد شوية أو راجع الـ Mini App للتحقق."
 )
 
+# عدد قراءات التحقق من الغياب المطلوبة قبل تأكيد الحذف. `GET /app-conversations?ids=`
+# بيقرا من نفس جلسة الكتابة (مفيش replica)، فقراءتين متتاليتين تغطّيان أي رؤية متأخّرة
+# طفيفة — وتمنع اعتبار غياب عارض/جزئي دليلًا قاطعًا (bounded: مفيش حلقات مفتوحة).
+_ABSENCE_CONFIRMATIONS = 2
+_RECHECK_DELAY = 0.1  # ثانية بين القراءات (باك-أوف بسيط ومحدود)
+
+
+async def _establish_absence(client, conversation_id: str) -> bool | None:
+    """يثبت غياب الشات بعيدًا بدرجة كافية. True=غايب (مؤكّد)، False=موجود، None=مش متأكد.
+
+    بيقرا الوجود لحد `_ABSENCE_CONFIRMATIONS` قراءات **متتالية** كلها ترجّع غياب. أي قراءة
+    ترجّع «موجود» ⇒ False فورًا (الشات لسه هناك). أي فشل في القراءة ⇒ None (عدم يقين — من
+    غير تخمين). العدد محدود ⇒ مفيش نداءات زايدة ولا حلقات مفتوحة.
+    """
+    for attempt in range(_ABSENCE_CONFIRMATIONS):
+        try:
+            exists = await client.conversation_exists(conversation_id)
+        except ApiError:
+            return None  # تعذّر التحقق ⇒ عدم يقين
+        if exists:
+            return False  # الشات لسه موجود بعيدًا ⇒ الحذف ما حصلش
+        if attempt + 1 < _ABSENCE_CONFIRMATIONS:
+            await asyncio.sleep(_RECHECK_DELAY)
+    return True  # كل القراءات اتّفقت على الغياب ⇒ دليل كافٍ
+
 
 @dataclass(frozen=True)
 class DeletionResult:
@@ -48,26 +77,47 @@ class DeletionResult:
 
 
 def _is_definite_failure(status_code: int | None) -> bool:
-    """فشل مؤكّد (الحذف البعيد ما حصلش): 4xx من غير 429 (اللي قابل لإعادة المحاولة)."""
+    """فشل مؤكّد (الحذف البعيد ما حصلش): 4xx **مبهم/قابل لإعادة المحاولة** مستثنى.
+
+    429 (قابل لإعادة المحاولة) و404 (مبهم: غياب أو فشل خدمة داخلي) **مش** فشل مؤكّد —
+    لازم يمرّوا بتسوية التحقق من الوجود، مش يُعاملوا كنجاح ولا كفشل نهائي.
+    """
     return (
         status_code is not None
         and 400 <= status_code < 500
-        and status_code != 429
+        and status_code not in (404, 429)
     )
-
-
-async def _remote_absent(client, conversation_id: str) -> bool | None:
-    """هل الشات اتأكد غيابه بعيدًا؟ True=غايب، False=موجود، None=تعذّر التحقق."""
-    try:
-        return not await client.conversation_exists(conversation_id)
-    except ApiError:
-        return None
 
 
 def _finalize(db, conversation_id: str, now: str) -> DeletionResult:
     """يثبّت الحذف المحلي + حالة 'confirmed' (ذرّي) ويرجّع نتيجة نجاح."""
     db.delete_conversation(conversation_id, now, remote_confirmed=True)
     return DeletionResult(STATUS_DELETED, DELETED_MESSAGE, conversation_id, http_status=200)
+
+
+async def _reconcile(client, db, conversation_id: str, now: str, restore_local) -> DeletionResult:
+    """تسوية نتيجة الحذف **المبهمة/المجهولة** عبر التحقق من الوجود البعيد.
+
+    - غايب (مؤكّد بقراءات متتالية) ⇒ نثبّت الحذف ('confirmed' + حذف محلي).
+    - موجود ⇒ الحذف ما حصلش ⇒ نرجّع الحالة المحلية ونبلّغ فشل صريح (مفيش نجاح كاذب).
+    - تعذّر التحقق ⇒ 'uncertain' (مش نجاح، ومش فشل مؤكّد) — ينجو من restart ويُسوّى لاحقًا.
+    """
+    absent = await _establish_absence(client, conversation_id)
+    if absent is True:
+        return _finalize(db, conversation_id, now)
+    if absent is False:
+        # اتأكدنا إن الشات لسه موجود ⇒ الحذف ما حصلش ⇒ نرجّع الحالة المحلية.
+        restore_local()
+        return DeletionResult(
+            STATUS_FAILED, FAILED_MESSAGE, conversation_id,
+            http_status=502, code="remote_delete_failed",
+        )
+    # تعذّر التحقق ⇒ 'pending' (مش نجاح، ومش فشل مؤكّد).
+    db.set_remote_deletion_state(conversation_id, db.REMOTE_UNCERTAIN, now)
+    return DeletionResult(
+        STATUS_PENDING, PENDING_MESSAGE, conversation_id,
+        http_status=503, code="remote_delete_pending",
+    )
 
 
 async def delete_conversation_remote(client, db, conversation_id: str) -> DeletionResult:
@@ -96,9 +146,6 @@ async def delete_conversation_remote(client, db, conversation_id: str) -> Deleti
         await client.delete_conversation(conversation_id)
     except ApiError as exc:
         code = exc.status_code
-        if code == 404:
-            # مش موجود بعيدًا أصلاً ⇒ الهدف اتحقق (idempotent).
-            return _finalize(db, conversation_id, now)
         if _is_definite_failure(code):
             # فشل مؤكّد: الحذف البعيد ما حصلش ⇒ نرجّع الحالة المحلية، ونبلّغ فشل صريح —
             # مفيش نجاح كاذب ومفيش إخفاء كاذب.
@@ -107,23 +154,9 @@ async def delete_conversation_remote(client, db, conversation_id: str) -> Deleti
                 STATUS_FAILED, FAILED_MESSAGE, conversation_id,
                 http_status=code, code="remote_delete_failed",
             )
-        # نتيجة مجهولة (429/5xx/انقطاع/إعادة توجيه/رد مش متوقع): نسوّي بالتحقق من الوجود.
-        absent = await _remote_absent(client, conversation_id)
-        if absent is True:
-            return _finalize(db, conversation_id, now)
-        if absent is False:
-            # اتأكدنا إن الشات لسه موجود ⇒ الحذف ما حصلش ⇒ نرجّع الحالة المحلية.
-            _restore_local()
-            return DeletionResult(
-                STATUS_FAILED, FAILED_MESSAGE, conversation_id,
-                http_status=502, code="remote_delete_failed",
-            )
-        # تعذّر التحقق ⇒ 'pending' (مش نجاح، ومش فشل مؤكّد).
-        db.set_remote_deletion_state(conversation_id, db.REMOTE_UNCERTAIN, now)
-        return DeletionResult(
-            STATUS_PENDING, PENDING_MESSAGE, conversation_id,
-            http_status=503, code="remote_delete_pending",
-        )
+        # 404 (مبهم: غياب أو فشل خدمة داخلي) / 429 / 5xx / انقطاع / إعادة توجيه / رد مش
+        # متوقع ⇒ نتيجة **مش مؤكّدة** ⇒ نفس التسوية: تحقق من الوجود قبل أي تأكيد.
+        return await _reconcile(client, db, conversation_id, now, _restore_local)
 
     # OpenHands أكّد (200 success=true) ⇒ نثبّت الحذف المحلي + 'confirmed'.
     return _finalize(db, conversation_id, now)
@@ -132,9 +165,9 @@ async def delete_conversation_remote(client, db, conversation_id: str) -> Deleti
 async def reconcile_pending_deletions(client, db) -> None:
     """تسوية الحذف البعيد المعلّق بعد restart (best-effort، غير قاتل).
 
-    لكل شات حالته 'deleting'/'uncertain': نتحقق من الوجود بعيدًا.
+    لكل شات حالته 'deleting'/'uncertain': نتحقق من الوجود بعيدًا (بقراءات متتالية).
     - غايب ⇒ نثبّت الحذف (اتحذف فعلًا قبل الانقطاع).
-    - موجود ⇒ نرجّعه محليًا (الحذف البعيد ما حصلش؛ مفيش إخفاء كاذب).
+    - موجود ⇒ نرجّعه محليًا (نشيل الشاهد — الحذف البعيد ما حصلش؛ مفيش إخفاء كاذب).
     - تعذّر التحقق ⇒ نسيبه معلّق (مفيش تخمين).
     """
     try:
@@ -143,7 +176,7 @@ async def reconcile_pending_deletions(client, db) -> None:
         log.warning("تعذّر قراءة الحذف البعيد المعلّق (%s)", type(exc).__name__)
         return
     for conversation_id in pending:
-        absent = await _remote_absent(client, conversation_id)
+        absent = await _establish_absence(client, conversation_id)
         now = outbox.now_iso()
         if absent is True:
             try:

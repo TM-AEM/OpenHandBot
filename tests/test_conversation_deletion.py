@@ -119,6 +119,98 @@ def test_miniapp_owner_can_delete(tmp_path):
     assert db.remote_deletion_state(CID) == db.REMOTE_CONFIRMED
 
 
+# ============================ OHB2-REMOTE-DELETE-404: ambiguous 404 via real route
+def _mock_404_then_exists(exists_after, exists_status=200):
+    """MockTransport: التفويض يقرا (قبل DELETE) ⇒ الشات موجود؛ وبعد DELETE (404) نرجّع
+    نتيجة فحص الوجود المطلوبة. `exists_after`: موجود/غايب. `exists_status`: ترميز GET بعد الحذف.
+    """
+    conv = {"id": CID, "title": "شات", "execution_status": "running",
+            "created_by_user_id": OWNER_UUID}
+    state = {"delete_calls": 0, "exists_calls": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "DELETE":
+            state["delete_calls"] += 1
+            return httpx.Response(404, json={"detail": "Conversation not found"})
+        if path == "/api/v1/users/me":
+            return httpx.Response(200, json={"id": OWNER_UUID, "role": "owner"})
+        if path == "/api/v1/app-conversations":
+            if state["delete_calls"] == 0:
+                return httpx.Response(200, json=[conv])  # قراءة التفويض (قبل الحذف)
+            state["exists_calls"] += 1
+            if exists_status != 200:
+                return httpx.Response(exists_status, json={"detail": "down"})
+            return httpx.Response(200, json=[conv] if exists_after else [])
+        if path.endswith("/events/search"):
+            return httpx.Response(200, json={"items": []})
+        return httpx.Response(404, json={"detail": "no"})
+
+    return state, handler
+
+
+def _client_with(handler) -> OpenHandsClient:
+    return OpenHandsClient("https://example.test", "key", transport=httpx.MockTransport(handler))
+
+
+def test_miniapp_404_with_present_conversation_is_failure(tmp_path):
+    """404 مبهم + الشات لسه موجود ⇒ فشل منظّم، الشات ما اتحذفش محليًا (مفيش نجاح كاذب)."""
+    db = _db(tmp_path)
+    db.add_watched(CID, "شات", chat_id=OWNER)
+    state, handler = _mock_404_then_exists(exists_after=True)
+    tc = TestClient(build_web_app(make_config(), db, client=_client_with(handler)),
+                    raise_server_exceptions=False)
+    login(tc)
+    r = tc.delete(f"/api/v1/conversations/{CID}", headers={"origin": ORIGIN})
+    assert r.status_code == 502, r.text
+    assert r.json()["error"] == "remote_delete_failed"
+    assert db.get_watched(CID) is not None  # لسه موجود محليًا
+    assert db.is_deleted(CID) is False
+    assert state["delete_calls"] == 1 and state["exists_calls"] >= 1
+
+
+def test_miniapp_404_with_confirmed_absence_is_success(tmp_path):
+    """404 + غياب مؤكّد (قراءات فاضية) ⇒ نجاح idempotent مؤكّد."""
+    db = _db(tmp_path)
+    db.add_watched(CID, "شات", chat_id=OWNER)
+    state, handler = _mock_404_then_exists(exists_after=False)
+    tc = TestClient(build_web_app(make_config(), db, client=_client_with(handler)),
+                    raise_server_exceptions=False)
+    login(tc)
+    r = tc.delete(f"/api/v1/conversations/{CID}", headers={"origin": ORIGIN})
+    assert r.status_code == 200, r.text
+    assert r.json()["deleted"] is True and r.json()["remote_deleted"] is True
+    assert db.get_watched(CID) is None
+    assert db.remote_deletion_state(CID) == db.REMOTE_CONFIRMED
+
+
+def test_miniapp_404_with_inconclusive_check_is_pending(tmp_path):
+    """404 + تعذّر التحقق (فشل GET) ⇒ '503 remote_delete_pending'، والحالة 'uncertain'."""
+    db = _db(tmp_path)
+    db.add_watched(CID, "شات", chat_id=OWNER)
+    state, handler = _mock_404_then_exists(exists_after=False, exists_status=503)
+    tc = TestClient(build_web_app(make_config(), db, client=_client_with(handler)),
+                    raise_server_exceptions=False)
+    login(tc)
+    r = tc.delete(f"/api/v1/conversations/{CID}", headers={"origin": ORIGIN})
+    assert r.status_code == 503, r.text
+    assert r.json()["error"] == "remote_delete_pending"
+    assert db.remote_deletion_state(CID) == db.REMOTE_UNCERTAIN
+
+
+def test_miniapp_404_non_owner_still_rejected_no_remote_call(tmp_path):
+    """التفويض قبل أي حذف: مالك تاني ⇒ 403 ومفيش نداء DELETE خالص (حتى مع 404)."""
+    api, db = MockAPI(), _db(tmp_path)
+    api.conv_owner = "someone-else"
+    db.add_watched(CID, "شات", chat_id=OWNER)
+    tc = make_client(api, db)
+    login(tc)
+    r = tc.delete(f"/api/v1/conversations/{CID}", headers={"origin": ORIGIN})
+    assert r.status_code == 403 and r.json()["error"] == "unauthorized"
+    assert db.get_watched(CID) is not None
+    assert api.deleted_remote_calls == 0  # مفيش حذف بعيد اتبعت خالص
+
+
 def test_miniapp_non_owner_cannot_delete(tmp_path):
     api, db = MockAPI(), _db(tmp_path)
     api.conv_owner = "someone-else"

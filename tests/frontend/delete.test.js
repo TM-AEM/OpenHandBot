@@ -221,7 +221,7 @@ test("بعد نجاح الحذف الشات بيختفي من القايمة ف�
   fetch.route((c) => c.path === "/conversations/c1/files", () => ({ status: 200, data: { conversation_id: "c1", files: [] } }));
   fetch.route((c) => c.method === "DELETE" && c.path === "/conversations/c1", () => {
     deleted = true;
-    return { status: 200, data: { ok: true, deleted: true, local_only: true } };
+    return { status: 200, data: { ok: true, deleted: true, remote_deleted: true } };
   });
 
   doc.getElementById("tab-chats").click();
