@@ -289,6 +289,21 @@ async def notifications_toggle(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 
+def _without_deleted(db, items: list[dict]) -> list[dict]:
+    """يشيل الشاتات المحذوفة محليًا (tombstone) من قايمة شاتات البوت (OHB2-F1).
+
+    القايمة بتيجي من بحث بعيد مش عارف بالحذف المحلي، فبندمجها مع شاهد الحذف قبل الترقيم
+    عشان الشات المحذوف ما يظهرش لا من كاش قديم ولا من بحث جديد. قاعدة غير متاحة ⇒ ما
+    نكسرش القايمة (نرجّع زي ما هي).
+    """
+    if not items:
+        return items
+    try:
+        return [c for c in items if not db.is_deleted(c.get("id") or "")]
+    except Exception:  # noqa: BLE001 — قاعدة غير متاحة ⇒ ما نكسرش القايمة
+        return items
+
+
 async def list_conversations(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
@@ -312,6 +327,9 @@ async def list_conversations(update: Update, context: ContextTypes.DEFAULT_TYPE)
         items = result["items"]
         if items:
             context.bot_data["list_cache"] = (time.monotonic(), items)
+    # OHB2-F1: الشاتات المحذوفة محليًا لازم تختفي من القايمة قبل الترقيم — سواء جاية من
+    # كاش قديم أو من بحث بعيد جديد (البحث مش عارف بالحذف المحلي).
+    items = _without_deleted(context.bot_data["db"], items)
     if not items:
         await _safe_edit(q, "ما فيهاش شاتات.", reply_markup=kb.main_menu(_mini_app_url(context)))
         return
@@ -531,6 +549,9 @@ async def delete_conversation_confirm(update: Update, context: ContextTypes.DEFA
         log.exception("تعذّر حذف الشات %s", conversation_id)
         await _safe_edit(q, "تعذّر الحذف دلوقتي (خطأ مؤقت في قاعدة البيانات). جرّب تاني.")
         return
+    # OHB2-F1: الحذف نجح ⇒ ترتيب/محتوى القايمة اتغيّر ⇒ نبطّل كاش القايمة (زي ما بنعمل
+    # بعد إرسال برومت أو بدء شات). مابنبطّلوش في حالات الفشل/عدم التفويض (بنرجع فوق).
+    context.bot_data.pop("list_cache", None)
     await _safe_edit(
         q,
         "تمام، اتشال من هنا ✅ (حذف محلي — الشات لسه موجود على OpenHands).",
