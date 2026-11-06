@@ -318,8 +318,9 @@ async def list_conversations(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.bot_data["db"].clear_awaiting(update.effective_user.id)  # تنقّل = خروج من أي توجيه
     page = int(q.data.split(":", 1)[1])
     client = context.bot_data["client"]
-    # نجيب كل صفحات البحث (نتبع next_page_id بحد أقصى) ونرتّبهم إحنا، عشان الترتيب الخام
-    # من الـ API مش مضمون وبيكسر الترقيم لو رتّبنا كل صفحة لوحدها.
+    # نجيب كل صفحات البحث (نتبع next_page_id بحد أقصى). `collect_conversations` بيرجّع
+    # القايمة مرتّبة بـ `updated_at` تنازليًا وبدون تكرارات (عقد ترتيب صريح، مش معتمد على
+    # ترتيب الـ API الخام) — فالترقيم ثابت عبر الصفحات.
     # TASK 55 (G4): كاش قصير للقايمة عشان الضغط على «المزيد» ما يعملش طلب API كل مرة.
     cache = context.bot_data.get("list_cache")
     if cache and time.monotonic() - cache[0] < LIST_TTL:

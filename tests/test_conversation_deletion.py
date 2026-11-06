@@ -711,6 +711,43 @@ def test_miniapp_list_hides_all_on_db_error(tmp_path):
     assert r.json()["items"] == [], "لازم نخفي القايمة كلها بدل ما نعرّض شات محذوف"
 
 
+# ===================== OHB2-PHASE5-FIX-04: fail-closed then recovery (P3-02)
+def test_miniapp_list_recovers_after_transient_db_failure(tmp_path):
+    """Mini App: فشل مؤقت في قراءة الشواهد ⇒ فشل مغلق (قايمة فاضية)، وبعد الرجوع ⇒ القايمة ترجع."""
+    db = _db(tmp_path)
+    items = [_conv("c1"), _conv("c2")]
+    app = _FakeApp()
+    tc = TestClient(
+        build_web_app(make_config(), db, client=_ListClient(items), application=app),
+        raise_server_exceptions=False,
+    )
+    login(tc)
+    # الكاش بيتملّى الأول عشان القراءة بعد كده توصل لفلتر الشواهد مباشرة.
+    assert tc.get("/api/v1/conversations?refresh=1").status_code == 200
+
+    # فلتر قابل للتحكّم: بيفشل مؤقتًا ثم يتعافى (نفس كائن القاعدة اللي الخدمة ماسكاه).
+    real = db.is_deleted
+    state = {"failing": True}
+
+    def flaky(cid):
+        if state["failing"]:
+            raise RuntimeError("database unavailable")
+        return real(cid)
+
+    db.is_deleted = flaky  # type: ignore[assignment]
+
+    # 1) الفشل المؤقت: الفلترة تفشل ⇒ فشل مغلق (مفيش إظهار لأي شات).
+    r1 = tc.get("/api/v1/conversations?refresh=1")
+    assert r1.status_code == 200
+    assert r1.json()["items"] == [], "الفشل المؤقت ⇒ مفيش إظهار لأي شات"
+
+    # 2) التعافي: القاعدة رجعت ⇒ القايمة ترجع مفلترة (مفيش انقطاع دائم).
+    state["failing"] = False
+    r2 = tc.get("/api/v1/conversations?refresh=1")
+    assert r2.status_code == 200
+    assert [i["id"] for i in r2.json()["items"]] == ["c1", "c2"]
+
+
 # ================================== OHB2-AUDIT-FIX-05: Mini App list collects all pages
 class _PagedListClient:
     """عميل وهمي بيدعم البحث بصفحات عبر next_page_id."""
