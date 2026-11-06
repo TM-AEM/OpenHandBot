@@ -531,3 +531,106 @@ def test_collect_conversations_propagates_api_error():
 
     with pytest.raises(ApiError):
         asyncio.run(collect_conversations(C()))
+
+
+# ================================= OHB2-PHASE5-FIX: ordering contract (P2-01)
+def test_collect_conversations_sorts_by_updated_at_desc_across_pages():
+    """صفحات بترتيب عالمي غير مرتّب ⇒ الناتج لازم يترتّب بـ updated_at تنازليًا."""
+    import asyncio
+    from bot.openhands_client import collect_conversations
+
+    pages = {
+        # الصفحة الأولى: الأحدث أولاً، لكن الأرقام نفسها مش مرتّبة عبر الصفحات.
+        None: {
+            "items": [
+                {"id": "a", "updated_at": "2026-01-03T00:00:00Z"},
+                {"id": "b", "updated_at": "2026-01-01T00:00:00Z"},
+            ],
+            "next_page_id": "p2",
+        },
+        "p2": {
+            "items": [
+                {"id": "c", "updated_at": "2026-01-04T00:00:00Z"},  # أحدث من الكل
+                {"id": "d", "updated_at": "2026-01-02T00:00:00Z"},
+            ],
+            "next_page_id": None,
+        },
+    }
+    calls = []
+    out = asyncio.run(collect_conversations(_paged_client(pages, calls)))
+    assert [c["id"] for c in out["items"]] == ["c", "a", "d", "b"]
+    assert out["truncated"] is False
+
+
+def test_collect_conversations_items_without_updated_at_sort_last():
+    """عناصر من غير updated_at بتقع في الآخر (نفس سلوك ترتيب الـ client لكل صفحة)."""
+    import asyncio
+    from bot.openhands_client import collect_conversations
+
+    pages = {
+        None: {
+            "items": [
+                {"id": "no_ts"},
+                {"id": "ts", "updated_at": "2026-01-01T00:00:00Z"},
+            ],
+            "next_page_id": None,
+        },
+    }
+    out = asyncio.run(collect_conversations(_paged_client(pages, [])))
+    assert [c["id"] for c in out["items"]] == ["ts", "no_ts"]
+
+
+# =============================== OHB2-PHASE5-FIX: duplicate IDs (P3-01)
+def test_collect_conversations_dedupes_overlapping_pages():
+    """المؤشّر رجّع نفس الشات في صفحتين ⇒ مفيش تكرار، أول ظهور (الأحدث) بيفضل."""
+    import asyncio
+    from bot.openhands_client import collect_conversations
+
+    pages = {
+        None: {
+            "items": [
+                {"id": "A", "updated_at": "2026-01-05T00:00:00Z"},
+                {"id": "B", "updated_at": "2026-01-03T00:00:00Z"},
+            ],
+            "next_page_id": "p2",
+        },
+        # "A" مكرّر هنا (تداخل صفحات) بعنوان مختلف.
+        "p2": {
+            "items": [
+                {"id": "A", "title": "نسخة تانية", "updated_at": "2026-01-01T00:00:00Z"},
+                {"id": "C", "updated_at": "2026-01-04T00:00:00Z"},
+            ],
+            "next_page_id": None,
+        },
+    }
+    calls = []
+    out = asyncio.run(collect_conversations(_paged_client(pages, calls)))
+    ids = [c["id"] for c in out["items"]]
+    assert ids == ["A", "C", "B"]            # مرتّبة تنازليًا + مفيش تكرار
+    assert len(ids) == len(set(ids))          # مفيش أي معرّف مكرّر
+    assert calls == [None, "p2"]              # لسه تابع المؤشّر
+    assert out["truncated"] is False
+    # أول ظهور لـ A محتفظ بيه (الأحدث) مش النسخة المتأخّرة.
+    a = next(c for c in out["items"] if c["id"] == "A")
+    assert "title" not in a
+
+
+def test_collect_conversations_dedupe_does_not_loop_forever():
+    """إزالة التكرار ما بتضيفش دورات ولا بتسبب حلقة: عدد النداءات = عدد الصفحات."""
+    import asyncio
+    from bot.openhands_client import collect_conversations
+
+    class SamePage:
+        def __init__(self):
+            self.calls = 0
+
+        async def search_conversations(self, limit=100, page_id=None):
+            self.calls += 1
+            # نفس العنصر في كل صفحة + مؤشّر دايمًا موجود ⇒ الحد هو اللي يوقّفه.
+            return {"items": [{"id": "dup"}], "next_page_id": "again"}
+
+    c = SamePage()
+    out = asyncio.run(collect_conversations(c, max_pages=4))
+    assert c.calls == 4                       # محدود بالحد، مفيش حلقة
+    assert [i["id"] for i in out["items"]] == ["dup"]  # اتدمج لصف واحد
+    assert out["truncated"] is True           # لسه فيه صفحات ⇒ إعلان صريح

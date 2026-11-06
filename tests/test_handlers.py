@@ -1458,3 +1458,50 @@ def test_list_conversations_flags_truncation(tmp_path):
     upd = _list_update(1, 0)
     asyncio.run(h.list_conversations(upd, ctx))
     assert "القايمة طويلة" in upd.callback_query.edits[-1]
+
+
+# ===================== OHB2-PHASE5-FIX-04: bot fail-closed then recovery (P3-02)
+class _ListFakeClient:
+    def __init__(self, items):
+        self._items = items
+
+    async def search_conversations(self, limit=100, page_id=None):
+        return {"items": list(self._items), "next_page_id": None}
+
+
+def test_bot_list_recovers_after_transient_db_failure(tmp_path):
+    """البوت: فشل مؤقت في قراءة الشواهد ⇒ فشل مغلق، وبعد الرجوع ⇒ القايمة ترجع."""
+    items = [
+        {"id": "c1", "title": "واحد", "execution_status": "running"},
+        {"id": "c2", "title": "اتنين", "execution_status": "running"},
+    ]
+    ctx = make_context(1, tmp_path, client=_ListFakeClient(items))
+    db = ctx.bot_data["db"]
+    # الكاش بيتملّى من أول نداء (والقاعدة الحقيقية شغالة).
+    first = _t55_cb_update(CQ("list:0"))
+    asyncio.run(h.list_conversations(first, ctx))
+    assert _shown_ids(first) == ["c1", "c2"]
+    assert "list_cache" in ctx.bot_data
+
+    # فلتر قابل للتحكّم: بيفشل مؤقتًا ثم يتعافى (على نفس كائن القاعدة).
+    real = db.is_deleted
+    state = {"failing": True}
+
+    def flaky(cid):
+        if state["failing"]:
+            raise RuntimeError("database unavailable")
+        return real(cid)
+
+    db.is_deleted = flaky  # type: ignore[assignment]
+
+    # 1) انقطاع مؤقت: الفلترة تفشل ⇒ فشل مغلق (مفيش إظهار).
+    second = _t55_cb_update(CQ("list:0"))
+    asyncio.run(h.list_conversations(second, ctx))
+    assert _shown_ids(second) == [], "الفشل المؤقت ⇒ مفيش شاتات معروضة"
+    assert "ما فيهاش شاتات" in second.callback_query.edits[-1]
+
+    # 2) التعافي: القاعدة رجعت ⇒ القايمة ترجع كاملة.
+    state["failing"] = False
+    third = _t55_cb_update(CQ("list:0"))
+    asyncio.run(h.list_conversations(third, ctx))
+    assert _shown_ids(third) == ["c1", "c2"]

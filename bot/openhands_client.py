@@ -560,6 +560,16 @@ async def collect_conversations(
     بيرجّع `{"items": [...], "truncated": bool}`. `truncated=True` لو فيه صفحات إضافية
     لسه موجودة بعد الحد (المستخدم لازم يعرف إن القايمة مش كاملة، مش إخفاء صامت).
     الأخطاء بتطلع للمستدعي زي ما هي (نفس سياسة الـ client).
+
+    OHB2-PHASE5-FIX (P2-01/P3-01) — عقد الترتيب والإزالة المكرّرة:
+    - **الترتيب:** القايمة النهائية بتترتّب بـ `updated_at` تنازليًا **هنا** (مش معتمدة
+      على ترتيب الـ API الخام اللي موثّق إنه مش مضمون، `docs/API_NOTES.md`). العناصر
+      اللي مالها `updated_at` بتقع في الآخر (زي ترتيب الـ client لكل صفحة). فالترتيب
+      صريح ومستقل عن ترتيب المؤشّر.
+    - **الإزالة المكرّرة:** لو المؤشّر رجّع نفس الشات في أكتر من صفحة، بنحتفظ **بأول ظهور**
+      (الصفحة الأحدث) ونشيل التكرارات — معرّف الشات هو المفتاح المستقر. العناصر من غير
+      `id` ما بتتدمجش (بتفضل زي ما هي). الإزالة محدودة (بتمرّة واحدة على العناصر المجمّعة)
+      فمستحيل تسبب حلقة لا نهائية.
     """
     items: list[dict] = []
     page_id: str | None = None
@@ -571,4 +581,23 @@ async def collect_conversations(
         page_id = result.get("next_page_id")
         if not page_id:
             break
-    return {"items": items, "truncated": bool(page_id)}
+    deduped = _dedupe_by_id(items)
+    deduped.sort(key=lambda it: it.get("updated_at") or "", reverse=True)
+    return {"items": deduped, "truncated": bool(page_id)}
+
+
+def _dedupe_by_id(items: list[dict]) -> list[dict]:
+    """يشيل التكرارات بمعرّف الشات، محتفظًا بأول ظهور (الصفحة الأحدث) وترتيب الظهور."""
+    seen: set[str] = set()
+    out: list[dict] = []
+    for it in items:
+        cid = it.get("id") if isinstance(it, dict) else None
+        if cid is None:
+            out.append(it)  # من غير معرّف مستقر ⇒ ما ندمجوش
+            continue
+        key = str(cid)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+    return out
