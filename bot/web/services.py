@@ -20,6 +20,7 @@ from ..messages import get_status, pr_url, state_label, truncate
 from ..openhands_client import collect_conversations
 from .. import features
 from .. import outbox
+from .. import deletion
 from .. import db as db_module
 from ..db import INBOX_PAGE_SIZE
 from ..files import (
@@ -506,21 +507,45 @@ class MiniAppService:
         return _conversation_dto(conv, cid in self._watched_ids())
 
     async def delete_conversation(self, conversation_id: str) -> dict:
-        """حذف محلي آمن لشات (OHB2-C7): إزالة كل الأثر المحلي، بلا حذف بعيد.
+        """حذف الشات **من OpenHands نفسه** ثم تثبيت الحذف محليًا (OHB2-MINIAPP).
 
-        التفويض أولاً (نفس عقد كل مسارات الشات: معرّف صالح ⇒ ملكية الشات)، وبعدين حذف
-        محلي ذرّي. **مفيش أي نداء حذف بعيد لـ OpenHands** — الشات على الخدمة يفضل زي ما
-        هو؛ إحنا بنشيل بس السجلات المحلية (متابعة/صندوق/إكمال/إشعارات/توجيه).
+        التفويض أولاً (معرّف صالح ⇒ ملكية الشات server-side)، وبعدين:
+        1. وسم الحذف الجاري (شاهد + 'deleting') في القاعدة — قبل أي نداء بعيد.
+        2. `DELETE /app-conversations/{id}` (Bearer) على OpenHands.
+        3. الحذف المحلي + 'confirmed' **بس** بعد ما OpenHands يأكّد (أو 404 = غايب أصلاً).
+
+        الفشل المؤكّد (401/403/422) والنتيجة المجهولة (429/5xx/انقطاع) **مايترجّعوش نجاح**:
+        الفشل المؤكّد ⇒ خطأ منظّم (الشات لسه موجود)، والمجهول ⇒ خطأ 'pending' (الشات متقفل
+        محليًا بس الحذف البعيد لسه مش متأكد). مفيش fallback صامت لحذف محلي فقط.
         """
         cid = _require_id(conversation_id)
         if self._db is None:
             raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
+        client = self._require_client()
+        # idempotent: حذف بعيد **مؤكّد سابقًا** ⇒ نجاح بدون نداء تاني. الشات بقى غايب
+        # بعيدًا فتفويض الملكية كان هيرجّع 404؛ بدل كده نعتبره نجاح (الحذف اتعمل فعلًا).
+        # آمن: الراوت (`_guarded`) بيفرض جلسة + مستخدم مسموح + Origin قبل ما نوصل هنا،
+        # والشاهد المؤكّد ما بيتكتبش غير بعد حذف متفاوَض عليه من نفس المالك.
+        if self._db.remote_deletion_state(cid) == self._db.REMOTE_CONFIRMED:
+            return {"ok": True, "deleted": True, "remote_deleted": True, "conversation_id": cid}
+        # تفويض الملكية **قبل** أي حذف (مفيش IDOR). بيرمي CodedApiError منظّم عند الرفض.
         await self._authorize_conversation(cid)
-        summary = self._db.delete_conversation(cid, outbox.now_iso())
+        result = await deletion.delete_conversation_remote(client, self._db, cid)
         # نبلّغ أي worker مالك (نفس العملية) إن فيه تغيير — من غير إنشاء worker جديد.
         for key in ("outbox_worker", "creation_worker", "completion_worker", "watcher", "notifier"):
             self._wake(key)
-        return {"ok": True, "deleted": True, "conversation_id": cid, "local_only": True, "summary": summary}
+        if result.status != deletion.STATUS_DELETED:
+            raise CodedApiError(
+                result.code or "remote_delete_failed",
+                result.message,
+                result.http_status or 502,
+            )
+        return {
+            "ok": True,
+            "deleted": True,
+            "remote_deleted": True,
+            "conversation_id": cid,
+        }
 
     async def get_cost(self, conversation_id: str) -> dict:
         """OHB2-09-04: تكلفة/استهلاك شات واحد (من نفس نداء التفاصيل — مفيش نداء إضافي)."""

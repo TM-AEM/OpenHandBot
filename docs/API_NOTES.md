@@ -40,6 +40,17 @@
 - `GET /app-conversations/start-tasks?ids=TASK_ID` → **array عناصرها ممكن `null`**. استنى `status == "READY"` وخد `app_conversation_id`. (المسار ده ماتمرنش live على شات جديد في المرحلة 0، اتأكد شكله فقط.)
 - `selected_repository` اختياري حسب الخطة؛ البوت بيدعم بدونه.
 
+## حذف شات (OHB2-MINIAPP)
+`DELETE /app-conversations/{id}` — حذف **بعيد** فعلي لشات على OpenHands (مش إخفاء محلي).
+- المصادقة: `Authorization: Bearer <OPENHANDS_API_KEY>` (زي باقي النداءات). موثّق كـ `APIKeyHeader`
+  (`X-Access-Token`) في OpenAPI، والواجهة الرسمية بتبعت `Bearer`.
+- النجاح: `200` بجسم `{"success": true}`. `404` = الشات مش موجود (نعتبرها نجاح idempotent).
+  `422` = معرّف غير صالح. `401/403` = فشل مصادقة/تفويض. `429`/`5xx` = نتيجة **مجهولة** (نعيد
+  المحاولة/نسوّي). التنفيذ: `bot/openhands_client.py::delete_conversation` +
+  التنسيق المشترك في `bot/deletion.py`.
+- التحقق من الوجود: `GET /app-conversations?ids=<id>` ⇒ قايمة فاضية = غايب (نفس نداء القراءة
+  المستخدم في التفويض) — يُستخدم لتسوية النتيجة المجهولة بعد الانقطاع/إعادة التشغيل.
+
 ## المستودعات
 `GET /git/repositories/search?provider=github&limit=100`
 - ترجّع `{"items":[...]}`، كل عنصر فيه `full_name`، `main_branch`، `is_public`.

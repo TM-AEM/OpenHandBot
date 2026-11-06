@@ -205,3 +205,57 @@ def test_index_is_framable_by_telegram(client):
     # الـ API نفسه مايتسمحش يتعمله framing.
     api = client.get("/health")
     assert api.headers.get("x-frame-options") == "SAMEORIGIN"
+
+
+# --------------------------------------------- OHB2-MINIAPP: activation & URL
+def test_index_loads_telegram_webapp_sdk(client):
+    """الواجهة لازم تحمّل SDK تيليجرام الرسمي قبل app.js (وإلا initData فاضي دايماً)."""
+    html = client.get("/mini/").text
+    assert "telegram-web-app.js" in html
+    assert html.index("telegram-web-app.js") < html.index("/mini/app.js")
+    # الـ CSP لازم يسمح للسكربت من telegram.org.
+    csp = client.get("/mini/").headers.get("content-security-policy", "")
+    assert "https://telegram.org" in csp
+
+
+def test_mini_app_url_rejects_credentials_fragment_query(monkeypatch):
+    import pytest as _pytest
+
+    from bot.config import ConfigError, load_config
+
+    def _cfg(url):
+        return load_config({
+            "TELEGRAM_BOT_TOKEN": BOT_TOKEN,
+            "OPENHANDS_API_KEY": "test-openhands-key-1234567890",
+            "ALLOWED_TELEGRAM_ID": str(OWNER),
+            "MINI_APP_URL": url,
+        })
+
+    for bad in (
+        "https://user:pass@app.example.com/mini/",
+        "https://app.example.com/mini/#frag",
+        "https://app.example.com/mini/?x=1",
+    ):
+        with _pytest.raises(ConfigError):
+            _cfg(bad)
+    # رابط نضيف https يعدّي.
+    assert _cfg("https://app.example.com/mini/").mini_app_url == "https://app.example.com/mini/"
+
+
+def test_app_command_diagnostic_is_non_secret(tmp_path):
+    """رسالة /app توضّح السبب (اسم الإعداد) بدون أي سر."""
+    from types import SimpleNamespace
+
+    import bot.handlers as h
+
+    ctx = SimpleNamespace()
+    ctx.bot_data = {"config": SimpleNamespace(mini_app_enabled=False, mini_app_url="")}
+    assert "MINI_APP_ENABLED" in h._mini_app_diagnostic(ctx)
+    ctx.bot_data["config"] = SimpleNamespace(mini_app_enabled=True, mini_app_url="")
+    assert "MINI_APP_URL" in h._mini_app_diagnostic(ctx)
+
+
+def test_delete_route_reachable_and_requires_auth(client):
+    """مسار الحذف موجود ويرفض غير المصادَق (401) — الطبقة الأمنية فعّالة."""
+    r = client.delete("/api/v1/conversations/c1")
+    assert r.status_code == 401

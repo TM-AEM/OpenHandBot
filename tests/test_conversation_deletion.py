@@ -60,9 +60,11 @@ class MockAPI:
         path = request.url.path
         method = request.method
         if method == "DELETE":
-            # لو الكود حاول يحذف الشات بعيدًا، نرصدها (المطلوب: مفيش حذف بعيد).
+            # OHB2-MINIAPP: الحذف البعيد مدعوم ⇒ نفس عقد OpenAPI (200 {"success": true})
+            # والشات يختفي بعيدًا (كده التحقق من الغياب يرجّع False).
             self.deleted_remote_calls += 1
-            return httpx.Response(200, json={"ok": True})
+            self.convs_present = False
+            return httpx.Response(200, json={"success": True})
         if path == "/api/v1/users/me":
             if self.owner_uuid is None:
                 return httpx.Response(200, json={})
@@ -111,9 +113,10 @@ def test_miniapp_owner_can_delete(tmp_path):
     r = tc.delete(f"/api/v1/conversations/{CID}", headers={"origin": ORIGIN})
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["deleted"] is True and body["local_only"] is True
+    assert body["deleted"] is True and body["remote_deleted"] is True
     assert db.get_watched(CID) is None  # اتشال محليًا
-    assert api.deleted_remote_calls == 0  # مفيش حذف بعيد
+    assert api.deleted_remote_calls == 1  # اتحذف من OpenHands نفسه
+    assert db.remote_deletion_state(CID) == db.REMOTE_CONFIRMED
 
 
 def test_miniapp_non_owner_cannot_delete(tmp_path):
@@ -161,8 +164,9 @@ def test_miniapp_repeated_delete_idempotent(tmp_path):
     r1 = tc.delete(f"/api/v1/conversations/{CID}", headers={"origin": ORIGIN})
     r2 = tc.delete(f"/api/v1/conversations/{CID}", headers={"origin": ORIGIN})
     assert r1.status_code == 200 and r2.status_code == 200
-    assert r1.json()["summary"]["watched_deleted"] == 1
-    assert r2.json()["summary"]["watched_deleted"] == 0  # idempotent
+    # الحذف البعيد اتعمل **مرة واحدة** بس (المرة التانية مقفولة على 'confirmed').
+    assert api.deleted_remote_calls == 1
+    assert r2.json()["deleted"] is True  # idempotent
 
 
 # ============================================================ bot handlers
@@ -222,8 +226,10 @@ class _BotClient:
             return {}
         return {"id": self._owner_uuid}
 
-    async def delete_conversation(self, conversation_id):  # لو الكود حاول حذف بعيد
+    async def delete_conversation(self, conversation_id):
+        # OHB2-MINIAPP: العميل بيرجّع True بس لما OpenHands يأكّد النجاح.
         self.deleted_remote_calls += 1
+        return True
 
 
 class _FakeConfig:
@@ -271,8 +277,8 @@ def test_bot_delete_confirm_owner_ok(tmp_path):
     update = _cb_update(OWNER, f"deleteok:{CID}")
     asyncio.run(h.delete_conversation_confirm(update, ctx))
     assert db.get_watched(CID) is None  # اتحذف محليًا
-    assert client.deleted_remote_calls == 0  # مفيش حذف بعيد
-    assert any("اتشال" in t for t in update.callback_query.edits)
+    assert client.deleted_remote_calls == 1  # اتحذف من OpenHands نفسه
+    assert any("OpenHands" in t for t in update.callback_query.edits)
 
 
 def test_bot_delete_confirm_non_owner_rejected(tmp_path):
@@ -490,35 +496,40 @@ def test_unwatch_behavior_unchanged(tmp_path):
     assert db.get_watched(CID) is None
 
 
-def test_delete_never_calls_remote_api(tmp_path):
-    """تأكيد صريح: مسار الحذف مابيعملش أي نداء DELETE بعيد (local-only)."""
+def test_delete_calls_remote_api(tmp_path):
+    """تأكيد صريح: مسار الحذف **بيعمل** نداء DELETE بعيد على OpenHands (مش local-only)."""
     api, db = MockAPI(), _db(tmp_path)
     db.add_watched(CID, "شات", chat_id=OWNER)
     tc = make_client(api, db)
     login(tc)
-    tc.delete(f"/api/v1/conversations/{CID}", headers={"origin": ORIGIN})
-    assert api.deleted_remote_calls == 0
+    r = tc.delete(f"/api/v1/conversations/{CID}", headers={"origin": ORIGIN})
+    assert r.status_code == 200
+    assert api.deleted_remote_calls == 1
 
 
 def test_bot_and_miniapp_delete_are_consistent(tmp_path):
-    """تكافؤ: الاتنين بيشيلوا نفس السجل المحلي (watched) بدون حذف بعيد."""
-    # Mini App
-    api, mdb = MockAPI(), _db(tmp_path)
+    """تكافؤ: الاتنين بيحذفوا من OpenHands **و** بيشيلوا نفس السجل المحلي (watched)."""
+    # Mini App (قاعدة مستقلة)
+    mini_dir = tmp_path / "mini"
+    mini_dir.mkdir()
+    api, mdb = MockAPI(), _db(mini_dir)
     mdb.add_watched(CID, "شات", chat_id=OWNER)
     tc = make_client(api, mdb)
     login(tc)
     assert tc.delete(f"/api/v1/conversations/{CID}", headers={"origin": ORIGIN}).status_code == 200
     assert mdb.get_watched(CID) is None
 
-    # البوت
+    # البوت (قاعدة مستقلة)
+    bot_dir = tmp_path / "bot"
+    bot_dir.mkdir()
     client = _BotClient()
-    ctx = _ctx(tmp_path, client)
+    ctx = _ctx(bot_dir, client)
     bdb = ctx.bot_data["db"]
     bdb.add_watched(CID, "شات", chat_id=OWNER)
     update = _cb_update(OWNER, f"deleteok:{CID}")
     asyncio.run(h.delete_conversation_confirm(update, ctx))
     assert bdb.get_watched(CID) is None
-    assert api.deleted_remote_calls == 0 and client.deleted_remote_calls == 0
+    assert api.deleted_remote_calls == 1 and client.deleted_remote_calls == 1
 
 
 # ===================================================== PHASE6-ALIGN: shared lifecycle
@@ -533,9 +544,9 @@ def test_both_interfaces_share_same_backend_lifecycle(tmp_path, monkeypatch):
     calls: list[str] = []
     original = Database.delete_conversation
 
-    def _spy(self, conversation_id, now):
+    def _spy(self, conversation_id, now, **kw):
         calls.append(conversation_id)
-        return original(self, conversation_id, now)
+        return original(self, conversation_id, now, **kw)
 
     monkeypatch.setattr(Database, "delete_conversation", _spy)
 
@@ -597,6 +608,10 @@ class _ListClient:
 
     async def get_current_user(self):
         return {"id": OWNER_UUID}
+
+    async def delete_conversation(self, conversation_id):
+        # OHB2-MINIAPP: الحذف البعيد بينجح (يرجّع True).
+        return True
 
 
 class _FakeApp:

@@ -6,6 +6,10 @@
     <meta name="color-scheme" content="light dark">
     <meta name="theme-color" content="#0f172a">
     <title>OpenHandBot</title>
+    <!-- OHB2-MINIAPP: SDK الرسمي لتيليجرام. لازم يتحمّل قبل app.js عشان `Telegram.WebApp`
+         (و`initData`) يكونوا موجودين جوه عميل تيليجرام الحقيقي (أندرويد/ديسكتوب/ويب).
+         من غيره الواجهة بتشوف initData فاضي ⇒ مصادقة تفشل. مسموح في CSP عبر telegram.org. -->
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
     <link rel="stylesheet" href="/mini/styles.css?v=5">
   </head>
   <body>

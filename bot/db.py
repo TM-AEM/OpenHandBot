@@ -453,7 +453,9 @@ class Database:
             -- القديمة بتاخده تلقائيًا (إضافي وغير مدمّر — مفيش فقد بيانات).
             CREATE TABLE IF NOT EXISTS deleted_conversations (
                 conversation_id TEXT PRIMARY KEY,
-                deleted_at      TEXT
+                deleted_at      TEXT,
+                remote_state    TEXT,
+                remote_updated_at TEXT
             );
             """
         )
@@ -667,6 +669,14 @@ class Database:
             # تنظيف: `idx_inbox_created(id)` كان زائد (الـ PK فهرس بالفعل) وبيضاعف الكتابة
             # عند كل إدراج/تقليم. بنشيله لو موجود (فهرس بس — مفيش أي مساس بالبيانات).
             self._conn.execute("DROP INDEX IF EXISTS idx_inbox_created")
+
+        # OHB2-MINIAPP: حالة الحذف البعيد على الشاهد (deleting ⇒ uncertain/confirmed).
+        # أعمدة إضافية على قاعدة موجودة (غير مدمّر: الصفوف القديمة تاخد NULL).
+        tomb_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(deleted_conversations)")}
+        if tomb_cols and "remote_state" not in tomb_cols:
+            self._conn.execute("ALTER TABLE deleted_conversations ADD COLUMN remote_state TEXT")
+        if tomb_cols and "remote_updated_at" not in tomb_cols:
+            self._conn.execute("ALTER TABLE deleted_conversations ADD COLUMN remote_updated_at TEXT")
 
     # ----------------------------------------------------------------- watched
     def add_watched(
@@ -942,6 +952,76 @@ class Database:
             (conversation_id, now),
         )
 
+    # --------------------------------- remote deletion state (OHB2-MINIAPP)
+    # القيم: None (مفيش حذف بعيد) ⇒ 'deleting' (اتطلب حذف بعيد، النتيجة لسه مجهولة)
+    # ⇒ 'uncertain' (فشل/انقطاع — محتاج إعادة محاولة/تسوية) أو 'confirmed' (OpenHands أكّد).
+    REMOTE_DELETING = "deleting"
+    REMOTE_UNCERTAIN = "uncertain"
+    REMOTE_CONFIRMED = "confirmed"
+
+    def mark_deletion_in_progress_nocommit(self, conversation_id: str, now: str) -> None:
+        """يكتب الشاهد **وحالة الحذف البعيد = 'deleting'** في معاملة المستدعي.
+
+        بيتنادى **قبل** أي نداء حذف بعيد: لو العملية ماتت/انقطعت بعد كده، الحالة الدائمة
+        ('deleting'/'uncertain') تفضل، فأي إعادة محاولة/تسوية تعرف إن فيه حذف بعيد معلّق
+        (ما تحاولش إحياء الشات، وتقدر تكمّل/تتحقق بأمان).
+        """
+        self._tombstone_nocommit(conversation_id, now)
+        self._conn.execute(
+            "UPDATE deleted_conversations SET remote_state=?, remote_updated_at=? "
+            "WHERE conversation_id=? AND remote_state IS NULL",
+            (self.REMOTE_DELETING, now, conversation_id),
+        )
+
+    def set_remote_deletion_state(self, conversation_id: str, state: str | None, now: str) -> None:
+        """يثبّت حالة الحذف البعيد ('deleting'/'uncertain'/'confirmed' أو NULL) — كتابة دائمة."""
+        self._conn.execute(
+            "UPDATE deleted_conversations SET remote_state=?, remote_updated_at=? "
+            "WHERE conversation_id=?",
+            (state, now, conversation_id),
+        )
+        self._conn.commit()
+
+    def remote_deletion_state(self, conversation_id: str) -> str | None:
+        """حالة الحذف البعيد للشات (None لو مفيش حذف بعيد اتبدأ)."""
+        row = self._conn.execute(
+            "SELECT remote_state FROM deleted_conversations WHERE conversation_id=?",
+            (conversation_id,),
+        ).fetchone()
+        return row["remote_state"] if row is not None else None
+
+    def begin_remote_deletion(self, conversation_id: str, now: str) -> None:
+        """يوسم الحذف الجاري (شاهد + 'deleting') في معاملة ذرّية واحدة **قبل** النداء البعيد.
+
+        لو العملية اتقطعت بعد كده، الحالة تفضل (تنجو من restart) فأي إعادة محاولة/تسوية
+        تعرف إن فيه حذف بعيد معلّق، ومايتحياش الشات في الوقت نفسه.
+        """
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.mark_deletion_in_progress_nocommit(conversation_id, now)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    def clear_remote_deletion(self, conversation_id: str) -> None:
+        """يشيل شاهد الحذف (استرجاع محلي) — يُستخدم لما يثبت إن الشات **لسه موجود** بعيدًا."""
+        self._conn.execute(
+            "DELETE FROM deleted_conversations WHERE conversation_id=?",
+            (conversation_id,),
+        )
+        self._conn.commit()
+
+    def list_pending_remote_deletions(self) -> list[str]:
+        """معرّفات الشاتات اللي حذفها البعيد لسه معلّق ('deleting'/'uncertain')."""
+        rows = self._conn.execute(
+            "SELECT conversation_id FROM deleted_conversations "
+            "WHERE remote_state IN (?, ?)",
+            (self.REMOTE_DELETING, self.REMOTE_UNCERTAIN),
+        ).fetchall()
+        return [r["conversation_id"] for r in rows]
+
     def _clear_tombstone_nocommit(self, conversation_id: str) -> None:
         """يشيل شاهد الحذف **داخل معاملة المستدعي** (إعادة تفاعل صريح من المستخدم)."""
         self._conn.execute(
@@ -949,7 +1029,7 @@ class Database:
             (conversation_id,),
         )
 
-    def delete_conversation(self, conversation_id: str, now: str) -> dict:
+    def delete_conversation(self, conversation_id: str, now: str, *, remote_confirmed: bool = False) -> dict:
         """حذف محلي آمن لشات في **معاملة ذرّية واحدة** (OHB2-C7).
 
         يشيل كل الأثر المحلي المرتبط بالشات من غير أي نداء خارجي (مفيش حذف بعيد):
@@ -1026,6 +1106,14 @@ class Database:
             # لسه غير محذوف عشان التسجيل الداخلي يكمّل؛ وبعد الـ commit الشاهد فعّال
             # لأي مسار لاحق (ساعتها مستحيل يتخلّل بين الكتابة والـ commit — قفل الكتابة).
             self._tombstone_nocommit(conversation_id, now)
+            # OHB2-MINIAPP: لو المستدعي أكّد نجاح الحذف البعيد، نثبّت الحالة 'confirmed'
+            # في **نفس** معاملة الحذف المحلي (ذرّي: مفيش حالة «محذوف محليًا بلا نتيجة بعيدة»).
+            if remote_confirmed:
+                conn.execute(
+                    "UPDATE deleted_conversations SET remote_state=?, remote_updated_at=? "
+                    "WHERE conversation_id=?",
+                    (self.REMOTE_CONFIRMED, now, conversation_id),
+                )
             conn.commit()
         except Exception:
             conn.rollback()
