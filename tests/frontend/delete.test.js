@@ -135,3 +135,110 @@ test("فشل الحذف (403) يعرض رسالة ويفضل على الشاشة
   assert.equal(toast.hidden, false, "لازم تبان رسالة خطأ");
   assert.ok(toast.textContent.indexOf("مش مسموح") !== -1, "رسالة عربية واضحة (مش تفاصيل خام)");
 });
+
+// ---------------------------------------------- PHASE6-UI: reachability & naming
+function findText(root, needle) {
+  return descendants(root).find(
+    (n) => typeof n.textContent === "string" && n.textContent.indexOf(needle) !== -1
+  ) || null;
+}
+
+test("زر الحذف متاح من قايمة الشاتات نفسها (reachable من القايمة)", async () => {
+  const env = await mkEnv();
+  const { doc, fetch } = env;
+  fetch.route((c) => c.path.startsWith("/conversations?"), () => ({
+    status: 200,
+    data: { items: [{ id: "c1", title: "T", status: "running" }], has_more: false },
+  }));
+  fetch.route((c) => c.path === "/conversations/c1", () => ({ status: 200, data: { id: "c1", title: "T" } }));
+  fetch.route((c) => c.path === "/conversations/c1/files", () => ({ status: 200, data: { conversation_id: "c1", files: [] } }));
+
+  // من قايمة الشاتات: نضغط على صف الشات (مش نداء مباشر للتفاصيل).
+  doc.getElementById("tab-chats").click();
+  await flush();
+  doc.getElementById("chats-refresh").click();
+  await flush();
+  const rows = doc.getElementById("chats-list").children.filter((c) => c.className.split(" ").includes("row"));
+  assert.equal(rows.length, 1, "صف الشات ظاهر في القايمة");
+  rows[0].click();
+  await flush();
+
+  // بعد الوصول من القايمة، زر الحذف لازم يكون ظاهر ومرئي.
+  const delBtn = findButton(doc.getElementById("view-detail"), "🗑 حذف الشات");
+  assert.ok(delBtn, "زر الحذف لازم يكون متاح من القايمة");
+  assert.equal(delBtn.hidden, false, "زر الحذف ظاهر مش مخفي");
+});
+
+test("التأكيد بيسمّي الشات المطلوب حذفه (مفيش حذف بالغلط)", async () => {
+  const env = await mkEnv();
+  await openDetail(env, { id: "c1", title: "مشروع أبولو", watched: false });
+  const { doc, fetch } = env;
+  const view = doc.getElementById("view-detail");
+
+  const note = findText(view, "متأكد إنك عايز تحذف");
+  assert.ok(note, "لازم يكون فيه نص تأكيد");
+  assert.ok(note.textContent.indexOf("مشروع أبولو") !== -1, "نص التأكيد بيسمّي الشات");
+  assert.equal(note.hidden, true, "نص التأكيد مخفي قبل الضغط");
+
+  findButton(view, "🗑 حذف الشات").click();
+  await flush();
+  assert.equal(note.hidden, false, "نص التأكيد يظهر بعد الضغط");
+  assert.equal(fetch.all((c) => c.method === "DELETE").length, 0, "لسه مفيش DELETE قبل التأكيد");
+});
+
+test("إلغاء التأكيد يخفي نص التأكيد ويرجّع زر الحذف من غير DELETE", async () => {
+  const env = await mkEnv();
+  await openDetail(env, { id: "c1", title: "T", watched: false });
+  const { doc, fetch } = env;
+  const view = doc.getElementById("view-detail");
+
+  findButton(view, "🗑 حذف الشات").click();
+  await flush();
+  findButton(view, "إلغاء").click();
+  await flush();
+
+  assert.equal(fetch.all((c) => c.method === "DELETE").length, 0, "الإلغاء مايبعتش DELETE");
+  assert.equal(findText(view, "متأكد إنك عايز تحذف").hidden, true, "نص التأكيد اتخفي بعد الإلغاء");
+  assert.equal(findButton(view, "🗑 حذف الشات").hidden, false, "زر الحذف رجع ظاهر");
+
+  // إعادة الفتح شغّالة عادي.
+  findButton(view, "🗑 حذف الشات").click();
+  await flush();
+  assert.equal(findButton(view, "🗑 أكّد الحذف").hidden, false, "نقدر نعيد فتح التأكيد");
+});
+
+test("بعد نجاح الحذف الشات بيختفي من القايمة فورًا (من غير restart)", async () => {
+  const env = await mkEnv();
+  const { doc, fetch } = env;
+  let deleted = false;
+  fetch.route((c) => c.path.startsWith("/conversations?"), () => ({
+    status: 200,
+    data: deleted
+      ? { items: [], has_more: false }
+      : { items: [{ id: "c1", title: "T", status: "running" }], has_more: false },
+  }));
+  fetch.route((c) => c.path === "/conversations/c1", () => ({ status: 200, data: { id: "c1", title: "T" } }));
+  fetch.route((c) => c.path === "/conversations/c1/files", () => ({ status: 200, data: { conversation_id: "c1", files: [] } }));
+  fetch.route((c) => c.method === "DELETE" && c.path === "/conversations/c1", () => {
+    deleted = true;
+    return { status: 200, data: { ok: true, deleted: true, local_only: true } };
+  });
+
+  doc.getElementById("tab-chats").click();
+  await flush();
+  doc.getElementById("chats-refresh").click();
+  await flush();
+  let rows = doc.getElementById("chats-list").children.filter((c) => c.className.split(" ").includes("row"));
+  assert.equal(rows.length, 1, "الشات ظاهر قبل الحذف");
+  rows[0].click();
+  await flush();
+
+  findButton(doc.getElementById("view-detail"), "🗑 حذف الشات").click();
+  await flush();
+  findButton(doc.getElementById("view-detail"), "🗑 أكّد الحذف").click();
+  await flush();
+
+  rows = doc.getElementById("chats-list").children.filter((c) => c.className.split(" ").includes("row"));
+  assert.equal(rows.length, 0, "الشات اختفى من القايمة بعد الحذف");
+  assert.equal(doc.getElementById("view-chats").hidden, false, "رجعنا لقايمة الشاتات");
+});

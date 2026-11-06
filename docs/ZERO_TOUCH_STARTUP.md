@@ -190,6 +190,72 @@ one process. Distinguish carefully:
 
 ---
 
+## 5b. Owner's final Phase 6 requirements (alignment record)
+
+This section records the owner's **final** requirements for Phase 6 hosting compatibility and
+deployment planning. It **supersedes** the earlier framing where a backup subsystem was in scope; it
+does **not** silently rewrite history — the superseded items are named explicitly.
+
+### 5b.1 Backup is permanently excluded (VERIFIED in this repository)
+
+- The owner's final decision: **Backup must not exist in application code** — a permanent exclusion.
+- Verified: there is **no** backup module, config, dependency, UI element, route, handler, worker,
+  scheduler, service, startup hook, or provider integration anywhere in the tree. `requirements.txt`
+  has no `paramiko`/SFTP/cloud-drive dependency, and the frontend has no backup control. Guarded by
+  `tests/test_zero_touch_contract.py::test_core_has_no_backup_references`,
+  `tests/test_security_invariants.py::test_core_modules_do_not_import_backup`, and
+  `tests/test_zero_touch_lifecycle.py::test_build_application_has_no_backup_state`.
+- **No external Backup workflow** (SFTP, Google Drive, cloud snapshot, sidecar job) is to be
+  configured as a substitute. Do not reintroduce the feature under alternate naming.
+
+### 5b.2 Ordinary SQLite persistence and data durability remain REQUIRED
+
+- Excluding Backup does **not** weaken normal persistence: WAL, `busy_timeout`, transactions,
+  integrity checks, additive migrations, and normal data durability stay in force (see §3.2 and
+  `tests/test_db_maintenance.py`, `tests/test_n1005_operational.py`).
+- Nothing here authorises removing unrelated persistence or recovery functionality.
+
+### 5b.3 Conversation deletion in BOTH interfaces (VERIFIED)
+
+- Deletion must be available in **both** the Telegram Bot and the Mini App / Website: a visible
+  action, an explicit confirmation step, a cancel path, correct loading/success/error states, UI
+  refresh after success, and correct Arabic RTL on mobile.
+- Both interfaces call the **same** authoritative backend lifecycle
+  (`Database.delete_conversation`), with ownership/authorization enforced **server-side** (never
+  client-side only). Evidence: `tests/test_conversation_deletion.py`,
+  `tests/test_resurrection_fix.py`, `tests/frontend/delete.test.js`; docs in `docs/MINI_APP.md` §10.
+
+### 5b.4 Deletion lifecycle and resurrection protection (VERIFIED)
+
+- A deleted conversation cannot be resurrected by delayed or recovered work: a durable tombstone
+  (`deleted_conversations`) is written in the same atomic transaction as the local cleanup, and every
+  non-explicit recreate/recovery path is refused. Idempotency and safe concurrency are preserved.
+- **Notification boundary (explicit):** a Telegram send already in flight before deletion may still
+  arrive. Local deletion does **not** permanently delete the remote OpenHands conversation, and no
+  claim is made that it does.
+
+### 5b.5 Former R-1b Backup requirement — NO LONGER APPLICABLE
+
+- The former **R-1b** requirement (a Backup application feature) is **superseded** by §5ب.1 and must
+  **not** block Phase 6. No source file in this repository ever encoded "R-1b"; the identifier is
+  preserved here for traceability of the owner's decision only.
+
+### 5b.6 Verified facts vs. unverified claims (hosting)
+
+- **Verified (repository):** one process, one poller, in-process workers; no inbound port needed for
+  long-polling; safe DB init + WAL + `busy_timeout`; core startup has no backup subsystem; a fresh DB
+  is initialised if absent.
+- **Documented (operator-facing, not verified here):** Katabump upload list, env vars, and startup
+  command (`docs/DEPLOY_KATABUMP.md`).
+- **Unverified platform claims (must not be described as production-ready):** that Katabump actually
+  installs `requirements.txt` on start; that the free server is auto-restarted after a crash;
+  **renewal every 4 days** and that the free server **stops if the renewal is missed**; filesystem
+  **durability** (the free tier has no documented durable volume ⇒ **data-loss risk**); no bank
+  **card** is required (marketing claim, not verified against a live signup). Do **not** call the free
+  hosting provider production-ready.
+
+---
+
 ## 6. Required runtime file set
 
 Per `docs/DEPLOY_KATABUMP.md` and enforced by `tests/test_deploy_manifest.py` (AST import closure
