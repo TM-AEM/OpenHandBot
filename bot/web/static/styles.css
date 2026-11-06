@@ -96,6 +96,8 @@ html, body {
 .pill.off { background: rgba(248, 113, 113, .18); color: var(--danger); }
 
 .hint { color: var(--muted); font-size: .82rem; text-align: center; margin: 6px 4px 0; }
+/* OHB2-C7: نص تأكيد الحذف المحلي — بيسمّي الشات المطلوب حذفه (كلاس مستقل مش .hint). */
+.delete-confirm-note { color: var(--danger); font-size: .85rem; text-align: center; margin: 6px 4px; }
 
 .btn {
   appearance: none;

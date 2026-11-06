@@ -603,6 +603,12 @@
       // OHB2-C7: حذف محلي للشات (بتأكيد صريح). ما بنحذفش الشات من OpenHands — إحنا
       // بنشيل بس السجل المحلي (المتابعة/الصندوق/الإشعارات). حرس الضغط المزدوج عبر
       // `deleting` + تعطيل الأزرار، والحالة الغامضة (انقطاع) تفضل retryable.
+      var delNote = el(
+        "p", "delete-confirm-note",
+        "متأكد إنك عايز تحذف «" + (d.title || "بدون عنوان") + "»؟ (حذف محلي)"
+      );
+      delNote.hidden = true;
+      box.appendChild(delNote);
       var delRow = el("div", "toolbar");
       var delBtn = el("button", "btn danger small", "🗑 حذف الشات");
       var confirmBtn = el("button", "btn danger small", "🗑 أكّد الحذف");
@@ -614,10 +620,12 @@
         delBtn.hidden = true;
         confirmBtn.hidden = false;
         cancelBtn.hidden = false;
+        delNote.hidden = false;
       });
       cancelBtn.addEventListener("click", function () {
         confirmBtn.hidden = true;
         cancelBtn.hidden = true;
+        delNote.hidden = true;
         delBtn.hidden = false;
       });
       confirmBtn.addEventListener("click", function () {

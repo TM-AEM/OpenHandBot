@@ -408,6 +408,10 @@ class MiniAppService:
             items = result.get("items", [])
             if items:
                 self._set_list_cache(items)
+        # OHB2-C7: الشاتات المحذوفة محليًا (tombstone) لازم تختفي من القايمة فورًا.
+        # مصدر القايمة بعيد (search) فمش عارف بالحذف المحلي؛ نفلترها قبل الترقيم عشان
+        # الشات المحذوف ما يظهرش تاني بعد refresh (من غير انتظار دورة البوت).
+        items = self._without_deleted(items)
         page = max(0, page)
         start = page * PAGE_SIZE
         chunk = items[start : start + PAGE_SIZE]
@@ -419,6 +423,15 @@ class MiniAppService:
             "has_more": len(items) > start + PAGE_SIZE,
             "items": [self._list_item(c, watched) for c in chunk],
         }
+
+    def _without_deleted(self, items: list[dict]) -> list[dict]:
+        """يشيل أي شات عليه شاهد حذف محلي (OHB2-C7) من قايمة الـ Mini App."""
+        if self._db is None or not items:
+            return items
+        try:
+            return [c for c in items if not self._db.is_deleted(c.get("id") or "")]
+        except Exception:  # noqa: BLE001 — قاعدة غير متاحة ⇒ ما نكسرش القايمة
+            return items
 
     def _list_item(self, conv: dict, watched: set[str]) -> dict:
         status = get_status(conv)

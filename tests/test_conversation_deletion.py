@@ -519,3 +519,139 @@ def test_bot_and_miniapp_delete_are_consistent(tmp_path):
     asyncio.run(h.delete_conversation_confirm(update, ctx))
     assert bdb.get_watched(CID) is None
     assert api.deleted_remote_calls == 0 and client.deleted_remote_calls == 0
+
+
+# ===================================================== PHASE6-ALIGN: shared lifecycle
+def test_both_interfaces_share_same_backend_lifecycle(tmp_path, monkeypatch):
+    """PHASE6-ALIGN: الواجهتين لازم يعدّوا من **نفس** الدالة الخلفية (مفيش مسارين).
+
+    نرقّب `Database.delete_conversation` (نفس كائن القاعدة) ونتأكد إن مسار البوت
+    ومسار الـ Mini App بينادوا عليه بنفس المعرّف — دليل ملموس على «دورة حياة واحدة».
+    """
+    from bot.db import Database
+
+    calls: list[str] = []
+    original = Database.delete_conversation
+
+    def _spy(self, conversation_id, now):
+        calls.append(conversation_id)
+        return original(self, conversation_id, now)
+
+    monkeypatch.setattr(Database, "delete_conversation", _spy)
+
+    # Mini App
+    api, mdb = MockAPI(), _db(tmp_path)
+    mdb.add_watched(CID, "شات", chat_id=OWNER)
+    tc = make_client(api, mdb)
+    login(tc)
+    assert tc.delete(f"/api/v1/conversations/{CID}", headers={"origin": ORIGIN}).status_code == 200
+
+    # البوت
+    client = _BotClient()
+    ctx = _ctx(tmp_path, client)
+    bctx_db = ctx.bot_data["db"]
+    bctx_db.add_watched(CID, "شات", chat_id=OWNER)
+    asyncio.run(h.delete_conversation_confirm(_cb_update(OWNER, f"deleteok:{CID}"), ctx))
+
+    # نفس الدالة الخلفية اتنادت مرتين (واحدة لكل واجهة) بنفس المعرّف.
+    assert calls.count(CID) == 2
+
+
+def test_delete_route_registered_on_web_app():
+    """PHASE6-ALIGN: مسار الحذف مسجّل فعلًا على تطبيق الـ Mini App بميثود DELETE."""
+    from bot.web.app import API_PREFIX, build_web_app
+
+    app = build_web_app(make_config(), _db(__import__("tempfile").mkdtemp()))
+    target = f"{API_PREFIX}/conversations/{{conversation_id}}"
+    routes = [r for r in app.routes if getattr(r, "path", None) == target]
+    assert routes, f"لازم يكون فيه راوت {target}"
+    methods = {m for r in routes for m in getattr(r, "methods", set()) or set()}
+    assert "DELETE" in methods, "لازم المسار يدعم DELETE"
+
+
+def test_bot_delete_menu_and_callbacks_wired():
+    """PHASE6-ALIGN: زر الحذف وقوائم التأكيد/الإلغاء موجودين ومربوطين بالـ callback data."""
+    from bot import keyboards as kb
+
+    menu = kb.conversation_actions(CID, watched=False)
+    datas = [b.callback_data for row in menu.inline_keyboard for b in row]
+    assert f"delete:{CID}" in datas, "زر الحذف لازم يكون ظاهر في قايمة الشات"
+
+    confirm = kb.delete_confirm_menu(CID)
+    cdatas = [b.callback_data for row in confirm.inline_keyboard for b in row]
+    assert f"deleteok:{CID}" in cdatas and f"open:{CID}" in cdatas, "تأكيد + إلغاء"
+
+
+# ================================================= PHASE6-UI: list hides deleted
+class _ListClient:
+    """عميل وهمي بسيط: search بيرجّع نفس الشاتات دايمًا (بعيد ⇒ مش عارف بالحذف المحلي)."""
+
+    def __init__(self, items):
+        self._items = items
+
+    async def search_conversations(self, limit=100, page_id=None):
+        return {"items": list(self._items), "next_page_id": None}
+
+    async def get_conversations(self, ids):
+        return [dict(i) for i in self._items if i["id"] in ids]
+
+    async def get_current_user(self):
+        return {"id": OWNER_UUID}
+
+
+class _FakeApp:
+    def __init__(self):
+        self.bot_data = {}
+
+
+def test_miniapp_list_hides_locally_deleted(tmp_path):
+    """بعد الحذف المحلي، الشات لازم يختفي من قايمة الـ Mini App (مصدر القايمة بعيد).
+
+    ده يمنع «رجوع الشات بعد refresh» — مفيش حالة عميل قديمة تعرضه تاني.
+    """
+    db = _db(tmp_path)
+    items = [
+        {"id": "c1", "title": "واحد", "execution_status": "running", "created_by_user_id": OWNER_UUID},
+        {"id": "c2", "title": "اتنين", "execution_status": "running", "created_by_user_id": OWNER_UUID},
+    ]
+    app = _FakeApp()
+    client = _ListClient(items)
+    tc = TestClient(
+        build_web_app(make_config(), db, client=client, application=app),
+        raise_server_exceptions=False,
+    )
+    login(tc)
+
+    r = tc.get("/api/v1/conversations?refresh=1")
+    assert r.status_code == 200, r.text
+    assert [i["id"] for i in r.json()["items"]] == ["c1", "c2"]
+
+    # حذف محلي لـ c1 عبر المسار الحقيقي.
+    assert tc.delete("/api/v1/conversations/c1", headers={"origin": ORIGIN}).status_code == 200
+
+    r2 = tc.get("/api/v1/conversations?refresh=1")
+    ids = [i["id"] for i in r2.json()["items"]]
+    assert "c1" not in ids, "الشات المحذوف محليًا لازم يختفي من القايمة"
+    assert ids == ["c2"]
+
+
+def test_miniapp_list_cache_refresh_still_hides_deleted(tmp_path):
+    """حتى مع الكاش القصير المشارك: الشات المحذوف ما يظهرش بعد refresh."""
+    db = _db(tmp_path)
+    items = [
+        {"id": "c1", "title": "واحد", "execution_status": "running", "created_by_user_id": OWNER_UUID},
+        {"id": "c2", "title": "اتنين", "execution_status": "running", "created_by_user_id": OWNER_UUID},
+    ]
+    app = _FakeApp()
+    client = _ListClient(items)
+    tc = TestClient(
+        build_web_app(make_config(), db, client=client, application=app),
+        raise_server_exceptions=False,
+    )
+    login(tc)
+
+    assert tc.get("/api/v1/conversations").status_code == 200  # يملأ الكاش
+    assert tc.delete("/api/v1/conversations/c1", headers={"origin": ORIGIN}).status_code == 200
+    # من غير refresh (من الكاش) برضه لازم يختفي.
+    r = tc.get("/api/v1/conversations")
+    assert "c1" not in [i["id"] for i in r.json()["items"]]

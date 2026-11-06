@@ -1141,3 +1141,266 @@ def test_start_menu_includes_web_app_button_when_configured(tmp_path):
     update = make_update(1)
     asyncio.run(h.start(update, ctx))
     assert len(update.message.replies) == 1
+
+
+# =====================================================================
+# OHB2-F1: الشاتات المحذوفة محليًا لازم تختفي من قايمة شاتات البوت
+# (البحث بعيد مش عارف بالحذف المحلي ⇒ بنفلتر بشاهد الحذف قبل الترقيم)
+# =====================================================================
+F1_OWNER_UUID = "owner-uuid-123"
+
+
+class F1ListClient:
+    """عميل للقايمة + التفويض: نتائج بحث بعيدة متحكَّم فيها + عدّادات نداءات."""
+
+    def __init__(self, list_items=None, conv=None, created_by=F1_OWNER_UUID):
+        self._list_items = list(list_items or [])
+        self._conv = conv
+        self._created_by = created_by
+        self.list_calls = 0
+        self.deleted_remote_calls = 0
+
+    async def search_conversations(self, limit=100, page_id=None):
+        self.list_calls += 1
+        return {"items": self._list_items[:limit], "next_page_id": None}
+
+    async def get_conversations(self, ids):
+        if self._conv is None:
+            return []
+        return [{**self._conv, "created_by_user_id": self._created_by}]
+
+    async def get_current_user(self):
+        return {"id": F1_OWNER_UUID}
+
+    async def delete_conversation(self, conversation_id):  # لو الكود حاول حذف بعيد
+        self.deleted_remote_calls += 1
+
+
+def _f1_items(n, prefix="c"):
+    return [
+        {"id": f"{prefix}{i}", "title": f"شات {i}", "execution_status": "running"}
+        for i in range(n)
+    ]
+
+
+def _list_callbacks(update):
+    return _markup_callbacks(update.callback_query.markups[-1])
+
+
+def _shown_ids(update):
+    """معرّفات الشاتات الظاهرة كأزرار فتح (open:<id>) فقط."""
+    return [d.split(":", 1)[1] for d in _list_callbacks(update) if d.startswith("open:")]
+
+
+def test_list_excludes_locally_deleted_and_keeps_valid(tmp_path):
+    """نتيجة بحث بعيدة فيها شاتات محذوفة محليًا ⇒ تختفي، والسليمة تفضل (ترتيب محفوظ)."""
+    client = F1ListClient(list_items=[
+        {"id": "keep1", "title": "سليم 1", "execution_status": "running"},
+        {"id": "gone1", "title": "محذوف 1", "execution_status": "running"},
+        {"id": "keep2", "title": "سليم 2", "execution_status": "running"},
+        {"id": "gone2", "title": "محذوف 2", "execution_status": "running"},
+    ])
+    ctx = make_context(1, tmp_path, client=client)
+    db = ctx.bot_data["db"]
+    db.delete_conversation("gone1", outbox.now_iso())
+    db.delete_conversation("gone2", outbox.now_iso())
+
+    update = _t55_cb_update(CQ("list:0"))
+    asyncio.run(h.list_conversations(update, ctx))
+
+    assert _shown_ids(update) == ["keep1", "keep2"]  # المحذوف مشيل والترتيب زي ما هو
+
+
+def test_list_all_deleted_shows_empty_message(tmp_path):
+    """كل النتائج محذوفة محليًا ⇒ رسالة 'ما فيهاش شاتات' (مفيش أزرار شاتات)."""
+    client = F1ListClient(list_items=[
+        {"id": "gone", "title": "محذوف", "execution_status": "running"},
+    ])
+    ctx = make_context(1, tmp_path, client=client)
+    ctx.bot_data["db"].delete_conversation("gone", outbox.now_iso())
+
+    update = _t55_cb_update(CQ("list:0"))
+    asyncio.run(h.list_conversations(update, ctx))
+
+    assert update.callback_query.edits == ["ما فيهاش شاتات."]
+
+
+def test_list_pagination_and_ordering_correct_after_filtering(tmp_path):
+    """الترقيم/الترتيب يفضلوا صح بعد إزالة المحذوف (القايمة بتتقسّم على الناتج المفلتر)."""
+    client = F1ListClient(list_items=_f1_items(22))
+    ctx = make_context(1, tmp_path, client=client)
+    db = ctx.bot_data["db"]
+    db.delete_conversation("c0", outbox.now_iso())
+    db.delete_conversation("c1", outbox.now_iso())
+
+    p0 = _t55_cb_update(CQ("list:0"))
+    asyncio.run(h.list_conversations(p0, ctx))
+    assert _shown_ids(p0) == [f"c{i}" for i in range(2, 12)]  # 10 عناصر مفلترة
+    assert "صفحة 1" in p0.callback_query.edits[-1]
+    assert "list:1" in _list_callbacks(p0)  # فيه المزيد
+
+    p1 = _t55_cb_update(CQ("list:1"))
+    asyncio.run(h.list_conversations(p1, ctx))
+    assert _shown_ids(p1) == [f"c{i}" for i in range(12, 22)]  # الـ 10 الباقيين
+    assert "list:2" not in _list_callbacks(p1)  # مفيش المزيد
+    assert client.list_calls == 1  # الصفحة التانية من الكاش (وبعدين اتّفلترت برضه)
+
+
+def test_list_keeps_valid_when_unrelated_tombstone_exists(tmp_path):
+    """شاهد حذف لشات مش موجود في القايمة مايشيلش شاتات سليمة (مفيش إزالة بالغلط)."""
+    client = F1ListClient(list_items=_f1_items(3))
+    ctx = make_context(1, tmp_path, client=client)
+    ctx.bot_data["db"].delete_conversation("other-conv", outbox.now_iso())
+
+    update = _t55_cb_update(CQ("list:0"))
+    asyncio.run(h.list_conversations(update, ctx))
+
+    assert _shown_ids(update) == ["c0", "c1", "c2"]
+
+
+def test_confirm_delete_invalidates_list_cache(tmp_path):
+    """الحذف المؤكَّد الناجح يبطّل كاش القايمة (زي البرومت/بدء الشات) ومايحذفش بعيد."""
+    client = F1ListClient(conv={"id": "c1", "title": "شات"})
+    ctx = make_context(1, tmp_path, client=client)
+    ctx.bot_data["db"].add_watched("c1", "شات", chat_id=99)
+    ctx.bot_data["list_cache"] = (
+        h.time.monotonic(),
+        [{"id": "c1", "title": "شات", "execution_status": "running"}],
+    )
+
+    update = _t55_cb_update(CQ("deleteok:c1"))
+    asyncio.run(h.delete_conversation_confirm(update, ctx))
+
+    assert "list_cache" not in ctx.bot_data  # اتبطّل
+    assert ctx.bot_data["db"].is_deleted("c1") is True  # اتحذف محليًا
+    assert client.deleted_remote_calls == 0  # مفيش حذف بعيد
+
+
+def test_stale_cache_cannot_display_deleted_conversation(tmp_path):
+    """كاش دافي (اتبنى قبل الحذف) ما يقدرش يعرض الشات المحذوف."""
+    client = F1ListClient(list_items=_f1_items(2))
+    ctx = make_context(1, tmp_path, client=client)
+    ctx.bot_data["list_cache"] = (
+        h.time.monotonic(),
+        [
+            {"id": "c0", "title": "شات 0", "execution_status": "running"},
+            {"id": "c1", "title": "شات 1", "execution_status": "running"},
+        ],
+    )
+    ctx.bot_data["db"].delete_conversation("c0", outbox.now_iso())
+
+    update = _t55_cb_update(CQ("list:0"))
+    asyncio.run(h.list_conversations(update, ctx))
+
+    assert "c0" not in _shown_ids(update)  # المحذوف مشيل
+    assert "c1" in _shown_ids(update)  # السليم فاضل
+    assert client.list_calls == 0  # جت من الكاش (بس اتّفلترت)
+
+
+def test_fresh_remote_search_cannot_resurrect_deleted(tmp_path):
+    """بحث بعيد جديد فيه الشات المحذوف ⇒ لسه مايظهرش (مفيش إحياء)."""
+    client = F1ListClient(list_items=[
+        {"id": "c1", "title": "شات", "execution_status": "running"},
+    ])
+    ctx = make_context(1, tmp_path, client=client)
+    ctx.bot_data["db"].delete_conversation("c1", outbox.now_iso())
+
+    update = _t55_cb_update(CQ("list:0"))
+    asyncio.run(h.list_conversations(update, ctx))
+
+    assert client.list_calls == 1  # بحث جديد فعلاً (مش كاش)
+    assert _shown_ids(update) == []
+    assert update.callback_query.edits[-1] == "ما فيهاش شاتات."
+
+
+def test_delete_prompt_does_not_delete_or_invalidate(tmp_path):
+    """ضغطة الحذف الأولى (تأكيد) ما بتحذفش ولا بتبطّل الكاش — محتاجة تأكيد صريح."""
+    client = F1ListClient(conv={"id": "c1", "title": "شات"})
+    ctx = make_context(1, tmp_path, client=client)
+    ctx.bot_data["db"].add_watched("c1", "شات", chat_id=99)
+    ctx.bot_data["list_cache"] = (h.time.monotonic(), [{"id": "c1"}])
+
+    update = _t55_cb_update(CQ("delete:c1"))
+    asyncio.run(h.delete_conversation_prompt(update, ctx))
+
+    assert "list_cache" in ctx.bot_data  # ما اتبطّلش
+    assert ctx.bot_data["db"].is_deleted("c1") is False  # ما اتحذفش
+
+
+def test_confirm_delete_non_owner_does_not_invalidate_or_delete(tmp_path):
+    """تفويض فاشل (غير مالك) ⇒ مفيش حذف ومفيش تبّطيل كاش."""
+    client = F1ListClient(conv={"id": "c1", "title": "شات"}, created_by="someone-else")
+    ctx = make_context(1, tmp_path, client=client)
+    ctx.bot_data["db"].add_watched("c1", "شات", chat_id=99)
+    ctx.bot_data["list_cache"] = (h.time.monotonic(), [{"id": "c1"}])
+
+    update = _t55_cb_update(CQ("deleteok:c1"))
+    asyncio.run(h.delete_conversation_confirm(update, ctx))
+
+    assert "list_cache" in ctx.bot_data  # ما اتبطّلش
+    assert ctx.bot_data["db"].is_deleted("c1") is False  # ما اتحذفش
+    assert client.deleted_remote_calls == 0
+
+
+def test_confirm_delete_disallowed_user_no_change(tmp_path):
+    """مستخدم غير مسموح ⇒ رجوع مبكر: مفيش حذف ومفيش تبّطيل كاش."""
+    client = F1ListClient(conv={"id": "c1", "title": "شات"})
+    ctx = make_context(1, tmp_path, client=client)
+    ctx.bot_data["db"].add_watched("c1", "شات", chat_id=99)
+    ctx.bot_data["list_cache"] = (h.time.monotonic(), [{"id": "c1"}])
+
+    update = _t55_cb_update(CQ("deleteok:c1"), user_id=999)
+    asyncio.run(h.delete_conversation_confirm(update, ctx))
+
+    assert "list_cache" in ctx.bot_data
+    assert ctx.bot_data["db"].is_deleted("c1") is False
+
+
+def test_confirm_delete_db_error_does_not_invalidate(tmp_path, monkeypatch):
+    """خطأ قاعدة بيانات أثناء الحذف ⇒ رسالة خطأ، ومفيش تبّطيل كاش."""
+    client = F1ListClient(conv={"id": "c1", "title": "شات"})
+    ctx = make_context(1, tmp_path, client=client)
+    ctx.bot_data["db"].add_watched("c1", "شات", chat_id=99)
+    ctx.bot_data["list_cache"] = (h.time.monotonic(), [{"id": "c1"}])
+
+    def boom(*_a, **_k):
+        raise sqlite3.Error("boom")
+
+    monkeypatch.setattr(ctx.bot_data["db"], "delete_conversation", boom)
+    update = _t55_cb_update(CQ("deleteok:c1"))
+    asyncio.run(h.delete_conversation_confirm(update, ctx))
+
+    assert "list_cache" in ctx.bot_data  # فشل ⇒ ما اتبطّلش
+    assert update.callback_query.edits  # رسالة خطأ عربية
+
+
+def test_delete_then_list_cannot_show_deleted_end_to_end(tmp_path):
+    """سيناريو كامل: عرض القايمة (كاش) ⇒ حذف مؤكَّد ⇒ عرض تاني ⇒ المحذوف مش ظاهر.
+
+    بيثبت إن الكاش مايقدرش يعرض الشات المحذوف بعد الحذف (سواء الكاش اتبطّل أو الفلترة
+    شالت الصف)، وإن بحث بعيد جديد لسه مايرجّعوش.
+    """
+    client = F1ListClient(
+        list_items=[
+            {"id": "keep", "title": "سليم", "execution_status": "running"},
+            {"id": "gone", "title": "محذوف", "execution_status": "running"},
+        ],
+        conv={"id": "gone", "title": "محذوف"},
+    )
+    ctx = make_context(1, tmp_path, client=client)
+
+    # 1) عرض أول ⇒ الشاتين ظاهرين + الكاش اتعبّى.
+    first = _t55_cb_update(CQ("list:0"))
+    asyncio.run(h.list_conversations(first, ctx))
+    assert _shown_ids(first) == ["keep", "gone"]
+    assert "list_cache" in ctx.bot_data
+
+    # 2) حذف مؤكَّد ⇒ الكاش اتبطّل.
+    asyncio.run(h.delete_conversation_confirm(_t55_cb_update(CQ("deleteok:gone")), ctx))
+    assert "list_cache" not in ctx.bot_data
+    assert ctx.bot_data["db"].is_deleted("gone") is True
+
+    # 3) عرض تاني (بحث جديد) ⇒ المحذوف مش ظاهر، السليم ظاهر.
+    second = _t55_cb_update(CQ("list:0"))
+    asyncio.run(h.list_conversations(second, ctx))
+    assert _shown_ids(second) == ["keep"]
