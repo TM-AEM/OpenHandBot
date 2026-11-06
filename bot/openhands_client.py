@@ -544,3 +544,31 @@ def _detail_from_bytes(body: bytes) -> str:
     if isinstance(data, dict) and "detail" in data:
         return str(data["detail"])[:300]
     return ""
+
+
+# OHB2-AUDIT-FIX-05: عدد أقصى لصفحات البحث عند لمّ قايمة الشات. الباگ الأصلي كان بطلب
+# صفحة واحدة (limit=100) ويهمل next_page_id ⇒ الشاتات الأقدم بقت غير قابلة للوصول. دلوقتي
+# بنتبع next_page_id لحد حد معقول (بدون حلقة لا نهائية لو السيرفر رجّع next_page_id غلط).
+CONVERSATIONS_MAX_PAGES = 20
+
+
+async def collect_conversations(
+    client, limit: int = 100, max_pages: int = CONVERSATIONS_MAX_PAGES
+) -> dict:
+    """يجمع شاتات عبر **كل** صفحات البحث (يتبع `next_page_id`) لحد حد أقصى.
+
+    بيرجّع `{"items": [...], "truncated": bool}`. `truncated=True` لو فيه صفحات إضافية
+    لسه موجودة بعد الحد (المستخدم لازم يعرف إن القايمة مش كاملة، مش إخفاء صامت).
+    الأخطاء بتطلع للمستدعي زي ما هي (نفس سياسة الـ client).
+    """
+    items: list[dict] = []
+    page_id: str | None = None
+    pages = 0
+    while pages < max(1, int(max_pages)):
+        result = await client.search_conversations(limit=limit, page_id=page_id)
+        items.extend(result.get("items", []))
+        pages += 1
+        page_id = result.get("next_page_id")
+        if not page_id:
+            break
+    return {"items": items, "truncated": bool(page_id)}

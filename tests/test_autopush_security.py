@@ -418,6 +418,43 @@ def test_safe_url_helper_strips_userinfo(mod):
     assert mod._safe_url("git@github.com:o/r.git") == "git@github.com:o/r.git"
 
 
+# ------------------------------------------------------------ F04: TLS verification
+# F04 regression: a parent process exporting GIT_SSL_NO_VERIFY must NOT be able to
+# disable TLS verification in a child git command. These tests never launch git.
+
+def test_child_env_drops_git_ssl_no_verify(mod, monkeypatch):
+    monkeypatch.setenv("GIT_SSL_NO_VERIFY", "true")
+    env = mod._child_env()
+    assert "GIT_SSL_NO_VERIFY" not in env
+
+
+def test_git_ssl_no_verify_not_in_allowlist(mod):
+    # Structural guard: the variable must never be an allowlisted key again.
+    assert "GIT_SSL_NO_VERIFY" not in mod._GIT_ENV_KEYS
+    assert "GIT_SSL_NO_VERIFY" in mod._TLS_DENY_KEYS
+
+
+def test_child_env_preserves_ca_configuration(mod, monkeypatch):
+    monkeypatch.setenv("GIT_SSL_CAINFO", "/etc/ssl/ca.pem")
+    monkeypatch.setenv("SSL_CERT_FILE", "/etc/ssl/certs.pem")
+    monkeypatch.setenv("SSL_CERT_DIR", "/etc/ssl/certs")
+    monkeypatch.setenv("GIT_SSL_NO_VERIFY", "1")
+    env = mod._child_env()
+    assert env["GIT_SSL_CAINFO"] == "/etc/ssl/ca.pem"
+    assert env["SSL_CERT_FILE"] == "/etc/ssl/certs.pem"
+    assert env["SSL_CERT_DIR"] == "/etc/ssl/certs"
+    assert "GIT_SSL_NO_VERIFY" not in env
+
+
+def test_child_env_denies_tls_bypass_even_if_allowlisted(mod, monkeypatch):
+    # If a future edit (mistakenly) re-adds the key to the allowlist, the explicit
+    # deny step must still strip it before the child process is built.
+    monkeypatch.setattr(mod, "_GIT_ENV_KEYS", tuple(mod._GIT_ENV_KEYS) + ("GIT_SSL_NO_VERIFY",))
+    monkeypatch.setenv("GIT_SSL_NO_VERIFY", "yes")
+    env = mod._child_env()
+    assert "GIT_SSL_NO_VERIFY" not in env
+
+
 # ------------------------------------------------------------------------ helpers
 
 

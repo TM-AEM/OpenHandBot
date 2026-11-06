@@ -463,3 +463,71 @@ def test_get_current_user_returns_dict():
 def test_get_current_user_non_dict_returns_empty():
     client = _client_returning(["unexpected"])
     assert _asyncio.run(client.get_current_user()) == {}
+
+
+# ============================================ OHB2-AUDIT-FIX-05: bounded pagination
+def _paged_client(pages, calls):
+    """عميل وهمي يرجّع صفحات متتالية عبر next_page_id ويسجّل كل نداء."""
+    class C:
+        async def search_conversations(self, limit=100, page_id=None):
+            calls.append(page_id)
+            return pages[page_id]
+    return C()
+
+
+def test_collect_conversations_follows_next_page_id():
+    import asyncio
+    from bot.openhands_client import collect_conversations
+
+    pages = {
+        None: {"items": [{"id": "c1"}, {"id": "c2"}], "next_page_id": "p2"},
+        "p2": {"items": [{"id": "c3"}], "next_page_id": None},
+    }
+    calls = []
+    out = asyncio.run(collect_conversations(_paged_client(pages, calls)))
+    assert [c["id"] for c in out["items"]] == ["c1", "c2", "c3"]
+    assert out["truncated"] is False
+    assert calls == [None, "p2"]  # تبع المؤشّر فعلاً
+
+
+def test_collect_conversations_stops_at_max_pages_and_flags_truncation():
+    import asyncio
+    from bot.openhands_client import collect_conversations
+
+    # كل صفحة بتوعد بصفحة تانية (next_page_id دايمًا موجود) ⇒ لازم يوقف عند الحد.
+    class C:
+        def __init__(self):
+            self.calls = 0
+
+        async def search_conversations(self, limit=100, page_id=None):
+            self.calls += 1
+            return {"items": [{"id": f"c{self.calls}"}], "next_page_id": f"p{self.calls + 1}"}
+
+    c = C()
+    out = asyncio.run(collect_conversations(c, max_pages=3))
+    assert c.calls == 3  # مفيش حلقة لا نهائية
+    assert out["truncated"] is True  # فيه صفحات لسه ⇒ إعلان صريح
+    assert len(out["items"]) == 3
+
+
+def test_collect_conversations_single_page_not_truncated():
+    import asyncio
+    from bot.openhands_client import collect_conversations
+
+    pages = {None: {"items": [{"id": "c1"}], "next_page_id": None}}
+    calls = []
+    out = asyncio.run(collect_conversations(_paged_client(pages, calls)))
+    assert out == {"items": [{"id": "c1"}], "truncated": False}
+    assert calls == [None]
+
+
+def test_collect_conversations_propagates_api_error():
+    import asyncio
+    from bot.openhands_client import collect_conversations
+
+    class C:
+        async def search_conversations(self, limit=100, page_id=None):
+            raise ApiError("boom", 500)
+
+    with pytest.raises(ApiError):
+        asyncio.run(collect_conversations(C()))

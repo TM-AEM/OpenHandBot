@@ -129,9 +129,15 @@ _PLACEHOLDER_TOKEN = "unset-no-token"
 # a full `os.environ` copy) prevents accidental leakage of unrelated process secrets.
 _GIT_ENV_KEYS = (
     "PATH", "HOME", "LANG", "LC_ALL", "TZ", "TMPDIR",
-    "SSL_CERT_FILE", "SSL_CERT_DIR", "GIT_SSL_CAINFO", "GIT_SSL_NO_VERIFY",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "GIT_SSL_CAINFO",
     "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
 )
+
+# TLS verification must never be disabled for child git commands. This variable is
+# deliberately NOT in the allowlist above; we also drop it explicitly in `_child_env`
+# so a future allowlist edit cannot silently reintroduce it. CA config
+# (`SSL_CERT_FILE`/`SSL_CERT_DIR`/`GIT_SSL_CAINFO`) is still forwarded.
+_TLS_DENY_KEYS = ("GIT_SSL_NO_VERIFY",)
 
 # Repo-relative paths Autopush may stage. Empty => refuse to stage anything (fail
 # closed). No default entry ever names a sensitive or backup path.
@@ -230,6 +236,10 @@ def _child_env() -> dict:
     variables above are forwarded unchanged).
     """
     env = {k: os.environ[k] for k in _GIT_ENV_KEYS if k in os.environ}
+    # Defence in depth: even if an allowlist entry is (re)added, TLS-disabling variables
+    # must never reach a child git command.
+    for denied in _TLS_DENY_KEYS:
+        env.pop(denied, None)
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_CONFIG_COUNT"] = "1"
     env["GIT_CONFIG_KEY_0"] = "credential.helper"

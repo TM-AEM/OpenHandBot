@@ -182,7 +182,7 @@ def test_api_error_shown_to_user_has_no_secret(tmp_path):
     register_secrets(KEY)
 
     class C:
-        async def search_conversations(self, limit=100):
+        async def search_conversations(self, limit=100, page_id=None):
             raise ApiError(f"fail {KEY}", 500)
 
     ctx = make_context(1, tmp_path, client=C())

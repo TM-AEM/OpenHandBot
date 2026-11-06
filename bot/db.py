@@ -1271,21 +1271,27 @@ class Database:
         (conversation_id, chat_id, client_ref)، بنرجّع الـ id بتاعه من غير أي كتابة —
         فإعادة إرسال نفس العملية (double-tap / إعادة محاولة بعد انقطاع الرد) ما بتعملش
         برومت مكرّر.
+
+        OHB2-AUDIT-FIX-01 (سباق إحياء الحذف): `reengage=True` معناه «المستخدم تفاعل صريح
+        **دلوقتي**» — مش «عملية بدأت قبل الحذف وخلصت بعده». العملية اللي بتحمل `client_ref`
+        (مصدرها الـ Mini App: الـ POST ممكن يخلص بعد الحذف بسبب await الشبكة) **عمرها ما
+        تحيي** شات متشاهد: بنرفضها (نرجّع 0، بدون أي كتابة) من غير ما نشيل الشاهد. ده يمنع
+        الـ POST المتأخّر (أو إعادة المحاولة/الضغط المزدوج) من إحياء شات اتحذف. العمليات من
+        غير `client_ref` (مسار البوت) زي ما هي: الصريح (`reengage=True`) يشيل الشاهد، وغير
+        الصريح يُرفض. الفحص كله جوه BEGIN IMMEDIATE ⇒ محصّن ضد حذف متزامن.
         """
         window = window if window is not None else GROUP_WINDOW
         conn = self._conn
         conn.execute("BEGIN IMMEDIATE")
         try:
-            # OHB2-C7 (RESURRECTION-FIX): إرسال برومت = إعادة تفاعل صريح من المستخدم ⇒
-            # يشيل شاهد الحذف (نبدأ دورة نظيفة). المسارات غير الصريحة (retry/recovery)
-            # بتبلّغ `reengage=False` فلو الشات متشاهد تُرفض — ده اللي يمنع الـ POST المتأخّر
-            # من إحياء شات محذوف. الفحص جوه المعاملة ⇒ محصّن ضد حذف متزامن.
             if self.is_deleted(conversation_id):
-                if not reengage:
+                # شات متشاهد: مفيش إحياء. عمليات `client_ref` (Mini App) مرفوضة دايمًا،
+                # والعمليات من غير `client_ref` (البوت) لازم تكون صريحة (`reengage`).
+                if client_ref or not reengage:
                     conn.rollback()
                     return 0
                 self._clear_tombstone_nocommit(conversation_id)
-            if client_ref:
+            elif client_ref:
                 existing = conn.execute(
                     "SELECT id FROM outbox "
                     "WHERE conversation_id=? AND chat_id=? AND client_ref=? "
