@@ -495,7 +495,7 @@ Creation-job reconciliation UI; remote conversation deletion semantics; Backup; 
   `styles.css`, `dom_stub.js`. DONE.
 - Step 5 (docs): `docs/NOTIFICATIONS.md` (§2.7/§3/§5/§9/§11/§12) + `docs/MINI_APP.md`
   (§13b/§14). DONE.
-- Step 6 (verification): pytest **1774 passed**, node **184 pass / 0 fail**, pyflakes **0**,
+- Step 6 (verification): pytest **1775 passed**, node **184 pass / 0 fail**, pyflakes **0**,
   compileall **0**, `git diff --check` clean. DONE.
 - Step 7 (independent review of the exact final SHA): PENDING — see "Suggested next step".
 
@@ -507,3 +507,12 @@ node --test tests/frontend/*.test.js
 .venv/bin/python -m compileall -q bot/ main.py
 git diff --check
 ```
+
+### Branch / commits
+- Branch: `agent/ohb2-phase1c-inbox-filter-archive-delete` (pushed to origin).
+- Commit: see `git log -1` on that branch (message `feat: Mini App inbox unread filter,
+  reversible archive, and safe eligible delete`).
+
+### Next
+- Independent review (separate agent-server session) of the exact final SHA: request
+  PASS / PASS-WITH-NOTES with no unresolved Critical/High findings before opening a PR.
