@@ -64,6 +64,8 @@ Telegram WebView ──HTTPS──▶ ingress (TLS) ──HTTP──▶ الحا
 | `/api/v1/conversations/{id}` | GET | كوكي | لأ | تفاصيل شات + آخر برومت/رد + رابط PR |
 | `/api/v1/conversations/{id}/status` | GET | كوكي | لأ | حالة شات بس |
 | `/api/v1/conversations/{id}/cost` | GET | كوكي | لأ | تكلفة/استهلاك شات (من نفس نداء التفاصيل) |
+| `/api/v1/conversations/{id}/reply` | GET | كوكي | لأ | الرد الكامل للـ assistant (`reply` + `reply_truncated`) — مصدر زر «نسخ الرد الكامل» |
+| `/api/v1/conversations/{id}/export` | GET | كوكي | لأ | تنزيل تصدير الشات (zip، نفس صيغة البوت، حد صلب) |
 | `/api/v1/conversations/{id}/files` | GET | كوكي | لأ | قايمة ملفات الشات (allowlist + تصريح) |
 | `/api/v1/conversations/{id}/file` | GET | كوكي | لأ | معاينة نصية محدودة لملف (`?path=`) |
 | `/api/v1/conversations/{id}/prompt` | POST | كوكي | ✔ | `{"text": "...", "client_ref": "..."}` ⇒ يسجّل البرومت في الصندوق |
@@ -351,12 +353,13 @@ python main.py
 python -m pytest -q tests/test_miniapp_initdata.py tests/test_miniapp_api.py \
     tests/test_miniapp_features.py tests/test_miniapp_ratelimit.py \
     tests/test_miniapp_integration.py tests/test_miniapp_config.py \
-    tests/test_miniapp_inbox.py tests/test_miniapp_session_persistence.py
+    tests/test_miniapp_inbox.py tests/test_miniapp_session_persistence.py \
+    tests/test_miniapp_export_reply.py
 ```
 
-اختبارات منطق الواجهة (دورة حياة معرّف العملية — idempotency، ومنطق صندوق الإشعارات):
-بتشتغل بـ Node المدمج على **نفس** الوحدات اللي الواجهة بتستعملها
-(`bot/web/static/ops.js` و`bot/web/static/inbox.js`):
+اختبارات منطق الواجهة (دورة حياة معرّف العملية — idempotency، صندوق الإشعارات،
+تصدير الشات، ونسخ الرد الكامل): بتشتغل بـ Node المدمج على **نفس** الوحدات اللي
+الواجهة بتستعملها (`bot/web/static/ops.js`، `inbox.js`، `copy.js`، `export.js`):
 
 ```bash
 node --test tests/frontend/*.test.js
@@ -473,12 +476,31 @@ node --test tests/frontend/*.test.js
   `delivery_status`/`delivery_attempts`/`delivered_at`، وبيترقّم بترقيم محدود، والصفحة
   الفاضية بسبب تجاوز الحد بترجع للأولى.
 
+## 13ج. تصدير الشات + نسخ الرد الكامل (OHB2-PHASE1B)
+
+كان البوت فيه **تصدير الشات** و**نسخ الرد الكامل**، لكن الـ Mini App كان ناقصهم.
+اتضافوا بنفس منطق البوت (مفيش مسار إرسال/تصدير جديد، ومفيش تكرار منطق):
+
+- **تصدير الشات** (`GET /api/v1/conversations/{id}/export`): بينزّل zip بنفس صيغة البوت
+  (`OpenHandsClient.export_conversation`)، بنفس السقف الصلب `MAX_EXPORT_BYTES` ونفس
+  القراءة المحدودة (`_read_capped`، مفيش تجميع غير محدود في الذاكرة). الترتيب:
+  **تفويض ملكية الشات أولًا** (server-side من الجلسة، فشل مغلق) ⇒ فحص شاهد الحذف المحلي
+  (شات محذوف/مُعلَّم لا يُصدَّر ولا يُحيا) ⇒ تنزيل محدود. عدّى الحد ⇒ `413 too_large`،
+  فشل التنزيل ⇒ خطأ منظّم — **مفيش تصدير «ناجح» كاذب**. اسم الملف بيتولّد من معرّف
+  **صالح** ومنقّى لمحارف ASCII آمنة ⇒ مفيش CR/LF/اقتباس (مفيش response-header injection).
+  الواجهة بتعمل تنزيل مباشر (same-origin) وبتقرأ الاسم الآمن من `Content-Disposition`.
+- **نسخ الرد الكامل** (`GET /api/v1/conversations/{id}/reply`): بترجّع **النص الكامل**
+  للـ assistant (`reply`) + علم `reply_truncated`. المعاينة في صفحة التفاصيل محدودة
+  (4000 محرف) لكن النسخ بياخد النص الكامل من نفس `get_last_exchange` بتاع البوت (سقف
+  صلب `MAX_FULL_REPLY_CHARS`). زر «📋 نسخ الرد الكامل» بيستعمل Clipboard API مع fallback
+  آمن (`execCommand`)، و**مايدّعيش نجاح** لو المسارين فشلوا (رسالة فشل صريحة).
+- **منطق الواجهة المشترك**: `bot/web/static/copy.js` و`export.js` وحدات مستقلة عن الـ DOM،
+  بتُختبر بـ Node (`tests/frontend/copy.test.js`، `tests/frontend/export.test.js`) وبتُستخدم
+  من `app.js` مباشرة. التغطية الخلفية: `tests/test_miniapp_export_reply.py`.
+
 ## 14. اللي فاضل لمهام OHB2 اللاحقة
 
 - جلسات **ثابتة عبر إعادة التشغيل** (المخزن الحالي في الذاكرة ⇒ أي restart بيلغي الجلسات).
-- تصدير الشات **لسه في البوت بس** (مش معروض في الـ Mini App). أما الملفات والتكلفة فبقوا معروضين
-  في تفاصيل الشات بعد استرجاع الميزات (F-08، القرار A — `DEFERRED_FEATURES_HIDDEN=False`).
-- نسخ الرد الكامل لسه مش معروض في الـ Mini App.
 - صندوق الإشعارات: **مفيش حذف/أرشفة** من الواجهة (التقليم تلقائي عند الحدود)، ولا فلترة
   "غير المقروء فقط" في الواجهة (الـ API بيدعم `unread=1`)، ولا إشعارات "مقروءة جزئيًا" —
   لو مطلوب نضيفه لاحقًا. **مفيش cleanup worker**: التقليم جوه نفس معاملة الإدراج.

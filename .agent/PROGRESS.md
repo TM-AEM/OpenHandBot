@@ -404,3 +404,12 @@ Plan:
 5. Frontend: `app.js` — زر تصدير + زر «نسخ الرد الكامل» مع Clipboard API + fallback + feedback صادق.
 6. Tests: backend export/reply + frontend copy/export.
 7. Docs: `docs/MINI_APP.md` (تصدير + نسخ كامل).
+
+### Phase 1B — تم (مبدئيًا)
+- Backend: `MiniAppService.export_conversation` (تفويض ⇒ شاهد حذف ⇒ تنزيل محدود) و`get_full_reply`.
+- Routes: `GET /api/v1/conversations/{id}/export` و`/reply` (مصادَقة، read-only).
+- Frontend: `copy.js` + `export.js` (وحدات مشتركة)، أزرار «نسخ الرد الكامل» و«تصدير الشات» في `app.js`.
+- Tests: `tests/test_miniapp_export_reply.py` (23)، `tests/frontend/copy.test.js` (8)،
+  `tests/frontend/export.test.js` (6)، `tests/frontend/export_copy_ui.test.js` (7).
+- Docs: `docs/MINI_APP.md` (§4 routes، §12 tests، §13ج جديد، §14 محدّث).
+- Results: pytest 1745 passed (baseline 1722) / node 166 pass 0 fail (baseline 145) / pyflakes 0 / compileall 0.
