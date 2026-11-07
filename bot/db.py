@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -455,7 +456,10 @@ class Database:
                 conversation_id TEXT PRIMARY KEY,
                 deleted_at      TEXT,
                 remote_state    TEXT,
-                remote_updated_at TEXT
+                remote_updated_at TEXT,
+                witness_origin  TEXT,
+                witness_attempt_id TEXT,
+                witness_preexisting INTEGER NOT NULL DEFAULT 0
             );
             """
         )
@@ -677,6 +681,31 @@ class Database:
             self._conn.execute("ALTER TABLE deleted_conversations ADD COLUMN remote_state TEXT")
         if tomb_cols and "remote_updated_at" not in tomb_cols:
             self._conn.execute("ALTER TABLE deleted_conversations ADD COLUMN remote_updated_at TEXT")
+        # OHB2-PR6: هُوية الشاهد **متينة** (بدل مقارنة الطوابع الزمنية — TS-1).
+        #   witness_origin     : NULL = شاهد قديم (حذف محلي سابق)، 'attempt' = محاولة حذف بعيد.
+        #   witness_attempt_id : رمز المحاولة المالكة (للـ compare-and-swap).
+        #   witness_preexisting: 1 = الصف كان موجودًا **قبل** أول محاولة بعيد (شاهد قديم)،
+        #                        0 = الصف أنشأته المحاولة نفسها. عمود **تراكمي** (monotonic):
+        #                        ما بيتصفّرش أبدًا، فلو محاولة **جديدة** ورثت شاهدًا قديمًا
+        #                        بتبان شاهدًا قديمًا دايمًا (منع إعادة التصنيف غلط — TS-1).
+        if tomb_cols and "witness_origin" not in tomb_cols:
+            self._conn.execute("ALTER TABLE deleted_conversations ADD COLUMN witness_origin TEXT")
+        if tomb_cols and "witness_attempt_id" not in tomb_cols:
+            self._conn.execute(
+                "ALTER TABLE deleted_conversations ADD COLUMN witness_attempt_id TEXT"
+            )
+        if tomb_cols and "witness_preexisting" not in tomb_cols:
+            self._conn.execute(
+                "ALTER TABLE deleted_conversations ADD COLUMN "
+                "witness_preexisting INTEGER NOT NULL DEFAULT 0"
+            )
+            # ترحيل غير مدمّر ولا يعتمد على الوقت: أي شاهد قديم موجود **الآن** (قبل أن
+            # يعرف الكود العمود الجديد) هو بالتعريف «سابق لأي محاولة» ⇒ نوسمه 1. هذا
+            # idempotent (العمود يتضاف مرة واحدة فقط؛ لو أُضيف من قبل لا نلمس البيانات)
+            # وآمن عند الانقطاع (ALTER + UPDATE داخل نفس معاملة `_migrate` الذرّية).
+            self._conn.execute(
+                "UPDATE deleted_conversations SET witness_preexisting=1 WHERE witness_origin IS NULL"
+            )
 
     # ----------------------------------------------------------------- watched
     def add_watched(
@@ -959,28 +988,135 @@ class Database:
     REMOTE_UNCERTAIN = "uncertain"
     REMOTE_CONFIRMED = "confirmed"
 
-    def mark_deletion_in_progress_nocommit(self, conversation_id: str, now: str) -> None:
-        """يكتب الشاهد **وحالة الحذف البعيد = 'deleting'** في معاملة المستدعي.
+    # OHB2-PR6: هُوية الشاهد المتينة. بدل تمييز «قديم/جديد» بمقارنة الطوابع الزمنية
+    # (`deleted_at != remote_updated_at` — عرضة لدقّة الساعة/رجوعها/التطبيع — TS-1)،
+    # بنعتمد على أعمدة صريحة:
+    #   witness_origin      = 'attempt' لشاهد أنشأته محاولة بعيد، NULL لشاهد قديم.
+    #   witness_attempt_id  = رمز المحاولة المالكة (compare-and-swap بين المحاولات).
+    #   witness_preexisting = 1 لو الصف كان موجودًا قبل أول محاولة بعيد (شاهد قديم)،
+    #                         وبيبقى 1 للأبد (monotonic) ⇒ مايتغيّرش مع إعادات المحاولة.
+    # التصنيف ما بيعتمدش على الوقت إطلاقًا ⇒ TS-1 مُلغى.
+    WITNESS_ORIGIN_ATTEMPT = "attempt"
 
-        بيتنادى **قبل** أي نداء حذف بعيد: لو العملية ماتت/انقطعت بعد كده، الحالة الدائمة
-        ('deleting'/'uncertain') تفضل، فأي إعادة محاولة/تسوية تعرف إن فيه حذف بعيد معلّق
-        (ما تحاولش إحياء الشات، وتقدر تكمّل/تتحقق بأمان).
+    def _begin_attempt_nocommit(self, conversation_id: str, now: str, attempt_id: str) -> bool:
+        """يوسم محاولة حذف بعيد **داخل معاملة المستدعي**: شاهد + 'deleting' + هُوية المحاولة.
+
+        `witness_preexisting` بيتحدّد **مرة واحدة** عند أول محاولة على الصف، وبعدها بيتغيّرش
+        (monotonic): 1 لو الصف كان موجودًا قبل أول محاولة (شاهد قديم)، و0 لو أول محاولة هي اللي
+        أنشأته. إعادات المحاولة اللاحقة **ما بتغيّرش** القيمة (لو `witness_origin` قديم =
+        'attempt' يبقى عندنا محاولة سابقة ⇒ نحافظ) ⇒ محاولة جديدة على صف أنشأته بنفسها تفضل
+        «جديدة»، ومحاولة على شاهد قديم تفضل «قديمة». التصنيف ما بيعتمدش على الوقت إطلاقًا.
+
+        **حراسة الإنهاء (CAS):** مش بنوسم 'deleting' على شات حالته 'confirmed' — إثبات الحذف
+        نهائي وما يتلغيش بمحاولة لاحقة. بيرجّع True لو خدنا الملكية، False لو الشات مؤكّد
+        مسبقًا (المستدعي يعالجها كحذف مكتمل).
         """
+        existed = self._conn.execute(
+            "SELECT 1 FROM deleted_conversations WHERE conversation_id=?",
+            (conversation_id,),
+        ).fetchone() is not None
         self._tombstone_nocommit(conversation_id, now)
-        self._conn.execute(
-            "UPDATE deleted_conversations SET remote_state=?, remote_updated_at=? "
-            "WHERE conversation_id=? AND remote_state IS NULL",
-            (self.REMOTE_DELETING, now, conversation_id),
+        cur = self._conn.execute(
+            "UPDATE deleted_conversations SET remote_state=?, remote_updated_at=?, "
+            "witness_origin=?, witness_attempt_id=?, "
+            "witness_preexisting=CASE "
+            "  WHEN witness_origin=? THEN witness_preexisting "  # محاولة سابقة ⇒ نحافظ
+            "  WHEN ? THEN 1 ELSE witness_preexisting END "       # أول محاولة على صف موجود ⇒ قديم
+            "WHERE conversation_id=? AND (remote_state IS NULL OR remote_state != ?)",
+            (
+                self.REMOTE_DELETING, now, self.WITNESS_ORIGIN_ATTEMPT, attempt_id,
+                self.WITNESS_ORIGIN_ATTEMPT, 1 if existed else 0, conversation_id,
+                self.REMOTE_CONFIRMED,
+            ),
         )
+        return cur.rowcount == 1
 
-    def set_remote_deletion_state(self, conversation_id: str, state: str | None, now: str) -> None:
-        """يثبّت حالة الحذف البعيد ('deleting'/'uncertain'/'confirmed' أو NULL) — كتابة دائمة."""
+    def begin_remote_deletion(self, conversation_id: str, now: str) -> str | None:
+        """يوسم الحذف الجاري (شاهد + 'deleting' + هُوية محاولة) في معاملة ذرّية **قبل** النداء.
+
+        يرجّع `attempt_id` الفريد للمحاولة دي (يُستخدم في الـ compare-and-swap بعد النداء)،
+        أو None لو الشات **مؤكّد الحذف مسبقًا** (في الحالة دي ما بناخدش ملكية — إثبات الحذف
+        نهائي). لو العملية اتقطعت بعد كده، الحالة تفضل (تنجو من restart) فأي إعادة محاولة/
+        تسوية تعرف إن فيه حذف بعيد معلّق، ومايتحياش الشات في الوقت نفسه.
+        """
+        attempt_id = uuid.uuid4().hex
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            took = self._begin_attempt_nocommit(conversation_id, now, attempt_id)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return attempt_id if took else None
+
+    def _set_remote_state_nocommit(self, conversation_id: str, state: str | None, now: str) -> None:
+        """يثبّت حالة الحذف البعيد **داخل معاملة المستدعي** (كتابة غير مشروطة)."""
         self._conn.execute(
             "UPDATE deleted_conversations SET remote_state=?, remote_updated_at=? "
             "WHERE conversation_id=?",
             (state, now, conversation_id),
         )
+
+    def set_remote_deletion_state(self, conversation_id: str, state: str | None, now: str) -> None:
+        """يثبّت حالة الحذف البعيد ('deleting'/'uncertain'/'confirmed' أو NULL) — كتابة دائمة.
+
+        كتابة غير مشروطة: تُستخدم في مسارات **ملكية المحاولة** (التسوية) اللي بتتأكد من
+        ملكية الشاهد بـ CAS على `witness_attempt_id` قبلها. مش مسار «تصفير بيانات محاولة».
+        """
+        self._set_remote_state_nocommit(conversation_id, state, now)
         self._conn.commit()
+
+    def revert_remote_deletion_cas(
+        self, conversation_id: str, attempt_id: str | None, state: str | None, now: str | None
+    ) -> bool:
+        """compare-and-swap: يرجّع بيانات الحذف البعيد لحالتها السابقة **بس** لو المحاولة دي
+        ما زالت مالكة الشاهد (`witness_attempt_id IS attempt_id`) **والحالة ليست 'confirmed'**.
+
+        `IS ?` (مش `= ?`) مقصود: مالك الشاهد القديم بعد الترحيل `NULL`، و`= NULL` ما بتطابقش
+        أبدًا فكانت تسيب الصفوف القديمة المعلّقة عالقة للأبد.
+
+        حرس الإنهاء: `'confirmed'` حالة **نهائية** (إثبات حذف بعيد بدليل إيجابي) ⇒ ممنوع أي
+        CAS يرجّعها/يطمسها. يرجّع True لو النجح (احنا المالك)، False لو محاولة أحدث سبقتنا أو
+        الحالة مؤكّدة (ما بنلمسش — منع lost-update). الكتابة ذرّية داخل `BEGIN IMMEDIATE`.
+        """
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = conn.execute(
+                "UPDATE deleted_conversations SET remote_state=?, remote_updated_at=? "
+                "WHERE conversation_id=? AND witness_attempt_id IS ? AND remote_state != ?",
+                (state, now, conversation_id, attempt_id, self.REMOTE_CONFIRMED),
+            )
+            ok = cur.rowcount == 1
+            conn.commit()
+            return ok
+        except Exception:
+            conn.rollback()
+            raise
+
+    def clear_witness_cas(self, conversation_id: str, attempt_id: str | None) -> bool:
+        """compare-and-swap: يشيل صف الشاهد **بس** لو المحاولة دي ما زالت مالكة الشاهد
+        (`witness_attempt_id IS attempt_id`) **والحالة ليست 'confirmed'**.
+
+        حرس الإنهاء: شاهد 'confirmed' (حذف بعيد مثبت) ما بيتحذفش أبدًا من مسار «الشات لسه
+        موجود» ⇒ مفيش إحياء لشات متحذّف. يرجّع True لو النجح (الصف اتشال)، False لو عملية
+        أحدث سبقتنا أو الحالة مؤكّدة.
+        """
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = conn.execute(
+                "DELETE FROM deleted_conversations "
+                "WHERE conversation_id=? AND witness_attempt_id IS ? AND remote_state != ?",
+                (conversation_id, attempt_id, self.REMOTE_CONFIRMED),
+            )
+            ok = cur.rowcount == 1
+            conn.commit()
+            return ok
+        except Exception:
+            conn.rollback()
+            raise
 
     def remote_deletion_state(self, conversation_id: str) -> str | None:
         """حالة الحذف البعيد للشات (None لو مفيش حذف بعيد اتبدأ)."""
@@ -990,23 +1126,26 @@ class Database:
         ).fetchone()
         return row["remote_state"] if row is not None else None
 
-    def begin_remote_deletion(self, conversation_id: str, now: str) -> None:
-        """يوسم الحذف الجاري (شاهد + 'deleting') في معاملة ذرّية واحدة **قبل** النداء البعيد.
+    def remote_deletion_metadata(self, conversation_id: str) -> tuple[str | None, str | None]:
+        """(حالة الحذف البعيد، طابعه الزمني) في قراءة واحدة — للاسترجاع الأمين بعد الفشل.
 
-        لو العملية اتقطعت بعد كده، الحالة تفضل (تنجو من restart) فأي إعادة محاولة/تسوية
-        تعرف إن فيه حذف بعيد معلّق، ومايتحياش الشات في الوقت نفسه.
+        بنقرأ الحقلين مع بعض عشان الاسترجاع يعيد الحالة **والطابع** الأصليين بالظبط (مش طابع
+        جديد). هُوية المالك (compare-and-swap) بتُقرأ من `witness_attempt_id()` منفصلة.
         """
-        conn = self._conn
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            self.mark_deletion_in_progress_nocommit(conversation_id, now)
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
+        row = self._conn.execute(
+            "SELECT remote_state, remote_updated_at FROM deleted_conversations "
+            "WHERE conversation_id=?",
+            (conversation_id,),
+        ).fetchone()
+        if row is None:
+            return (None, None)
+        return (row["remote_state"], row["remote_updated_at"])
 
     def clear_remote_deletion(self, conversation_id: str) -> None:
-        """يشيل شاهد الحذف (استرجاع محلي) — يُستخدم لما يثبت إن الشات **لسه موجود** بعيدًا."""
+        """يشيل شاهد الحذف (استرجاع محلي) — يُستخدم لما يثبت إن الشات **لسه موجود** بعيدًا.
+
+        كتابة غير مشروطة: تُستخدم في مسارات ملكية المحاولة اللي بتتحقق من الملكية أولًا.
+        """
         self._conn.execute(
             "DELETE FROM deleted_conversations WHERE conversation_id=?",
             (conversation_id,),
@@ -1021,6 +1160,44 @@ class Database:
             (self.REMOTE_DELETING, self.REMOTE_UNCERTAIN),
         ).fetchall()
         return [r["conversation_id"] for r in rows]
+
+    def list_pending_remote_deletions_with_owner(self) -> list[tuple[str, str | None]]:
+        """زي `list_pending_remote_deletions` لكن مع رمز المحاولة المالكة لكل شات.
+
+        التسوية بتستخدم المالك (`witness_attempt_id`) للـ compare-and-swap، فما تطمسش
+        محاولة أحدث بدأت بعد ما قرأنا القايمة.
+        """
+        rows = self._conn.execute(
+            "SELECT conversation_id, witness_attempt_id FROM deleted_conversations "
+            "WHERE remote_state IN (?, ?)",
+            (self.REMOTE_DELETING, self.REMOTE_UNCERTAIN),
+        ).fetchall()
+        return [(r["conversation_id"], r["witness_attempt_id"]) for r in rows]
+
+    def is_legacy_witness(self, conversation_id: str) -> bool:
+        """هل الشاهد **سبق** أول محاولة حذف بعيد (حذف محلي قديم)؟
+
+        التصنيف **متين وغير زمني** (OHB2-PR6 / TS-1): بيعتمد على `witness_preexisting`
+        (1 = الصف كان موجودًا قبل المحاولة) بدل مقارنة `deleted_at` بـ `remote_updated_at`.
+        الصفوف القديمة (المرحّلة) بتاخد 1؛ أي محاولة جديدة على شاهد قديم بتخليه 1 (monotonic)؛
+        ومحاولة جديدة على صف أنشأته بنفسها بتخليه 0. القيمة دائمة ⇒ تنجو من الانهيار/إعادة
+        التشغيل/إعادة المحاولة، وما بتعتمدش على دقّة الساعة ولا رجوعها ولا التطبيع.
+        """
+        row = self._conn.execute(
+            "SELECT witness_preexisting FROM deleted_conversations WHERE conversation_id=?",
+            (conversation_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        return bool(row["witness_preexisting"])
+
+    def witness_attempt_id(self, conversation_id: str) -> str | None:
+        """رمز محاولة الحذف المالكة للشاهد (None لو مفيش صف أو الشاهد قديم بلا محاولة)."""
+        row = self._conn.execute(
+            "SELECT witness_attempt_id FROM deleted_conversations WHERE conversation_id=?",
+            (conversation_id,),
+        ).fetchone()
+        return None if row is None else row["witness_attempt_id"]
 
     def _clear_tombstone_nocommit(self, conversation_id: str) -> None:
         """يشيل شاهد الحذف **داخل معاملة المستدعي** (إعادة تفاعل صريح من المستخدم)."""
