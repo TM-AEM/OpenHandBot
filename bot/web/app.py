@@ -25,7 +25,7 @@ from ..errors import ApiError, error_text
 from .clientip import parse_trusted_proxies, resolve_client_ip
 from .initdata import DEFAULT_MAX_AGE, InitDataError, TelegramUser, validate_init_data
 from .ratelimit import api_limiter, auth_limiter
-from .services import MiniAppService, ValidationError
+from .services import MiniAppService, ValidationError, EXPORT_CONTENT_TYPE
 from .sessions import SessionStore
 
 log = logging.getLogger(__name__)
@@ -35,6 +35,11 @@ INDEX_FILE = STATIC_DIR / "index.html"
 COOKIE_NAME = "ohb_session"
 MAX_BODY_BYTES = 16 * 1024
 API_PREFIX = "/api/v1"
+# OHB2-PHASE1B: المحارف المسموح بيها في اسم ملف التنزيل (ASCII آمن) — نمنع أي CR/LF
+# أو اقتباس أو محرف تحكّم من إنه يوصل لهيدر `Content-Disposition`.
+_HEADER_SAFE_NAME = frozenset(
+    ch for ch in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
+)
 
 _MIME_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -79,6 +84,22 @@ def _json(payload: dict, status: int = 200, headers: dict | None = None) -> JSON
 
 def _error(status: int, code: str, message: str, headers: dict | None = None) -> JSONResponse:
     return _json({"error": code, "message": message}, status=status, headers=headers)
+
+
+def _attachment(data: bytes, filename: str) -> Response:
+    """رد تنزيل ملف (zip) بهيدرز آمنة واسم ملف آمن (OHB2-PHASE1B).
+
+    `Content-Disposition: attachment` مع `filename` آمن (بيتولّد من معرّف صالح ومنقّى
+    ⇒ مفيش CR/LF/اقتباس ⇒ مفيش response-header injection). `Content-Length` صريح
+    بيوصف الحجم الفعلي بعد الحد الصلب. الهيدرز الأمنية العامة (`nosniff`/`no-store`/
+    `CORP`) بتتضاف هنا كمان عشان الرد الخام ماشي على نفس مسار `_json` الأمني.
+    """
+    safe = "".join(ch for ch in filename if ch in _HEADER_SAFE_NAME) or "conversation.zip"
+    headers = dict(_SECURITY_HEADERS)
+    headers["Content-Type"] = EXPORT_CONTENT_TYPE
+    headers["Content-Disposition"] = f'attachment; filename="{safe}"'
+    headers["Content-Length"] = str(len(data))
+    return Response(data, media_type=EXPORT_CONTENT_TYPE, headers=headers)
 
 
 class MiniApp:
@@ -299,6 +320,16 @@ class MiniApp:
             Route(
                 f"{API_PREFIX}/conversations/{{conversation_id}}/cost",
                 self.conversation_cost,
+                methods=["GET"],
+            ),
+            Route(
+                f"{API_PREFIX}/conversations/{{conversation_id}}/reply",
+                self.conversation_reply,
+                methods=["GET"],
+            ),
+            Route(
+                f"{API_PREFIX}/conversations/{{conversation_id}}/export",
+                self.conversation_export,
                 methods=["GET"],
             ),
             Route(
@@ -583,6 +614,45 @@ class MiniApp:
         except ApiError as exc:
             return self._api_error(exc)
         return _json(data)
+
+    async def conversation_reply(self, request):
+        """OHB2-PHASE1B: الرد الكامل للـ assistant (مصادَقة، read-only).
+
+        مصدر زر «نسخ الرد الكامل»: النص الكامل بلا قصّ بصري (المعاينة في التفاصيل
+        محدودة بـ 4000 محرف، لكن النسخ محتاج الرد كامل). التفويض والملكية server-side.
+        """
+        session, err = await self._guarded(request, state_changing=False)
+        if err is not None:
+            return err
+        try:
+            data = await self._service.get_full_reply(
+                request.path_params.get("conversation_id", "")
+            )
+        except ValidationError as exc:
+            return _error(400, "bad_request", str(exc))
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json(data)
+
+    async def conversation_export(self, request):
+        """OHB2-PHASE1B: تصدير الشات (zip) للمستخدم المصرّح له — مصادَقة، read-only.
+
+        بترجّع الملف الخام بنوع `application/zip` واسم تنزيل آمن. التفويض والملكية
+        server-side؛ مفيش ثقة في أي معرّف مستخدم من العميل. فشل التنزيل/عدّى الحد
+        ⇒ خطأ منظّم (مفيش ملف)، فمفيش تصدير «ناجح» كاذب.
+        """
+        session, err = await self._guarded(request, state_changing=False)
+        if err is not None:
+            return err
+        try:
+            data, filename = await self._service.export_conversation(
+                request.path_params.get("conversation_id", "")
+            )
+        except ValidationError as exc:
+            return _error(400, "bad_request", str(exc))
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _attachment(data, filename)
 
     async def conversation_files(self, request):
         """OHB2-09-02: قايمة ملفات شات مصرّح به (read-only، مصادَقة)."""

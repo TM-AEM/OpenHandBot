@@ -15,7 +15,7 @@ import logging
 import math
 import time
 
-from ..errors import ApiError
+from ..errors import ApiError, ResponseTooLargeError
 from ..messages import get_status, pr_url, state_label, truncate
 from ..openhands_client import collect_conversations
 from .. import features
@@ -41,6 +41,10 @@ log = logging.getLogger(__name__)
 PAGE_SIZE = 10
 MAX_PROMPT_CHARS = 8000
 MAX_REPO_LEN = 200
+# OHB2-PHASE1B: حدّ أعلى لنص الرد الكامل اللي بيتحوّل للواجهة عند «نسخ الرد الكامل».
+# المعاينة العادية في التفاصيل محدودة بـ 4000 محرف؛ النسخ الكامل بياخد النص الأطول
+# (محدود) عشان مايتقصّش بصريًا، مع سقف صلب يمنع تضخيم ذاكرة/رد غير محدود.
+MAX_FULL_REPLY_CHARS = 100_000
 # OHB2-07: معرّف العملية اللي العميل يولّده (idempotency). قاصر على حروف/أرقام/شرطة
 # وشرطة سفلية، بطول محدود، عشان ما يتحوّلش لقناة حقن أو مفتاح ضخم في الذاكرة/القاعدة.
 MAX_REF_LEN = 64
@@ -238,6 +242,27 @@ def _cost_dto(conv: dict) -> dict:
         "completion_tokens": _as_int(usage.get("completion_tokens")),
         "total_tokens": _as_int(usage.get("total_tokens")),
     }
+
+
+# OHB2-PHASE1B: تصدير الشات من الـ Mini App بنفس صيغة البوت (zip من OpenHands) ونفس
+# الحدود. اسم الملف بيتولّد من معرّف **متفوَّض عليه** (بعد التحقق)، وبيتنقّى لمجموعة
+# محارف آمنة عشان مايتحوّلش لقناة حقن في الهيدر (CR/LF) أو مسار.
+EXPORT_CONTENT_TYPE = "application/zip"
+_EXPORT_NAME_SAFE = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+)
+
+
+def export_filename(conversation_id: str) -> str:
+    """اسم ملف تنزيل آمن (`conversation-<id>.zip`).
+
+    المعرّف لازم يكون **صالح** (حروف/أرقام/`-`/`_` بطول محدود) — نتأكد تاني هنا
+    (دفاع بعمق) وبعدين ننقّي أي محرف تاني. النتيجة قاصر على محارف آمنة ⇒ مفيش CR/LF
+    ولا اقتباس ولا مسار، فمفيش response-header injection ولا اجتياز مسار.
+    """
+    cid = conversation_id if is_valid_conversation_id(conversation_id) else ""
+    safe = "".join(ch for ch in cid if ch in _EXPORT_NAME_SAFE)
+    return f"conversation-{safe}.zip" if safe else "conversation.zip"
 
 
 class MiniAppService:
@@ -491,6 +516,58 @@ class MiniAppService:
         cid = _require_id(conversation_id)
         conv = await self._authorize_conversation(cid)
         return _conversation_dto(conv, cid in self._watched_ids())
+
+    async def get_full_reply(self, conversation_id: str) -> dict:
+        """OHB2-PHASE1B: الرد الكامل للـ assistant (مصدر زر «نسخ الرد الكامل»).
+
+        التفويض أولًا (نفس عقد الملكية)، ثم **نفس** `get_last_exchange` اللي البوت
+        بيستخدمه. بترجّع النص الكامل (بلا قصّ بصري) + علم `reply_truncated` لو عدّى
+        السقف الصلب `MAX_FULL_REPLY_CHARS` (حالة نادرة جدًا). مفيش أي معرّفات داخلية
+        ولا بيانات غير مصرّح بها — النص بس + العلم.
+        """
+        cid = _require_id(conversation_id)
+        client = self._require_client()
+        await self._authorize_conversation(cid)
+        _user_text, reply = await client.get_last_exchange(cid)
+        text, cut = truncate(reply, MAX_FULL_REPLY_CHARS)
+        return {"conversation_id": cid, "reply": text, "reply_truncated": cut}
+
+    async def export_conversation(self, conversation_id: str):
+        """OHB2-PHASE1B: تصدير الشات (zip) للمستخدم المصرّح له — نفس صيغة البوت.
+
+        بترجّع `(data, filename)` أو بترمي `CodedApiError` منظّم. الترتيب المهم:
+
+        1. **التفويض قبل أي تنزيل** (ملكية الشات من `/users/me` + `created_by_user_id`،
+           فشل مغلق) — مفيش ثقة في أي هوية من العميل، والمستخدم جاي من الجلسة.
+        2. **فحص شاهد الحذف المحلي** بعد التفويض وقبل التنزيل: شات محذوف/مُعلَّم لا
+           يُصدَّر ولا يُحيا من بيانات محلية قديمة (نفس حماية الحذف البعيد).
+        3. تنزيل **محدود** بنفس `OpenHandsClient.export_conversation` (سقف صلب
+           `MAX_EXPORT_BYTES` عبر `_read_capped`، ومفيش تجميع غير محدود).
+        4. فشل التنزيل/عدّى الحد ⇒ خطأ منظّم، **مفيش** تصدير «ناجح» كاذب.
+        """
+        cid = _require_id(conversation_id)
+        client = self._require_client()
+        await self._authorize_conversation(cid)
+        # شاهد الحذف المحلي (لو فيه قاعدة مربوطة): شات محذوف/مُعلَّم لا يُصدَّر ولا يُحيا
+        # من بيانات محلية قديمة. من غير قاعدة (وضع مستقل) مفيش شواهد محلية نحترمها —
+        # نفس سلوك `_watched_ids`. أي فشل قراءة ⇒ فشل مغلق (مفيش تصدير).
+        if self._db is not None:
+            try:
+                if self._db.is_deleted(cid):
+                    # نفس رسالة «مش موجود» عشان ما نسيبش استنتاج وجود شات متحذف.
+                    raise CodedApiError("not_found", "الشات مش موجود.", 404)
+            except CodedApiError:
+                raise
+            except Exception:  # noqa: BLE001 — قاعدة غير متاحة ⇒ فشل مغلق
+                log.warning("تعذّر قراءة شاهد الحذف؛ بنرفض التصدير (فشل مغلق).")
+                raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
+        try:
+            data = await client.export_conversation(cid)
+        except ResponseTooLargeError:
+            raise CodedApiError(
+                "too_large", "التصدير كبير أوي للتنزيل الآمن. جرّب شات أصغر.", 413
+            )
+        return data, export_filename(cid)
 
     async def associate_repository(self, conversation_id: str, repository: str) -> dict:
         """يربط مستودع بشات موجود (OHB2: إدارة الشاتات).
