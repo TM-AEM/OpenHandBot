@@ -372,3 +372,35 @@ Verified by the reviewer with real output: pytest 1721 passed, pyflakes 0, sessi
 raw token absent from DB file, auth survives reconstruct, expired rejected, revoked durable, db error -> fail closed.
 Findings addressed in `ad6dd84`: revoke DB failure now logged (not silent) + stale docstring fixed + test.
 Nit left as-is (documented): `reset()` uses `prune_web_sessions(inf)`; no production callers.
+
+## OHB2-PHASE1B-MINIAPP-CONVERSATION-EXPORT-AND-FULL-REPLY-COPY — IN PROGRESS
+
+Branch: `agent/ohb2-phase1b-export-and-copy-reply` (from verified Phase 1A `8a86e25`).
+
+Goal: إضافة قدرتين ناقصتين في الـ Mini App: (1) تصدير الشات، (2) نسخ الرد الكامل للـ assistant.
+
+Acceptance criteria:
+1. تصدير الشات يشتغل للمستخدم المصرّح له (endpoint مصادَق).
+2. منع تصدير شات مستخدم تاني server-side (مفيش ثقة في هوية من العميل).
+3. حجم/ذاكرة التصدير محدودة (نفس `MAX_EXPORT_BYTES`/`_read_capped`).
+4. حمايات الحذف/الشواهد كما هي: مفيش تصدير/إحياء لشات محذوف محليًا.
+5. نسخ الرد الكامل بلا قصّ بصري (مصدره الرد الكامل مش المعاينة).
+6. فشل/رفض الحافظة يُبلّغ بصدق (مفيش نجاح كاذب) + fallback آمن.
+7. العربي/RTL وWebView الموبايل مغطّيين باختبارات.
+8. الاختبارات والفحوص الثابتة تمر (بلا انخفاض عن baseline: pytest 1722 / node 145 / pyflakes 0).
+9. مراجعة مستقلة PASS أو PASS-WITH-NOTES بدون Critical/High.
+10. الـ diff النهائي فيه تغييرات المهمة بس.
+
+Out of scope: Inbox archive/delete/filter، creation-job reconciliation UI، تغيير دلالات الحذف البعيد،
+أي Backup، Autopush، نشر/دمج.
+
+Baseline (before): pytest 1722 passed / pyflakes 0 / compileall 0 / node 145 pass 0 fail.
+
+Plan:
+1. Backend: `MiniAppService.export_conversation` (تفويض ملكية ⇒ قراءة محدودة ⇒ حدود حجم ⇒ اسم ملف آمن).
+2. Backend: `MiniAppService.get_full_reply` (الرد الكامل + علامة القصّ).
+3. Routes: `GET .../conversations/{id}/export` (مصادَق، غير مُغيّر للحالة) + `GET .../conversations/{id}/reply`.
+4. Frontend: وحدة `export.js` مشتركة (اسم ملف آمن + منطق النسخ + رسائل) تُختبر في Node.
+5. Frontend: `app.js` — زر تصدير + زر «نسخ الرد الكامل» مع Clipboard API + fallback + feedback صادق.
+6. Tests: backend export/reply + frontend copy/export.
+7. Docs: `docs/MINI_APP.md` (تصدير + نسخ كامل).
