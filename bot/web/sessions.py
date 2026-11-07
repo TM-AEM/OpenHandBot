@@ -17,9 +17,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import secrets
 import time
 from dataclasses import dataclass, field
+
+log = logging.getLogger(__name__)
 
 _TOKEN_BYTES = 32
 
@@ -125,7 +128,9 @@ class SessionStore:
         try:
             self._db.delete_web_session(hash_token(token))
         except Exception:  # noqa: BLE001 — فشل الإلغاء ما يخلّيش الطلب ينهار
-            pass
+            # ما نبلعش الخطأ بصمت: لو الحذف فشل، الصف ممكن يفضل سارٍ لحد الـ TTL،
+            # فبنسجّل تحذير بلا أي سر (نوع الخطأ بس) عشان يبان في التشغيل.
+            log.warning("فشل إلغاء جلسة الـ Mini App (%s)", "db_error")
 
     def reset(self) -> None:
         if self._db is None:

@@ -84,7 +84,8 @@ def _error(status: int, code: str, message: str, headers: dict | None = None) ->
 class MiniApp:
     """يملك حالة الـ web (مخزن الجلسات + الإعدادات) ويبني تطبيق Starlette.
 
-    `db` هو **نفس** كائن قاعدة بيانات البوت (مفيش اتصال تاني) — بنقرأ منه قراءة فقط.
+    `db` هو **نفس** كائن قاعدة بيانات البوت (مفيش اتصال تاني) — بنقرأ منه قراءة فقط،
+    وبنكتب فيه جلسات الـ Mini App بس (OHB2-PHASE1A).
     """
 
     def __init__(self, config: Config, db=None, client=None, application=None) -> None:

@@ -362,6 +362,21 @@ def test_ttl_defaults_and_minimum(tmp_path):
     assert s.expires_at == 1001.0
 
 
+def test_revoke_failure_is_logged_not_swallowed_silently(tmp_path, caplog):
+    db = make_db(tmp_path)
+    store = SessionStore(ttl=100, db=db)
+    s = store.create(OWNER)
+
+    def boom(*_a, **_k):
+        raise sqlite3.OperationalError("database is locked")
+
+    db.delete_web_session = boom  # type: ignore[assignment]
+    with caplog.at_level(logging.WARNING):
+        store.revoke(s.token)  # ما يرميش، لكن يسجّل تحذير بلا أي سر
+    assert any("إلغاء جلسة" in r.getMessage() for r in caplog.records)
+    assert s.token not in "\n".join(r.getMessage() for r in caplog.records)
+
+
 def test_tokens_not_logged(tmp_path, caplog):
     db = make_db(tmp_path)
     store = SessionStore(ttl=100, db=db)
