@@ -95,12 +95,16 @@ def _finalize(db, conversation_id: str, now: str) -> DeletionResult:
     return DeletionResult(STATUS_DELETED, DELETED_MESSAGE, conversation_id, http_status=200)
 
 
-async def _reconcile(client, db, conversation_id: str, now: str, restore_local) -> DeletionResult:
+async def _reconcile(
+    client, db, conversation_id: str, now: str, restore_local, pending_ts: str
+) -> DeletionResult:
     """تسوية نتيجة الحذف **المبهمة/المجهولة** عبر التحقق من الوجود البعيد.
 
     - غايب (مؤكّد بقراءات متتالية) ⇒ نثبّت الحذف ('confirmed' + حذف محلي).
     - موجود ⇒ الحذف ما حصلش ⇒ نرجّع الحالة المحلية ونبلّغ فشل صريح (مفيش نجاح كاذب).
     - تعذّر التحقق ⇒ 'uncertain' (مش نجاح، ومش فشل مؤكّد) — ينجو من restart ويُسوّى لاحقًا.
+      بنسجّل `pending_ts` (طابع ما قبل المحاولة لو كانت إعادة محاولة، وإلا `now`) عشان تصنيف
+      الشاهد (قديم/جديد) ما يتغيّرش (F1-R).
     """
     absent = await _establish_absence(client, conversation_id)
     if absent is True:
@@ -112,8 +116,9 @@ async def _reconcile(client, db, conversation_id: str, now: str, restore_local) 
             STATUS_FAILED, FAILED_MESSAGE, conversation_id,
             http_status=502, code="remote_delete_failed",
         )
-    # تعذّر التحقق ⇒ 'pending' (مش نجاح، ومش فشل مؤكّد).
-    db.set_remote_deletion_state(conversation_id, db.REMOTE_UNCERTAIN, now)
+    # تعذّر التحقق ⇒ 'pending' (مش نجاح، ومش فشل مؤكّد). الطابع المسجّل لازم يحافظ على
+    # تصنيف الشاهد: للشاهد الجديد يفضل == `deleted_at`، وللشاهد القديم يفضل مختلفًا.
+    db.set_remote_deletion_state(conversation_id, db.REMOTE_UNCERTAIN, pending_ts)
     return DeletionResult(
         STATUS_PENDING, PENDING_MESSAGE, conversation_id,
         http_status=503, code="remote_delete_pending",
@@ -123,20 +128,30 @@ async def _reconcile(client, db, conversation_id: str, now: str, restore_local) 
 async def delete_conversation_remote(client, db, conversation_id: str) -> DeletionResult:
     """يحذف شات من OpenHands ثم يثبّت الحذف محليًا. يتطلب تفويض ملكية مسبق من المستدعي."""
     now = outbox.now_iso()
-    pre_state = db.remote_deletion_state(conversation_id)
+    # نقرأ الحالة **والطابع الأصليين** مع بعض قبل أي كتابة، عشان الاسترجاع بعد الفشل يرجّع
+    # نفس القيم بالظبط (مش طابع جديد) — من غير ما نغيّر تصنيف الشاهد (قديم/جديد).
+    pre_state, pre_updated_at = db.remote_deletion_metadata(conversation_id)
+    # هل كان فيه شاهد حذف محلي **قبل** المحاولة دي؟ (مهم للحالة القديمة: صف موجود بـ
+    # remote_state=NULL من حذف محلي سابق — `pre_state` لوحدها بتخلّيه يبان زي «مفيش شاهد».)
+    had_witness = db.is_deleted(conversation_id)
 
     # حذف بعيد مؤكّد سابقًا: نعيد تثبيت الحذف المحلي (idempotent) من غير نداء تاني.
     if pre_state == db.REMOTE_CONFIRMED:
         return _finalize(db, conversation_id, now)
 
     def _restore_local() -> None:
-        # الفشل يعني إن طلب المستخدم ما اكتملش ⇒ نرجّع الحالة المحلية زي ما كانت. لو إحنا
-        # اللي كتبنا الشاهد في المحاولة دي (مفيش حالة سابقة) نشيله؛ لو كان فيه شاهد قديم
-        # (حذف محلي سابق) ما نلمسوش (نشيل وسم الحذف البعيد بس) — ما نكسرش منع الإحياء القديم.
+        # الفشل يعني إن طلب المستخدم ما اكتملش ⇒ نرجّع الحالة المحلية زي ما كانت. بنشيل
+        # الصف بس لو **إحنا** اللي كتبناه في المحاولة دي (مفيش شاهد قبله). أي شاهد سابق —
+        # حتى لو حالته البعيدة NULL (حذف محلي قديم) — بنحافظ على الصف ونرجّع **الحالة
+        # والطابع الأصليين بالظبط** (مش طابع جديد)، عشان تصنيف الشاهد (قديم/جديد) ما يتغيّرش
+        # بعد إعادة المحاولة (F1) وما يتفتحش إحياء لشات مخفي.
         if pre_state is None:
-            db.clear_remote_deletion(conversation_id)
+            if had_witness:
+                db.set_remote_deletion_state(conversation_id, None, None)
+            else:
+                db.clear_remote_deletion(conversation_id)
         else:
-            db.set_remote_deletion_state(conversation_id, pre_state, now)
+            db.set_remote_deletion_state(conversation_id, pre_state, pre_updated_at)
 
     # نوسم الحذف الجاري **قبل** النداء البعيد (شاهد + 'deleting') — ينجو من restart ويمنع
     # أي worker/مسار من إحياء الشات أثناء الحذف.
@@ -156,7 +171,10 @@ async def delete_conversation_remote(client, db, conversation_id: str) -> Deleti
             )
         # 404 (مبهم: غياب أو فشل خدمة داخلي) / 429 / 5xx / انقطاع / إعادة توجيه / رد مش
         # متوقع ⇒ نتيجة **مش مؤكّدة** ⇒ نفس التسوية: تحقق من الوجود قبل أي تأكيد.
-        return await _reconcile(client, db, conversation_id, now, _restore_local)
+        # لو كانت إعادة محاولة على شاهد موجود أصلًا (`pre_updated_at is not None`)، نسجّل
+        # 'uncertain' بطابعه الأصلي بدل `now` — عشان تصنيف الشاهد (قديم/جديد) ما يتغيّرش (F1-R).
+        pending_ts = pre_updated_at if pre_updated_at is not None else now
+        return await _reconcile(client, db, conversation_id, now, _restore_local, pending_ts)
 
     # OpenHands أكّد (200 success=true) ⇒ نثبّت الحذف المحلي + 'confirmed'.
     return _finalize(db, conversation_id, now)
@@ -167,7 +185,9 @@ async def reconcile_pending_deletions(client, db) -> None:
 
     لكل شات حالته 'deleting'/'uncertain': نتحقق من الوجود بعيدًا (بقراءات متتالية).
     - غايب ⇒ نثبّت الحذف (اتحذف فعلًا قبل الانقطاع).
-    - موجود ⇒ نرجّعه محليًا (نشيل الشاهد — الحذف البعيد ما حصلش؛ مفيش إخفاء كاذب).
+    - موجود ⇒ نرجّعه محليًا: نشيل وسم الحذف البعيد. لو الشاهد كان موجود **قبل** المحاولة
+      (حذف محلي قديم بحالة NULL) نسيبه محفوظ ونصفّر بيانات الحذف البعيد بس — عشان مايتحذفش
+      الشاهد القديم ويسمح بإحياء شات مخفي (R1)؛ ولو الشاهد من المحاولة نفسها نشيل الصف.
     - تعذّر التحقق ⇒ نسيبه معلّق (مفيش تخمين).
     """
     try:
@@ -186,8 +206,13 @@ async def reconcile_pending_deletions(client, db) -> None:
                 log.warning("تعذّر تثبيت حذف معلّق (%s)", type(exc).__name__)
         elif absent is False:
             try:
-                db.clear_remote_deletion(conversation_id)
-                log.info("تسوية: الشات لسه موجود بعيدًا ⇒ رجع محليًا (%s)", conversation_id)
+                if db.is_legacy_witness(conversation_id):
+                    # R1: شاهد سبق المحاولة ⇒ نحافظ على الصف ونصفّر بيانات الحذف البعيد بس.
+                    db.set_remote_deletion_state(conversation_id, None, None)
+                    log.info("تسوية: شاهد حذف قديم اتّحفظ (الشات لسه موجود) (%s)", conversation_id)
+                else:
+                    db.clear_remote_deletion(conversation_id)
+                    log.info("تسوية: الشات لسه موجود بعيدًا ⇒ رجع محليًا (%s)", conversation_id)
             except Exception as exc:  # noqa: BLE001
                 log.warning("تعذّر استرجاع شات معلّق (%s)", type(exc).__name__)
         # absent is None ⇒ نسيبه معلّق (مفيش تخمين).

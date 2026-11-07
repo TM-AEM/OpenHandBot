@@ -990,6 +990,22 @@ class Database:
         ).fetchone()
         return row["remote_state"] if row is not None else None
 
+    def remote_deletion_metadata(self, conversation_id: str) -> tuple[str | None, str | None]:
+        """(حالة الحذف البعيد، طابعه الزمني) في قراءة واحدة — للاسترجاع الأمين بعد الفشل.
+
+        بنقرأ الحقلين مع بعض عشان `_restore_local` تعيد الحالة **والطابع** الأصليين بالظبط.
+        كتابة طابع جديد عند الاسترجاع كانت بتكسر تصنيف الشاهد (شاهد جديد يصبح شبه قديم لأن
+        `deleted_at` يفضل == الطابع الأصلي).
+        """
+        row = self._conn.execute(
+            "SELECT remote_state, remote_updated_at FROM deleted_conversations "
+            "WHERE conversation_id=?",
+            (conversation_id,),
+        ).fetchone()
+        if row is None:
+            return (None, None)
+        return (row["remote_state"], row["remote_updated_at"])
+
     def begin_remote_deletion(self, conversation_id: str, now: str) -> None:
         """يوسم الحذف الجاري (شاهد + 'deleting') في معاملة ذرّية واحدة **قبل** النداء البعيد.
 
@@ -1021,6 +1037,24 @@ class Database:
             (self.REMOTE_DELETING, self.REMOTE_UNCERTAIN),
         ).fetchall()
         return [r["conversation_id"] for r in rows]
+
+    def is_legacy_witness(self, conversation_id: str) -> bool:
+        """هل الشاهد **قبل** محاولة الحذف البعيد الجارية (شاهد حذف محلي قديم)؟
+
+        `begin_remote_deletion` بتكتب `deleted_at` (لو الصف جديد) و`remote_updated_at` من
+        **نفس** الطابع الزمني (`now`) للنداء الواحد. لو الشاهد كان موجود **قبل** المحاولة
+        (مثلاً حذف محلي قديم بحالة NULL)، `deleted_at` بتاعه أقدم من `remote_updated_at`
+        (أو `remote_updated_at` فاضي) ⇒ الشاهد أقدم من المحاولة. المقارنة بتنجو من
+        الانهيار وإعادة التشغيل (الحقلان دائمين، مفيش حالة in-memory).
+        """
+        row = self._conn.execute(
+            "SELECT deleted_at, remote_updated_at FROM deleted_conversations "
+            "WHERE conversation_id=?",
+            (conversation_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        return row["remote_updated_at"] is None or row["deleted_at"] != row["remote_updated_at"]
 
     def _clear_tombstone_nocommit(self, conversation_id: str) -> None:
         """يشيل شاهد الحذف **داخل معاملة المستدعي** (إعادة تفاعل صريح من المستخدم)."""
