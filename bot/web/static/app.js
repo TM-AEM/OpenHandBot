@@ -113,6 +113,12 @@
   if (!FILES) { throw new Error("RecovoFiles مش محمّل (files.js)"); }
   var COST = window.RecovoCost;
   if (!COST) { throw new Error("RecovoCost مش محمّل (cost.js)"); }
+  var COPY = window.RecovoCopy;
+  if (!COPY) { throw new Error("RecovoCopy مش محمّل (copy.js)"); }
+  var EXPORT = window.RecovoExport;
+  if (!EXPORT) { throw new Error("RecovoExport مش محمّل (export.js)"); }
+  // OHB2-PHASE1B: مرجع آمن لـ navigator (مش موجود في بيئة الاختبار المصغّرة).
+  var NAV = (typeof navigator !== "undefined") ? navigator : null;
   // OHB2-09-02: منع طلبات الملفات المكرّرة المتزامنة (نفس الشات/الملف).
   var filesDeduper = FILES.createDeduper();
   function opKey(parts) { return OPS.identityKey(parts); }
@@ -540,6 +546,29 @@
       rb.appendChild(el("span", "bubble-label", "آخر رد"));
       rb.appendChild(el("p", "bubble-text", d.last_reply || "لسه مفيش رد."));
       box.appendChild(rb);
+      // OHB2-PHASE1B: زر نسخ **الرد الكامل** (مش المعاينة المقصوصة). بيجيب النص
+      // الكامل من الـ endpoint المصادَق وقت الضغط، وبيبلّغ بنجاح/فشل النسخ بصدق.
+      var copyRow = el("div", "toolbar");
+      var copyBtn = el("button", "btn ghost small", "📋 نسخ الرد الكامل");
+      if (!d.last_reply) { copyBtn.disabled = true; }
+      copyBtn.addEventListener("click", function () {
+        if (copyBtn.disabled) { return; }
+        copyBtn.disabled = true;
+        get("/conversations/" + encodeURIComponent(id) + "/reply").then(function (res) {
+          if (!res.ok) {
+            copyBtn.disabled = false;
+            toast(friendlyMessage(res.status, res.data));
+            return;
+          }
+          var full = (res.data && res.data.reply) || "";
+          COPY.copyText(full, { navigator: NAV, document: document }).then(function (result) {
+            copyBtn.disabled = false;
+            toast(COPY.feedback(result));
+          });
+        }).catch(function () { copyBtn.disabled = false; toast("مش قادر أوصل للسيرفر."); });
+      });
+      copyRow.appendChild(copyBtn);
+      box.appendChild(copyRow);
 
       var prompt = el("textarea", "textarea");
       prompt.rows = 3;
@@ -585,6 +614,41 @@
           trackOperation(opBox, "prompt", ref, id, null, resend, promptOps);
         });
       });
+
+      // OHB2-PHASE1B: زر تصدير الشات (zip) — تنزيل مباشر عبر رابط مصادَق. بنقرأ اسم
+      // الملف الآمن من هيدر `Content-Disposition`، ولو فشل الطلب بنعرض رسالة واضحة
+      // (مفيش تنزيل وهمي). التنزيل بيحصل على مسار المصادقة/الكوكي نفسه (same-origin).
+      var exportBtn = el("button", "btn ghost small", "⬇️ تصدير الشات");
+      exportBtn.addEventListener("click", function () {
+        if (exportBtn.disabled) { return; }
+        exportBtn.disabled = true;
+        var url = API + "/conversations/" + encodeURIComponent(id) + "/export";
+        fetch(url, { method: "GET", credentials: "same-origin", cache: "no-store" })
+          .then(function (res) {
+            if (!res.ok) {
+              return res.json().catch(function () { return {}; }).then(function (data) {
+                exportBtn.disabled = false;
+                var code = data && data.error;
+                toast(EXPORT.errorLabel(code, friendlyMessage(res.status, data)));
+              });
+            }
+            var name = EXPORT.filenameFromDisposition(res.headers.get("content-disposition"));
+            return res.blob().then(function (blob) {
+              var objUrl = URL.createObjectURL(blob);
+              var a = el("a", "link", "");
+              a.href = objUrl;
+              a.download = name;
+              document.body.appendChild(a);
+              a.click();
+              if (a.remove) { a.remove(); }
+              setTimeout(function () { URL.revokeObjectURL(objUrl); }, 0);
+              exportBtn.disabled = false;
+              toast("تم تنزيل التصدير ✅");
+            });
+          })
+          .catch(function () { exportBtn.disabled = false; toast("مش قادر أوصل للسيرفر."); });
+      });
+      box.appendChild(exportBtn);
 
       var watchBtn = el("button", "btn ghost small", d.watched ? "إلغاء المتابعة" : "متابعة");
       watchBtn.addEventListener("click", function () {
