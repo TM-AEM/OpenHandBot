@@ -541,16 +541,18 @@ def test_lifecycle_no_stale_overwrite_across_restart(tmp_path):
     db = Database(p)
     db.add_watched(CID, "شات", chat_id=1)
     stale_owner = db.begin_remote_deletion(CID, outbox.now_iso())
-    # محاولة أحدث تسحب الملكية ثم تؤكّد الحذف.
+    # محاولة أحدث تسحب الملكية ثم يؤكّد الحذف محليًا (نفس مسار `_finalize`).
     newer_owner = db.begin_remote_deletion(CID, outbox.now_iso())
     assert newer_owner != stale_owner
-    assert db.confirm_remote_deletion_cas(CID, newer_owner, outbox.now_iso()) is True
+    db.delete_conversation(CID, outbox.now_iso(), remote_confirmed=True)
     db.close()
     db2 = Database(p)
     assert db2.remote_deletion_state(CID) == db2.REMOTE_CONFIRMED
     # المحاولة القديمة ما تقدرش تطمس التأكيد (لا مسح ولا كتابة).
     assert db2.clear_witness_cas(CID, stale_owner) is False
     assert db2.revert_remote_deletion_cas(CID, stale_owner, None, None) is False
+    # ولا حتى المالك الحالي يقدر (confirmed نهائي).
+    assert db2.clear_witness_cas(CID, newer_owner) is False
     assert db2.is_deleted(CID) is True
     assert db2.remote_deletion_state(CID) == db2.REMOTE_CONFIRMED
 
@@ -567,8 +569,10 @@ def test_new_attempt_does_not_clobber_confirmed(tmp_path):
     db = Database(_path(tmp_path))
     db.add_watched(CID, "شات", chat_id=1)
     owner = db.begin_remote_deletion(CID, outbox.now_iso())
-    assert db.confirm_remote_deletion_cas(CID, owner, outbox.now_iso()) is True
+    db.delete_conversation(CID, outbox.now_iso(), remote_confirmed=True)
+    assert db.remote_deletion_state(CID) == db.REMOTE_CONFIRMED
     confirmed_owner = db.witness_attempt_id(CID)
+    assert owner is not None
     # محاولة جديدة تبدأ بعد التأكيد ⇒ ممنوعة من سحب الملكية (begin يرجّع None).
     assert db.begin_remote_deletion(CID, outbox.now_iso()) is None
     assert db.remote_deletion_state(CID) == db.REMOTE_CONFIRMED
@@ -586,3 +590,123 @@ def test_stale_failure_redundant_if_newer_attempt_owns(tmp_path):
     assert db.revert_remote_deletion_cas(CID, old, "confirmed", outbox.now_iso()) is False
     assert db.witness_attempt_id(CID) == newer
     assert db.remote_deletion_state(CID) == db.REMOTE_DELETING
+
+
+# ======================================== E. مراجعة مستقلة: «confirmed» حالة نهائية
+class _GateClient:
+    """عميل ببوّابات تحكّم (asyncio Events) لضبط ترتيب تسليم النتائج بدقّة."""
+
+    def __init__(self, first_succeeds=True):
+        self.first_succeeds = first_succeeds
+        self.n = 0
+        self.first_entered = asyncio.Event()
+        self.second_entered = asyncio.Event()
+        self.release_first = asyncio.Event()
+        self.release_second = asyncio.Event()
+
+    async def delete_conversation(self, conversation_id):
+        self.n += 1
+        if self.n == 1:
+            self.first_entered.set()
+            await self.release_first.wait()
+            if self.first_succeeds:
+                return True
+            raise ApiError("x", 403)
+        self.second_entered.set()
+        await self.release_second.wait()
+        raise ApiError("x", 403)
+
+    async def conversation_exists(self, conversation_id):
+        return False
+
+
+def test_confirmed_terminal_newer_owner_stale_failure(tmp_path):
+    """(مراجعة) الترتيب المعاكس: محاولة أحدث (مالكة) تفشل بعد ما محاولة أقدم أكّدت الحذف.
+
+    لازم 'confirmed' تفضل نهائية — ما ترجعش 'deleting' (منع lost-update).
+    """
+    db = Database(_path(tmp_path))
+    db.add_watched(CID, "شات", chat_id=1)
+    cl = _GateClient()
+
+    async def scenario():
+        # B: المحاولة الأقدم (بتأكّد الحذف)، بتبدأ الأولى ⇒ ملكية=B.
+        b = asyncio.create_task(deletion.delete_conversation_remote(cl, db, CID))
+        await cl.first_entered.wait()
+        # A: محاولة أحدث بتبدأ بعد كده ⇒ ملكية=A.
+        a = asyncio.create_task(deletion.delete_conversation_remote(cl, db, CID))
+        await cl.second_entered.wait()
+        # B (المالك القديم) تأكّد الحذف الأول.
+        cl.release_first.set()
+        rb = await b
+        assert rb.status == deletion.STATUS_DELETED
+        assert db.remote_deletion_state(CID) == db.REMOTE_CONFIRMED
+        # A (المالك الأحدث) تفشل فشل مؤكّد وترجع لقطتها القديمة ⇒ ما تطمسش التأكيد.
+        cl.release_second.set()
+        ra = await a
+        assert ra.status == deletion.STATUS_FAILED  # الفشل المؤكّد يبلّغ فشل صريح
+        # لكن الحالة المحلية تفضل 'confirmed' (نهائية) والشاهد ما اتشالش (منع lost-update).
+        assert db.remote_deletion_state(CID) == db.REMOTE_CONFIRMED
+        assert db.is_deleted(CID) is True
+
+    asyncio.run(scenario())
+
+
+def test_reconcile_cannot_erase_confirmed_witness(tmp_path):
+    """(مراجعة) تسوية إقلاع «الشات لسه موجود» ما تشيلش شاهدًا اتأكّد حذفه في الأثناء."""
+    db = Database(_path(tmp_path))
+    db.add_watched(CID, "شات", chat_id=1)
+    owner = db.begin_remote_deletion(CID, outbox.now_iso())
+
+    class _RacingPresent:
+        async def conversation_exists(self, conversation_id):
+            # عملية متزامنة أكّدت الحذف البعيد أثناء التسوية.
+            db.delete_conversation(conversation_id, outbox.now_iso(), remote_confirmed=True)
+            return True  # «الشات لسه موجود» — نتيجة قديمة
+
+        async def delete_conversation(self, conversation_id):
+            return True
+
+    asyncio.run(deletion.reconcile_pending_deletions(_RacingPresent(), db))
+    assert db.remote_deletion_state(CID) == db.REMOTE_CONFIRMED
+    assert db.is_deleted(CID) is True
+    assert db.witness_attempt_id(CID) == owner  # الشاهد ما اتشالش
+
+
+def test_cas_refuses_confirmed_for_owner_and_stale(tmp_path):
+    """(مراجعة) confirmed نهائية: لا clear ولا revert ينجحوا حتى لو المالك مطابق."""
+    db = Database(_path(tmp_path))
+    db.add_watched(CID, "شات", chat_id=1)
+    owner = db.begin_remote_deletion(CID, outbox.now_iso())
+    db.delete_conversation(CID, outbox.now_iso(), remote_confirmed=True)
+    assert db.clear_witness_cas(CID, owner) is False
+    assert db.revert_remote_deletion_cas(CID, owner, None, None) is False
+    assert db.remote_deletion_state(CID) == db.REMOTE_CONFIRMED
+    assert db.is_deleted(CID) is True
+
+
+def test_migrated_legacy_pending_settles_on_present_reconcile(tmp_path):
+    """(مراجعة) صف قديم معلّق بعد الترحيل (مالك NULL) بيتسوّى مع «موجود» والشاهد يفضل."""
+    p = _path(tmp_path)
+    # مخطط قديم فيه صف معلّق (remote_state='deleting') بدون أعمدة الهُوية الجديدة.
+    _make_old_schema(p, rows=[(CID, LEGACY_TS, "deleting", LEGACY_TS)])
+    db = Database(p)  # الترحيل يوسمه preexisting=1 ويسيب المالك NULL
+    assert db.is_legacy_witness(CID) is True
+    assert db.witness_attempt_id(CID) is None
+    assert db.list_pending_remote_deletions_with_owner() == [(CID, None)]
+    asyncio.run(deletion.reconcile_pending_deletions(FakeClient(exists=True), db))
+    assert db.remote_deletion_state(CID) is None  # اتحلّت — مابقيتش عالقة
+    assert db.is_deleted(CID) is True             # الشاهد القديم اتحفظ
+
+
+def test_legacy_pending_migration_survives_restart(tmp_path):
+    """صف قديم معلّق (مالك NULL) + إعادة تشغيل ثم تسوية «موجود» ⇒ يفضل متسوّى والشاهد محفوظ."""
+    p = _path(tmp_path)
+    _make_old_schema(p, rows=[(CID, LEGACY_TS, "uncertain", LEGACY_TS)])
+    db = Database(p)
+    db.close()
+    db2 = Database(p)
+    assert db2.witness_attempt_id(CID) is None
+    asyncio.run(deletion.reconcile_pending_deletions(FakeClient(exists=True), db2))
+    assert db2.remote_deletion_state(CID) is None
+    assert db2.is_deleted(CID) is True

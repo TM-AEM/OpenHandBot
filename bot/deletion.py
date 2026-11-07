@@ -93,8 +93,9 @@ def _finalize(db, conversation_id: str, now: str) -> DeletionResult:
     """يثبّت الحذف المحلي + حالة 'confirmed' (ذرّي) ويرجّع نتيجة نجاح.
 
     في المسار ده عندنا **دليل إيجابي** إن الشات اتحذف بعيدًا (رد 200 صريح، أو غياب مثبت
-    بقراءتين متتاليتين)، فالتثبيت غير مشروط آمن: أسوأ حالة إن تأكيد متأخّر يوثّق 'confirmed'
-    على شات متحذف فعلًا (لا خطر إحياء — إثبات الحذف ما بيتلغي).
+    بقراءتين متتاليتين)، فالتثبيت غير مشروط آمن. و`'confirmed'` **حالة نهائية**: كل الـ CAS
+    (`revert_remote_deletion_cas`/`clear_witness_cas`) فيه شرط `remote_state != 'confirmed'`،
+    فأي محاولة قديمة/أحدث ما تقدرش ترجّع أو تطمس أو تحذف الشاهد المؤكّد ⇒ **لا خطر إحياء**.
     """
     db.delete_conversation(conversation_id, now, remote_confirmed=True)
     return DeletionResult(STATUS_DELETED, DELETED_MESSAGE, conversation_id, http_status=200)
@@ -182,7 +183,8 @@ async def delete_conversation_remote(client, db, conversation_id: str) -> Deleti
         code = exc.status_code
         if _is_definite_failure(code):
             # فشل مؤكّد: الحذف البعيد ما حصلش ⇒ نرجّع الحالة المحلية (CAS)، ونبلّغ فشل صريح —
-            # مفيش نجاح كاذب ومفيش إخفاء كاذب، ومفيش طمس لمحاولة أحدث.
+            # مفيش نجاح كاذب ومفيش إخفاء كاذب، ومفيش طمس لمحاولة أحدث ولا لحالة 'confirmed'
+            # سبقتنا (الـ CAS في `revert/clear` بيمنع أي كتابة على حالة مؤكّدة ⇒ الحالة نهائية).
             _restore_snapshot(db, conversation_id, attempt_id, snapshot)
             return DeletionResult(
                 STATUS_FAILED, FAILED_MESSAGE, conversation_id,

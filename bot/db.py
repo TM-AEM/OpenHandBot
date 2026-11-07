@@ -1068,21 +1068,25 @@ class Database:
         self._conn.commit()
 
     def revert_remote_deletion_cas(
-        self, conversation_id: str, attempt_id: str, state: str | None, now: str | None
+        self, conversation_id: str, attempt_id: str | None, state: str | None, now: str | None
     ) -> bool:
         """compare-and-swap: يرجّع بيانات الحذف البعيد لحالتها السابقة **بس** لو المحاولة دي
-        ما زالت مالكة الشاهد (`witness_attempt_id == attempt_id`).
+        ما زالت مالكة الشاهد (`witness_attempt_id IS attempt_id`) **والحالة ليست 'confirmed'**.
 
-        يرجّع True لو النجح (احنا المالك ⇒ كتبنا)، False لو محاولة/عملية أحدث سبقتنا
-        (ما بنلمسش حالتها — منع lost-update). الكتابة ذرّية داخل `BEGIN IMMEDIATE`.
+        `IS ?` (مش `= ?`) مقصود: مالك الشاهد القديم بعد الترحيل `NULL`، و`= NULL` ما بتطابقش
+        أبدًا فكانت تسيب الصفوف القديمة المعلّقة عالقة للأبد.
+
+        حرس الإنهاء: `'confirmed'` حالة **نهائية** (إثبات حذف بعيد بدليل إيجابي) ⇒ ممنوع أي
+        CAS يرجّعها/يطمسها. يرجّع True لو النجح (احنا المالك)، False لو محاولة أحدث سبقتنا أو
+        الحالة مؤكّدة (ما بنلمسش — منع lost-update). الكتابة ذرّية داخل `BEGIN IMMEDIATE`.
         """
         conn = self._conn
         conn.execute("BEGIN IMMEDIATE")
         try:
             cur = conn.execute(
                 "UPDATE deleted_conversations SET remote_state=?, remote_updated_at=? "
-                "WHERE conversation_id=? AND witness_attempt_id=?",
-                (state, now, conversation_id, attempt_id),
+                "WHERE conversation_id=? AND witness_attempt_id IS ? AND remote_state != ?",
+                (state, now, conversation_id, attempt_id, self.REMOTE_CONFIRMED),
             )
             ok = cur.rowcount == 1
             conn.commit()
@@ -1091,42 +1095,21 @@ class Database:
             conn.rollback()
             raise
 
-    def confirm_remote_deletion_cas(
-        self, conversation_id: str, attempt_id: str, now: str
-    ) -> bool:
-        """compare-and-swap: يثبّت 'confirmed' **بس** لو المحاولة دي ما زالت مالكة الشاهد.
-
-        يرجّع True لو نجح، False لو عملية أحدث سبقتنا (منع تأكيد متأخّر يطمس حالة أحدث).
-        """
-        conn = self._conn
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            cur = conn.execute(
-                "UPDATE deleted_conversations SET remote_state=?, remote_updated_at=? "
-                "WHERE conversation_id=? AND witness_attempt_id=?",
-                (self.REMOTE_CONFIRMED, now, conversation_id, attempt_id),
-            )
-            ok = cur.rowcount == 1
-            conn.commit()
-            return ok
-        except Exception:
-            conn.rollback()
-            raise
-
-    def clear_witness_cas(self, conversation_id: str, attempt_id: str) -> bool:
+    def clear_witness_cas(self, conversation_id: str, attempt_id: str | None) -> bool:
         """compare-and-swap: يشيل صف الشاهد **بس** لو المحاولة دي ما زالت مالكة الشاهد
-        (`witness_attempt_id == attempt_id`).
+        (`witness_attempt_id IS attempt_id`) **والحالة ليست 'confirmed'**.
 
-        يرجّع True لو نجح (الصف اتشال)، False لو عملية أحدث سبقتنا (ما بنحذفش شاهد حد تاني —
-        منع حذف شاهد أثبته/ثبّته عملية أحدث).
+        حرس الإنهاء: شاهد 'confirmed' (حذف بعيد مثبت) ما بيتحذفش أبدًا من مسار «الشات لسه
+        موجود» ⇒ مفيش إحياء لشات متحذّف. يرجّع True لو النجح (الصف اتشال)، False لو عملية
+        أحدث سبقتنا أو الحالة مؤكّدة.
         """
         conn = self._conn
         conn.execute("BEGIN IMMEDIATE")
         try:
             cur = conn.execute(
                 "DELETE FROM deleted_conversations "
-                "WHERE conversation_id=? AND witness_attempt_id=?",
-                (conversation_id, attempt_id),
+                "WHERE conversation_id=? AND witness_attempt_id IS ? AND remote_state != ?",
+                (conversation_id, attempt_id, self.REMOTE_CONFIRMED),
             )
             ok = cur.rowcount == 1
             conn.commit()
