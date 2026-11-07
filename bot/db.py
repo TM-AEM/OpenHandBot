@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -461,6 +462,19 @@ class Database:
                 witness_attempt_id TEXT,
                 witness_preexisting INTEGER NOT NULL DEFAULT 0
             );
+            -- OHB2-PHASE1A: جلسات الـ Mini App **دائمة** (بدل in-memory). العمود
+            -- `token_hash` هو SHA-256 للتوكن الخام؛ **التوكن الخام ما بيتخزّنش أبدًا**.
+            -- `expires_at` ختم زمني من السيرفر (unix float) بيحكم الانتهاء حتى لو العميل
+            -- فضل يبعت الكوكي. الحذف من نفس الجدول = إلغاء (revoke) دائم ينجو من restart.
+            -- `CREATE TABLE IF NOT EXISTS` ⇒ إضافي وغير مدمّر للقواعد القديمة.
+            CREATE TABLE IF NOT EXISTS web_sessions (
+                token_hash  TEXT PRIMARY KEY,
+                user_id     INTEGER NOT NULL,
+                created_at  REAL NOT NULL,
+                expires_at  REAL NOT NULL,
+                profile     TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_web_sessions_expires ON web_sessions(expires_at);
             """
         )
         self._migrate()
@@ -1303,6 +1317,51 @@ class Database:
             "notif_state_deleted": int(notif_state_deleted),
             "inbox_superseded": int(inbox_superseded),
         }
+
+    # ------------------------------------------------------ Mini App sessions
+    # OHB2-PHASE1A: جلسات الـ Mini App **دائمة** في نفس قاعدة SQLite (نفس المالك
+    # الواحد للعملية). بنخزّن **هاش** التوكن بس (`token_hash` = SHA-256 hex)؛ التوكن
+    # الخام عمود ما بيتخزّنش. كل عملية صغيرة معاملة واحدة (`with self._conn`) — مفيش
+    # نداء شبكة جوه أي معاملة، و`sqlite3` بيدير commit/rollback تلقائيًا.
+
+    def add_web_session(
+        self, token_hash: str, user_id: int, created_at: float, expires_at: float, profile_json: str
+    ) -> None:
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO web_sessions (token_hash, user_id, created_at, expires_at, profile) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (token_hash, int(user_id), float(created_at), float(expires_at), profile_json),
+            )
+
+    def get_web_session(self, token_hash: str, now: float) -> tuple[int, float, float, str] | None:
+        """يرجّع (user_id, created_at, expires_at, profile_json) للجلسة **غير المنتهية**.
+
+        المنتهي ما بيرجّعش أبدًا (fail closed): بنفلتر بـ `expires_at > now` في نفس
+        الاستعلام. أي `token_hash` غير موجود/غير صالح ⇒ None."""
+        row = self._conn.execute(
+            "SELECT user_id, created_at, expires_at, profile FROM web_sessions "
+            "WHERE token_hash=? AND expires_at > ?",
+            (token_hash, float(now)),
+        ).fetchone()
+        if row is None:
+            return None
+        return int(row["user_id"]), float(row["created_at"]), float(row["expires_at"]), row["profile"]
+
+    def delete_web_session(self, token_hash: str) -> None:
+        """إلغاء/تسجيل خروج دائم (نجو من restart). غير موجود ⇒ لا شيء (idempotent)."""
+        with self._conn:
+            self._conn.execute("DELETE FROM web_sessions WHERE token_hash=?", (token_hash,))
+
+    def prune_web_sessions(self, now: float) -> int:
+        """يحذف الجلسات المنتهية. يرجّع العدد المحذوف. غير مدمّر للجلسات السارية."""
+        with self._conn:
+            cur = self._conn.execute("DELETE FROM web_sessions WHERE expires_at <= ?", (float(now),))
+            return int(cur.rowcount)
+
+    def count_web_sessions(self) -> int:
+        row = self._conn.execute("SELECT COUNT(*) AS n FROM web_sessions").fetchone()
+        return int(row["n"])
 
     def list_watched(self) -> list[Watched]:
         rows = self._conn.execute(
@@ -3261,6 +3320,9 @@ class Database:
         try:
             self.optimize()
             self.checkpoint()
+            # OHB2-PHASE1A: تنظيف جلسات الـ Mini App المنتهية عند الإقلاع (داخل نفس
+            # دورة الصيانة — مفيش worker/مجدول جديد). غير حرج: لو فشل ما نوقفش الإقلاع.
+            self.prune_web_sessions(time.time())
         except sqlite3.Error as exc:
             # الصيانة مش حرجة: القاعدة سليمة، فمنعطّلش البوت عشانها.
             log.warning("صيانة قاعدة البيانات اتخطّت (%s)", type(exc).__name__)

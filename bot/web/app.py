@@ -92,7 +92,9 @@ class MiniApp:
         self._db = db
         self._application = application
         self._service = MiniAppService(config, db, client, application)
-        self.sessions = SessionStore(config.mini_app_session_ttl)
+        # OHB2-PHASE1A: الجلسات **دائمة** في نفس قاعدة SQLite (نفس كائن `db` المملوك
+        # للعملية الواحدة). مفيش اتصال تاني ولا مخزن خارجي.
+        self.sessions = SessionStore(config.mini_app_session_ttl, db)
         self.max_age = config.mini_app_initdata_max_age or DEFAULT_MAX_AGE
         self.owner_id = config.owner_id
         self.allowed_origins = set(config.mini_app_allowed_origins)

@@ -53,7 +53,17 @@ def _client(monkeypatch, hidden: bool):
         owner_id=OWNER,
         mini_app_cookie_secure=False,
     )
-    db = SimpleNamespace(list_watched=lambda: [], get_notifications_enabled=lambda: True)
+    sessions: dict = {}
+    db = SimpleNamespace(
+        list_watched=lambda: [],
+        get_notifications_enabled=lambda: True,
+        add_web_session=lambda h, u, c, e, p: sessions.__setitem__(h, (u, c, e, p)),
+        get_web_session=lambda h, n: (
+            sessions[h] if h in sessions and sessions[h][2] > float(n) else None
+        ),
+        delete_web_session=lambda h: sessions.pop(h, None),
+        prune_web_sessions=lambda n: 0,
+    )
     tc = TestClient(build_web_app(cfg, db, client=client), raise_server_exceptions=False)
     assert tc.post("/api/v1/auth", json={"initData": make_init_data(OWNER)}).status_code == 200
     return tc

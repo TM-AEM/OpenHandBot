@@ -336,3 +336,31 @@ Changes:
 VERIFIED: pytest 1612 passed; node 145/145; pyflakes 0; compileall 0; focused deletion 252 passed.
 NOT VERIFIED: live behavior against real OpenHands (no real API calls). Independent review pending.
 No commit/push/PR/deploy/real deletion.
+
+## OHB2-PHASE1A-PERSISTENT-MINIAPP-SESSIONS — IN PROGRESS (branch agent/ohb2-phase1a-persistent-sessions)
+
+Goal: جلسات Telegram Mini App **دائمة** تنجو من إعادة تشغيل العملية/الخدمة، **بدون** إضعاف
+أي ضمان مصادقة/تفويض/جلسة، وبدون كسر المعمارية (نفس مالك العملية/اتصال SQLite الواحد).
+
+Acceptance criteria:
+1. جلسة صالحة تفضل تصادق بعد إعادة بناء الخدمة/القاعدة (مثبت باختبار).
+2. الانتهاء (TTL) والإلغاء (logout/رفض مستخدم) يفضلوا فعّالين بعد إعادة التشغيل.
+3. الأمان ما اتضعّفش: توكن عشوائي opaque؛ القاعدة تخزّن **هاش SHA-256** بس (مفيش توكن خام)؛
+   كوكي HttpOnly/Secure/SameSite=Strict؛ ملكية المستخدم مفروضة؛ فشل مغلق عند أي خطأ؛ مفيش تسجيل أسرار.
+4. المعمارية محفوظة: نفس كائن Database/الاتصال الواحد؛ مفيش worker أو مخزن خارجي أو اتصال جديد.
+5. الترحيل إضافي وغير مدمّر (CREATE TABLE IF NOT EXISTS) للقواعد القديمة.
+6. كل الفحوص تمر: pytest كامل، pyflakes، node (بدون انخفاض عن baseline 1692).
+7. مراجعة مستقلة معلّقة (مفيش backend reviewer متاح) + handoff جاهز.
+8. مفيش نشر/دمج/force-push.
+
+Out of scope: تغيير TTL الافتراضي أو خصائص الكوكي، إضافة تبعيات، تغيير بروتوكول initData،
+تغيير تصميم التفويض، أي نشر/دمج.
+
+Plan: (1) عمود/جدول web_sessions + دوال DB. (2) SessionStore دائم (هاش + fail closed).
+(3) ربط app.py + FakeDb. (4) اختبارات. (5) توثيق MINI_APP.md. (6) تحقق كامل + مراجعة.
+
+Baseline (before): pytest 1692 passed / pyflakes 0 / node 145 pass 0 fail.
+After: pytest 1721 passed / pyflakes 0 / node 145 pass 0 fail.
+
+Done: كل الكود والاختبارات والتوثيق (اختبارات الجلسات الجديدة 29).
+Next: مراجعة مستقلة على SHA محدّد، ثم تقرير.
