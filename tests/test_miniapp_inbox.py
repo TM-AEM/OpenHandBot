@@ -81,6 +81,7 @@ def test_inbox_list_pagination_and_unread_count(tmp_path):
     assert body["items"][0]["message"] == "m11"
     assert set(body["items"][0]) == {
         "id", "conversation_id", "title", "kind", "message", "created_at", "read",
+        "archived", "deletable",
         "delivery_status", "delivery_attempts", "delivered_at",
     }
 
@@ -183,6 +184,7 @@ def test_inbox_dto_does_not_leak_event_key(tmp_path):
     assert "event_key" not in item
     assert set(item) == {
         "id", "conversation_id", "title", "kind", "message", "created_at", "read",
+        "archived", "deletable",
         "delivery_status", "delivery_attempts", "delivered_at",
     }
     assert "secret-internal-key" not in str(item)

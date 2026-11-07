@@ -57,9 +57,12 @@ Telegram WebView ──HTTPS──▶ ingress (TLS) ──HTTP──▶ الحا
 | `/api/v1/auth/logout` | POST | كوكي | ✔ | يلغي الجلسة ويمسح الكوكي |
 | `/api/v1/app/bootstrap` | GET | كوكي | لأ | اسم العرض + الإشعارات + ميتا + `inbox.unread_count` |
 | `/api/v1/app/notifications` | POST | كوكي | ✔ | `{"enabled": bool}` يضبط الإشعارات |
-| `/api/v1/notifications` | GET | كوكي | لأ | صندوق الإشعارات (صفحات، `?page=&unread=1`) |
+| `/api/v1/notifications` | GET | كوكي | لأ | صندوق الإشعارات (صفحات، `?page=&unread=1&archived=1`) |
 | `/api/v1/notifications/{id}/read` | POST | كوكي | ✔ | يعلّم إشعار كمقروء |
 | `/api/v1/notifications/read-all` | POST | كوكي | ✔ | يعلّم كل الإشعارات كمقروءة |
+| `/api/v1/notifications/{id}/archive` | POST | كوكي | ✔ | يؤرشف إشعار (قابل للعكس) |
+| `/api/v1/notifications/{id}/unarchive` | POST | كوكي | ✔ | يرجّع إشعار مؤرشف للصندوق النشط |
+| `/api/v1/notifications/{id}` | DELETE | كوكي | ✔ | حذف نهائي **مؤهّل بس** (وإلا 409) |
 | `/api/v1/conversations` | GET | كوكي | لأ | آخر الشاتات (صفحات، `?page=&refresh=1`) |
 | `/api/v1/conversations/{id}` | GET | كوكي | لأ | تفاصيل شات + آخر برومت/رد + رابط PR |
 | `/api/v1/conversations/{id}/status` | GET | كوكي | لأ | حالة شات بس |
@@ -470,11 +473,13 @@ node --test tests/frontend/*.test.js
   عند الفتح (فهرس بس — مفيش مساس بالبيانات). جداول Batch 1/2 (`watched`/`notification_state`/
   `outbox`/`notifier_pending`/`notifier_retry_not_before`) ما بتتلمسش غير إضافة الأعمدة الإضافية.
 - الواجهة: تبويب **الإشعارات** بشارة غير المقروء، قايمة، تعليم عند الضغط (وبيفتح الشات)،
-  شارة حالة التسليم (`بيتسلّم…`/`فشل التسليم`)، وزر **تعليم الكل كمقروء**.
-- **API**: `GET /api/v1/notifications?page=&unread=1`، `POST /api/v1/notifications/{id}/read`،
-  `POST /api/v1/notifications/read-all`. الـ DTO ما بيكشفش `event_key` (حمولة داخلية)، وبيحمّل
-  `delivery_status`/`delivery_attempts`/`delivered_at`، وبيترقّم بترقيم محدود، والصفحة
-  الفاضية بسبب تجاوز الحد بترجع للأولى.
+  شارة حالة التسليم (`بيتسلّم…`/`فشل التسليم`)، وزر **تعليم الكل كمقروء**، و**فلتر**
+  (الكل/غير المقروء/المؤرشف) + **أرشفة/استرجاع** + **حذف نهائي بتأكيد صريح**.
+- **API**: `GET /api/v1/notifications?page=&unread=1&archived=1`، `POST /api/v1/notifications/{id}/read`،
+  `POST /api/v1/notifications/read-all`، `POST /api/v1/notifications/{id}/archive`،
+  `POST /api/v1/notifications/{id}/unarchive`، `DELETE /api/v1/notifications/{id}`. الـ DTO ما بيكشفش
+  `event_key` (حمولة داخلية)، وبيحمّل `delivery_status`/`delivery_attempts`/`delivered_at`
+  و`archived`/`deletable`، وبيترقّم بترقيم محدود، والصفحة الفاضية بسبب تجاوز الحد بترجع للأولى.
 
 ## 13ج. تصدير الشات + نسخ الرد الكامل (OHB2-PHASE1B)
 
@@ -501,8 +506,9 @@ node --test tests/frontend/*.test.js
 ## 14. اللي فاضل لمهام OHB2 اللاحقة
 
 - جلسات **ثابتة عبر إعادة التشغيل** (المخزن الحالي في الذاكرة ⇒ أي restart بيلغي الجلسات).
-- صندوق الإشعارات: **مفيش حذف/أرشفة** من الواجهة (التقليم تلقائي عند الحدود)، ولا فلترة
-  "غير المقروء فقط" في الواجهة (الـ API بيدعم `unread=1`)، ولا إشعارات "مقروءة جزئيًا" —
-  لو مطلوب نضيفه لاحقًا. **مفيش cleanup worker**: التقليم جوه نفس معاملة الإدراج.
+- صندوق الإشعارات: **الحذف النهائي مؤهّل بس** (المعلّق/الفاشل/غير المقروء/مرجع التسوية
+  محمي ⇒ 409)، والأرشفة **قابلة للعكس** وتخفي من الشارة والصندوق النشط. لسه مفيش
+  إشعارات "مقروءة جزئيًا" ولا أرشفة جماعية — لو مطلوب نضيفه لاحقًا. **مفيش cleanup
+  worker**: التقليم جوه نفس معاملة الإدراج.
 - تفعيل `MINI_APP_ENABLED` في الإنتاج + تحديث `/app` يشاور على الواجهة الفعلية.
 - معالجة الرابط الثابت (القسم 13).

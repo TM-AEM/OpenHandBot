@@ -306,6 +306,21 @@ class MiniApp:
                 self.notification_read,
                 methods=["POST"],
             ),
+            Route(
+                f"{API_PREFIX}/notifications/{{item_id}}/archive",
+                self.notification_archive,
+                methods=["POST"],
+            ),
+            Route(
+                f"{API_PREFIX}/notifications/{{item_id}}/unarchive",
+                self.notification_unarchive,
+                methods=["POST"],
+            ),
+            Route(
+                f"{API_PREFIX}/notifications/{{item_id}}",
+                self.notification_delete,
+                methods=["DELETE"],
+            ),
             Route(f"{API_PREFIX}/conversations", self.conversations, methods=["GET"]),
             Route(
                 f"{API_PREFIX}/conversations/{{conversation_id}}",
@@ -532,8 +547,11 @@ class MiniApp:
         except ValueError:
             return _error(400, "bad_request", "رقم الصفحة غير صالح.")
         unread_only = request.query_params.get("unread") in ("1", "true")
+        archived = request.query_params.get("archived") in ("1", "true")
         try:
-            data = self._service.list_notifications(page=page, unread_only=unread_only)
+            data = self._service.list_notifications(
+                page=page, unread_only=unread_only, archived=archived
+            )
         except ApiError as exc:
             return self._api_error(exc)
         return _json(data)
@@ -544,6 +562,42 @@ class MiniApp:
             return err
         try:
             data = self._service.mark_notification_read(request.path_params.get("item_id", ""))
+        except ValidationError as exc:
+            return _error(400, "bad_request", str(exc))
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json(data)
+
+    async def notification_archive(self, request):
+        session, err = await self._guarded(request, state_changing=True)
+        if err is not None:
+            return err
+        try:
+            data = self._service.archive_notification(request.path_params.get("item_id", ""))
+        except ValidationError as exc:
+            return _error(400, "bad_request", str(exc))
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json(data)
+
+    async def notification_unarchive(self, request):
+        session, err = await self._guarded(request, state_changing=True)
+        if err is not None:
+            return err
+        try:
+            data = self._service.unarchive_notification(request.path_params.get("item_id", ""))
+        except ValidationError as exc:
+            return _error(400, "bad_request", str(exc))
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json(data)
+
+    async def notification_delete(self, request):
+        session, err = await self._guarded(request, state_changing=True)
+        if err is not None:
+            return err
+        try:
+            data = self._service.delete_notification(request.path_params.get("item_id", ""))
         except ValidationError as exc:
             return _error(400, "bad_request", str(exc))
         except ApiError as exc:

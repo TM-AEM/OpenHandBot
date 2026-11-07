@@ -413,3 +413,97 @@ Plan:
   `tests/frontend/export.test.js` (6)، `tests/frontend/export_copy_ui.test.js` (7).
 - Docs: `docs/MINI_APP.md` (§4 routes، §12 tests، §13ج جديد، §14 محدّث).
 - Results: pytest 1745 passed (baseline 1722) / node 166 pass 0 fail (baseline 145) / pyflakes 0 / compileall 0.
+
+---
+
+# OHB2-PHASE1C-MINIAPP-INBOX-FILTER-ARCHIVE-AND-SAFE-DELETE
+
+## Goal
+Complete the Mini App Inbox: all/unread-only filter, reversible archive, and a
+restricted server-enforced permanent delete — without losing operational events,
+hiding unresolved failures, or weakening delivery/reconciliation guarantees.
+
+## Verified baseline (Phase 0)
+- Repo `TM-AEM/OpenHandBot`; branch `agent/ohb2-phase1c-inbox-filter-archive-delete`
+  from `30987867555386204fda587462fd72c488158689` (Phase 1B tip, descendant of Phase 1A
+  `8a86e25e8cc6fe29191b08c4dca6aae90dd0d8e6`). Both are ancestors of HEAD (verified).
+- Baseline green: pytest 1745 passed; node 166 pass/0 fail; pyflakes 0; compileall 0.
+- Inbox data model: `notification_inbox` rows with `read_at` (read axis) and
+  `delivery_status` ∈ {pending, delivered, failed} (delivery axis). Kinds: terminal,
+  timeout, missing, stale_report, proactive. Retention (`_prune_inbox`) deletes only
+  read, non-pending rows at soft caps. `notifier_pending.event_id` links a durable
+  pending-delivery marker to an inbox row (reconciliation evidence).
+- API already supports `GET /notifications?unread=1` (reuse it; do not duplicate).
+- Single-owner Mini App: `_guarded` enforces an allowed Telegram session; non-owners
+  cannot authenticate. No second DB/worker/scheduler.
+
+## Acceptance criteria (testable)
+1. The Mini App exposes an all / unread-only filter that changes the rendered data via
+   the existing `unread=1` API, and preserves read-state, pagination and ordering.
+2. Authorized users can archive and unarchive eligible notifications reversibly;
+   archiving changes only visibility, never delivery/operation/read state, and is
+   idempotent; archived items are excluded from the active inbox and reachable via an
+   archived view.
+3. Permanent deletion is server-enforced to the safe subset only (delivered + read +
+   not referenced by `notifier_pending`); pending/failed/unread evidence is protected.
+4. Failed DB operations never produce false success; cross-user access/mutation is
+   rejected; underlying operation/outbox/delivery/reconciliation rows are untouched.
+5. Full pytest + node suites, pyflakes and compileall pass (>= baseline); docs updated.
+6. Independent review of the exact final SHA returns PASS or PASS-WITH-NOTES with no
+   unresolved Critical/High findings.
+
+## Plan (steps)
+1. DB: additive `archived_at` column + migration; `list_inbox`/`count_inbox` archived
+   param; `archive_inbox_item`/`unarchive_inbox_item`/`delete_inbox_item` (transactional,
+   eligibility-checked) + DB tests.
+2. Service: `list_notifications(archived=)`, `archive_notification`,
+   `unarchive_notification`, `delete_notification` + API tests.
+3. App routes: `POST /notifications/{id}/archive|unarchive`, `DELETE /notifications/{id}`,
+   list `archived=1` param.
+4. Frontend: `inbox.js` helpers (filter query, canDelete, archived), `app.js` filter +
+   row actions with confirmation, `index.html` controls, `dom_stub` updates, node tests.
+5. Docs (`docs/MINI_APP.md` §13b, `docs/NOTIFICATIONS.md` §9) + this file.
+6. Verification: focused + full suites, pyflakes, compileall, diff self-review.
+7. Independent review (separate agent-server session) of the exact final SHA.
+
+## Assumptions / decisions
+- Archive is a third axis (`archived_at`), separate from read and delivery state; it is
+  reversible and never mutates delivery/operation state.
+- Unread badge counts **active** (non-archived) unread items; `read_at` semantics unchanged.
+- Permanent delete eligible subset = `delivery_status='delivered' AND read_at IS NOT NULL`
+  AND not referenced by `notifier_pending` — i.e. no more than what retention already
+  prunes, and never pending/failed/unread evidence.
+- Protected from permanent delete: `pending`, `failed`, unread, and `notifier_pending`-
+  referenced rows. Deletion touches only `notification_inbox`.
+- Deletion requires an explicit two-step confirmation in the UI; the server re-checks.
+
+## Out of scope
+Creation-job reconciliation UI; remote conversation deletion semantics; Backup; Autopush
+(remains DISABLED/INACTIVE); any second DB/worker/scheduler/external service.
+
+## Status: DONE (implementation + local verification)
+
+- Step 1 (DB): `archived_at` column + migration; `archived` on `InboxItem`;
+  `list_inbox`/`count_inbox(archived=)`; `archive_inbox_item`/`unarchive_inbox_item`/
+  `inbox_item_delete_eligibility`/`delete_inbox_item`. DONE.
+- Step 2 (service): `list_notifications(archived=)`, `archive_notification`,
+  `unarchive_notification`, `delete_notification` (404/409 mapping, no false success). DONE.
+- Step 3 (routes): `POST /notifications/{id}/archive|unarchive`, `DELETE /notifications/{id}`,
+  `GET /notifications?archived=1`. DONE.
+- Step 4 (frontend): `inbox.js` (`isArchived`/`canDelete`/`filterQuery`/`emptyText`),
+  `app.js` filter bar + `renderInboxRow` + two-step delete confirm, `index.html` chips,
+  `styles.css`, `dom_stub.js`. DONE.
+- Step 5 (docs): `docs/NOTIFICATIONS.md` (§2.7/§3/§5/§9/§11/§12) + `docs/MINI_APP.md`
+  (§13b/§14). DONE.
+- Step 6 (verification): pytest **1774 passed**, node **184 pass / 0 fail**, pyflakes **0**,
+  compileall **0**, `git diff --check` clean. DONE.
+- Step 7 (independent review of the exact final SHA): PENDING — see "Suggested next step".
+
+### Working commands
+```
+.venv/bin/python -m pytest -q
+node --test tests/frontend/*.test.js
+.venv/bin/python -m pyflakes bot/ main.py tests/
+.venv/bin/python -m compileall -q bot/ main.py
+git diff --check
+```

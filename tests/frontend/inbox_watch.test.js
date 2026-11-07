@@ -903,7 +903,12 @@ test("H4: إعادة المحاولة الناجحة تضيف الصفوف مر�
   doc.getElementById("inbox-next").click();
   await flush();
   const rows = dataRows(inboxList(doc));
-  assert.deepEqual(rows.map((r) => r.textContent), ["N1انتهى شاتمقروء", "N2انتهى شاتمقروء", "N3انتهى شاتمقروء"]);
+  // OHB2-PHASE1C: الصف بقى فيه أزرار أرشفة/حذف كمان (لكل صف مُسلَّم+مقروء).
+  assert.deepEqual(rows.map((r) => r.textContent), [
+    "N1انتهى شاتمقروءأرشفة🗑 حذفأكّد الحذفإلغاء",
+    "N2انتهى شاتمقروءأرشفة🗑 حذفأكّد الحذفإلغاء",
+    "N3انتهى شاتمقروءأرشفة🗑 حذفأكّد الحذفإلغاء",
+  ]);
   assert.equal(rows.length, 3, "3 صفوف بالظبط (مفيش تكرار)");
 });
 

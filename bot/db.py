@@ -99,6 +99,13 @@ INBOX_PAGE_SIZE = 10
 INBOX_DELIVERY_PENDING = "pending"
 INBOX_DELIVERY_DELIVERED = "delivered"
 INBOX_DELIVERY_FAILED = "failed"
+# OHB2-PHASE1C: نتيجة محاولة الحذف النهائي لصف صندوق (مُفرَض على السيرفر، مش على الواجهة).
+#   deleted   : الصف كان مؤهّلًا واتحذف فعلًا.
+#   protected : الصف موجود لكنه محمي (مش مؤهّل للحذف النهائي) ⇒ مفيش أي تغيير.
+#   missing   : الصف مش موجود أصلًا.
+INBOX_DELETE_DELETED = "deleted"
+INBOX_DELETE_PROTECTED = "protected"
+INBOX_DELETE_MISSING = "missing"
 # أقصى طول لتصنيف خطأ التسليم المحفوظ (نوع الاستثناء بس — مفيش نص حسّاس/أسرار).
 INBOX_MAX_ERROR_CHARS = 120
 # أقصى عدد محاولات تسليم للحدث الواحد قبل ما نصنّفه فاشل (ميزانية مستقلة لكل حدث).
@@ -284,10 +291,18 @@ class InboxItem:
     claim_token: str | None = None
     # وقت أخذ الحجز (ISO). بيسمح بحجز له مدة صلاحية: حجز قديم (من عملية وقعت) بيتحرّر تلقائيًا.
     claim_at: str | None = None
+    # OHB2-PHASE1C: محور **الأرشفة** (منفصل تمامًا عن القراءة والتسليم). NULL = نشط
+    # (ظاهر في الصندوق العادي). وقت ISO = مؤرشف (مخفي من العادي، بيظهر في عرض الأرشيف).
+    # الأرشفة **قابلة للعكس** (`archived_at` بس، مفيش أي مساس بالتسليم/العملية/القراءة).
+    archived_at: str | None = None
 
     @property
     def unread(self) -> bool:
         return self.read_at is None
+
+    @property
+    def archived(self) -> bool:
+        return self.archived_at is not None
 
     @property
     def delivery_pending(self) -> bool:
@@ -443,7 +458,8 @@ class Database:
                 transition_status TEXT,
                 transition_seq  INTEGER,
                 claim_token     TEXT,
-                claim_at        TEXT
+                claim_at        TEXT,
+                archived_at     TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_inbox_unread ON notification_inbox(read_at);
             CREATE INDEX IF NOT EXISTS idx_inbox_conversation
@@ -657,6 +673,12 @@ class Database:
         if inbox_cols and "claim_at" not in inbox_cols:
             self._conn.execute(
                 "ALTER TABLE notification_inbox ADD COLUMN claim_at TEXT"
+            )
+        # OHB2-PHASE1C: عمود الأرشفة (محور منفصل وقابل للعكس). إضافي nullable ⇒ الصفوف
+        # القديمة بتاخد NULL = نشطة (مفيش فقد بيانات، ومفيش تغيير في سلوك القراءة/التسليم).
+        if inbox_cols and "archived_at" not in inbox_cols:
+            self._conn.execute(
+                "ALTER TABLE notification_inbox ADD COLUMN archived_at TEXT"
             )
         if inbox_cols:
             self._conn.execute(
@@ -3034,7 +3056,8 @@ class Database:
     _INBOX_COLUMNS = (
         "id, conversation_id, title, kind, message, created_at, read_at, event_key, "
         "delivery_status, delivery_attempts, last_attempt_at, delivered_at, last_error, "
-        "next_retry_at, chat_id, transition_status, transition_seq, claim_token, claim_at"
+        "next_retry_at, chat_id, transition_status, transition_seq, claim_token, claim_at, "
+        "archived_at"
     )
 
     @staticmethod
@@ -3045,13 +3068,31 @@ class Database:
             r["delivery_status"], r["delivery_attempts"], r["last_attempt_at"],
             r["delivered_at"], r["last_error"], r["next_retry_at"], r["chat_id"],
             r["transition_status"], r["transition_seq"], r["claim_token"], r["claim_at"],
+            r["archived_at"],
         )
 
+    @staticmethod
+    def _inbox_visibility_clause(archived: bool) -> str:
+        """شرط محور الأرشفة: عرض النشط بس، أو عرض الأرشيف بس."""
+        return "archived_at IS NOT NULL" if archived else "archived_at IS NULL"
+
     def list_inbox(
-        self, *, limit: int = INBOX_PAGE_SIZE, offset: int = 0, unread_only: bool = False
+        self,
+        *,
+        limit: int = INBOX_PAGE_SIZE,
+        offset: int = 0,
+        unread_only: bool = False,
+        archived: bool = False,
     ) -> list[InboxItem]:
-        """قايمة الصندوق (الأحدث أولًا)، بترقيم محدود على مستوى SQL (payload محدود)."""
-        where = "WHERE read_at IS NULL" if unread_only else ""
+        """قايمة الصندوق (الأحدث أولًا)، بترقيم محدود على مستوى SQL (payload محدود).
+
+        `archived=False` (الافتراضي) = الصندوق النشط (غير المؤرشف). `archived=True` =
+        عرض الأرشيف بس. الأرشفة محور مستقل ⇒ ما بتغيّرش ترتيب `id DESC` ولا حالة القراءة.
+        """
+        clauses = [self._inbox_visibility_clause(archived)]
+        if unread_only:
+            clauses.append("read_at IS NULL")
+        where = "WHERE " + " AND ".join(clauses)
         rows = self._conn.execute(
             f"SELECT {self._INBOX_COLUMNS} FROM notification_inbox {where} "
             f"ORDER BY id DESC LIMIT ? OFFSET ?",
@@ -3077,14 +3118,20 @@ class Database:
         ).fetchone()
         return self._inbox_from_row(row) if row else None
 
-    def count_inbox(self, *, unread_only: bool = False, pending_only: bool = False) -> int:
-        """عدد عناصر الصندوق (كلها / غير المقروءة / المعلّقة)."""
-        clauses = []
+    def count_inbox(
+        self, *, unread_only: bool = False, pending_only: bool = False, archived: bool = False
+    ) -> int:
+        """عدد عناصر الصندوق (كلها / غير المقروءة / المعلّقة) داخل نطاق الأرشفة.
+
+        `archived=False` (الافتراضي) = العناصر **النشطة** (غير المؤرشفة) بس — فالشارة
+        وعدّ غير المقروء بيفضلوا على الصندوق الفعلي (الأرشيف محور مستقل).
+        """
+        clauses = [self._inbox_visibility_clause(archived)]
         if unread_only:
             clauses.append("read_at IS NULL")
         if pending_only:
             clauses.append("delivery_status='pending'")
-        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        where = "WHERE " + " AND ".join(clauses)
         row = self._conn.execute(
             f"SELECT COUNT(*) AS n FROM notification_inbox {where}"
         ).fetchone()
@@ -3114,6 +3161,96 @@ class Database:
         )
         conn.commit()
         return int(cur.rowcount or 0)
+
+    def archive_inbox_item(self, item_id: int, now: str) -> bool | None:
+        """يؤرشف صف صندوق (idempotent). True لو بقى مؤرشف، False لو العنصر مش موجود.
+
+        OHB2-PHASE1C: الأرشفة **قابلة للعكس** ومستقلة تمامًا عن محور التسليم/القراءة —
+        بتكتب `archived_at` بس. أرشفة صف مؤرشف بالفعل ما بتغيّرش وقت الأرشفة الأصلي
+        (COALESCE) ⇒ idempotent، ومفيش أي مساس بالتسليم/العملية/القراءة.
+        """
+        conn = self._conn
+        cur = conn.execute(
+            "UPDATE notification_inbox SET archived_at=COALESCE(archived_at, ?) WHERE id=?",
+            (now, int(item_id)),
+        )
+        conn.commit()
+        if cur.rowcount and cur.rowcount > 0:
+            return True
+        row = conn.execute(
+            "SELECT 1 FROM notification_inbox WHERE id=?", (int(item_id),)
+        ).fetchone()
+        return True if row is not None else False
+
+    def unarchive_inbox_item(self, item_id: int) -> bool | None:
+        """يلغي أرشفة صف (idempotent). True لو بقى نشط، False لو العنصر مش موجود.
+
+        ما بيمسحش الصف؛ بيمسح `archived_at` بس ⇒ الصف يرجع للصندوق النشط بنفس الهوية
+        وبنفس حالة القراءة/التسليم.
+        """
+        conn = self._conn
+        cur = conn.execute(
+            "UPDATE notification_inbox SET archived_at=NULL WHERE id=?", (int(item_id),)
+        )
+        conn.commit()
+        if cur.rowcount and cur.rowcount > 0:
+            return True
+        row = conn.execute(
+            "SELECT 1 FROM notification_inbox WHERE id=?", (int(item_id),)
+        ).fetchone()
+        return True if row is not None else False
+
+    def inbox_item_delete_eligibility(self, item_id: int) -> str:
+        """تصنيف أهلية الصف للحذف النهائي: deleted / protected / missing.
+
+        OHB2-PHASE1C — سياسة الحذف النهائي (مُفرَضة على السيرفر):
+        - `missing`  : الصف مش موجود.
+        - `protected`: الصف محمي من الحذف النهائي. الحالات المحمية:
+            * `delivery_status='pending'` — حدث لسه بيتسلّم (دليل تسليم معلّق).
+            * `delivery_status='failed'`  — فشل تسليم (مايُفقدش صامت).
+            * غير مقروء (`read_at IS NULL`) — المستخدم لسه ما شافهوش.
+            * مرجع في `notifier_pending.event_id` — دليل تسوية معلّق لازم للاسترجاع.
+        - `deleted`  : مؤهّل (مُسلَّم + مقروء + مش مرجع تسوية) — نفس المجموعة اللي
+          سياسة التقليم بتحذفها أصلًا، فما فيش تقليل لضمانات أمنية جديدة.
+        """
+        row = self._conn.execute(
+            "SELECT read_at, delivery_status FROM notification_inbox WHERE id=?",
+            (int(item_id),),
+        ).fetchone()
+        if row is None:
+            return INBOX_DELETE_MISSING
+        if row["delivery_status"] != INBOX_DELIVERY_DELIVERED or row["read_at"] is None:
+            return INBOX_DELETE_PROTECTED
+        ref = self._conn.execute(
+            "SELECT 1 FROM notifier_pending WHERE event_id=? LIMIT 1", (int(item_id),)
+        ).fetchone()
+        if ref is not None:
+            return INBOX_DELETE_PROTECTED
+        return INBOX_DELETE_DELETED
+
+    def delete_inbox_item(self, item_id: int) -> str:
+        """يحذف صف صندوق **نهائيًا** لو مؤهّل، في معاملة ذرّية واحدة.
+
+        يرجّع `deleted` (اتحذف فعلًا) / `protected` (محمي، مفيش تغيير) / `missing`
+        (مش موجود). الأهلية بتُعاد فحصها **داخل** المعاملة (`BEGIN IMMEDIATE`) ⇒ مفيش
+        سباق مع تسجيل تسليم/ربط `notifier_pending` في نفس اللحظة. الحذف بيلمس جدول
+        `notification_inbox` بس — مفيش أي مساس بصفوف outbox/creation/watched/
+        notification_state/notifier_pending (مفيش حذف عرضي لسجل عملية أو تسوية).
+        """
+        ident = int(item_id)
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            verdict = self.inbox_item_delete_eligibility(ident)
+            if verdict != INBOX_DELETE_DELETED:
+                conn.commit()
+                return verdict
+            conn.execute("DELETE FROM notification_inbox WHERE id=?", (ident,))
+            conn.commit()
+            return INBOX_DELETE_DELETED
+        except Exception:
+            conn.rollback()
+            raise
 
     def mark_inbox_delivered(self, item_id: int, now: str, *, _commit: bool = True) -> bool:
         """يسجّل نجاح تسليم تليجرام للحدث (delivery_status='delivered'). idempotent.

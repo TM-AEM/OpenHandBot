@@ -64,6 +64,11 @@
             <button class="btn ghost" type="button" id="inbox-refresh">تحديث</button>
             <button class="btn ghost" type="button" id="inbox-read-all">تعليم الكل كمقروء</button>
           </div>
+          <div class="filter-bar">
+            <button class="chip active" type="button" id="inbox-filter-all" data-filter="all">الكل</button>
+            <button class="chip" type="button" id="inbox-filter-unread" data-filter="unread">غير المقروء</button>
+            <button class="chip" type="button" id="inbox-filter-archived" data-filter="archived">المؤرشف</button>
+          </div>
           <ul class="list" id="inbox-list"></ul>
           <div class="more" id="inbox-more" hidden>
             <button class="btn ghost" type="button" id="inbox-next">المزيد</button>

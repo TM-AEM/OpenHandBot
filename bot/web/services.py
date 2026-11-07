@@ -22,7 +22,11 @@ from .. import features
 from .. import outbox
 from .. import deletion
 from .. import db as db_module
-from ..db import INBOX_PAGE_SIZE
+from ..db import (
+    INBOX_DELETE_DELETED,
+    INBOX_DELETE_MISSING,
+    INBOX_PAGE_SIZE,
+)
 from ..files import (
     CONVERSATION_ERRORS,
     FILE_CONTENT_STATUSES,
@@ -360,25 +364,32 @@ class MiniAppService:
         return bool(enabled)
 
     # ------------------------------------------------------ notification inbox
-    def list_notifications(self, page: int = 0, unread_only: bool = False) -> dict:
+    def list_notifications(
+        self, page: int = 0, unread_only: bool = False, archived: bool = False
+    ) -> dict:
         """قايمة صندوق الإشعارات (الأحدث أولًا) بترقيم محدود على مستوى SQL.
 
         payload محدود (LIMIT/OFFSET) زي باقي القوايم؛ `unread_count` بيساعد الواجهة
         تعرض شارة غير المقروء من غير ما تجيب كل الصفحات. لو القاعدة مش متاحة، نرجّع
         فاضي بدل ما نكسّر الصفحة (زي `bootstrap`).
+
+        OHB2-PHASE1C: `archived=False` (الافتراضي) = الصندوق النشط؛ `archived=True` =
+        عرض الأرشيف. `unread_count` بيفضل على النشط دايمًا (الأرشيف ما بيأثّرش على الشارة).
         """
         if self._db is None:
             return {"page": 0, "has_more": False, "unread_count": 0, "items": []}
         page = max(0, page)
         offset = page * INBOX_PAGE_SIZE
         items = self._db.list_inbox(
-            limit=INBOX_PAGE_SIZE, offset=offset, unread_only=unread_only
+            limit=INBOX_PAGE_SIZE, offset=offset, unread_only=unread_only, archived=archived
         )
         # لو الصفحة فاضية بسبب تجاوز الحد، نرجع للأولى (زي قايمة المتابعات).
         if not items and page > 0:
             page, offset = 0, 0
-            items = self._db.list_inbox(limit=INBOX_PAGE_SIZE, offset=0, unread_only=unread_only)
-        total = self._db.count_inbox(unread_only=unread_only)
+            items = self._db.list_inbox(
+                limit=INBOX_PAGE_SIZE, offset=0, unread_only=unread_only, archived=archived
+            )
+        total = self._db.count_inbox(unread_only=unread_only, archived=archived)
         return {
             "page": page,
             "has_more": total > offset + len(items),
@@ -386,8 +397,13 @@ class MiniAppService:
             "items": [self._inbox_dto(it) for it in items],
         }
 
-    @staticmethod
-    def _inbox_dto(item) -> dict:
+    def _inbox_dto(self, item) -> dict:
+        # OHB2-PHASE1C: هل السيرفر يعتبر الصف مؤهّلًا للحذف النهائي؟ بنستدعي **نفس** فحص
+        # الأهلية بتاع مسار الحذف (`inbox_item_delete_eligibility`) عشان الإشارة للواجهة
+        # ما تختلفش عن التنفيذ أبدًا. القرار النهائي بيتفرض على السيرفر وقت الحذف نفسه.
+        deletable = False
+        if self._db is not None and item.id is not None:
+            deletable = self._db.inbox_item_delete_eligibility(item.id) == INBOX_DELETE_DELETED
         return {
             "id": item.id,
             "conversation_id": item.conversation_id,
@@ -396,6 +412,9 @@ class MiniAppService:
             "message": item.message or "",
             "created_at": item.created_at or "",
             "read": not item.unread,
+            # OHB2-PHASE1C: محور الأرشفة (مستقل) — الواجهة تعرف تعرض زر أرشفة/استرجاع.
+            "archived": bool(item.archived),
+            "deletable": deletable,
             # OHB2-08-05 (Batch 3R): حالة التسليم المتينة — عشان الواجهة تفرّق بين
             # إشعار اتسلّم وإشعار لسه معلّق أو فشل (event-first، مش تسجيل تاريخي بس).
             "delivery_status": getattr(item, "delivery_status", None) or "delivered",
@@ -422,6 +441,66 @@ class MiniAppService:
             raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
         changed = self._db.mark_all_inbox_read(outbox.now_iso())
         return {"ok": True, "marked": changed, "unread_count": self._db.count_inbox(unread_only=True)}
+
+    @staticmethod
+    def _inbox_item_id(item_id) -> int:
+        """يتحقّق من معرّف عنصر الصندوق (عدد صحيح موجب) أو يرفع ValidationError."""
+        try:
+            ident = int(item_id)
+        except (TypeError, ValueError):
+            raise ValidationError("معرّف الإشعار غير صالح")
+        if ident <= 0:
+            raise ValidationError("معرّف الإشعار غير صالح")
+        return ident
+
+    def archive_notification(self, item_id) -> dict:
+        """يؤرشف إشعار (idempotent، قابل للعكس). ما بيغيّرش التسليم/القراءة/العملية."""
+        if self._db is None:
+            raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
+        ident = self._inbox_item_id(item_id)
+        ok = self._db.archive_inbox_item(ident, outbox.now_iso())
+        if not ok:
+            raise ApiError("الإشعار مش موجود.", 404)
+        return {
+            "ok": True,
+            "archived": True,
+            "unread_count": self._db.count_inbox(unread_only=True),
+        }
+
+    def unarchive_notification(self, item_id) -> dict:
+        """يلغي أرشفة إشعار (idempotent) ويرجّعه للصندوق النشط بنفس الهوية."""
+        if self._db is None:
+            raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
+        ident = self._inbox_item_id(item_id)
+        ok = self._db.unarchive_inbox_item(ident)
+        if not ok:
+            raise ApiError("الإشعار مش موجود.", 404)
+        return {
+            "ok": True,
+            "archived": False,
+            "unread_count": self._db.count_inbox(unread_only=True),
+        }
+
+    def delete_notification(self, item_id) -> dict:
+        """يحذف إشعار نهائيًا **بس لو مؤهّل** (القرار بيتفرض على السيرفر).
+
+        الصفوف المحمية (معلّقة/فاشلة/غير مقروءة/مرجع تسوية) بترجّع 409 و`deleted: false`
+        من غير أي تغيير ⇒ مفيش نجاح كاذب ولا فقد دليل تشغيلي.
+        """
+        if self._db is None:
+            raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
+        ident = self._inbox_item_id(item_id)
+        verdict = self._db.delete_inbox_item(ident)
+        if verdict == INBOX_DELETE_MISSING:
+            raise ApiError("الإشعار مش موجود.", 404)
+        if verdict != INBOX_DELETE_DELETED:
+            # محمي: الإشعار لسه بيحمل دليلًا تشغيليًا (تسليم/تسوية) أو لسه ما اتقراش.
+            raise ApiError("الإشعار ده محمي من الحذف النهائي.", 409)
+        return {
+            "ok": True,
+            "deleted": True,
+            "unread_count": self._db.count_inbox(unread_only=True),
+        }
 
     # ------------------------------------------------------ conversations
     async def list_conversations(self, page: int = 0, refresh: bool = False) -> dict:

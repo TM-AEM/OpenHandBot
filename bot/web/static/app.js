@@ -5,7 +5,7 @@
   var API = "/api/v1";
   var tg = (window.Telegram && window.Telegram.WebApp) || null;
   var REQUEST_TIMEOUT = 12000;
-  var state = { chatsPage: 0, currentChat: null, selectedRepo: null, inboxPage: 0, inboxLoading: false, inboxIds: {}, inboxHasMore: false, inboxVisible: false, inboxLastRefreshAt: 0, detailSeq: 0 };
+  var state = { chatsPage: 0, currentChat: null, selectedRepo: null, inboxPage: 0, inboxLoading: false, inboxIds: {}, inboxHasMore: false, inboxVisible: false, inboxLastRefreshAt: 0, inboxFilter: "all", detailSeq: 0 };
   // OHB2-08-07: مؤقّت التحديث الدوري (مرئي فقط) + آخر وقت تحديث (للتهدئة).
   var inboxPollTimer = null;
 
@@ -374,8 +374,11 @@
     // حالة التحميل الجاري. بيتصفّر في then/catch تحت.
     if (state.inboxLoading) { return; }
     state.inboxLoading = true;
+    var unreadOnly = state.inboxFilter === "unread";
+    var archived = state.inboxFilter === "archived";
+    var query = INBOX.filterQuery(page || 0, unreadOnly, archived);
     if (page === 0) { state.inboxIds = {}; if (!silent) { list.innerHTML = ""; list.appendChild(el("li", "loading-row", "بيتم التحميل…")); } }
-    get("/notifications?page=" + (page || 0)).then(function (res) {
+    get("/notifications?" + query).then(function (res) {
       state.inboxLoading = false;
       var data = res.data || {};
       if (!res.ok) {
@@ -395,32 +398,14 @@
       renderInboxBadge(data.unread_count);
       var items = data.items || [];
       if (page === 0) { list.innerHTML = ""; }
-      if (page === 0 && !items.length) { list.appendChild(el("li", "empty-row", "مفيش إشعارات.")); }
+      if (page === 0 && !items.length) { list.appendChild(el("li", "empty-row", INBOX.emptyText(unreadOnly, archived))); }
       items.forEach(function (it) {
         // OHB2-08-06: منع تكرار نفس الإشعار — الترقيم بـ offset ممكن يتداخل لما
         // إشعارات جديدة تتصدّر القايمة، فنفس المعرّف يظهر في صفحتين.
         var idKey = String(it.id);
         if (state.inboxIds[idKey]) { return; }
         state.inboxIds[idKey] = true;
-        var unread = INBOX.isUnread(it);
-        var li = el("li", "row" + (unread ? " unread" : ""));
-        var main = el("div", "row-main");
-        main.appendChild(el("span", "row-title", it.title || it.conversation_id || ""));
-        main.appendChild(el("span", "row-sub", kindLabel(it.kind)));
-        li.appendChild(main);
-        // OHB2-08-05 (Batch 3R): شارة حالة التسليم (مفيش شارة لو اتسلّم).
-        var delivery = INBOX.deliveryLabel(it.delivery_status);
-        if (delivery) { li.appendChild(el("span", "pill delivery", delivery)); }
-        li.appendChild(el("span", "pill", unread ? "جديد" : "مقروء"));
-        li.addEventListener("click", function () {
-          if (unread) {
-            post("/notifications/" + encodeURIComponent(it.id) + "/read", {}).then(function (r2) {
-              if (r2.ok) { renderInboxBadge(r2.data && r2.data.unread_count); }
-            }).catch(function () { /* نتجاهل: العرض لسه شغال */ });
-          }
-          if (it.conversation_id) { openDetail(it.conversation_id); }
-        });
-        list.appendChild(li);
+        list.appendChild(renderInboxRow(it));
       });
       var more = $("inbox-more");
       if (more) { more.hidden = !data.has_more; }
@@ -428,6 +413,119 @@
       state.inboxLoading = false;
       if (page === 0 && !silent) { list.innerHTML = ""; list.appendChild(el("li", "empty-row", "مش قادر أوصل للسيرفر.")); }
     });
+  }
+
+  // OHB2-PHASE1C: صف إشعار واحد + أزرار الأرشفة/الاسترجاع/الحذف. الحذف النهائي بيتطلب
+  // تأكيد صريح (خطوتين) في الواجهة، والسيرفر بيفرض الأهلية تاني بشكل مستقل.
+  function renderInboxRow(it) {
+    var unread = INBOX.isUnread(it);
+    var archived = INBOX.isArchived(it);
+    var li = el("li", "row" + (unread ? " unread" : "") + (archived ? " archived" : ""));
+    var main = el("div", "row-main");
+    main.appendChild(el("span", "row-title", it.title || it.conversation_id || ""));
+    main.appendChild(el("span", "row-sub", kindLabel(it.kind)));
+    li.appendChild(main);
+    var pills = el("div", "row-pills");
+    // OHB2-08-05 (Batch 3R): شارة حالة التسليم (مفيش شارة لو اتسلّم).
+    var delivery = INBOX.deliveryLabel(it.delivery_status);
+    if (delivery) { pills.appendChild(el("span", "pill delivery", delivery)); }
+    pills.appendChild(el("span", "pill", unread ? "جديد" : "مقروء"));
+    li.appendChild(pills);
+    var actions = el("div", "row-actions");
+    // أرشفة/استرجاع (قابل للعكس دائمًا).
+    var archiveBtn = el("button", "btn ghost small", archived ? "استرجاع" : "أرشفة");
+    archiveBtn.addEventListener("click", function (e) {
+      if (e && e.stopPropagation) { e.stopPropagation(); }
+      setInboxArchived(it, !archived, archiveBtn);
+    });
+    actions.appendChild(archiveBtn);
+    // حذف نهائي — بس لو السيرفر قال إنه مؤهّل، ومع تأكيد صريح.
+    if (INBOX.canDelete(it)) {
+      var delBtn = el("button", "btn danger small", "🗑 حذف");
+      var confirmBtn = el("button", "btn danger small", "أكّد الحذف");
+      confirmBtn.hidden = true;
+      var cancelBtn = el("button", "btn ghost small", "إلغاء");
+      cancelBtn.hidden = true;
+      var deleting = false;
+      delBtn.addEventListener("click", function (e) {
+        if (e && e.stopPropagation) { e.stopPropagation(); }
+        delBtn.hidden = true; confirmBtn.hidden = false; cancelBtn.hidden = false;
+      });
+      cancelBtn.addEventListener("click", function (e) {
+        if (e && e.stopPropagation) { e.stopPropagation(); }
+        delBtn.hidden = false; confirmBtn.hidden = true; cancelBtn.hidden = true;
+      });
+      confirmBtn.addEventListener("click", function (e) {
+        if (e && e.stopPropagation) { e.stopPropagation(); }
+        if (deleting) { return; }
+        deleting = true;
+        confirmBtn.disabled = true; cancelBtn.disabled = true;
+        del("/notifications/" + encodeURIComponent(it.id)).then(function (res) {
+          if (res.ok) {
+            renderInboxBadge(res.data && res.data.unread_count);
+            toast("اتحذف الإشعار نهائيًا ✅");
+            loadInbox(0);
+          } else {
+            deleting = false; confirmBtn.disabled = false; cancelBtn.disabled = false;
+            toast(friendlyMessage(res.status, res.data));
+          }
+        }).catch(function () {
+          // انقطاع الشبكة: النتيجة غامضة ⇒ نسمح بإعادة المحاولة (مفيش نجاح كاذب).
+          deleting = false; confirmBtn.disabled = false; cancelBtn.disabled = false;
+          toast("مش قادر أوصل للسيرفر — جرّب تاني.");
+        });
+      });
+      actions.appendChild(delBtn);
+      actions.appendChild(confirmBtn);
+      actions.appendChild(cancelBtn);
+    }
+    li.appendChild(actions);
+    li.addEventListener("click", function () {
+      if (unread) {
+        post("/notifications/" + encodeURIComponent(it.id) + "/read", {}).then(function (r2) {
+          if (r2.ok) { renderInboxBadge(r2.data && r2.data.unread_count); }
+        }).catch(function () { /* نتجاهل: العرض لسه شغال */ });
+      }
+      if (it.conversation_id) { openDetail(it.conversation_id); }
+    });
+    return li;
+  }
+
+  // OHB2-PHASE1C: أرشفة/استرجاع إشعار (قابل للعكس). ما بنحدّثش العرض كذبًا: بنعيد التحميل
+  // من السيرفر بعد النجاح بس، وأي فشل يعرض رسالة من غير ما يغيّر الحالة المعروضة.
+  function setInboxArchived(it, wantArchived, btn) {
+    var path = "/notifications/" + encodeURIComponent(it.id) + (wantArchived ? "/archive" : "/unarchive");
+    if (btn) { btn.disabled = true; }
+    post(path, {}).then(function (res) {
+      if (btn) { btn.disabled = false; }
+      if (res.ok) {
+        renderInboxBadge(res.data && res.data.unread_count);
+        toast(wantArchived ? "اتأرشف ✅" : "اتسترجع ✅");
+        loadInbox(0);
+      } else {
+        toast(friendlyMessage(res.status, res.data));
+      }
+    }).catch(function () {
+      if (btn) { btn.disabled = false; }
+      toast("مش قادر أوصل للسيرفر.");
+    });
+  }
+
+  // OHB2-PHASE1C: تبديل فلتر الصندوق (الكل / غير المقروء / المؤرشف). بيصفّر الترقيم
+  // عشان ما نتخطّاش سجلات عند تغيير الفلتر، وبيعيد التحميل من أول صفحة.
+  function setInboxFilter(filter) {
+    state.inboxFilter = filter;
+    ["inbox-filter-all", "inbox-filter-unread", "inbox-filter-archived"].forEach(function (id) {
+      var btn = $(id);
+      if (!btn) { return; }
+      var on = btn.getAttribute("data-filter") === filter;
+      btn.className = on ? "chip active" : "chip";
+    });
+    state.inboxPage = 0;
+    state.inboxIds = {};
+    state.inboxHasMore = false;
+    state.inboxLastRefreshAt = Date.now();
+    loadInbox(0);
   }
 
   // OHB2-08-07: تحديث صندوق الإشعارات لو الصفحة مرئية وتبويب الإشعارات مفتوح فعلاً،
@@ -966,6 +1064,10 @@
     $("chats-next").addEventListener("click", function () { state.chatsPage += 1; loadChats(false); });
     $("watches-refresh").addEventListener("click", loadWatches);
     $("inbox-refresh").addEventListener("click", function () { state.inboxLastRefreshAt = Date.now(); loadInbox(0); });
+    ["inbox-filter-all", "inbox-filter-unread", "inbox-filter-archived"].forEach(function (id) {
+      var btn = $(id);
+      if (btn) { btn.addEventListener("click", function () { setInboxFilter(btn.getAttribute("data-filter")); }); }
+    });
     $("inbox-next").addEventListener("click", function () {
       if (state.inboxLoading) { return; }
       if (!state.inboxHasMore) { return; }  // OHB2-08-08: مفيش المزيد ⇒ ما نطلبش صفحة مش موجودة.

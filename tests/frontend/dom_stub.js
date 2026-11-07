@@ -169,6 +169,7 @@ const IDS = [
   "chats-list", "chats-more", "chats-next", "chats-refresh",
   "watches-list", "watches-refresh",
   "inbox-list", "inbox-more", "inbox-next", "inbox-refresh", "inbox-read-all", "inbox-badge",
+  "inbox-filter-all", "inbox-filter-unread", "inbox-filter-archived",
   "repo-search", "repo-search-btn", "repo-list",
   "newchat-form", "newchat-repo", "newchat-text", "newchat-send", "newchat-op", "newchat-norepo",
   "notif-toggle", "toast",
@@ -184,6 +185,13 @@ const TABS = [
 function buildDocument() {
   const doc = new Document();
   IDS.forEach((id) => doc.register(new El("div"), id));
+  // OHB2-PHASE1C: خصائص فلاتر الصندوق زي index.html (data-filter).
+  const FILTERS = { "inbox-filter-all": "all", "inbox-filter-unread": "unread", "inbox-filter-archived": "archived" };
+  Object.keys(FILTERS).forEach((id) => {
+    const el = doc.getElementById(id);
+    el.setAttribute("data-filter", FILTERS[id]);
+    el.className = "chip";
+  });
   TABS.forEach((t) => {
     const b = new El("button");
     b.setAttribute("data-view", t.view);
