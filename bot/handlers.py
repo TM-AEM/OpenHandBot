@@ -12,6 +12,7 @@ from telegram.ext import ContextTypes
 
 from . import keyboards as kb
 from . import outbox
+from . import deletion
 from .errors import ApiError, ResponseTooLargeError, error_text
 from .file_cache import FileCache
 from .openhands_client import collect_conversations
@@ -173,11 +174,32 @@ async def _guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
 
 
 def _mini_app_url(context: ContextTypes.DEFAULT_TYPE) -> str:
-    """رابط الـ Mini App من الإعداد (فاضي لو الميزة متوقفة)."""
-    return getattr(context.bot_data.get("config"), "mini_app_url", "") or ""
+    """رابط الـ Mini App لو الميزة **مفعّلة** ومهيّأة، وإلا فاضي.
+
+    لازم الاتنين: `MINI_APP_ENABLED=1` **و** رابط `MINI_APP_URL` صالح. كده ما بنعرضش
+    زر web_app لرابط ميت (الميزة مفعّلة بلا سيرفر شغّال، أو رابط بدون تفعيل).
+    """
+    cfg = context.bot_data.get("config")
+    if cfg is None or not getattr(cfg, "mini_app_enabled", False):
+        return ""
+    return getattr(cfg, "mini_app_url", "") or ""
 
 
-MINI_APP_UNAVAILABLE = "التطبيق المصغّر مش متاح دلوقتي. الأوامر والأزرار العادية شغالة زي ما هي."
+def _mini_app_diagnostic(context: ContextTypes.DEFAULT_TYPE) -> str:
+    """سبب عدم إتاحة الـ Mini App — **بدون أي أسرار** (أسماء إعدادات بس)."""
+    cfg = context.bot_data.get("config")
+    if cfg is None:
+        return "الإعداد غير متاح."
+    if not getattr(cfg, "mini_app_enabled", False):
+        return "الميزة مقفولة (MINI_APP_ENABLED=0)."
+    if not (getattr(cfg, "mini_app_url", "") or ""):
+        return "الرابط العام (MINI_APP_URL) غير مهيّأ."
+    return "الإعداد غير مكتمل."
+
+
+MINI_APP_UNAVAILABLE = (
+    "التطبيق المصغّر مش متاح دلوقتي. الأوامر والأزرار العادية شغالة زي ما هي."
+)
 
 
 HELP_TEXT = (
@@ -218,7 +240,9 @@ async def app_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     url = _mini_app_url(context)
     if not url:
-        await update.message.reply_text(MINI_APP_UNAVAILABLE)
+        await update.message.reply_text(
+            f"{MINI_APP_UNAVAILABLE}\nالسبب: {_mini_app_diagnostic(context)}"
+        )
         return
     await update.message.reply_text("افتح التطبيق من الزر:", reply_markup=kb.mini_app_launch(url))
 
@@ -230,7 +254,10 @@ async def app_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     url = _mini_app_url(context)
     if not url:
-        await q.edit_message_text(MINI_APP_UNAVAILABLE, reply_markup=kb.main_menu(_mini_app_url(context)))
+        await q.edit_message_text(
+            f"{MINI_APP_UNAVAILABLE}\nالسبب: {_mini_app_diagnostic(context)}",
+            reply_markup=kb.main_menu(_mini_app_url(context)),
+        )
         return
     await q.edit_message_text("افتح التطبيق من الزر:", reply_markup=kb.mini_app_launch(url))
 
@@ -521,7 +548,7 @@ async def unwatch_conversation(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def delete_conversation_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """OHB2-C7: يعرض تأكيد حذف الشات (محلي). تفويض الملكية قبل أي حذف."""
+    """OHB2-MINIAPP: يعرض تأكيد حذف الشات **من OpenHands**. تفويض الملكية قبل أي حذف."""
     q = update.callback_query
     await q.answer()
     if not _allowed(update, context.bot_data["config"]):
@@ -536,14 +563,14 @@ async def delete_conversation_prompt(update: Update, context: ContextTypes.DEFAU
     title = conv.get("title") or "بدون عنوان"
     await _safe_edit(
         q,
-        f"متأكد إنك عايز تحذف الشات «{title}» من هنا؟\n"
-        "ده حذف محلي بس (المتابعة/السجل المحلي) — مش بيمسح الشات من OpenHands نفسه.",
+        f"متأكد إنك عايز تحذف الشات «{title}»؟\n"
+        "ده هيحذفه نهائيًا من OpenHands نفسه (مش إخفاء محلي) — العملية مش قابلة للرجوع.",
         reply_markup=kb.delete_confirm_menu(conversation_id),
     )
 
 
 async def delete_conversation_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """OHB2-C7: تأكيد حذف الشات محليًا. تفويض الملكية إلزامي قبل أي حذف (مفيش IDOR)."""
+    """OHB2-MINIAPP: تأكيد حذف الشات **من OpenHands** ثم محليًا. تفويض الملكية إلزامي."""
     q = update.callback_query
     await q.answer()
     if not _allowed(update, context.bot_data["config"]):
@@ -557,17 +584,18 @@ async def delete_conversation_confirm(update: Update, context: ContextTypes.DEFA
         await _safe_edit(q, message)
         return
     try:
-        db.delete_conversation(conversation_id, outbox.now_iso())
+        result = await deletion.delete_conversation_remote(client, db, conversation_id)
     except sqlite3.Error:
         log.exception("تعذّر حذف الشات %s", conversation_id)
         await _safe_edit(q, "تعذّر الحذف دلوقتي (خطأ مؤقت في قاعدة البيانات). جرّب تاني.")
         return
-    # OHB2-F1: الحذف نجح ⇒ ترتيب/محتوى القايمة اتغيّر ⇒ نبطّل كاش القايمة (زي ما بنعمل
-    # بعد إرسال برومت أو بدء شات). مابنبطّلوش في حالات الفشل/عدم التفويض (بنرجع فوق).
-    context.bot_data.pop("list_cache", None)
+    # نجاح الحذف (المؤكّد) ⇒ ترتيب/محتوى القايمة اتغيّر ⇒ نبطّل كاش القايمة (زي البرومت/
+    # بدء الشات). مابنبطّلوش في حالات الفشل/النتيجة المجهولة (الشات ممكن لسه بعيدًا).
+    if result.status == deletion.STATUS_DELETED:
+        context.bot_data.pop("list_cache", None)
     await _safe_edit(
         q,
-        "تمام، اتشال من هنا ✅ (حذف محلي — الشات لسه موجود على OpenHands).",
+        result.message,
         reply_markup=kb.main_menu(_mini_app_url(context)),
     )
 

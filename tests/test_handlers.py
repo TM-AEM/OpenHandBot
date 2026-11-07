@@ -49,6 +49,9 @@ class FakeConfig:
         self.allowed_telegram_ids = frozenset({allowed_id})
         self.owner_id = allowed_id
         self.openhands_base_url = "https://app.all-hands.dev"
+        # OHB2-MINIAPP: زر web_app بيتعرض بس لما الميزة مفعّلة والرابط مهيّأ.
+        self.mini_app_enabled = False
+        self.mini_app_url = ""
 
     def is_allowed(self, user_id):
         return user_id in self.allowed_telegram_ids
@@ -1112,6 +1115,7 @@ def test_app_command_without_url_is_graceful(tmp_path):
 
 def test_app_command_with_url_sends_web_app_button(tmp_path):
     ctx = make_context(1, tmp_path)
+    ctx.bot_data["config"].mini_app_enabled = True
     ctx.bot_data["config"].mini_app_url = "https://app.example.com/mini"
     update = make_update(1)
     asyncio.run(h.app_command(update, ctx))
@@ -1128,6 +1132,7 @@ def test_app_open_callback_without_url_shows_unavailable(tmp_path):
 
 def test_app_open_callback_with_url_edits_to_web_app_button(tmp_path):
     ctx = make_context(1, tmp_path)
+    ctx.bot_data["config"].mini_app_enabled = True
     ctx.bot_data["config"].mini_app_url = "https://app.example.com/mini"
     update = _cb_update(1, "app:open")
     asyncio.run(h.app_open(update, ctx))
@@ -1137,6 +1142,7 @@ def test_app_open_callback_with_url_edits_to_web_app_button(tmp_path):
 
 def test_start_menu_includes_web_app_button_when_configured(tmp_path):
     ctx = make_context(1, tmp_path)
+    ctx.bot_data["config"].mini_app_enabled = True
     ctx.bot_data["config"].mini_app_url = "https://app.example.com/mini"
     update = make_update(1)
     asyncio.run(h.start(update, ctx))
@@ -1172,8 +1178,10 @@ class F1ListClient:
     async def get_current_user(self):
         return {"id": F1_OWNER_UUID}
 
-    async def delete_conversation(self, conversation_id):  # لو الكود حاول حذف بعيد
+    async def delete_conversation(self, conversation_id):
+        # OHB2-MINIAPP: العميل بيرجّع True بس لما OpenHands يأكّد النجاح.
         self.deleted_remote_calls += 1
+        return True
 
 
 def _f1_items(n, prefix="c"):
@@ -1259,7 +1267,7 @@ def test_list_keeps_valid_when_unrelated_tombstone_exists(tmp_path):
 
 
 def test_confirm_delete_invalidates_list_cache(tmp_path):
-    """الحذف المؤكَّد الناجح يبطّل كاش القايمة (زي البرومت/بدء الشات) ومايحذفش بعيد."""
+    """الحذف المؤكَّد الناجح يبطّل كاش القايمة (زي البرومت/بدء الشات) ويحذف من OpenHands."""
     client = F1ListClient(conv={"id": "c1", "title": "شات"})
     ctx = make_context(1, tmp_path, client=client)
     ctx.bot_data["db"].add_watched("c1", "شات", chat_id=99)
@@ -1273,7 +1281,8 @@ def test_confirm_delete_invalidates_list_cache(tmp_path):
 
     assert "list_cache" not in ctx.bot_data  # اتبطّل
     assert ctx.bot_data["db"].is_deleted("c1") is True  # اتحذف محليًا
-    assert client.deleted_remote_calls == 0  # مفيش حذف بعيد
+    assert client.deleted_remote_calls == 1  # اتحذف من OpenHands نفسه
+    assert ctx.bot_data["db"].remote_deletion_state("c1") == ctx.bot_data["db"].REMOTE_CONFIRMED
 
 
 def test_stale_cache_cannot_display_deleted_conversation(tmp_path):

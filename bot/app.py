@@ -16,6 +16,7 @@ from telegram.ext import (
 from . import features, handlers
 from .config import Config
 from .db import Database
+from . import deletion
 from .notifier import Notifier
 from .openhands_client import OpenHandsClient
 from .outbox import CompletionWorker, CreationWorker, OutboxWorker, completion_recover
@@ -139,6 +140,13 @@ def build_application(config: Config) -> Application:
         # 1.1) OHB2-STABILIZATION-F02: تسوية/تعافي الإكمال المحلي (صفوف قديمة sent/done من
         #      غير intent + إعادة تأهيل العناصر منتهية الإجارة). بدون أي POST خارجي.
         await completion_recover(application)
+        # 1.2) OHB2-MINIAPP: تسوية الحذف البعيد المعلّق (شات اتحذف من OpenHands واتقطع
+        #      قبل ما نثبّت، أو العكس). best-effort: ما تمنعش الإقلاع، وما بتخمّنش (تسيب
+        #      المجهول معلّق). بتشتغل قبل الـ workers عشان مايحصلش إحياء لشات متشاهد.
+        try:
+            await deletion.reconcile_pending_deletions(client, db)
+        except Exception as exc:  # noqa: BLE001 — التسوية ما تمنعش الإقلاع
+            log.warning("تسوية الحذف البعيد المعلّق اتخطّت (%s)", type(exc).__name__)
         # 2) worker واحد مالك لكل جدول — يبدأوا بعد ما التعافي يخلص (عشان مايعالجوش
         #    سجل 'sending'/'starting' قبل ما يتحوّل 'unknown'). الحرس ده يمنع worker
         #    تاني لو اتنادت _post_init تاني (إعادة تهيئة مكرّرة).

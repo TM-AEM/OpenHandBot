@@ -239,7 +239,17 @@ def load_config(env: dict | None = None) -> Config:
     if mini_app_url:
         if not _URL_RE.match(mini_app_url) or not mini_app_url.startswith("https://"):
             raise ConfigError("MINI_APP_URL لازم يكون رابط https:// صالح")
-        host = urlsplit(mini_app_url).hostname or ""
+        parts = urlsplit(mini_app_url)
+        # OHB2-MINIAPP: رابط web_app لازم يكون نضيف: ممنوع userinfo (مستخدم:كلمة سر)،
+        # وممنوع fragment (#...)، وممنوع query (?...) — تيليجرام بيفتح الرابط كما هو
+        # وأي جزء إضافي ممكن يهرّب اعتماد أو يكسّر المصادقة. المسار مسموح (/mini/).
+        if parts.username or parts.password:
+            raise ConfigError("MINI_APP_URL ما يحتويش على اسم مستخدم/كلمة سر")
+        if parts.fragment:
+            raise ConfigError("MINI_APP_URL ما يحتويش على fragment (#...)")
+        if parts.query:
+            raise ConfigError("MINI_APP_URL ما يحتويش على query (?...)")
+        host = parts.hostname or ""
         if _is_loopback_host(host):
             raise ConfigError("MINI_APP_URL لازم يكون رابط عام (مش loopback) لأن تيليجرام بيفتحه من جهاز المستخدم")
 

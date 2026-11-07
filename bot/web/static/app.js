@@ -600,12 +600,12 @@
       });
       box.appendChild(watchBtn);
 
-      // OHB2-C7: حذف محلي للشات (بتأكيد صريح). ما بنحذفش الشات من OpenHands — إحنا
-      // بنشيل بس السجل المحلي (المتابعة/الصندوق/الإشعارات). حرس الضغط المزدوج عبر
-      // `deleting` + تعطيل الأزرار، والحالة الغامضة (انقطاع) تفضل retryable.
+      // OHB2-MINIAPP: حذف الشات **من OpenHands نفسه** (بتأكيد صريح). الـ backend بيعمل
+      // نداء الحذف البعيد الأول، وبيرجّع 200 بس لما OpenHands يأكّد. أي فشل/نتيجة غامضة
+      // بترجع رسالة واضحة وبتفضل على الشاشة (retryable) — مفيش نجاح كاذب.
       var delNote = el(
         "p", "delete-confirm-note",
-        "متأكد إنك عايز تحذف «" + (d.title || "بدون عنوان") + "»؟ (حذف محلي)"
+        "متأكد إنك عايز تحذف «" + (d.title || "بدون عنوان") + "» نهائيًا من OpenHands؟"
       );
       delNote.hidden = true;
       box.appendChild(delNote);
@@ -635,7 +635,7 @@
         cancelBtn.disabled = true;
         del("/conversations/" + encodeURIComponent(id)).then(function (res) {
           if (res.ok) {
-            toast("اتشال من هنا ✅ (حذف محلي — الشات لسه على OpenHands).");
+            toast("اتحذف من OpenHands نهائيًا ✅");
             showView("view-chats");
             loadChats(true);
           } else {
