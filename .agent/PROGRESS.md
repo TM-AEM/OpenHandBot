@@ -364,3 +364,11 @@ After: pytest 1721 passed / pyflakes 0 / node 145 pass 0 fail.
 
 Done: كل الكود والاختبارات والتوثيق (اختبارات الجلسات الجديدة 29).
 Next: مراجعة مستقلة على SHA محدّد، ثم تقرير.
+
+### Independent review (2026-11-06)
+Reviewer conversation `90ff1c53-...` (delegated, separate context) reviewed exact commit
+`3b75954` in an isolated worktree: **VERDICT: PASS-WITH-NOTES** (no blocker/major).
+Verified by the reviewer with real output: pytest 1721 passed, pyflakes 0, session suite 29 passed,
+raw token absent from DB file, auth survives reconstruct, expired rejected, revoked durable, db error -> fail closed.
+Findings addressed in `ad6dd84`: revoke DB failure now logged (not silent) + stale docstring fixed + test.
+Nit left as-is (documented): `reset()` uses `prune_web_sessions(inf)`; no production callers.
