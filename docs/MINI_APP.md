@@ -80,7 +80,9 @@ Telegram WebView ──HTTPS──▶ ingress (TLS) ──HTTP──▶ الحا
 | `/api/v1/chats` | POST | كوكي | ✔ | `{"repository": "owner/repo", "text": "...", "client_ref": "..."}` ⇒ شات جديد |
 | `/api/v1/operations/outbox` | GET | كوكي | لأ | حالة عملية برومت (`?id=` أو `?conversation_id=&client_ref=`) |
 | `/api/v1/operations/outbox/reconcile` | POST | كوكي | ✔ | تسوية يدوية لعملية برومت: `{"id": N, "action": "discard"|"mark_sent"}` |
-| `/api/v1/operations/creation` | GET | كوكي | لأ | حالة عملية إنشاء شات (`?id=` أو `?client_ref=`) |
+| `/api/v1/operations/creation` | GET | كوكي | لأ | حالة عملية إنشاء شات (`?id=` أو `?client_ref=`) — **مقيّد بالمالك** |
+| `/api/v1/operations/creation/list` | GET | كوكي | لأ | قايمة طلبات الشات الجديد بتاعة المالك (`?page=`) — **مقيّد بالمالك** |
+| `/api/v1/operations/creation/reconcile` | POST | كوكي | ✔ | تسوية يدوية لطلب شات: `{"id": N, "action": "cancel"\|"mark_sent"}` — **مقيّد بالمالك** |
 | `/api/v1/*` (غير معروف) | أي | — | — | `404` JSON موحّد |
 | `/`, `/mini/`, `/mini/<asset>` | GET | لأ | لأ | الواجهة والأصول الثابتة (**بدون تحديد معدّل**) |
 
@@ -457,15 +459,16 @@ node --test tests/frontend/*.test.js
   (ذرّيًا، `BEGIN IMMEDIATE`) — مفيش حدث معلّق للأبد. (Batch 3R-FIX2: `transition_seq` بقى
   **عصر اكتشاف** بيتثبّت عند الاكتشاف في `note_transition`، فالتسوية ما بتلمسوش.)
 - **حدود payload ونمو محدود**: الرسالة بتتقصّ عند `INBOX_MAX_MESSAGE_CHARS` (1000).
-  التقليم عند الإدراج (نفس المعاملة) بسياسة صريحة (Batch 3R-FIX): **الصفوف المعلّقة
-  (`pending`) وغير المقروءة (`read_at IS NULL`) مايتقلّمش أبدًا**؛ **المقروءة بس** مؤهّلة
+  التقليم عند الإدراج (نفس المعاملة) بسياسة صريحة (Batch 3R-FIX + OHB2-PHASE1C):
+  **الصفوف المعلّقة (`pending`) وغير المقروءة (`read_at IS NULL`) والمؤرشفة
+  (`archived_at IS NOT NULL`) مايتقلّمش أبدًا**؛ **المقروءة غير المؤرشفة بس** مؤهّلة
   للتقليم الأقدم أولًا لحد `INBOX_MAX_PER_CONVERSATION` (50) لكل محادثة و`INBOX_MAX_TOTAL`
   (500) عامًا — والسقفين **سقفان ناعمان**: لو الصفوف المحمية لوحدها تعدّيهم، الجدول يتعدّاهم
   (مفيش حذف صامت لإشعار لسه ما شافهوش المستخدم). القايمة بترقيم على مستوى SQL
   (`INBOX_PAGE_SIZE = 10`) بترتيب `id DESC` (مستقر لأن الـ id تسلسلي). `unread_count` بيرجع
   مع كل صفحة ومع `bootstrap` لشارة التبويب.
 - **الترحيل**: الأعمدة الجديدة (`event_key`، `delivery_status`، `delivery_attempts`، ...
-  و`transition_status`، و`transition_seq` في `notification_inbox`) و`transition_seq` +
+  و`transition_status`، و`transition_seq`، و`archived_at` في `notification_inbox`) و`transition_seq` +
   `discovered_status` في `notification_state` بتتضاف لقاعدة موجودة عبر
   `ALTER TABLE ... ADD COLUMN` في `_migrate`، والفهارس الفريدة الجزئية (`idx_inbox_event_key`
   و`idx_inbox_transition_seq_unique`) بتتعمل **بعد** ضمان الأعمدة (نمط المستودع) — idempotent وآمن
@@ -503,12 +506,82 @@ node --test tests/frontend/*.test.js
   بتُختبر بـ Node (`tests/frontend/copy.test.js`، `tests/frontend/export.test.js`) وبتُستخدم
   من `app.js` مباشرة. التغطية الخلفية: `tests/test_miniapp_export_reply.py`.
 
+## 13د. رؤية/إلغاء/تسوية طلبات الشات الجديد (OHB2-PHASE1D)
+
+الـ Mini App بقى بيعرض للـ **مالك** حالة طلبات إنشاء الشات (`creation_jobs`) ويسمح
+بإجراءين تسوية يدوية فقط — بنفس دلالات أوامر البوت (مفيش منطق تسوية موازي).
+
+### 1. آلة الحالة (المصدر: `bot/db.py`)
+
+| الحالة | المعنى | نهائي؟ | POST البدء ممكن يكون بدأ؟ |
+| --- | --- | --- | --- |
+| `pending` | اتسجّل بثبات، لسه مابدأش | لأ | **لأ (مؤكد)** |
+| `claimed` | الـ worker اخده ذرّياً، لسه مابدأش | لأ | **لأ (مؤكد)** |
+| `starting` | بدأ POST البدء/استطلاع مهمة معروفة | لأ | **أيوه (ممكن)** |
+| `done` | اتأكد البدء + `conversation_id` | ✔ | أيوه (اتأكد) |
+| `unknown` | نتيجة غامضة (timeout/انقطاع/إلغاء/بدون task_id) | ✔ | **مش معروف** |
+| `failed` | رفض نهائي مؤكد (4xx غير 429) | ✔ | لأ (اتأكد فشل) |
+| `discarded` | اتلغى قبل الإرسال | ✔ | **لأ (مؤكد)** |
+
+**حدّ الإرسال المشتقّ (`post_state` في الـ DTO):** `not_started` (pending/claimed) ·
+`uncertain` (starting) · `started` (done) · `failed` (failed) · `cancelled` (discarded).
+الـ DTO مابيرجّعش **نص** الطلب ولا `client_ref` ولا أي أسرار — بس معرّفات وحالات
+ومشتقات آمنة، و`conversation_id` **بس** لما `status=done` (الدليل الوحيد المعتمد).
+
+### 2. القايمة والتفاصيل (قراءة فقط)
+
+- `GET /api/v1/operations/creation/list?page=` — قايمة المالك (ترقيم 20/صفحة).
+- `GET /api/v1/operations/creation?id=` أو `?client_ref=` — تفاصيل طلب واحد.
+- **كل** بحث مقيّد بالمالك على السيرفر (`owner_id`) — id بتاع مستخدم تاني ⇒ **404**،
+  والترقيم/الفلترة مايقدروش يتجاوزوا الملكية.
+- **دفاع في العمق:** نطاق المالك مفروض كمان على مستوى `bot/db.py` في دوال الكتابة
+  (`discard_creation_job`/`set_creation_status_if_in` بتقبل `chat_id` وبتضيف `AND chat_id=?`)،
+  مش بس في الخدمة — فأي مستدعي جديد مايقدرش يعدّل صف مستخدم تاني بالغلط.
+
+### 3. الإلغاء (`action=cancel`)
+
+- **الأهلية (سيرفر):** مسموح **بس** في `pending`/`claimed` — الحالتين اللي الكود بيثبت
+  فيهم إن POST البدء **مابدأش**.
+- **ذرّي (CAS):** `discard_creation_job` بتعمل `UPDATE ... WHERE status IN (pending,claimed)`
+  في جملة واحدة ⇒ لو الـ worker حجز/بدأ بين القراءة والكتابة، `rowcount=0` (مفيش clobber).
+- **`starting`/`unknown`:** مفيش ادّعاء إلغاء — نرجّع الحالة الحالية + `cancellation="not_confirmed"`
+  والقاعدة **ماتتغيّرش** (مستحيل إلغاء يخفي نتيجة غامضة أو يفتح إعادة POST).
+- **حالة نهائية:** 409 `already_terminal` من غير أي تغيير.
+- **idempotent:** إعادة الإلغاء بعد النجاح ⇒ 409 (الطلب بقى `discarded`).
+
+### 4. تأكيد البدء (`action=mark_sent`)
+
+- **الغرض:** حسم غموض `unknown` **بتأكيد المالك** إن الشات بدأ (مش إثبات من OpenHands).
+- **الأهلية (سيرفر):** من `unknown` **بس** ⇒ `done`. `done` أصلاً ⇒ no-op (idempotent).
+  أي حالة تانية ⇒ 409 `invalid_state`.
+- **ذرّي (CAS):** `set_creation_status_if_in(..., allowed={unknown})` ⇒ لو حد تاني حسم
+  الطلب بين القراءة والكتابة، `rowcount=0` (مفيش clobber؛ ولو بقى `done` ⇒ no-op).
+- **مابيعملش** أي POST بعيد ⇒ مستحيل ينشئ شات تاني.
+
+### 5. ليه الغموض مايتعاودش تلقائيًا
+
+`unknown`/`starting` **نهائية/محجوزة** ومستحيل ترجع `pending` (كل التحويلات CAS بتمنع
+ده). الـ worker بيعمل إعادة POST **بس** للطلبات اللي لسه في حدّ «مابدأش»، و`done` نهائي
+نهائي. التسوية اليدوية مابتعملش شبكة خالص، فمفيش أي مسار يحوّل غموض ⇒ إعادة إنشاء.
+إثبات: `tests/test_miniapp_creation_jobs.py::test_unknown_never_becomes_retryable_pending`
+و`::test_reconcile_never_touches_remote_client`.
+
+### 6. الواجهة
+
+تاب جديد «طلبات البدء» (`view-jobs`) + `bot/web/static/jobs.js` (منطق عرض مستقل عن الـ
+DOM ومُختبر بـ Node). الأزرار بتظهر **بس** حسب أعلام السيرفر (`cancellable`/`resolvable`)
+— fail-closed: لو العلم مش `true` صراحةً، مفيش إجراء. الإلغاء/الحسم بيتطلبوا **تأكيد
+صريح (خطوتين)**، وأي 409/فشل شبكة مايعرضوش نجاح كاذب.
+
 ## 14. اللي فاضل لمهام OHB2 اللاحقة
 
 - جلسات **ثابتة عبر إعادة التشغيل** (المخزن الحالي في الذاكرة ⇒ أي restart بيلغي الجلسات).
-- صندوق الإشعارات: **الحذف النهائي مؤهّل بس** (المعلّق/الفاشل/غير المقروء/مرجع التسوية
-  محمي ⇒ 409)، والأرشفة **قابلة للعكس** وتخفي من الشارة والصندوق النشط. لسه مفيش
-  إشعارات "مقروءة جزئيًا" ولا أرشفة جماعية — لو مطلوب نضيفه لاحقًا. **مفيش cleanup
-  worker**: التقليم جوه نفس معاملة الإدراج.
+- صندوق الإشعارات: **الحذف النهائي مؤهّل بس** — الأنواع المؤهّلة
+  (`terminal`/`timeout`/`missing`/`stale_report`) لازم تكون مُسلَّمة + مقروءة + مفيش دليل
+  تسوية/عملية مرتبط (`notifier_pending.event_id`، أو علامة `notifier_pending` للمحادثة،
+  أو برومت `outbox` غير منتهٍ لنفس المحادثة)؛ أي نوع **غير معروف** أو `proactive` محمي
+  (fail-closed) ⇒ 409. الأرشفة **قابلة للعكس**، بتخفي من الشارة والصندوق النشط، وبتُعفي
+  الصفوف من التقليم. لسه مفيش إشعارات "مقروءة جزئيًا" ولا أرشفة جماعية — لو مطلوب نضيفه
+  لاحقًا. **مفيش cleanup worker**: التقليم جوه نفس معاملة الإدراج.
 - تفعيل `MINI_APP_ENABLED` في الإنتاج + تحديث `/app` يشاور على الواجهة الفعلية.
 - معالجة الرابط الثابت (القسم 13).

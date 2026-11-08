@@ -13,6 +13,7 @@ from starlette.testclient import TestClient
 from bot.config import Config
 from bot.db import (
     Database,
+    INBOX_DELIVERY_DELIVERED,
     INBOX_DELIVERY_PENDING,
 )
 from bot.web import build_web_app
@@ -374,10 +375,12 @@ def test_delete_db_failure_is_not_false_success(tmp_path):
 
 
 def test_delete_does_not_touch_operation_records(tmp_path):
-    """حذف إشعار نهائيًا مايمسّش صفوف العملية/التسوية/المتابعة."""
+    """حذف إشعار نهائيًا مايمسّش صفوف العملية/التسوية/المتابعة (لمحادثات تانية)."""
     db = Database(str(tmp_path / "t.sqlite3"))
-    ident = seed(db, message="x", read=True)
-    outbox_id = db.add_or_group_outbox("c1", 42, "hello", "t0", client_ref="ref-1")
+    ident = seed(db, message="x", read=True)  # c1
+    # صفوف عمليات لمحادثات **تانية** (c1 نفسها لو عليها عملية جارية بتبقى محمية، وده
+    # متغطّي في test_open_outbox_on_same_conversation_protects).
+    outbox_id = db.add_or_group_outbox("c9", 42, "hello", "t0", client_ref="ref-1")
     db.set_notifier_pending("c2", "finished", "t0", event_id=999, transition_seq=1)
 
     c, db = authed(tmp_path, db)
@@ -430,3 +433,201 @@ def test_dto_deletable_matches_delete_path(tmp_path):
     assert c.delete(f"/api/v1/notifications/{pending}", headers={"origin": ORIGIN}).status_code == 409
     assert c.delete(f"/api/v1/notifications/{ready}", headers={"origin": ORIGIN}).status_code == 200
 
+
+
+# ================================ 4. حدّ الأمان الصارم للحذف (fail-closed)
+def test_unknown_kind_cannot_be_deleted(tmp_path):
+    """نوع إشعار غير معروف ⇒ محمي (fail-closed): ما نضيّعش دليلًا ما عرفناش دلالته."""
+    db = Database(str(tmp_path / "t.sqlite3"))
+    ident = seed(db, kind="future_kind", message="x", read=True)
+    c, db = authed(tmp_path, db)
+
+    assert db.inbox_item_delete_eligibility(ident) == "protected"
+    assert c.get("/api/v1/notifications").json()["items"][0]["deletable"] is False
+    r = c.delete(f"/api/v1/notifications/{ident}", headers={"origin": ORIGIN})
+    assert r.status_code == 409
+    assert db.get_inbox_item(ident) is not None
+
+
+def test_proactive_kind_is_protected_even_when_read(tmp_path):
+    """`proactive` (إشعار حالة حيّة) محمي دائمًا، حتى لو مُسلَّم+مقروء."""
+    db = Database(str(tmp_path / "t.sqlite3"))
+    ident = db.add_inbox_item("c1", "t", "proactive", "m", "t0")
+    db.mark_inbox_read(ident, "t1")
+    c, db = authed(tmp_path, db)
+
+    assert db.get_inbox_item(ident).delivery_status == INBOX_DELIVERY_DELIVERED
+    assert c.delete(f"/api/v1/notifications/{ident}", headers={"origin": ORIGIN}).status_code == 409
+    assert db.get_inbox_item(ident) is not None
+
+
+def test_open_outbox_on_same_conversation_protects(tmp_path):
+    """محادثة عليها برومت **غير منتهٍ** ⇒ إشعارها مايتحذفش (دليل عملية معلّقة)."""
+    db = Database(str(tmp_path / "t.sqlite3"))
+    ident = seed(db, cid="c1", message="x", read=True)  # delivered+read+safe kind
+    outbox_id = db.add_or_group_outbox("c1", 42, "hello", "t0", client_ref="r1")
+    c, db = authed(tmp_path, db)
+
+    assert db.inbox_item_delete_eligibility(ident) == "protected"
+    assert c.delete(f"/api/v1/notifications/{ident}", headers={"origin": ORIGIN}).status_code == 409
+    assert db.get_inbox_item(ident) is not None
+    # الحارس **مش** بيمسّ صف العملية نفسه (مفيش حذف عرضي).
+    assert db.get_outbox(outbox_id) is not None
+
+
+def test_closed_outbox_allows_delete(tmp_path):
+    """برومت **منتهٍ** (sent) مابيمنعش الحذف (مفيش عملية جارية)."""
+    db = Database(str(tmp_path / "t.sqlite3"))
+    ident = seed(db, cid="c1", message="x", read=True)
+    outbox_id = db.add_or_group_outbox("c1", 42, "hello", "t0", client_ref="r1")
+    db.set_outbox_status(outbox_id, "sent", "t1")
+    c, db = authed(tmp_path, db)
+
+    assert c.delete(f"/api/v1/notifications/{ident}", headers={"origin": ORIGIN}).status_code == 200
+    assert db.get_inbox_item(ident) is None
+    assert db.get_outbox(outbox_id) is not None  # صف العملية محفوظ
+
+
+def test_notifier_pending_same_conversation_protects(tmp_path):
+    """علامة تسوية معلّقة لنفس المحادثة ⇒ إشعارها محمي (دليل تسوية حيّ)."""
+    db = Database(str(tmp_path / "t.sqlite3"))
+    ident = seed(db, cid="c1", message="x", read=True)
+    db.set_notifier_pending("c1", "finished", "t0", event_id=None, transition_seq=1)
+    c, db = authed(tmp_path, db)
+
+    assert db.inbox_item_delete_eligibility(ident) == "protected"
+    assert c.delete(f"/api/v1/notifications/{ident}", headers={"origin": ORIGIN}).status_code == 409
+    assert db.get_inbox_item(ident) is not None
+    assert db.get_notifier_pending("c1") == "finished"
+
+
+def test_delete_eligibility_allowlist_and_fail_closed(tmp_path):
+    """النوع الآمن مؤهّل؛ غير المعروف و`proactive` محميان (fail-closed)."""
+    from bot.db import INBOX_DELETABLE_KINDS, INBOX_KIND_PROACTIVE
+
+    assert INBOX_KIND_PROACTIVE not in INBOX_DELETABLE_KINDS  # إشعار حيّ محمي
+    db = Database(str(tmp_path / "t.sqlite3"))
+    for kind in INBOX_DELETABLE_KINDS:
+        ident = seed(db, kind=kind, message=f"k-{kind}", read=True)
+        assert db.inbox_item_delete_eligibility(ident) == "deleted"
+    for kind in ("proactive", "unknown_new", "", "auth_incident"):
+        ident = seed(db, kind=kind, message=f"k-{kind}", read=True)
+        assert db.inbox_item_delete_eligibility(ident) == "protected"
+
+
+# ============================== 5. ثبات الأرشيف عبر التقليم (الأرشفة تدوم)
+def test_archived_rows_survive_retention_prune(tmp_path):
+    """الأرشفة إجراء مقصود ⇒ التقليم التلقائي مايحذفش الصفوف المؤرشفة."""
+    from bot.db import INBOX_MAX_PER_CONVERSATION
+
+    db = Database(str(tmp_path / "t.sqlite3"))
+    archived = seed(db, cid="c1", message="archived-keep", read=True)
+    assert db.archive_inbox_item(archived, "t1") is True
+    # نتجاوز السقف لكل محادثة بمقروءة غير مؤرشفة ⇒ التقليم العادي يشتغل.
+    for i in range(INBOX_MAX_PER_CONVERSATION + 10):
+        seed(db, cid="c1", message=f"m{i}", read=True)
+
+    assert db.get_inbox_item(archived) is not None  # المؤرشف محفوظ
+    assert db.get_inbox_item(archived).archived is True
+    assert db.list_inbox(archived=True, limit=100)[0].id == archived
+
+
+def test_unarchived_rows_are_prunable_again(tmp_path):
+    """بعد الاسترجاع، الصف المقروء يرجع مؤهّلًا للتقليم العادي (مفيش احتفاظ أبدي عرضي)."""
+    from bot.db import INBOX_MAX_PER_CONVERSATION
+
+    db = Database(str(tmp_path / "t.sqlite3"))
+    ident = seed(db, cid="c1", message="old", read=True)
+    db.archive_inbox_item(ident, "t1")
+    db.unarchive_inbox_item(ident)
+    for i in range(INBOX_MAX_PER_CONVERSATION + 10):
+        seed(db, cid="c1", message=f"m{i}", read=True)
+
+    assert db.get_inbox_item(ident) is None  # اتقلّم بعد الاسترجاع (زي أي صف مقروء)
+
+
+# ================================ 6. الأمان: الجلسات/المعدّل/الترويسات
+def test_mutation_endpoints_reject_invalid_session(tmp_path):
+    """جلسة مزيّفة/غير موجودة ⇒ رفض 401 لكل مسارات الإدارة."""
+    db = Database(str(tmp_path / "t.sqlite3"))
+    ident = seed(db, message="x", read=True)
+    c, db = build(tmp_path, db)
+    c.cookies.set("ohb_session", "not-a-real-token")
+    assert c.post(f"/api/v1/notifications/{ident}/archive", json={}, headers={"origin": ORIGIN}).status_code == 401
+    assert c.post(f"/api/v1/notifications/{ident}/unarchive", json={}, headers={"origin": ORIGIN}).status_code == 401
+    assert c.delete(f"/api/v1/notifications/{ident}", headers={"origin": ORIGIN}).status_code == 401
+    assert c.get("/api/v1/notifications").status_code == 401
+    assert db.get_inbox_item(ident).archived is False
+
+
+def test_mutation_endpoints_reject_expired_session(tmp_path):
+    """جلسة منتهية ⇒ رفض (fail closed) قبل أي عملية."""
+    db = Database(str(tmp_path / "t.sqlite3"))
+    ident = seed(db, message="x", read=True)
+    c, db = authed(tmp_path, db)
+    # نُنهي كل الجلسات المخزّنة (بمحاكاة انتهاء الختم على القاعدة).
+    db._conn.execute("UPDATE web_sessions SET expires_at=1")
+    db._conn.commit()
+    assert c.get("/api/v1/notifications").status_code == 401
+    assert c.delete(f"/api/v1/notifications/{ident}", headers={"origin": ORIGIN}).status_code == 401
+    assert db.get_inbox_item(ident) is not None
+
+
+def test_mutation_endpoints_rate_limited(tmp_path):
+    """حدّ المعدّل يفضل ساريًا على مسارات الإدارة (429 بعد تجاوز الحد)."""
+    db = Database(str(tmp_path / "t.sqlite3"))
+    ident = seed(db, message="x", read=True)
+    c, db = authed(tmp_path, db, mini_app_api_rate_per_minute=3)
+    codes = [
+        c.post(f"/api/v1/notifications/{ident}/archive", json={}, headers={"origin": ORIGIN}).status_code
+        for _ in range(6)
+    ]
+    assert 429 in codes, codes
+    assert codes.count(429) >= 1
+
+
+def test_delete_and_archive_reject_cross_origin(tmp_path):
+    """Origin غير مسموح ⇒ 403 لكل عمليات الإدارة، ومفيش تغيير."""
+    db = Database(str(tmp_path / "t.sqlite3"))
+    ident = seed(db, message="x", read=True)
+    c, db = authed(tmp_path, db)
+    bad = {"origin": "https://evil.test"}
+    assert c.post(f"/api/v1/notifications/{ident}/archive", json={}, headers=bad).status_code == 403
+    assert c.post(f"/api/v1/notifications/{ident}/unarchive", json={}, headers=bad).status_code == 403
+    assert c.delete(f"/api/v1/notifications/{ident}", headers=bad).status_code == 403
+    assert db.get_inbox_item(ident).archived is False
+    assert db.get_inbox_item(ident) is not None
+
+
+def test_archive_unarchive_repeat_is_safe_and_stable(tmp_path):
+    """تكرار الأرشفة/الاسترجاع آمن وثابت (idempotent) بلا ازدواج صفوف."""
+    db = Database(str(tmp_path / "t.sqlite3"))
+    ident = seed(db, message="x", read=True)
+    c, db = authed(tmp_path, db)
+    for _ in range(3):
+        assert c.post(f"/api/v1/notifications/{ident}/archive", json={}, headers={"origin": ORIGIN}).status_code == 200
+        assert c.post(f"/api/v1/notifications/{ident}/unarchive", json={}, headers={"origin": ORIGIN}).status_code == 200
+    assert db.get_inbox_item(ident) is not None
+    assert db.get_inbox_item(ident).archived is False
+    assert db.count_inbox() == 1
+
+
+def test_delete_repeat_after_success_is_missing_not_false_success(tmp_path):
+    """تكرار الحذف بعد النجاح ⇒ 404 (مفيش نجاح كاذب ثانٍ)."""
+    db = Database(str(tmp_path / "t.sqlite3"))
+    ident = seed(db, message="x", read=True)
+    c, db = authed(tmp_path, db)
+    assert c.delete(f"/api/v1/notifications/{ident}", headers={"origin": ORIGIN}).status_code == 200
+    assert c.delete(f"/api/v1/notifications/{ident}", headers={"origin": ORIGIN}).status_code == 404
+
+
+def test_delete_eligibility_rechecked_inside_transaction(tmp_path):
+    """لو الصف بقى محميًا بين العرض والحذف، الحذف داخل المعاملة يرفضه (مفيش TOCTOU)."""
+    db = Database(str(tmp_path / "t.sqlite3"))
+    ident = seed(db, message="x", read=True)
+    c, db = authed(tmp_path, db)
+    assert c.get("/api/v1/notifications").json()["items"][0]["deletable"] is True
+    # بين العرض والحذف: محادثة الصف بقى عليها برومت غير منتهٍ ⇒ الحذف يرفض.
+    db.add_or_group_outbox("c1", 42, "late", "t1", client_ref="late-1")
+    assert c.delete(f"/api/v1/notifications/{ident}", headers={"origin": ORIGIN}).status_code == 409
+    assert db.get_inbox_item(ident) is not None

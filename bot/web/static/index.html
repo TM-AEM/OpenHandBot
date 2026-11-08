@@ -37,6 +37,7 @@
           <button class="tab" type="button" data-view="watches" role="tab">المتابعات</button>
           <button class="tab" type="button" data-view="inbox" role="tab">الإشعارات <span class="badge" id="inbox-badge" hidden></span></button>
           <button class="tab" type="button" data-view="new" role="tab">شات جديد</button>
+          <button class="tab" type="button" data-view="jobs" role="tab">طلبات البدء</button>
           <button class="tab" type="button" data-view="settings" role="tab">الإعدادات</button>
         </nav>
 
@@ -92,6 +93,17 @@
           </div>
         </div>
 
+        <div class="view" id="view-jobs" hidden>
+          <div class="toolbar">
+            <button class="btn ghost" type="button" id="jobs-refresh">تحديث</button>
+          </div>
+          <p class="hint">طلبات بدء الشاتات. الإلغاء متاح بس لو السيرفر أكّد إن الإرسال لسه مابدأش؛ ولو النتيجة غامضة ممكن تأكّد إنها بدأت — من غير أي إعادة إرسال تلقائية.</p>
+          <ul class="list" id="jobs-list"></ul>
+          <div class="more" id="jobs-more" hidden>
+            <button class="btn ghost" type="button" id="jobs-next">المزيد</button>
+          </div>
+        </div>
+
         <div class="view" id="view-settings" hidden>
           <div class="card row">
             <span class="card-label">الإشعارات الاستباقية</span>
@@ -104,7 +116,8 @@
       <div class="toast" id="toast" hidden role="status" aria-live="polite"></div>
     </main>
 
-    <script src="/mini/ops.js?v=6" defer></script>
+    <script src="/mini/jobs.js?v=7" defer></script>
+    <script src="/mini/ops.js?v=7" defer></script>
     <script src="/mini/inbox.js?v=6" defer></script>
     <script src="/mini/files.js?v=6" defer></script>
     <script src="/mini/cost.js?v=6" defer></script>

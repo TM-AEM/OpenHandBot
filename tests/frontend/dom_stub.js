@@ -165,11 +165,12 @@ class Document {
 const IDS = [
   "app", "user-name",
   "state-loading", "state-error", "error-msg", "retry-btn", "state-ready",
-  "view-chats", "view-detail", "view-watches", "view-inbox", "view-new", "view-settings",
+  "view-chats", "view-detail", "view-watches", "view-inbox", "view-jobs", "view-new", "view-settings",
   "chats-list", "chats-more", "chats-next", "chats-refresh",
   "watches-list", "watches-refresh",
   "inbox-list", "inbox-more", "inbox-next", "inbox-refresh", "inbox-read-all", "inbox-badge",
   "inbox-filter-all", "inbox-filter-unread", "inbox-filter-archived",
+  "jobs-list", "jobs-more", "jobs-next", "jobs-refresh",
   "repo-search", "repo-search-btn", "repo-list",
   "newchat-form", "newchat-repo", "newchat-text", "newchat-send", "newchat-op", "newchat-norepo",
   "notif-toggle", "toast",
@@ -179,6 +180,7 @@ const TABS = [
   { view: "watches", label: "المتابعات" },
   { view: "inbox", label: "الإشعارات" },
   { view: "new", label: "شات جديد" },
+  { view: "jobs", label: "طلبات البدء" },
   { view: "settings", label: "الإعدادات" },
 ];
 
@@ -205,7 +207,7 @@ function buildDocument() {
   doc.getElementById("state-ready").hidden = true;
   doc.getElementById("inbox-badge").hidden = true;
   doc.getElementById("toast").hidden = true;
-  ["view-chats", "view-detail", "view-watches", "view-inbox", "view-new", "view-settings"]
+  ["view-chats", "view-detail", "view-watches", "view-inbox", "view-jobs", "view-new", "view-settings"]
     .forEach((id) => { doc.getElementById(id).hidden = true; });
   return doc;
 }
@@ -326,7 +328,7 @@ function loadApp(opts) {
 
   const root = path.resolve(__dirname, "../../bot/web/static");
   const ctx = vm.createContext(sandbox);
-  for (const file of ["ops.js", "inbox.js", "files.js", "cost.js", "copy.js", "export.js", "app.js"]) {
+  for (const file of ["jobs.js", "ops.js", "inbox.js", "files.js", "cost.js", "copy.js", "export.js", "app.js"]) {
     const code = fs.readFileSync(path.join(root, file), "utf8");
     vm.runInContext(code, ctx, { filename: file });
   }

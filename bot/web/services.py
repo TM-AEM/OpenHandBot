@@ -81,6 +81,29 @@ _TERMINAL_OUTBOX = {db_module.OUTBOX_SENT, db_module.OUTBOX_FAILED, db_module.OU
 # الحالية بعلامة "الإلغاء غير مؤكد" (حدّ الإلغاء C2). ده يمنع ادّعاء إلغاء وهمي.
 _DISCARDABLE_OUTBOX = {db_module.OUTBOX_PENDING, db_module.OUTBOX_CLAIMED}
 _NOT_CONFIRMED_OUTBOX = {db_module.OUTBOX_SENDING, db_module.OUTBOX_UNKNOWN}
+# OHB2-PHASE1D: نفس مجموعات الحدّ لطلب الشات الجديد (creation job) — parity مع البوت.
+# الحالات النهائية: done/failed/discarded. الإلغاء (cancel/discard) مسموح **بس** في
+# `pending`/`claimed` (اللي الكود بيثبت إن الـ POST لسه مابدأش). `starting`/`unknown`
+# = الـ POST ممكن يكون بدأ ⇒ مفيش ادّعاء إلغاء (not_confirmed). `done` ⇒ فيه محادثة
+# بعيدة، مستحيل نلغيه أو نعمل POST تاني (at-most-once محفوظ).
+_TERMINAL_CREATION = {db_module.CREATION_DONE, db_module.CREATION_FAILED, db_module.CREATION_DISCARDED}
+_DISCARDABLE_CREATION = {db_module.CREATION_PENDING, db_module.CREATION_CLAIMED}
+_NOT_CONFIRMED_CREATION = {db_module.CREATION_STARTING, db_module.CREATION_UNKNOWN}
+# OHB2-PHASE1D: وصف آمن لحدّ POST البدء (للعرض فقط؛ القرار النهائي في `reconcile_creation`).
+#   not_started : الكود بيثبت إن POST البدء لسه مابدأش (pending/claimed).
+#   uncertain   : POST البدء ممكن يكون بدأ ونتيجته غامضة (starting/unknown).
+#   started     : POST البدء اتأكد ونجح (done) — فيه محادثة بعيدة.
+#   failed      : رفض نهائي مؤكد (failed).
+#   cancelled   : اتلغى قبل الإرسال (discarded).
+_CREATION_POST_STATE = {
+    db_module.CREATION_PENDING: "not_started",
+    db_module.CREATION_CLAIMED: "not_started",
+    db_module.CREATION_STARTING: "uncertain",
+    db_module.CREATION_UNKNOWN: "uncertain",
+    db_module.CREATION_DONE: "started",
+    db_module.CREATION_FAILED: "failed",
+    db_module.CREATION_DISCARDED: "cancelled",
+}
 
 
 class ValidationError(ValueError):
@@ -794,22 +817,47 @@ class MiniAppService:
 
     # --------------------------------------------------- operation status
     def outbox_operation(self, outbox_id: int) -> dict:
-        """حالة عملية برومت (DTO آمن: مفيش نص البرومت ولا تفاصيل داخلية خام)."""
+        """حالة عملية برومت (DTO آمن: مفيش نص البرومت ولا تفاصيل داخلية خام).
+
+        OHB2-PHASE1D: البحث **مقيّد بالمالك** (نفس `owner_id`) — أي id لمستخدم تاني ⇒ 404
+        (مفيش تسريب وجود صف ولا محتوى غيره).
+        """
         if self._db is None:
             raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
-        item = self._db.get_outbox(outbox_id)
+        item = self._db.get_outbox(outbox_id, self._config.owner_id)
         if item is None:
             raise ApiError("العملية مش موجودة.", 404)
         return self._outbox_dto(item)
 
     def creation_operation(self, job_id: int) -> dict:
-        """حالة عملية إنشاء شات (DTO آمن)."""
+        """حالة عملية إنشاء شات (DTO آمن).
+
+        OHB2-PHASE1D: البحث **مقيّد بالمالك** — أي job لمستخدم تاني ⇒ 404.
+        """
         if self._db is None:
             raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
-        job = self._db.get_creation_job(job_id)
+        job = self._db.get_creation_job(job_id, self._config.owner_id)
         if job is None:
             raise ApiError("العملية مش موجودة.", 404)
         return self._creation_dto(job)
+
+    def list_creation_jobs(self, page: int = 0) -> dict:
+        """قايمة طلبات الشات الجديد **المملوكة للمالك** (قراءة فقط) + الترقيم.
+
+        OHB2-PHASE1D: نطاق المالك مفروض في الاستعلام؛ الترقيم offset ثابت؛ أي محاولة
+        تمرير معرّف مستخدم من الواجهة مُتجاهَلة (المصدر الوحيد هو `config.owner_id`).
+        """
+        if self._db is None:
+            raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
+        page = max(0, int(page))
+        jobs, has_more = self._db.list_creation_jobs_for_owner(
+            self._config.owner_id, page=page, page_size=PAGE_SIZE
+        )
+        return {
+            "page": page,
+            "has_more": has_more,
+            "items": [self._creation_dto(j) for j in jobs],
+        }
 
     def reconcile_outbox(self, outbox_id: int, action: str) -> dict:
         """OHB2-09-05: تسوية يدوية لعملية برومت معلّقة (parity مع أوامر البوت).
@@ -825,7 +873,7 @@ class MiniAppService:
             raise ValidationError("إجراء غير معروف")
         if self._db is None:
             raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
-        item = self._db.get_outbox(outbox_id)
+        item = self._db.get_outbox(outbox_id, self._config.owner_id)
         if item is None:
             raise ApiError("العملية مش موجودة.", 404)
         status = item.status
@@ -850,14 +898,14 @@ class MiniAppService:
             )
             if not changed:
                 # حد تاني حسم السجل بين القراءة والـ CAS ⇒ نرجّع الحالة الحقيقية.
-                current = self._db.get_outbox(outbox_id)
+                current = self._db.get_outbox(outbox_id, self._config.owner_id)
                 if current is not None and current.status in _NOT_CONFIRMED_OUTBOX:
                     dto = self._outbox_dto(current)
                     dto["cancellation"] = "not_confirmed"
                     return dto
                 raise CodedApiError("already_terminal", "العملية خلاص في حالة نهائية.", 409)
             log.info("reconcile: outbox=%s discard", outbox_id)
-            result = self._outbox_dto(self._db.get_outbox(outbox_id))
+            result = self._outbox_dto(self._db.get_outbox(outbox_id, self._config.owner_id))
             result["cancellation"] = "discarded"
             return result
         else:  # mark_sent
@@ -874,12 +922,80 @@ class MiniAppService:
             )
             if not changed:
                 # حد تاني حسم السجل بين القراءة والكتابة ⇒ ما بنغيّرش حاجة.
-                current = self._db.get_outbox(outbox_id)
+                current = self._db.get_outbox(outbox_id, self._config.owner_id)
                 if current is not None and current.status == db_module.OUTBOX_SENT:
                     return self._outbox_dto(current)
                 raise CodedApiError("invalid_state", "الأمر ده للسجلات 'unknown' بس.", 409)
             log.info("reconcile: outbox=%s mark_sent", outbox_id)
-        return self._outbox_dto(self._db.get_outbox(outbox_id))
+        return self._outbox_dto(self._db.get_outbox(outbox_id, self._config.owner_id))
+
+    def reconcile_creation(self, job_id: int, action: str) -> dict:
+        """OHB2-PHASE1D: تسوية يدوية لطلب شات جديد معلّق (parity مع أوامر البوت).
+
+        - `cancel`   : نفس دلالات `discard_creation_job` — مسموح **بس** في `pending`/
+          `claimed` (اللي الكود بيثبت إن POST البدء لسه مابدأش). CAS ذرّي ⇒ `discarded`
+          (نهائي، مستحيل يرجع `pending` ⇒ مفيش إعادة POST). لو الـ POST ممكن يكون بدأ
+          (`starting`/`unknown`) ⇒ مفيش ادّعاء إلغاء: نرجّع الحالة الحالية + علامة
+          `cancellation="not_confirmed"` والقاعدة ماتتغيّرش. حالة نهائية ⇒ 409.
+        - `mark_sent` (`done`): مسموح **بس** من `unknown` ⇒ `done` (تأكيد المالك، مش إثبات
+          من OpenHands). `done` أصلاً ⇒ no-op (idempotent). أي حالة تانية ⇒ 409.
+
+        التسوية **مابتعملش** أي POST شبكة، والتحويلات نهائية (at-most-once محفوظ).
+        البحث مقيّد بالمالك.
+        """
+        if action not in ("cancel", "mark_sent"):
+            raise ValidationError("إجراء غير معروف")
+        if self._db is None:
+            raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
+        job = self._db.get_creation_job(job_id, self._config.owner_id)
+        if job is None:
+            raise ApiError("العملية مش موجودة.", 404)
+        status = job.status
+        if action == "cancel":
+            if status in _TERMINAL_CREATION:
+                raise CodedApiError("already_terminal", "العملية خلاص في حالة نهائية.", 409)
+            if status in _NOT_CONFIRMED_CREATION:
+                # الـ POST ممكن يكون بدأ ⇒ مفيش ادّعاء إلغاء. نرجّع الحالة الحالية + علامة.
+                log.info("reconcile: creation=%s cancel not confirmed (state=%s)", job_id, status)
+                dto = self._creation_dto(job)
+                dto["cancellation"] = "not_confirmed"
+                return dto
+            # CAS ذرّي: الشرط جوّه الـ UPDATE ⇒ لو الـ worker حجز/بدأ بين القراءة والكتابة
+            # الـ rowcount=0 (مفيش clobber). نفس دلالات أمر البوت `outbox_discard`.
+            outcome = self._db.discard_creation_job(
+                job_id, outbox.now_iso(), "اتلغى يدوياً", chat_id=self._config.owner_id
+            )
+            if outcome == "discarded":
+                log.info("reconcile: creation=%s cancel", job_id)
+                result = self._creation_dto(self._db.get_creation_job(job_id, self._config.owner_id))
+                result["cancellation"] = "discarded"
+                return result
+            current = self._db.get_creation_job(job_id, self._config.owner_id)
+            if current is not None and current.status in _NOT_CONFIRMED_CREATION:
+                dto = self._creation_dto(current)
+                dto["cancellation"] = "not_confirmed"
+                return dto
+            raise CodedApiError("already_terminal", "العملية خلاص في حالة نهائية.", 409)
+        # mark_sent ⇒ done
+        if status == db_module.CREATION_DONE:
+            return self._creation_dto(job)  # idempotent
+        if status != db_module.CREATION_UNKNOWN:
+            raise CodedApiError("invalid_state", "الأمر ده للطلبات 'ambiguous' بس.", 409)
+        changed = self._db.set_creation_status_if_in(
+            job_id,
+            db_module.CREATION_DONE,
+            outbox.now_iso(),
+            {db_module.CREATION_UNKNOWN},
+            "أكّده المالك",
+            chat_id=self._config.owner_id,
+        )
+        if not changed:
+            current = self._db.get_creation_job(job_id, self._config.owner_id)
+            if current is not None and current.status == db_module.CREATION_DONE:
+                return self._creation_dto(current)
+            raise CodedApiError("invalid_state", "الأمر ده للطلبات 'ambiguous' بس.", 409)
+        log.info("reconcile: creation=%s mark_sent", job_id)
+        return self._creation_dto(self._db.get_creation_job(job_id, self._config.owner_id))
 
     def find_outbox_operation(self, conversation_id: str, client_ref: str) -> dict | None:
         """يبحث عن عملية برومت بمعرّف العميل (للاستعلام بعد نتيجة غامضة) أو None."""
@@ -915,11 +1031,19 @@ class MiniAppService:
 
     @staticmethod
     def _creation_dto(job) -> dict:
+        status = job.status
+        terminal = status in _TERMINAL_CREATION
         return {
             "kind": "creation",
             "id": job.id,
             "repository": job.repo or "",
-            "state": _CREATION_STATES.get(job.status, "unknown"),
+            "state": _CREATION_STATES.get(status, "unknown"),
+            # OHB2-PHASE1D: حقول آمنة مشتقّة على السيرفر (مش من الواجهة) لوصف حدّ الإرسال
+            # والعمليات المتاحة. القرار النهائي يفضل جوّه `reconcile_creation` (إعادة فحص).
+            "post_state": _CREATION_POST_STATE.get(status, "uncertain"),
+            "terminal": terminal,
+            "cancellable": status in _DISCARDABLE_CREATION,
+            "resolvable": status == db_module.CREATION_UNKNOWN,
             "conversation_id": job.conversation_id or "",
             "created_at": job.created_at,
             "updated_at": job.updated_at,

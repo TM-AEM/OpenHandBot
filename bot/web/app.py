@@ -375,8 +375,18 @@ class MiniApp:
             Route(f"{API_PREFIX}/operations/outbox", self.outbox_operation, methods=["GET"]),
             Route(f"{API_PREFIX}/operations/creation", self.creation_operation, methods=["GET"]),
             Route(
+                f"{API_PREFIX}/operations/creation/list",
+                self.creation_operation_list,
+                methods=["GET"],
+            ),
+            Route(
                 f"{API_PREFIX}/operations/outbox/reconcile",
                 self.outbox_reconcile,
+                methods=["POST"],
+            ),
+            Route(
+                f"{API_PREFIX}/operations/creation/reconcile",
+                self.creation_reconcile,
                 methods=["POST"],
             ),
             Route(
@@ -804,6 +814,24 @@ class MiniApp:
             return self._api_error(exc)
         return _json(data)
 
+    async def creation_operation_list(self, request):
+        """OHB2-PHASE1D: قايمة طلبات الشات الجديد المملوكة للمالك (قراءة فقط) + الترقيم."""
+        session, err = await self._guarded(request, state_changing=False)
+        if err is not None:
+            return err
+        raw_page = (request.query_params.get("page") or "0").strip()
+        try:
+            page = int(raw_page)
+        except ValueError:
+            return _error(400, "bad_request", "رقم الصفحة غير صالح")
+        if page < 0:
+            return _error(400, "bad_request", "رقم الصفحة غير صالح")
+        try:
+            data = self._service.list_creation_jobs(page)
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json(data)
+
     async def outbox_reconcile(self, request):
         """OHB2-09-05: تسوية يدوية لعملية برومت (discard/mark_sent) — parity مع البوت."""
         session, err = await self._guarded(request, state_changing=True)
@@ -822,6 +850,30 @@ class MiniApp:
             return _error(400, "bad_request", "رقم العملية غير صالح")
         try:
             data = self._service.reconcile_outbox(outbox_id, (body.get("action") or "").strip())
+        except ValidationError as exc:
+            return _error(400, "bad_request", str(exc))
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json(data)
+
+    async def creation_reconcile(self, request):
+        """OHB2-PHASE1D: تسوية يدوية لطلب شات جديد (cancel/mark_sent) — parity مع البوت."""
+        session, err = await self._guarded(request, state_changing=True)
+        if err is not None:
+            return err
+        try:
+            body = await self._read_body(request)
+        except _BodyTooLarge:
+            return _error(413, "payload_too_large", "الطلب كبير أوي.")
+        except _BadJson:
+            return _error(400, "bad_request", "صيغة الطلب غير صحيحة.")
+        raw_id = body.get("id")
+        try:
+            job_id = int(raw_id)
+        except (TypeError, ValueError):
+            return _error(400, "bad_request", "رقم العملية غير صالح")
+        try:
+            data = self._service.reconcile_creation(job_id, (body.get("action") or "").strip())
         except ValidationError as exc:
             return _error(400, "bad_request", str(exc))
         except ApiError as exc:

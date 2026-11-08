@@ -130,9 +130,9 @@ class FakeDb:
         self.outbox.append(item)
         return item["id"]
 
-    def get_outbox(self, outbox_id):
+    def get_outbox(self, outbox_id, chat_id=None):
         for item in self.outbox:
-            if item["id"] == outbox_id:
+            if item["id"] == outbox_id and (chat_id is None or item["chat_id"] == chat_id):
                 return _Row(
                     id=item["id"], conversation_id=item["cid"], status=item["status"],
                     created_at="t", updated_at="t",
@@ -165,9 +165,9 @@ class FakeDb:
         self.creation.append(job)
         return job["id"]
 
-    def get_creation_job(self, job_id):
+    def get_creation_job(self, job_id, chat_id=None):
         for job in self.creation:
-            if job["id"] == job_id:
+            if job["id"] == job_id and (chat_id is None or job["chat_id"] == chat_id):
                 return _Row(
                     id=job["id"], repo=job["repo"], status=job["status"],
                     conversation_id=job["conversation_id"], created_at="t", updated_at="t",

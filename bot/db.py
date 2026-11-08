@@ -80,6 +80,22 @@ INBOX_KIND_MISSING = "missing"         # شات متابَع اختفى من Ope
 INBOX_KIND_STALE_REPORT = "stale_report"  # مفيش تقرير جديد بعد البرومبت
 INBOX_KIND_PROACTIVE = "proactive"     # إشعار استباقي عام (المُبلّغ)
 
+# OHB2-PHASE1C: مجموعة الحذف النهائي **الآمنة** (allowlist صريحة). دول بس أنواع **تقارير
+# حالة/نتيجة** مش مرتبطة بعملية قابلة للتنفيذ: مفيش outbox/creation job مرتبط بيهم،
+# فحذفهم بعد التسليم + القراءة ما بيفقدش دليلًا تشغيليًا.
+#   - `proactive` **مستثنى** لأنه إشعار حالة حيّة لمحادثة (مرتبط بعلامة تسوية `notifier_pending`
+#     ومفتاح حدث؛ حذفه يهدّد دليل الاسترجاع).
+#   - أي نوع **غير معروف** (مش هنا) محمي تلقائيًا — سياسة fail-closed: أي نوع جديد/غريب
+#     مايتحذفش نهائيًا لحد ما يتقيّم ويتضاف صراحةً.
+INBOX_DELETABLE_KINDS = frozenset(
+    {
+        INBOX_KIND_TERMINAL,
+        INBOX_KIND_TIMEOUT,
+        INBOX_KIND_MISSING,
+        INBOX_KIND_STALE_REPORT,
+    }
+)
+
 # أقصى طول لنص الإشعار المحفوظ. ردود الـ agent ممكن تكون ضخمة؛ بنقصّها عشان القاعدة ما
 # تتضخّمش. الرسالة الكاملة بتفضل في تيليجرام؛ الصندوق ملخّص قابل للعرض.
 INBOX_MAX_MESSAGE_CHARS = 1000
@@ -1829,8 +1845,18 @@ class Database:
         ).fetchone()
         return int(row["id"]) if row else None
 
-    def get_outbox(self, outbox_id: int) -> OutboxItem | None:
-        row = self._conn.execute("SELECT * FROM outbox WHERE id=?", (outbox_id,)).fetchone()
+    def get_outbox(self, outbox_id: int, chat_id: int | None = None) -> OutboxItem | None:
+        """يجيب سجل صندوق بالمعرّف.
+
+        OHB2-PHASE1D: `chat_id` اختياري لفرض **ملكية** الصف (نطاق المالك). الـ Mini App
+        بيمرّره دايمًا؛ المسارات الداخلية (البوت/الـ workers) بتستدعيها من غير نطاق.
+        """
+        if chat_id is None:
+            row = self._conn.execute("SELECT * FROM outbox WHERE id=?", (outbox_id,)).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT * FROM outbox WHERE id=? AND chat_id=?", (outbox_id, int(chat_id))
+            ).fetchone()
         return self._row_to_outbox(row) if row else None
 
     def list_outbox_by_status(self, status: str) -> list[OutboxItem]:
@@ -1906,9 +1932,40 @@ class Database:
         ).fetchone()
         return self._row_to_creation(row) if row else None
 
-    def get_creation_job(self, job_id: int) -> CreationJob | None:
-        row = self._conn.execute("SELECT * FROM creation_jobs WHERE id=?", (job_id,)).fetchone()
+    def get_creation_job(self, job_id: int, chat_id: int | None = None) -> CreationJob | None:
+        """يجيب طلب شات جديد بالمعرّف.
+
+        OHB2-PHASE1D: `chat_id` اختياري لفرض **ملكية** الصف (نطاق المالك). الـ Mini App
+        بيمرّره دايمًا؛ المسارات الداخلية بتستدعيها من غير نطاق.
+        """
+        if chat_id is None:
+            row = self._conn.execute(
+                "SELECT * FROM creation_jobs WHERE id=?", (job_id,)
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT * FROM creation_jobs WHERE id=? AND chat_id=?", (job_id, int(chat_id))
+            ).fetchone()
         return self._row_to_creation(row) if row else None
+
+    def list_creation_jobs_for_owner(
+        self, chat_id: int, page: int = 0, page_size: int = 10
+    ) -> tuple[list[CreationJob], bool]:
+        """قايمة طلبات الشات الجديد **المملوكة** لـ `chat_id` (الأحدث أولاً) + has_more.
+
+        OHB2-PHASE1D: نطاق المالك مفروض في الاستعلام نفسه، والترتيب ثابت
+        (created_at DESC, id DESC) والترقيم بـ offset — نفس دلالات قايمة الشاتات.
+        """
+        size = max(1, int(page_size))
+        offset = max(0, int(page)) * size
+        rows = self._conn.execute(
+            "SELECT * FROM creation_jobs WHERE chat_id=? "
+            "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+            (int(chat_id), size + 1, offset),
+        ).fetchall()
+        has_more = len(rows) > size
+        jobs = [self._row_to_creation(r) for r in rows[:size]]
+        return jobs, has_more
 
     def list_creation_jobs_by_status(self, status: str) -> list[CreationJob]:
         rows = self._conn.execute(
@@ -1973,21 +2030,32 @@ class Database:
         now: str,
         allowed_statuses,
         error: str | None = None,
+        chat_id: int | None = None,
     ) -> bool:
         """تحويل حالة طلب شات **ذرّي مشروط** (CAS) — نظير `set_outbox_status_if_in`.
 
         القرار والكتابة في جملة SQL واحدة؛ لو سبقنا كاتب تاني، الـ rowcount=0 ومفيش
         تغيير. بترجّع True لو الحالة اتغيّرت فعلاً.
+
+        OHB2-PHASE1D: `chat_id` اختياري لفرض **ملكية** الصف في الـ UPDATE (دفاع في العمق).
+        المسارات الداخلية (البوت/الـ workers) بتستدعيها من غير نطاق؛ الـ Mini App بيمرّره.
         """
         allowed = tuple(allowed_statuses)
         if not allowed:
             return False
         placeholders = ", ".join("?" for _ in allowed)
-        cur = self._conn.execute(
-            f"UPDATE creation_jobs SET status=?, error=?, updated_at=? "
-            f"WHERE id=? AND status IN ({placeholders})",
-            (new_status, error, now, job_id, *allowed),
-        )
+        if chat_id is None:
+            cur = self._conn.execute(
+                f"UPDATE creation_jobs SET status=?, error=?, updated_at=? "
+                f"WHERE id=? AND status IN ({placeholders})",
+                (new_status, error, now, job_id, *allowed),
+            )
+        else:
+            cur = self._conn.execute(
+                f"UPDATE creation_jobs SET status=?, error=?, updated_at=? "
+                f"WHERE id=? AND chat_id=? AND status IN ({placeholders})",
+                (new_status, error, now, job_id, int(chat_id), *allowed),
+            )
         changed = cur.rowcount == 1
         self._conn.commit()
         return changed
@@ -2083,19 +2151,47 @@ class Database:
             return "not_confirmed"
         return "terminal"
 
-    def discard_creation_job(self, job_id: int, now: str, reason: str | None = None) -> str:
-        """شطب ذرّي لطلب شات مع تمييز حدّ الإلغاء — نفس دلالات `discard_outbox`."""
-        cur = self._conn.execute(
-            "UPDATE creation_jobs SET status=?, error=?, updated_at=? "
-            "WHERE id=? AND status IN (?, ?)",
-            (CREATION_DISCARDED, reason, now, job_id, CREATION_PENDING, CREATION_CLAIMED),
-        )
+    def discard_creation_job(
+        self, job_id: int, now: str, reason: str | None = None, chat_id: int | None = None
+    ) -> str:
+        """شطب ذرّي لطلب شات مع تمييز حدّ الإلغاء — نفس دلالات `discard_outbox`.
+
+        OHB2-PHASE1D: `chat_id` اختياري لفرض **ملكية** الصف في الـ UPDATE والقراءة
+        اللاحقة (دفاع في العمق). المسارات الداخلية (البوت/الـ workers) بتستدعيها من غير
+        نطاق؛ الـ Mini App بيمرّره دايمًا بعد فحص الملكية في الخدمة.
+        """
+        if chat_id is None:
+            cur = self._conn.execute(
+                "UPDATE creation_jobs SET status=?, error=?, updated_at=? "
+                "WHERE id=? AND status IN (?, ?)",
+                (CREATION_DISCARDED, reason, now, job_id, CREATION_PENDING, CREATION_CLAIMED),
+            )
+        else:
+            cur = self._conn.execute(
+                "UPDATE creation_jobs SET status=?, error=?, updated_at=? "
+                "WHERE id=? AND chat_id=? AND status IN (?, ?)",
+                (
+                    CREATION_DISCARDED,
+                    reason,
+                    now,
+                    job_id,
+                    int(chat_id),
+                    CREATION_PENDING,
+                    CREATION_CLAIMED,
+                ),
+            )
         if cur.rowcount == 1:
             self._conn.commit()
             return "discarded"
-        row = self._conn.execute(
-            "SELECT status FROM creation_jobs WHERE id=?", (job_id,)
-        ).fetchone()
+        if chat_id is None:
+            row = self._conn.execute(
+                "SELECT status FROM creation_jobs WHERE id=?", (job_id,)
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT status FROM creation_jobs WHERE id=? AND chat_id=?",
+                (job_id, int(chat_id)),
+            ).fetchone()
         self._conn.commit()
         if row is None:
             return "terminal"
@@ -3028,27 +3124,34 @@ class Database:
         السياسة (OHB2-08-05 Batch 3R-FIX):
         - الصفوف **المعلّقة** (`pending`) و**غير المقروءة** (`read_at IS NULL`)
           **مايتقلّمش أبدًا** — إشعار مستني تسليم أو لسه ماتشافش مايتحذفش صامت.
-        - الصفوف **المقروءة** بس هي المؤهّلة للتقليم، الأقدم أولًا (تحديد ثابت: `id ASC`).
+        - الصفوف **المؤرشفة** (`archived_at IS NOT NULL`) **مايتقلّمش أبدًا** (OHB2-PHASE1C):
+          الأرشفة إجراء **مقصود من المستخدم** للاحتفاظ بالإشعار؛ التقليم التلقائي مايلغيهاش.
+        - الصفوف **المقروءة وغير المؤرشفة** بس هي المؤهّلة للتقليم، الأقدم أولًا (تحديد
+          ثابت: `id ASC`).
         - السقف لكل محادثة (`INBOX_MAX_PER_CONVERSATION`) والسقف العام (`INBOX_MAX_TOTAL`)
           بيفضلوا **سقوفًا ناعمة**: لو الصفوف المحمية لوحدها تعدّي السقف، الجدول يتعدّاه
           (مفيش حذف لصف محمي عشان نرضي سقف). التقليم بيتخطّى الصفوف المحمية باستمرار.
         """
-        # 1) تقليم لكل محادثة (المقروءة بس).
+        # 1) تقليم لكل محادثة (المقروءة غير المؤرشفة بس).
         conn.execute(
             "DELETE FROM notification_inbox "
             "WHERE conversation_id=? AND delivery_status!='pending' AND read_at IS NOT NULL "
+            "AND archived_at IS NULL "
             "AND id NOT IN ("
             "SELECT id FROM notification_inbox "
             "WHERE conversation_id=? AND delivery_status!='pending' AND read_at IS NOT NULL "
+            "AND archived_at IS NULL "
             "ORDER BY id DESC LIMIT ?)",
             (conversation_id, conversation_id, INBOX_MAX_PER_CONVERSATION),
         )
-        # 2) تقليم عام (المقروءة بس).
+        # 2) تقليم عام (المقروءة غير المؤرشفة بس).
         conn.execute(
             "DELETE FROM notification_inbox "
-            "WHERE delivery_status!='pending' AND read_at IS NOT NULL AND id NOT IN ("
+            "WHERE delivery_status!='pending' AND read_at IS NOT NULL "
+            "AND archived_at IS NULL AND id NOT IN ("
             "SELECT id FROM notification_inbox "
             "WHERE delivery_status!='pending' AND read_at IS NOT NULL "
+            "AND archived_at IS NULL "
             "ORDER BY id DESC LIMIT ?)",
             (INBOX_MAX_TOTAL,),
         )
@@ -3200,31 +3303,68 @@ class Database:
         ).fetchone()
         return True if row is not None else False
 
+    def has_open_outbox(self, conversation_id: str) -> bool:
+        """هل فيه برومت **غير منتهٍ** (pending/claimed/sending) لنفس المحادثة؟
+
+        OHB2-PHASE1C: حارس الحذف النهائي — إشعار لمحادثة عليها عملية إرسال جارية أو
+        معلّقة مايتحذفش (حتى لو مُسلَّم+مقروء) عشان ما نفقدش دليل العملية المعلّقة.
+        """
+        row = self._conn.execute(
+            "SELECT 1 FROM outbox WHERE conversation_id=? "
+            "AND status IN (?, ?, ?) LIMIT 1",
+            (conversation_id, OUTBOX_PENDING, OUTBOX_CLAIMED, OUTBOX_SENDING),
+        ).fetchone()
+        return row is not None
+
+    def has_notifier_pending(self, conversation_id: str) -> bool:
+        """هل فيه علامة تسليم معلّقة (`notifier_pending`) لنفس المحادثة؟
+
+        OHB2-PHASE1C: حارس الحذف النهائي — علامة التسوية المعلّقة دليل تشغيلي حيّ
+        (بتُستخدم للاسترجاع/التسوية)، فإشعار نفس المحادثة مايتحذفش نهائيًا.
+        """
+        row = self._conn.execute(
+            "SELECT 1 FROM notifier_pending WHERE conversation_id=? LIMIT 1",
+            (conversation_id,),
+        ).fetchone()
+        return row is not None
+
     def inbox_item_delete_eligibility(self, item_id: int) -> str:
         """تصنيف أهلية الصف للحذف النهائي: deleted / protected / missing.
 
-        OHB2-PHASE1C — سياسة الحذف النهائي (مُفرَضة على السيرفر):
+        OHB2-PHASE1C — سياسة الحذف النهائي (مُفرَضة على السيرفر، **fail-closed**):
         - `missing`  : الصف مش موجود.
-        - `protected`: الصف محمي من الحذف النهائي. الحالات المحمية:
-            * `delivery_status='pending'` — حدث لسه بيتسلّم (دليل تسليم معلّق).
-            * `delivery_status='failed'`  — فشل تسليم (مايُفقدش صامت).
+        - `protected`: الصف محمي. الحالات المحمية:
+            * `kind` **غير معروف** (مش في `INBOX_DELETABLE_KINDS`) — أي نوع لسه
+              ماتقيّمش/غريب بيتعامَل محميًا (ما نفقدش دليلًا ما عرفناش دلالته).
+            * `delivery_status != 'delivered'` — لسه معلّق أو فشل (دليل تسليم).
             * غير مقروء (`read_at IS NULL`) — المستخدم لسه ما شافهوش.
             * مرجع في `notifier_pending.event_id` — دليل تسوية معلّق لازم للاسترجاع.
-        - `deleted`  : مؤهّل (مُسلَّم + مقروء + مش مرجع تسوية) — نفس المجموعة اللي
-          سياسة التقليم بتحذفها أصلًا، فما فيش تقليل لضمانات أمنية جديدة.
+            * المحادثة عليها علامة `notifier_pending` — دليل تسوية حيّ لنفس المحادثة.
+            * المحادثة عليها برومت **غير منتهٍ** في `outbox` — عملية جارية/معلّقة.
+        - `deleted`  : مؤهّل (نوع آمن + مُسلَّم + مقروء + مفيش دليل تسوية/عملية مرتبط).
+          ده **أضيق** من مجموعة التقليم، فما فيش تقليل لأي ضمان.
         """
         row = self._conn.execute(
-            "SELECT read_at, delivery_status FROM notification_inbox WHERE id=?",
+            "SELECT conversation_id, kind, read_at, delivery_status "
+            "FROM notification_inbox WHERE id=?",
             (int(item_id),),
         ).fetchone()
         if row is None:
             return INBOX_DELETE_MISSING
+        # سياسة fail-closed: نوع غير معروف (أو `proactive`) ⇒ محمي.
+        if row["kind"] not in INBOX_DELETABLE_KINDS:
+            return INBOX_DELETE_PROTECTED
         if row["delivery_status"] != INBOX_DELIVERY_DELIVERED or row["read_at"] is None:
             return INBOX_DELETE_PROTECTED
         ref = self._conn.execute(
             "SELECT 1 FROM notifier_pending WHERE event_id=? LIMIT 1", (int(item_id),)
         ).fetchone()
         if ref is not None:
+            return INBOX_DELETE_PROTECTED
+        conversation_id = row["conversation_id"]
+        if self.has_notifier_pending(conversation_id):
+            return INBOX_DELETE_PROTECTED
+        if self.has_open_outbox(conversation_id):
             return INBOX_DELETE_PROTECTED
         return INBOX_DELETE_DELETED
 

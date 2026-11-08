@@ -177,13 +177,15 @@ test("A1: زر الأرشفة يبعت /archive ويعيد التحميل", asyn
   doc.getElementById("tab-inbox").click();
   await flush();
   fetch.route("/notifications/5/archive", () => ({ status: 200, data: { ok: true, archived: true, unread_count: 0 } }));
+  const before = fetch.all((c) => c.path.startsWith("/notifications?")).length;
   const btn = findButtonByText(dataRows(inboxList(doc))[0], "أرشفة");
   assert.ok(btn, "لازم زر أرشفة");
   btn.click();
   await flush();
   const call = fetch.last((c) => c.path === "/notifications/5/archive");
   assert.ok(call && call.method === "POST");
-  assert.ok(fetch.last((c) => c.path.startsWith("/notifications?")) !== null, "أعاد التحميل");
+  const after = fetch.all((c) => c.path.startsWith("/notifications?")).length;
+  assert.ok(after > before, "أعاد تحميل القايمة بعد الأرشفة");
 });
 
 test("A2: العنصر المؤرشف بيعرض زر 'استرجاع'", async () => {
@@ -272,6 +274,7 @@ test("D4: تأكيد الحذف يبعت DELETE ويعيد التحميل", asyn
   doc.getElementById("tab-inbox").click();
   await flush();
   fetch.route("/notifications/5", () => ({ status: 200, data: { ok: true, deleted: true, unread_count: 0 } }));
+  const before = fetch.all((c) => c.path.startsWith("/notifications?")).length;
   const row = dataRows(inboxList(doc))[0];
   findButtonByText(row, "🗑 حذف").click();
   await flush();
@@ -279,7 +282,8 @@ test("D4: تأكيد الحذف يبعت DELETE ويعيد التحميل", asyn
   await flush();
   const call = fetch.last((c) => c.method === "DELETE");
   assert.ok(call && call.path === "/notifications/5", "DELETE صح");
-  assert.ok(fetch.last((c) => c.path.startsWith("/notifications?")) !== null, "أعاد التحميل");
+  const after = fetch.all((c) => c.path.startsWith("/notifications?")).length;
+  assert.ok(after > before, "أعاد تحميل القايمة بعد الحذف");
 });
 
 test("D5: رفض السيرفر (409) بيعرض رسالة ومفيش حذف وهمي", async () => {
@@ -326,4 +330,128 @@ test("D7: الصف بيحمل صنف archived + أزرار في حاوية row-a
   assert.ok(row.className.split(" ").includes("unread"), "صنف unread");
   const actions = descendants(row).find((n) => n.className && n.className.split(" ").includes("row-actions"));
   assert.ok(actions, "حاوية row-actions موجودة");
+});
+
+// ====================================== F8: سباق تغيير الفلتر مع طلب جاري
+test("F8: تغيير الفلتر أثناء طلب جاري يتجاهل الرد القديم ويعيد التحميل بالفلتر الجديد", async () => {
+  const env = await mkEnv({ deferred: true });
+  const { doc, fetch } = env;
+  // نكمّل الإقلاع (كل الطلبات مؤجّلة في هذا النمط).
+  for (let i = 0; i < 30; i++) {
+    const pend = fetch.pending();
+    if (!pend.length) { break; }
+    for (const c of pend) {
+      if (c.path === "/auth") { c.resolve({ status: 200, data: { ok: true } }); }
+      else if (c.path === "/app/bootstrap") { c.resolve(bootResponse()); }
+      else { c.resolve({ status: 200, data: { items: [], has_more: false } }); }
+    }
+    await flush();
+  }
+  doc.getElementById("tab-inbox").click();
+  await flush();
+  const first = fetch.last((c) => c.path.startsWith("/notifications?"));
+  assert.equal(first.path, "/notifications?page=0", "طلب الكل جاري");
+
+  // نغيّر الفلتر أثناء الطلب الجاري (الحارس القديم كان بيضيّع التغيير).
+  doc.getElementById("inbox-filter-unread").click();
+  await flush();
+
+  // الرد القديم (الكل) يوصل ⇒ لازم يتجاهله ويعيد التحميل بفلتر غير المقروء.
+  first.resolve(inboxPage([item({ id: 1, title: "ALLITEM", read: true })]));
+  await flush();
+  const second = fetch.last((c) => c.path.startsWith("/notifications?"));
+  assert.equal(second.path, "/notifications?page=0&unread=1", "طلب جديد بالفلتر الحالي");
+  second.resolve(inboxPage([item({ id: 2, title: "UNREADITEM", read: false })], { unread_count: 1 }));
+  await flush();
+
+  assert.ok(inboxList(doc).textContent.includes("UNREADITEM"), "بيانات الفلتر الجديد");
+  assert.ok(!inboxList(doc).textContent.includes("ALLITEM"), "الرد القديم ما ظهرش");
+});
+
+test("F9: تعدّد تغييرات الفلتر المتتابعة ينتهي ببيانات الفلتر الأخير", async () => {
+  const env = await mkEnv({ deferred: true });
+  const { doc, fetch } = env;
+  for (let i = 0; i < 30; i++) {
+    const pend = fetch.pending();
+    if (!pend.length) { break; }
+    for (const c of pend) {
+      if (c.path === "/auth") { c.resolve({ status: 200, data: { ok: true } }); }
+      else if (c.path === "/app/bootstrap") { c.resolve(bootResponse()); }
+      else { c.resolve({ status: 200, data: { items: [], has_more: false } }); }
+    }
+    await flush();
+  }
+  doc.getElementById("tab-inbox").click();
+  await flush();
+  doc.getElementById("inbox-filter-unread").click();   // طلب غير المقروء (جاري)
+  await flush();
+  doc.getElementById("inbox-filter-archived").click(); // الفلتر يتغيّر أثناء الطلب
+  await flush();
+  // نصفّي سلسلة الطلبات: كل رد قديم يعيد التحميل بالفلتر الحالي لحد ما تستقرّ.
+  for (let i = 0; i < 10; i++) {
+    const pend = fetch.pending().filter((c) => c.path.startsWith("/notifications?"));
+    if (!pend.length) { break; }
+    for (const c of pend) {
+      c.resolve(c.path.includes("archived=1")
+        ? inboxPage([item({ id: 3, title: "ARCH", archived: true })])
+        : inboxPage([]));
+    }
+    await flush();
+  }
+  const last = fetch.last((c) => c.path.startsWith("/notifications?"));
+  assert.equal(last.path, "/notifications?page=0&archived=1", "آخر طلب بالفلتر الأخير");
+  assert.ok(inboxList(doc).textContent.includes("ARCH"), "بيانات الفلتر الأخير معروضة");
+});
+
+test("D8: احتياطي canDelete يرفض النوع غير المعروف لما السيرفر ما يبعتش deletable", async () => {
+  const env = await mkEnv();
+  const inbox = env.sandbox.RecovoInbox;
+  assert.ok(inbox, "RecovoInbox متاح في الـ sandbox");
+  // نوع آمن + مقروء + مُسلَّم ⇒ مسموح.
+  assert.equal(inbox.canDelete({ kind: "terminal", read: true, delivery_status: "delivered" }), true);
+  // نوع غير معروف ⇒ مرفوض (fail-closed).
+  assert.equal(inbox.canDelete({ kind: "future_kind", read: true, delivery_status: "delivered" }), false);
+  // proactive (إشعار حيّ) ⇒ مرفوض.
+  assert.equal(inbox.canDelete({ kind: "proactive", read: true, delivery_status: "delivered" }), false);
+  // غير مقروء ⇒ مرفوض.
+  assert.equal(inbox.canDelete({ kind: "terminal", read: false, delivery_status: "delivered" }), false);
+  // لسه معلّق ⇒ مرفوض.
+  assert.equal(inbox.canDelete({ kind: "terminal", read: true, delivery_status: "pending" }), false);
+  // إشارة السيرفر الصريحة تتقدّم دائمًا.
+  assert.equal(inbox.canDelete({ kind: "future_kind", read: true, delivery_status: "delivered", deletable: true }), true);
+  assert.equal(inbox.canDelete({ kind: "terminal", read: true, delivery_status: "delivered", deletable: false }), false);
+  // قيم وراثة prototype ما تتفهمش كأنواع آمنة (fail-closed).
+  assert.equal(inbox.canDelete({ kind: "constructor", read: true, delivery_status: "delivered" }), false);
+  assert.equal(inbox.canDelete({ kind: "toString", read: true, delivery_status: "delivered" }), false);
+  assert.equal(inbox.canDelete({ kind: "__proto__", read: true, delivery_status: "delivered" }), false);
+  assert.equal(inbox.canDelete({ kind: "hasOwnProperty", read: true, delivery_status: "delivered" }), false);
+});
+
+test("F10: فشل شبكة لطلب جاري + تغيير الفلتر ⇒ إعادة تحميل بالفلتر الحالي (مفيش خطأ قديم)", async () => {
+  const env = await mkEnv({ deferred: true });
+  const { doc, fetch } = env;
+  for (let i = 0; i < 30; i++) {
+    const pend = fetch.pending();
+    if (!pend.length) { break; }
+    for (const c of pend) {
+      if (c.path === "/auth") { c.resolve({ status: 200, data: { ok: true } }); }
+      else if (c.path === "/app/bootstrap") { c.resolve(bootResponse()); }
+      else { c.resolve({ status: 200, data: { items: [], has_more: false } }); }
+    }
+    await flush();
+  }
+  doc.getElementById("tab-inbox").click();
+  await flush();
+  const first = fetch.last((c) => c.path.startsWith("/notifications?"));
+  assert.equal(first.path, "/notifications?page=0");
+  doc.getElementById("inbox-filter-unread").click();   // الفلتر يتغيّر أثناء الطلب
+  await flush();
+  first.reject(new Error("network down"));             // الطلب القديم يفشل
+  await flush();
+  const second = fetch.last((c) => c.path.startsWith("/notifications?"));
+  assert.equal(second.path, "/notifications?page=0&unread=1", "إعادة تحميل بالفلتر الحالي");
+  assert.ok(!inboxList(doc).textContent.includes("مش قادر أوصل للسيرفر"), "مفيش خطأ قديم معروض");
+  second.resolve(inboxPage([item({ id: 2, title: "UNREADITEM", read: false })], { unread_count: 1 }));
+  await flush();
+  assert.ok(inboxList(doc).textContent.includes("UNREADITEM"));
 });

@@ -5,7 +5,7 @@
   var API = "/api/v1";
   var tg = (window.Telegram && window.Telegram.WebApp) || null;
   var REQUEST_TIMEOUT = 12000;
-  var state = { chatsPage: 0, currentChat: null, selectedRepo: null, inboxPage: 0, inboxLoading: false, inboxIds: {}, inboxHasMore: false, inboxVisible: false, inboxLastRefreshAt: 0, inboxFilter: "all", detailSeq: 0 };
+  var state = { chatsPage: 0, currentChat: null, selectedRepo: null, inboxPage: 0, inboxLoading: false, inboxIds: {}, inboxHasMore: false, inboxVisible: false, inboxLastRefreshAt: 0, inboxFilter: "all", detailSeq: 0, jobsPage: 0, jobsLoading: false, jobsHasMore: false };
   // OHB2-08-07: مؤقّت التحديث الدوري (مرئي فقط) + آخر وقت تحديث (للتهدئة).
   var inboxPollTimer = null;
 
@@ -31,7 +31,7 @@
     // الردود القديمة (`currentChat`) فعالًا لوحده: رد تفاصيل جاي بعد ما المستخدم ساب
     // الشاشة (تنقّل/رجوع) مايدهسش الشاشة الجديدة، مش بس لو فتح شات تاني.
     if (name !== "view-detail") { state.currentChat = null; }
-    ["view-chats", "view-detail", "view-watches", "view-inbox", "view-new", "view-settings"].forEach(function (id) {
+    ["view-chats", "view-detail", "view-watches", "view-inbox", "view-jobs", "view-new", "view-settings"].forEach(function (id) {
       var n = $(id);
       if (n) { n.hidden = (id !== name); }
     });
@@ -109,6 +109,9 @@
   if (!OPS) { throw new Error("RecovoOps مش محمّل (ops.js)"); }
   var INBOX = window.RecovoInbox;
   if (!INBOX) { throw new Error("RecovoInbox مش محمّل (inbox.js)"); }
+  // OHB2-PHASE1D: منطق عرض/إدارة طلبات الشات الجديد — مشترك ومُختبر في jobs.js.
+  var JOBS = window.RecovoJobs;
+  if (!JOBS) { throw new Error("RecovoJobs مش محمّل (jobs.js)"); }
   var FILES = window.RecovoFiles;
   if (!FILES) { throw new Error("RecovoFiles مش محمّل (files.js)"); }
   var COST = window.RecovoCost;
@@ -374,12 +377,17 @@
     // حالة التحميل الجاري. بيتصفّر في then/catch تحت.
     if (state.inboxLoading) { return; }
     state.inboxLoading = true;
-    var unreadOnly = state.inboxFilter === "unread";
-    var archived = state.inboxFilter === "archived";
+    // OHB2-PHASE1C: نلتقط الفلتر اللي الطلب ده بتاعه. لو المستخدم غيّر الفلتر أثناء
+    // الطلب، الرد ده بقى قديم ⇒ نتجاهله ونعيد التحميل بالفلتر الحالي (منع سباق
+    // بين تغيير الفلتر والترقيم والتحديثات).
+    var reqFilter = state.inboxFilter;
+    var unreadOnly = reqFilter === "unread";
+    var archived = reqFilter === "archived";
     var query = INBOX.filterQuery(page || 0, unreadOnly, archived);
     if (page === 0) { state.inboxIds = {}; if (!silent) { list.innerHTML = ""; list.appendChild(el("li", "loading-row", "بيتم التحميل…")); } }
     get("/notifications?" + query).then(function (res) {
       state.inboxLoading = false;
+      if (reqFilter !== state.inboxFilter) { loadInbox(0); return; }
       var data = res.data || {};
       if (!res.ok) {
         // فشل تحديث خلفي ⇒ نتجاهله ونحافظ على المعروض (مفيش وميض/مسح).
@@ -411,6 +419,9 @@
       if (more) { more.hidden = !data.has_more; }
     }).catch(function () {
       state.inboxLoading = false;
+      // OHB2-PHASE1C: نفس حارس السباق في مسار الفشل (رفض الشبكة) — لو الفلتر اتغيّر
+      // أثناء الطلب، مانعرضش خطأ للفلتر القديم؛ نعيد التحميل بالفلتر الحالي.
+      if (reqFilter !== state.inboxFilter) { loadInbox(0); return; }
       if (page === 0 && !silent) { list.innerHTML = ""; list.appendChild(el("li", "empty-row", "مش قادر أوصل للسيرفر.")); }
     });
   }
@@ -526,6 +537,151 @@
     state.inboxHasMore = false;
     state.inboxLastRefreshAt = Date.now();
     loadInbox(0);
+  }
+
+  // OHB2-PHASE1D: قايمة طلبات الشات الجديد (قراءة فقط، مقيّدة بالمالك على السيرفر).
+  // `page===0` بتصفّر القايمة؛ الفشل الصامت (silent) بيحافظ على المعروض.
+  function loadJobs(page, silent) {
+    var list = $("jobs-list");
+    if (!list) { return; }
+    if (state.jobsLoading) { return; }
+    state.jobsLoading = true;
+    var p = page || 0;
+    if (p === 0 && !silent) {
+      list.innerHTML = "";
+      list.appendChild(el("li", "loading-row", "بيتم التحميل…"));
+    }
+    get("/operations/creation/list?page=" + encodeURIComponent(p)).then(function (res) {
+      state.jobsLoading = false;
+      var data = res.data || {};
+      if (!res.ok) {
+        if (silent) { return; }
+        if (p === 0) { list.innerHTML = ""; }
+        list.appendChild(el("li", "empty-row", friendlyMessage(res.status, res.data)));
+        return;
+      }
+      if (typeof data.page === "number" && data.page >= 0) { state.jobsPage = data.page; }
+      state.jobsHasMore = !!data.has_more;
+      var items = data.items || [];
+      if (p === 0) { list.innerHTML = ""; }
+      if (p === 0 && !items.length) {
+        list.appendChild(el("li", "empty-row", "مفيش طلبات بدء شات لسه."));
+      }
+      items.forEach(function (it) { list.appendChild(renderJobRow(it)); });
+      var more = $("jobs-more");
+      if (more) { more.hidden = !data.has_more; }
+    }).catch(function () {
+      state.jobsLoading = false;
+      if (p === 0 && !silent) {
+        list.innerHTML = "";
+        list.appendChild(el("li", "empty-row", "مش قادر أوصل للسيرفر."));
+      }
+    });
+  }
+
+  // OHB2-PHASE1D: صف طلب شات جديد. الأزرار بتظهر **بس** حسب أعلام السيرفر
+  // (`cancellable`/`resolvable`) — مفيش قرار من الواجهة، والسيرفر بيفرض الأهلية تاني.
+  function renderJobRow(it) {
+    var li = el("li", "row");
+    var main = el("div", "row-main");
+    var title = el("div", "row-title", "طلب بدء #" + it.id + (it.repository ? (" — " + it.repository) : ""));
+    main.appendChild(title);
+    var meta = el("div", "row-meta");
+    meta.appendChild(el("span", "op-pill", JOBS.stateLabel(it.state)));
+    var postLabel = JOBS.postStateLabel(it.post_state);
+    if (postLabel) { meta.appendChild(el("span", "pill", "الإرسال: " + postLabel)); }
+    if (it.terminal) { meta.appendChild(el("span", "pill", "نهائي")); }
+    main.appendChild(meta);
+    main.appendChild(el("p", "op-note", JOBS.note(it)));
+    li.appendChild(main);
+
+    var actions = el("div", "row-actions");
+    // إلغاء آمن — بس قبل الإرسال المؤكد، ومع تأكيد صريح (خطوتين).
+    if (JOBS.canCancel(it)) {
+      var cancelBtn = el("button", "btn danger small", "إلغاء الطلب");
+      var confirmBtn = el("button", "btn danger small", "أكّد الإلغاء");
+      confirmBtn.hidden = true;
+      var backBtn = el("button", "btn ghost small", "رجوع");
+      backBtn.hidden = true;
+      var busy = false;
+      cancelBtn.addEventListener("click", function () {
+        cancelBtn.hidden = true; confirmBtn.hidden = false; backBtn.hidden = false;
+      });
+      backBtn.addEventListener("click", function () {
+        cancelBtn.hidden = false; confirmBtn.hidden = true; backBtn.hidden = true;
+      });
+      confirmBtn.addEventListener("click", function () {
+        if (busy) { return; }
+        busy = true;
+        confirmBtn.disabled = true; backBtn.disabled = true;
+        reconcileJob(it.id, "cancel").then(function (res) {
+          if (res.ok) {
+            var data = res.data || {};
+            if (data.cancellation === "not_confirmed") {
+              toast("الإلغاء غير مؤكد — الإرسال ممكن يكون بدأ. استعلم عن الحالة.");
+            } else {
+              toast("اتلغى قبل الإرسال ✅");
+            }
+            loadJobs(0);
+          } else {
+            busy = false; confirmBtn.disabled = false; backBtn.disabled = false;
+            toast(friendlyMessage(res.status, res.data));
+          }
+        }).catch(function () {
+          busy = false; confirmBtn.disabled = false; backBtn.disabled = false;
+          toast("مش قادر أوصل للسيرفر — جرّب تاني.");
+        });
+      });
+      actions.appendChild(cancelBtn);
+      actions.appendChild(confirmBtn);
+      actions.appendChild(backBtn);
+    }
+    // تأكيد البدء (حسم الغموض) — بس لو السيرفر قال إن الطلب غامض، ومع تأكيد صريح.
+    if (JOBS.canResolve(it)) {
+      var markBtn = el("button", "btn small", "أكّد إنه بدأ");
+      var markConfirm = el("button", "btn small", "تأكيد نهائي");
+      markConfirm.hidden = true;
+      var markBack = el("button", "btn ghost small", "رجوع");
+      markBack.hidden = true;
+      var markBusy = false;
+      markBtn.addEventListener("click", function () {
+        markBtn.hidden = true; markConfirm.hidden = false; markBack.hidden = false;
+      });
+      markBack.addEventListener("click", function () {
+        markBtn.hidden = false; markConfirm.hidden = true; markBack.hidden = true;
+      });
+      markConfirm.addEventListener("click", function () {
+        if (markBusy) { return; }
+        markBusy = true;
+        markConfirm.disabled = true; markBack.disabled = true;
+        reconcileJob(it.id, "mark_sent").then(function (res) {
+          if (res.ok) { toast("اتأكد إنه بدأ ✅"); loadJobs(0); }
+          else {
+            markBusy = false; markConfirm.disabled = false; markBack.disabled = false;
+            toast(friendlyMessage(res.status, res.data));
+          }
+        }).catch(function () {
+          markBusy = false; markConfirm.disabled = false; markBack.disabled = false;
+          toast("مش قادر أوصل للسيرفر — جرّب تاني.");
+        });
+      });
+      actions.appendChild(markBtn);
+      actions.appendChild(markConfirm);
+      actions.appendChild(markBack);
+    }
+    // فتح المحادثة المرتبطة — بس لو السيرفر رجّع معرّف محادثة (بدليل).
+    if (JOBS.hasConversation(it)) {
+      var openBtn = el("button", "btn ghost small", "افتح الشات");
+      openBtn.addEventListener("click", function () { openDetail(it.conversation_id); });
+      actions.appendChild(openBtn);
+    }
+    li.appendChild(actions);
+    return li;
+  }
+
+  // OHB2-PHASE1D: تسوية طلب شات (cancel/mark_sent) عبر مسار مصادَق (POST).
+  function reconcileJob(id, action) {
+    return post("/operations/creation/reconcile", { id: id, action: action });
   }
 
   // OHB2-08-07: تحديث صندوق الإشعارات لو الصفحة مرئية وتبويب الإشعارات مفتوح فعلاً،
@@ -1056,6 +1212,7 @@
           if (view === "chats") { state.chatsPage = 0; loadChats(false); }
           if (view === "watches") { loadWatches(); }
           if (view === "inbox") { state.inboxLastRefreshAt = Date.now(); loadInbox(0); }
+          if (view === "jobs") { state.jobsPage = 0; loadJobs(0, false); }
           if (view === "new") { loadRepos(""); }
         });
       })(tabs[i]);
@@ -1076,6 +1233,13 @@
       loadInbox(INBOX.nextPage(state.inboxPage, true));
     });
     $("inbox-read-all").addEventListener("click", markAllRead);
+    // OHB2-PHASE1D: تحديث/المزيد لطلبات البدء.
+    $("jobs-refresh").addEventListener("click", function () { state.jobsPage = 0; loadJobs(0, false); });
+    $("jobs-next").addEventListener("click", function () {
+      if (state.jobsLoading) { return; }
+      if (!state.jobsHasMore) { return; }
+      loadJobs(state.jobsPage + 1, false);
+    });
     $("repo-search-btn").addEventListener("click", function () { loadRepos($("repo-search").value); });
     $("repo-search").addEventListener("keydown", function (e) { if (e.key === "Enter") { loadRepos($("repo-search").value); } });
     $("newchat-send").addEventListener("click", createChat);

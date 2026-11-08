@@ -450,8 +450,8 @@ def test_reconcile_discard_loses_cas_race_returns_conflict(tmp_path):
     calls = {"n": 0}
     first_seen = {}
 
-    def racing_get(outbox_id):
-        item = real_get(outbox_id)
+    def racing_get(outbox_id, chat_id=None):
+        item = real_get(outbox_id, chat_id)
         calls["n"] += 1
         # أول قراءة (قبل الـ CAS) بتشوف `pending`؛ بعدها بنحسم السجل من برّه (thread تاني).
         if calls["n"] == 1:

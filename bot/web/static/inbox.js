@@ -81,11 +81,23 @@
     return !!(item.archived_at);
   }
 
+  // OHB2-PHASE1C: الأنواع **الآمنة للحذف النهائي** (نفس allowlist السيرفر). `proactive`
+  // مستثنى (إشعار حالة حيّة مرتبط بدليل تسوية). أي نوع غير معروف ⇒ محمي.
+  var DELETABLE_KINDS = { terminal: true, timeout: true, missing: true, stale_report: true };
+
+  // فحص ملكية صريح (مش وراثة prototype) عشان قيم زي `constructor`/`__proto__` ما
+  // تتفهمش غلط كأنواع آمنة (fail-closed في إشارة الواجهة).
+  function isDeletableKind(kind) {
+    return typeof kind === "string" && Object.prototype.hasOwnProperty.call(DELETABLE_KINDS, kind);
+  }
+
   // OHB2-PHASE1C: هل السيرفر/الواجهة يعتبروا العنصر قابلًا للحذف النهائي؟ إشارة للواجهة
-  // بس (القرار النهائي على السيرفر). لو السيرفر ما بعتش `deletable`، نستنتج: مُسلَّم + مقروء.
+  // بس (القرار النهائي على السيرفر). لو السيرفر ما بعتش `deletable`، نستنتج **بتحفّظ**:
+  // نوع آمن + مُسلَّم + مقروء — نفس شرط السيرفر (fail-closed لأي نوع غير معروف).
   function canDelete(item) {
     if (!item) { return false; }
     if (typeof item.deletable === "boolean") { return item.deletable; }
+    if (!isDeletableKind(item.kind)) { return false; }
     return !isUnread(item) && (item.delivery_status === undefined || item.delivery_status === "delivered");
   }
 

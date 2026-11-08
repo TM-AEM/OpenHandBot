@@ -499,6 +499,48 @@ Creation-job reconciliation UI; remote conversation deletion semantics; Backup; 
   compileall **0**, `git diff --check` clean. DONE.
 - Step 7 (independent review of the exact final SHA): PENDING — see "Suggested next step".
 
+## Hardening pass (spec re-audit, OHB2-PHASE1C)
+Re-read the full task spec against the implementation; found and closed these gaps:
+- **G1 (delete safety)**: eligibility was not kind-aware. Added `INBOX_DELETABLE_KINDS`
+  allowlist `{terminal,timeout,missing,stale_report}` — unknown kinds and `proactive`
+  are now protected (fail-closed). New `has_open_outbox`/`has_notifier_pending` guards
+  protect a row whose conversation has an open outbox prompt or a durable
+  `notifier_pending` marker. `delete_inbox_item` already re-checks inside
+  `BEGIN IMMEDIATE`.
+- **G2 (archive durability)**: `_prune_inbox` now exempts `archived_at IS NOT NULL`
+  rows, so a deliberate archive is not silently pruned by retention.
+- **G3 (frontend race)**: `loadInbox` now captures the request filter and discards a
+  stale response (reloads for the current filter) — proven by a `/tmp` mutation.
+- **G4 (frontend fallback)**: `canDelete` fallback is now fail-closed for unknown kinds
+  (mirrors the server allowlist).
+- **G5 (tests)**: added unknown/`proactive` kind, open-outbox (same/closed conv),
+  `notifier_pending` (event ref + conversation), archived-prune survival,
+  unarchive-prunable-again, invalid/expired session, rate-limit, cross-origin, repeat
+  archive/delete, TOCTOU, migration (`archived_at`), and frontend filter-race tests.
+- **Verification**: pytest **1791 passed** (+16), node **187 pass / 0 fail** (+3),
+  pyflakes **0**, compileall **0**, `git diff --check` clean.
+- **Gap (accepted)**: the spec's "authentication/security incident notifications" and
+  "running/incomplete creation jobs" categories have no dedicated kind/table link in
+  this codebase; they are covered by the fail-closed default (unknown kind ⇒ protected)
+  and by the open-outbox guard. Documented as an explicit limitation, not a code gap.
+
+### Independent review (adversarial, separate agent-server session)
+- Reviewer read the real code (db/services/app/inbox + watcher/notifier/outbox) at the
+  working-tree revision, ran the suites, and mutation-tested every guard.
+- Verdict: **PASS-WITH-NOTES** — no Critical/High/Medium. All required guarantees
+  (delivery evidence, unresolved-failure visibility, no loss of operation/reconciliation
+  rows, reversible archive, two-step delete, non-destructive migration) held.
+- Notes found and fixed:
+  1. Filter-race guard existed only in the `.then` path; added the same guard to the
+     `.catch` (network failure) path + test `F10` (mutation-verified).
+  2. `canDelete` fallback read inherited prototype keys (`constructor`/`__proto__` →
+     true, fail-open in the UI hint). Switched to `hasOwnProperty` + `typeof string` +
+     widened `D8` (mutation-verified).
+  3. `A1`/`D4` "reload" assertions were vacuous (`!== null`); now count `/notifications?`
+     calls before/after (mutation-verified).
+- Verification after fixes: pytest **1791 passed**, node **188 pass / 0 fail**, pyflakes
+  **0**, compileall **0**, `git diff --check` clean.
+
 ### Working commands
 ```
 .venv/bin/python -m pytest -q
@@ -516,3 +558,47 @@ git diff --check
 ### Next
 - Independent review (separate agent-server session) of the exact final SHA: request
   PASS / PASS-WITH-NOTES with no unresolved Critical/High findings before opening a PR.
+
+# OHB2-PHASE1D-MINIAPP-CREATION-JOB-RECONCILIATION
+
+## Goal
+رؤية آمنة (owner-scoped) لطلبات إنشاء الشات في الـ Mini App + إجراءات تسوية يدوية
+(إلغاء قبل الإرسال / تأكيد البدء للغامض) بنفس دلالات البوت، مع الحفاظ الكامل على
+حدّ at-most-once ومنع أي إنشاء شات مكرّر.
+
+## Verified baseline
+- Branch `agent/ohb2-phase1c-inbox-filter-archive-delete`, HEAD `48fa7f85583b69dbb6e4b187c90c7116e45fa9eb`.
+- Phase 1A `8a86e25e8cc6fe29191b08c4dca6aae90dd0d8e6` و1B `30987867555386204fda587462fd72c488158689`
+  و1C موجودين في الأسلاف الفعلية (تم التحقق من ancestry الملفات والحالة).
+
+## State machine (من `bot/db.py`)
+pending/claimed (POST مابدأش، آمن للإلغاء) · starting (POST ممكن بدأ) · done (اتأكد) ·
+unknown (غامض) · failed (فشل مؤكد) · discarded (اتلغى قبل الإرسال).
+التحويلات: pending→claimed→starting→done/failed/unknown · pending/claimed→discarded (CAS).
+
+## Implemented
+- `bot/db.py`: `get_outbox(id, chat_id=None)` و`get_creation_job(id, chat_id=None)` مقيّدين بالمالك.
+- `bot/web/services.py`: `creation_operation_list`، `reconcile_creation` (cancel/mark_sent)،
+  تفريغ `_creation_dto` بحقول آمنة (`post_state`/`cancellable`/`resolvable`/`terminal`)،
+  وتطبيق نطاق المالك على مسارات الـ outbox كمان.
+- `bot/web/app.py`: راوتس/هاندلرز `/operations/creation/list` و`/operations/creation/reconcile`.
+- الواجهة: تاب «طلبات البدء» + `bot/web/static/jobs.js` + `app.js` (عرض + تأكيد خطوتين).
+
+## Safety guarantees
+- الإلغاء **بس** pending/claimed (CAS `discard_creation_job`)؛ starting/unknown ⇒ not_confirmed
+  بلا تغيير؛ نهائي ⇒ 409.
+- mark_sent **بس** من unknown (CAS `set_creation_status_if_in`) ⇒ done؛ idempotent.
+- التسوية مابتعملش أي شبكة ⇒ مستحيل إنشاء مكرّر؛ الغموض مايتحوّلش لحالة قابلة لإعادة POST.
+- **دفاع في العمق (بعد مراجعة مستقلة)**: نطاق المالك اتضاف كمان على مستوى `bot/db.py`
+  في `discard_creation_job(chat_id=...)` و`set_creation_status_if_in(chat_id=...)`
+  (شرط `AND chat_id=?` جوّه الـ UPDATE والقراءة اللاحقة)؛ المسارات الداخلية من غير نطاق
+  لسه شغّالة زي ما هي. mutation-tested: شيل الشرط بيفشّل اختبارات `test_db_*_owner_scoped_*`.
+
+## Tests
+- `.venv/bin/python -m pytest -q` ⇒ **1824 passed** (كان 1791).
+- `node --test tests/frontend/*.test.js` ⇒ **203 pass / 0 fail** (كان 188).
+- pyflakes **0**, compileall **0**, `git diff --check` clean.
+- Mutation testing (M1–M6) أثبت إن اختبارات الحمايات غير تافهة (تفشل عند كسر الحرس).
+
+## Next
+- مراجعة مستقلة نهائية (agent-server session منفصلة) على SHA الحالي.
