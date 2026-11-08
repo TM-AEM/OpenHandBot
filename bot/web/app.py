@@ -933,7 +933,7 @@ class MiniApp:
         return _json(data)
 
     async def conversation_delete(self, request):
-        """حذف محلي لشات (OHB2-C7). تفويض ملكية + تغيير حالة (CSRF/origin) قبل أي حذف."""
+        """حذف الشات **من OpenHands نفسه** ثم تثبيته محليًا (OHB2-MINIAPP). تفويض ملكية + تغيير حالة (CSRF/origin) قبل أي حذف."""
         session, err = await self._guarded(request, state_changing=True)
         if err is not None:
             return err

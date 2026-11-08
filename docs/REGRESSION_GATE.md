@@ -7,16 +7,23 @@
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pyflakes bot/ main.py tests/   # فحص ثابت: مفيش imports/متغيرات ميتة
-python -m pytest -q                      # كل الاختبارات لازم تعدّي
+python -m pyflakes bot/ automation/ tools/ main.py tests/  # فحص ثابت: مفيش imports/متغيرات ميتة
+python -m pip_audit -r requirements-dev.txt                # فحص أمني للتبعيات (SCA)
+python -m bandit -r bot/ main.py -lll -s B613              # فحص أمني ثابت لكود التشغيل (SAST)
+python -m pytest -q                                        # كل الاختبارات لازم تعدّي
+node --test tests/frontend/*.test.js                       # اختبارات الواجهة
 ```
 
 ## معايير القبول
 
-1. **فحص ثابت نضيف**: `pyflakes` ما يطلّعش أي تحذير على `bot/` و`main.py` و`tests/`.
-2. **كل الاختبارات خضراء**: `pytest` بيعدّي كامل من غير أي فشل/خطأ.
-3. **مفيش أسرار في الكود**: التوكنات والمفاتيح متغيرات بيئة بس (راجع قسم الأمان في README).
-4. **مفيش كتابة كاملة لسجل ممكن يكون قديم**: أي تحديث لحقل واحد يستخدم
+1. **فحص ثابت نضيف**: `pyflakes` ما يطلّعش أي تحذير على `bot/` و`automation/` و`tools/`
+   و`main.py` و`tests/`.
+2. **كل الاختبارات خضراء**: `pytest` و`node --test` بيعدّوا كامل من غير أي فشل/خطأ.
+3. **مفيش ثغرات تبعيات معروفة**: `pip-audit` يرجّع «No known vulnerabilities found».
+4. **مفيش نتائج SAST عالية الخطورة**: `bandit -lll -s B613` يخرج بصفر (B613 = محارف bidi
+   مقصودة في التعليقات العربية، مش trojan-source).
+5. **مفيش أسرار في الكود**: التوكنات والمفاتيح متغيرات بيئة بس (راجع قسم الأمان في README).
+6. **مفيش كتابة كاملة لسجل ممكن يكون قديم**: أي تحديث لحقل واحد يستخدم
    `UPDATE ... WHERE id=:id` ضيّق (مش استبدال الصف كامل).
 
 ## تشغيل محلي سريع

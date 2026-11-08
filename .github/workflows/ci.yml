@@ -32,8 +32,20 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
-      - name: Static check (pyflakes)
-        run: python -m pyflakes bot/ main.py tests/
+      - name: Static check (pyflakes, all first-party modules)
+        # OHB2-PHASE1E: pyflakes بقى يغطّي automation/ و tools/ كمان (كان bot/ main.py tests/ بس).
+        # pyflakes بيفحص ثابت (AST) من غير استيراد/تنفيذ ⇒ مفيش تشغيل لأتمتة/autopush.
+        run: python -m pyflakes bot/ automation/ tools/ main.py tests/
+      - name: Dependency audit (pip-audit)
+        # OHB2-PHASE1E: SCA على requirements-dev.txt (بيسحب requirements.txt). بيفشل عند أي
+        # ثغرة معروفة. محتاج شبكة (advisory DB) — متوفّرة على GitHub runners.
+        run: python -m pip_audit -r requirements-dev.txt
+      - name: SAST (bandit, runtime code)
+        # OHB2-PHASE1E: فحص أمني ثابت لكود التشغيل (bot/ + main.py) عند severity عالي فقط.
+        # B613 (محارف bidi) مستثنى عمدًا: المشروع عربي والتعليقات فيها علامات RTL مقصودة
+        # (مش trojan-source) — شوف docs/OPERATIONS_RUNBOOK.md. باقي نتائج bandit منخفضة/متوسطة
+        # وكلها إيجابيات كاذبة موثّقة (SQL مُعامَل، bind-all مقصود، try/except pass مقصود).
+        run: python -m bandit -r bot/ main.py -lll -s B613
       - name: Tests (pytest)
         run: python -m pytest -q
 

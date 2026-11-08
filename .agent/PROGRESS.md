@@ -1,3 +1,44 @@
+# PROGRESS — OHB2-PHASE1E: full product-quality + security completion + CI review (Phase 1)
+
+## Goal
+Final engineering-quality and security-completion pass over Phase 1A–1D (persistent Mini App
+sessions, conversation export + full reply copy, inbox filter/archive/delete, creation-job
+reconciliation). Fix real findings, extend CI to cover them, keep every finished piece working.
+
+## Acceptance criteria
+1. No known dependency vulnerabilities (`pip-audit -r requirements-dev.txt` = clean) with the
+   runtime still working (full pytest + a live uvicorn smoke test pass).
+2. Static analysis covers ALL first-party modules (pyflakes on bot/ automation/ tools/ main.py tests/),
+   and CI enforces it; a regression test guards the CI config.
+3. SAST (bandit) runs in CI at high severity; the only high finding (B613 bidi) is documented as
+   intentional (Arabic comments), not silently suppressed repo-wide.
+4. Docs no longer contradict the code: DELETE does real remote OpenHands deletion (MINI_APP.md,
+   DEPLOY_KATABUMP.md, and stale code docstrings).
+5. Full `python -m pytest -q`, `node --test tests/frontend/*.test.js`, pyflakes, pip-audit, bandit
+   all pass on the pinned versions (fresh-venv verified).
+
+## Plan (done)
+- requirements.txt: starlette 0.41.3 -> 1.3.1 (clears 8 advisories; 1.3.1 is the minimal fix).
+- requirements-dev.txt: pytest 8.4.2 -> 9.0.3 (PYSEC-2026-1845), pytest-asyncio 1.1.0 -> 1.3.0
+  (1.1.0 pins pytest<9), add pip-audit==2.10.1 + bandit==1.9.4.
+- .github/workflows/ci.yml: widen pyflakes scope; add pip-audit + bandit steps.
+- AGENTS.md §1, README.md, docs/REGRESSION_GATE.md, docs/OPERATIONS_RUNBOOK.md: document new commands.
+- docs/MINI_APP.md, docs/DEPLOY_KATABUMP.md, bot/web/app.py, bot/keyboards.py: fix local-only DELETE claims.
+- tests/test_ci_workflow_security.py: 9 tests guarding CI triggers, least-privilege, coverage,
+  no production side effects, exact runtime pins.
+
+## Baseline vs now
+- Python: 1839 passed -> 1848 passed, 0 failed.
+- Frontend: 206 passed -> 206 passed.
+- pyflakes bot/ main.py tests/: clean -> clean (now covers automation/ tools/ too).
+- pip-audit: 14 advisories (starlette 0.41.3) -> No known vulnerabilities found.
+- bandit -lll -s B613 on bot/ main.py: 0 high -> 0 high.
+
+## Assumptions / decisions
+- Bumped starlette/pytest only because the advisories are the proven cause of the audit finding,
+  and the bumps were verified (1839->1848 tests, live uvicorn smoke, fresh venv) — AGENTS.md §4.
+- The Katabump deploy doc still needs `starlette==1.3.1` to be uploaded (it ships requirements.txt).
+
 # PROGRESS — OHB2 overall-audit remediation (WP1–WP6)
 
 ## Goal

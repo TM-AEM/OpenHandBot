@@ -177,7 +177,7 @@ def conversation_actions(
 
 
 def delete_confirm_menu(conversation_id: str) -> InlineKeyboardMarkup:
-    """تأكيد حذف الشات (OHB2-C7): زر تأكيد صريح + زر إلغاء. الحذف محلي فقط."""
+    """تأكيد حذف الشات (OHB2-MINIAPP): زر تأكيد صريح + زر إلغاء. الحذف بعيد فعلي (من OpenHands) ثم تثبيت محلي."""
     return InlineKeyboardMarkup(
         [
             [_btn(DELETE_CONFIRM, callback_data=f"deleteok:{conversation_id}")],

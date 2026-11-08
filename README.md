@@ -81,14 +81,19 @@ python main.py
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pyflakes bot/ main.py tests/   # فحص ثابت
-python -m pytest -q                      # كل الاختبارات
+python -m pyflakes bot/ automation/ tools/ main.py tests/  # فحص ثابت
+python -m pip_audit -r requirements-dev.txt                # فحص أمني للتبعيات (SCA)
+python -m bandit -r bot/ main.py -lll -s B613              # فحص أمني ثابت (SAST)
+python -m pytest -q                                        # كل الاختبارات
+node --test tests/frontend/*.test.js                       # اختبارات الواجهة (Node)
 ```
 
-بوابة الانحدار الكاملة (فحص ثابت + اختبارات) في `docs/REGRESSION_GATE.md`، وبتشتغل تلقائيًا في CI.
+بوابة الانحدار الكاملة (فحص ثابت + SCA + SAST + اختبارات) في `docs/REGRESSION_GATE.md`،
+وبتشتغل تلقائيًا في CI.
 
 CI (`.github/workflows/`) بيشتغل على `push`/`pull_request` على `main` بـ Python **3.11** و**3.13**
-(مصفوفة)، وبيشغّل نفس الأمرين: `python -m pyflakes bot/ main.py tests/` و`python -m pytest -q`.
+(مصفوفة)، وبيشغّل نفس الفحوص (`pyflakes` على كل وحدات المشروع + `pip-audit` + `bandit` +
+`pytest`)، بالإضافة لوظيفة اختبارات الواجهة على Node.
 
 ## النشر على Katabump
 

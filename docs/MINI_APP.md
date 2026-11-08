@@ -74,7 +74,7 @@ Telegram WebView ──HTTPS──▶ ingress (TLS) ──HTTP──▶ الحا
 | `/api/v1/conversations/{id}/prompt` | POST | كوكي | ✔ | `{"text": "...", "client_ref": "..."}` ⇒ يسجّل البرومت في الصندوق |
 | `/api/v1/conversations/{id}/watch` | POST | كوكي | ✔ | يضيف الشات للمتابعة |
 | `/api/v1/conversations/{id}/watch` | DELETE | كوكي | ✔ | يلغي المتابعة |
-| `/api/v1/conversations/{id}` | DELETE | كوكي | ✔ | حذف محلي آمن للشات (بتأكيد في الواجهة): يشيل المتابعة/الصندوق/الإكمال/الإشعارات/التوجيه ويكتب شاهد حذف دائم (tombstone) — **مفيش حذف بعيد لـ OpenHands** |
+| `/api/v1/conversations/{id}` | DELETE | كوكي | ✔ | حذف **بعيد فعلي** للشات (بتأكيد في الواجهة): ينادي `DELETE /app-conversations/{id}` على OpenHands، ويثبّت الحذف المحلي + شاهد حذف دائم (tombstone) **بس** بعد تأكيد OpenHands (200) أو إثبات الغياب بقراءتين متتاليتين. **404 مبهم** (غياب أو فشل خدمة) ⇒ تسوية تحقق مش نجاح تلقائي؛ الفشل المؤكّد/المجهول مابيرجّعوش نجاح كاذب. التفاصيل في §«حذف الشات» تحت |
 | `/api/v1/watches` | GET | كوكي | لأ | قائمة المتابعات |
 | `/api/v1/repositories` | GET | كوكي | لأ | بحث المستودعات (`?q=&page=`) |
 | `/api/v1/chats` | POST | كوكي | ✔ | `{"repository": "owner/repo", "text": "...", "client_ref": "..."}` ⇒ شات جديد |
