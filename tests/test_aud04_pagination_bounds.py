@@ -235,6 +235,17 @@ def test_page_offset_helper_rejects_non_int(tmp_path):
             services_module._page_offset(bad, 10)
 
 
+def test_page_offset_helper_rejects_overflow_offset(tmp_path):
+    """AUD-04: حتى لو مرّ `page` داخل `[0, MAX_PAGE]`، لازم نتحقق إن `page × size`
+    نفسه جوه نطاق SQLite — فرع `offset > MAX_SQLITE_INT` مش كود ميّت."""
+    import pytest
+
+    with pytest.raises(services_module.ValidationError):
+        services_module._page_offset(MAX_PAGE, MAX_SQLITE_INT)
+    # حدّ صحيح: أعلى (page,size) لسه داخل النطاق ⇒ مسموح.
+    assert services_module._page_offset(MAX_PAGE, INBOX_PAGE_SIZE) == MAX_PAGE * INBOX_PAGE_SIZE
+
+
 # --------------------------------------------------------- حدود حجم الصفحة (AUD-04)
 def test_oversized_page_size_rejected_at_db_layer(tmp_path):
     """حجم صفحة ضخم لازم يترفض قبل الـ binding (`size+1` ممكن يعدّي نطاق SQLite)."""

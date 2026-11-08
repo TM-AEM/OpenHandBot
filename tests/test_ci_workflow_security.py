@@ -118,3 +118,18 @@ def test_runtime_dependencies_are_exactly_pinned():
         if not line or line.startswith("#"):
             continue
         assert "==" in line, f"تبعية غير مثبّتة: {line!r}"
+
+
+def test_docs_document_bandit_scope_with_automation():
+    """AUD-08: أي توثيق بيذكر أمر bandit لازم يطابق نطاق CI (`bot/ automation/ main.py`).
+    كان README.md لسه على النطاق القديم (bot/ main.py) — ده بيمنع التراجع الصامت."""
+    docs = {
+        "README.md": (ROOT / "README.md").read_text(encoding="utf-8"),
+        "docs/OPERATIONS_RUNBOOK.md": (ROOT / "docs/OPERATIONS_RUNBOOK.md").read_text(encoding="utf-8"),
+        "docs/REGRESSION_GATE.md": (ROOT / "docs/REGRESSION_GATE.md").read_text(encoding="utf-8"),
+        "AGENTS.md": (ROOT / "AGENTS.md").read_text(encoding="utf-8"),
+    }
+    for name, text in docs.items():
+        if "bandit -r" in text:
+            assert "bandit -r bot/ automation/ main.py" in text, f"{name}: نطاق bandit قديم"
+            assert "bandit -r bot/ main.py" not in text, f"{name}: لسه فيه النطاق الضيّق"

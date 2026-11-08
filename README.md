@@ -83,7 +83,7 @@ python main.py
 pip install -r requirements-dev.txt
 python -m pyflakes bot/ automation/ main.py tests/  # فحص ثابت
 python -m pip_audit -r requirements-dev.txt                # فحص أمني للتبعيات (SCA)
-python -m bandit -r bot/ main.py -lll -s B613              # فحص أمني ثابت (SAST)
+python -m bandit -r bot/ automation/ main.py -lll -s B613  # فحص أمني ثابت (SAST)
 python -m pytest -q                                        # كل الاختبارات
 node --test tests/frontend/*.test.js                       # اختبارات الواجهة (Node)
 ```
