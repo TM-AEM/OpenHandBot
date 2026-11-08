@@ -42,6 +42,7 @@ class FileStatus(str, Enum):
     OK = "ok"
     UNAUTHORIZED = "unauthorized"      # الملكية مش مثبتة (fail closed)
     NOT_FOUND = "not_found"            # الشات أو الملف مش موجود
+    DELETED = "deleted"                # الشات عليه شاهد حذف (F-1) — يُعرَض كـ not_found
     INVALID_PATH = "invalid_path"      # مسار مرفوض محليًا (مطلق/اجتياز/غير صالح)
     BINARY = "binary"                  # محتوى ثنائي (مش نص)
     NOT_UTF8 = "not_utf8"              # ترميز غير صالح
@@ -104,6 +105,9 @@ def is_listed_path(path: str | None, listed) -> bool:
 CONVERSATION_ERRORS: dict["FileStatus", tuple[str, int, str]] = {
     FileStatus.UNAUTHORIZED: ("unauthorized", 403, "مش مسموح لك بالوصول للشات ده."),
     FileStatus.NOT_FOUND: ("not_found", 404, "الشات مش موجود."),
+    # F-1: شات عليه شاهد حذف يُعرَض **بنفس** رد «مش موجود» (404) عشان ما نكشفش وجود
+    # شات محذوف ولا أي تفاصيل عنه. الرد آمن ومتسق مع عرف الـ API.
+    FileStatus.DELETED: ("not_found", 404, "الشات مش موجود."),
     FileStatus.UPSTREAM_ERROR: ("upstream_error", 502, "تعذّر الوصول للشات دلوقتي، جرّب تاني."),
 }
 
@@ -112,6 +116,7 @@ CONVERSATION_ERRORS: dict["FileStatus", tuple[str, int, str]] = {
 FILE_STATUS_ERRORS: dict["FileStatus", tuple[str, int]] = {
     FileStatus.UNAUTHORIZED: ("unauthorized", 403),
     FileStatus.NOT_FOUND: ("not_found", 404),
+    FileStatus.DELETED: ("not_found", 404),
     FileStatus.INVALID_PATH: ("invalid_path", 400),
     FileStatus.TOO_LARGE: ("too_large", 413),
     FileStatus.UPSTREAM_ERROR: ("upstream_error", 502),
@@ -119,6 +124,7 @@ FILE_STATUS_ERRORS: dict["FileStatus", tuple[str, int]] = {
 FILE_STATUS_MESSAGES: dict["FileStatus", str] = {
     FileStatus.UNAUTHORIZED: "مش مسموح لك بالوصول لملفات الشات ده.",
     FileStatus.NOT_FOUND: "الشات أو الملف مش موجود.",
+    FileStatus.DELETED: "الشات أو الملف مش موجود.",
     FileStatus.INVALID_PATH: "مسار الملف غير صالح.",
     FileStatus.BINARY: "الملف مش نص (مش قابل للعرض).",
     FileStatus.NOT_UTF8: "الملف بترميز مش مدعوم (مش قابل للعرض).",
@@ -169,20 +175,28 @@ class IdentityCache:
 
 
 async def authorize_conversation(
-    client, identity: IdentityCache, conversation_id: str
+    client, identity: IdentityCache, conversation_id: str, db=None, *, allow_deleted: bool = False
 ) -> tuple[dict | None, FileStatus]:
     """يتأكّد إن الشات موجود ومملوك لهوية المالك الحالية. يرجّع (الميتاداتا أو None، الحالة).
 
     **مفيش أي جلب لبيانات محمية هنا** — الدالة بترجّع بس الميتاداتا المتفوَّض عليها.
-    الترتيب: فحص المعرّف ⇒ جلب الميتاداتا ⇒ جلب/مقارنة الهوية ⇒ قرار. أي فشل (معرّف
-    غير صالح/ميتاداتا ناقصة/مالك None/غير مطابق/فشل upstream) ⇒ رفض مغلق.
+    الترتيب: فحص المعرّف ⇒ فحص شاهد الحذف المحلي (F-1، لو `db` متاح و`allow_deleted=False`)
+    ⇒ جلب الميتاداتا ⇒ جلب/مقارنة الهوية ⇒ قرار. أي فشل (معرّف غير صالح/شات متشاهد/ميتاداتا
+    ناقصة/مالك None/غير مطابق/فشل upstream) ⇒ رفض مغلق.
+
+    `allow_deleted=True` استثناء مقصود لعمليتين صريحتين بس (مش قراءة): **إعادة التفاعل
+    الصريح (`watch`)** و**إعادة محاولة الحذف** — دول بيعتمدوا على طبقة القاعدة (reengage /
+    CAS الحذف) للتعامل مع الحالة المتشاهدة بأمان. كل مسارات القراءة/التصدير/التفاعل
+    بتمرّ بالفحص (الافتراضي).
     """
-    conv, status, _error = await authorize_conversation_detailed(client, identity, conversation_id)
+    conv, status, _error = await authorize_conversation_detailed(
+        client, identity, conversation_id, db, allow_deleted=allow_deleted
+    )
     return conv, status
 
 
 async def authorize_conversation_detailed(
-    client, identity: IdentityCache, conversation_id: str
+    client, identity: IdentityCache, conversation_id: str, db=None, *, allow_deleted: bool = False
 ) -> tuple[dict | None, FileStatus, str | None]:
     """نفس تفويض `authorize_conversation` لكن بترجّع كمان رسالة خطأ upstream الآمنة.
 
@@ -190,9 +204,24 @@ async def authorize_conversation_detailed(
     (حالة ⇒ HTTP)، والبوت بيستخدم المطوّلة عشان يعرض رسالة الخطأ المتنقّحة عند فشل
     upstream (429/503/مهلة) بدل ما يخسّر التفصيل. **فشل upstream لسه رفض مغلق** —
     مفيش بيانات محمية بتتقرا.
+
+    **F-1 (فرض شاهد الحذف):** لو `db` متاح و`allow_deleted=False` وفيه شاهد حذف فعّال
+    للمعرّف، بنرفض **قبل** أي نداء بعيد لـ OpenHands (مفيش جلب ميتاداتا ولا محتوى). الشات
+    المتشاهد بيُعرَض بحالة `DELETED` اللي بتتحوّل لنفس رد «مش موجود» (404) عند كل الطبقات —
+    كده مفيش كشف لوجود شات محذوف ولا أي تفاصيل عنه. الفحص **فشل مغلق**: أي خطأ في قراءة
+    القاعدة ⇒ نعتبره متشاهد (نخفي)، نفس سلوك `_without_deleted` وحماية التصدير القائمة.
+    من غير `db` (سياقات مستقلة/اختبارات معزولة بلا قاعدة) أو مع `allow_deleted=True`
+    (watch/حذف) الفحص بيتخطّى.
     """
     if not is_valid_conversation_id(conversation_id):
         return None, FileStatus.NOT_FOUND, None
+    if db is not None and not allow_deleted:
+        try:
+            deleted = db.is_deleted(conversation_id)
+        except Exception:  # noqa: BLE001 — قاعدة غير متاحة ⇒ فشل مغلق (نخفي، مفيش نداء بعيد)
+            return None, FileStatus.DELETED, None
+        if deleted:
+            return None, FileStatus.DELETED, None
     try:
         convs = await client.get_conversations([conversation_id])
     except ApiError as exc:
@@ -252,6 +281,7 @@ class FileService:
         max_bytes: int = MAX_PREVIEW_BYTES,
         preview_chars: int = PREVIEW_CHARS,
         identity: IdentityCache | None = None,
+        db=None,
     ) -> None:
         self._client = client
         self._max_bytes = int(max_bytes)
@@ -259,17 +289,24 @@ class FileService:
         # كاش الهوية ممكن يتشارك مع الخدمة الأم (نفس العميل) عشان `/users/me` يتنادى
         # مرة واحدة بس عبر كل العمليات. الافتراضي: كاش خاص بالخدمة.
         self._identity = identity if identity is not None else IdentityCache(client)
+        # F-1: كائن القاعدة المالك (نفس اتصال العملية) لفرض شاهد الحذف عند التفويض.
+        # اختياري: من غير قاعدة (سياقات مستقلة) ما فيش شواهد محلية تُفرَض.
+        self._db = db
 
     async def _owner_identity(self) -> str | None:
         """هوية المالك (UUID) عبر الكاش المشترك، أو None لو مش قادرين نتأكّد (fail closed)."""
         return await self._identity.owner_id()
 
-    async def authorize(self, conversation_id: str) -> tuple[dict | None, FileStatus]:
+    async def authorize(self, conversation_id: str, *, allow_deleted: bool = False) -> tuple[dict | None, FileStatus]:
         """يفوّض الوصول لشات واحد: (الميتاداتا أو None، الحالة).
 
-        التفويض كله في الدالة المشتركة `authorize_conversation` (مفيش نسخة تانية).
+        التفويض كله في الدالة المشتركة `authorize_conversation` (مفيش نسخة تانية)،
+        بما فيه فرض شاهد الحذف (F-1) لما تكون القاعدة متاحة. `allow_deleted=True`
+        بيتخطّى الفحص لعمليتي watch/حذف بس (استثناء مقصود موثّق).
         """
-        return await authorize_conversation(self._client, self._identity, conversation_id)
+        return await authorize_conversation(
+            self._client, self._identity, conversation_id, self._db, allow_deleted=allow_deleted
+        )
 
     async def list_files(self, conversation_id: str) -> FileListing:
         """قايمة ملفات مساحة عمل شات مصرّح به (مسارات نسبية آمنة بس)."""

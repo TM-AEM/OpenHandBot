@@ -57,6 +57,9 @@ def _client(monkeypatch, hidden: bool):
     db = SimpleNamespace(
         list_watched=lambda: [],
         get_notifications_enabled=lambda: True,
+        # F-1: الفرض الموحّد لشاهد الحذف بيسأل `is_deleted` عند تفويض مسارات الشات
+        # (cost/files). الستب ده بيمثّل قاعدة من غير أي شواهد ⇒ False (مفيش شات محذوف).
+        is_deleted=lambda cid: False,
         add_web_session=lambda h, u, c, e, p: sessions.__setitem__(h, (u, c, e, p)),
         get_web_session=lambda h, n: (
             sessions[h] if h in sessions and sessions[h][2] > float(n) else None

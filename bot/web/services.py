@@ -372,16 +372,24 @@ class MiniAppService:
             raise ApiError("خدمة OpenHands مش متاحة دلوقتي.", 503)
         return self._client
 
-    async def _authorize_conversation(self, conversation_id: str) -> dict:
+    async def _authorize_conversation(self, conversation_id: str, *, allow_deleted: bool = False) -> dict:
         """يفوّض شات واحد عبر الخدمة المشتركة **قبل** أي جلب بيانات محمية (OHB2-09-A2-02).
 
         بترجّع الميتاداتا المتفوَّض عليها أو بترمي `FileApiError` منظّم (403/404/502).
         كل مسار شات في الـ Mini App بيعدي من هنا — مفيش مقارنة مالك مكرّرة في مسار.
+
+        F-1: بنمرّر قاعدة البيانات المالكة (`self._db`) عشان فرض شاهد الحذف يحصل **قبل**
+        أي نداء بعيد — الشات المتشاهد يُرفض بـ `DELETED` ⇒ رد «مش موجود» (404).
+        `allow_deleted=True` استثناء مقصود لعمليتين صريحتين بس (مش قراءة): **إعادة
+        التفاعل (`watch`)** و**إعادة محاولة الحذف** — دول بيعتمدوا على طبقة القاعدة
+        (reengage/CAS الحذف) للتعامل مع الحالة المتشاهدة بأمان.
         """
         client = self._require_client()
         if self._identity is None:
             self._identity = IdentityCache(client)
-        conv, status = await authorize_conversation(client, self._identity, conversation_id)
+        conv, status = await authorize_conversation(
+            client, self._identity, conversation_id, self._db, allow_deleted=allow_deleted
+        )
         if conv is None:
             raise self._conversation_error(status)
         return conv
@@ -778,7 +786,10 @@ class MiniAppService:
         if self._db.remote_deletion_state(cid) == self._db.REMOTE_CONFIRMED:
             return {"ok": True, "deleted": True, "remote_deleted": True, "conversation_id": cid}
         # تفويض الملكية **قبل** أي حذف (مفيش IDOR). بيرمي CodedApiError منظّم عند الرفض.
-        await self._authorize_conversation(cid)
+        # F-1: `allow_deleted=True` — إعادة محاولة الحذف عملية صريحة على شات ممكن يكون
+        # متشاهد (deleting/uncertain)؛ الحماية الحقيقية في طبقة القاعدة (CAS الحذف)، مش
+        # في حجب القراءة. (الفشل المؤكّد/المجهول لسه مايرجّعش نجاح كاذب — في `deletion`.)
+        await self._authorize_conversation(cid, allow_deleted=True)
         result = await deletion.delete_conversation_remote(client, self._db, cid)
         # نبلّغ أي worker مالك (نفس العملية) إن فيه تغيير — من غير إنشاء worker جديد.
         for key in ("outbox_worker", "creation_worker", "completion_worker", "watcher", "notifier"):
@@ -814,7 +825,7 @@ class MiniAppService:
         client = self._require_client()
         if self._identity is None:
             self._identity = IdentityCache(client)
-        return FileService(client, identity=self._identity)
+        return FileService(client, identity=self._identity, db=self._db)
 
     async def list_files(self, conversation_id: str) -> dict:
         """قايمة ملفات شات مصرّح به (نتيجة منظّمة، مفيش استثناءات للـ route)."""
@@ -864,7 +875,11 @@ class MiniAppService:
         # OHB2-09-A2-02: تفويض ملكية الشات **قبل** تسجيل أي برومت في الصندوق — نفس
         # عقد باقي مسارات الشات (تفاصيل/حالة/تكلفة/ملفات/متابعة). كده مستخدم مصادَق
         # (مش المالك) مايقدرش يوجّه برومت لشات مش بتاعه. مفيش أي أثر (سجل صندوق) قبل القرار.
-        await self._authorize_conversation(cid)
+        # F-1: `allow_deleted=True` مقصود — إرسال برومت من الـ Mini App **مش** مسار قراءة،
+        # ورده المتّفق عليه (والموثّق/المُختبَر) للشات المتشاهد هو **409 conversation_deleted**
+        # من طبقة القاعدة (الفحص الذرّي جوّه `add_or_group_outbox` مع `reengage=False`)،
+        # مش 404. كده مفيش تفاعل مع شات متشاهد، والقاعدة هي الحاجز الموثوق (race-safe).
+        await self._authorize_conversation(cid, allow_deleted=True)
         chat_id = self._config.owner_id
         # OHB2-AUDIT-FIX-01: `reengage=False` — مسار الـ Mini App **مش** إعادة تفاعل صريح
         # (إعادة المتابعة عند الـ Mini App بتحصل عبر `watch`، مش عبر إرسال برومت). كده أي
@@ -1161,7 +1176,10 @@ class MiniAppService:
         if self._db is None:
             raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
         # OHB2-09-A2-02: نفس عقد الملكية قبل إضافة الشات للمتابعة (مفيش شات غير مملوك).
-        conv = await self._authorize_conversation(cid)
+        # F-1: `allow_deleted=True` — زر «متابعة» هو **إعادة التفاعل الصريح** الوحيد
+        # الموثّق اللي بيشيل الشاهد ويبدأ دورة نظيفة (طبقة القاعدة عبر `reengage=True`).
+        # ده مش مسار قراءة، فبنستثنيه من فرض الشاهد عن قصد.
+        conv = await self._authorize_conversation(cid, allow_deleted=True)
         self._db.add_watched(cid, conv.get("title", ""), self._config.owner_id, new_lifecycle=False, reengage=True)
         self._db.set_last_state(cid, conv.get("execution_status") or "")
         return {"ok": True, "watched": True}

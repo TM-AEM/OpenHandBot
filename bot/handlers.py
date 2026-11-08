@@ -114,19 +114,35 @@ def _identity_cache(context: ContextTypes.DEFAULT_TYPE):
 
 
 def _files_service(context: ContextTypes.DEFAULT_TYPE) -> FileService:
-    """`FileService` فوق نفس العميل المشترك وكاش الهوية المشترك (مفيش عميل تاني)."""
-    return FileService(context.bot_data["client"], identity=_identity_cache(context))
+    """`FileService` فوق نفس العميل المشترك وكاش الهوية المشترك (مفيش عميل تاني).
+
+    F-1: بنمرّر قاعدة بيانات البوت كمان عشان `FileService.authorize` يفرض شاهد الحذف
+    قبل أي قراءة ملفات (نفس الحماية اللي بيمرّ بيها مسار البوت).
+    """
+    return FileService(
+        context.bot_data["client"],
+        identity=_identity_cache(context),
+        db=context.bot_data.get("db"),
+    )
 
 
-async def _authorized_conversation(client, context: ContextTypes.DEFAULT_TYPE, conversation_id: str):
+async def _authorized_conversation(
+    client, context: ContextTypes.DEFAULT_TYPE, conversation_id: str, *, allow_deleted: bool = False
+):
     """يفوّض شات عبر **نفس** تنفيذ `FileService` (ملكية/معرّف/فشل مغلق).
 
     يرجّع `(conv | None, message)`؛ لو `conv` فاضي فـ `message` رسالة عربي آمنة. عند
     فشل upstream (429/503/مهلة/انقطاع) بنعرض رسالة الخطأ المتنقّحة (زي مسار البوت
     القديم)، ولسه **مفيش أي جلب بيانات محمية** غير الميتاداتا المتفوَّض عليها.
+
+    F-1: بنمرّر قاعدة بيانات البوت (`bot_data["db"]`) عشان فرض شاهد الحذف يحصل **قبل**
+    أي نداء بعيد — أي مسار بيمرّ من هنا (فتح/حالة/تكلفة/رد/تصدير/ملفات/متابعة/حذف)
+    يرفض الشات المتشاهد برسالة «مش موجود» من غير أي كشف. `allow_deleted=True` استثناء
+    مقصود لعمليتي watch/حذف بس (زي طبقة الـ Mini App).
     """
     conv, status, error = await authorize_conversation_detailed(
-        client, _identity_cache(context), conversation_id
+        client, _identity_cache(context), conversation_id, context.bot_data.get("db"),
+        allow_deleted=allow_deleted,
     )
     if conv is not None:
         return conv, None
@@ -501,7 +517,11 @@ async def watch_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE)
     client = context.bot_data["client"]
     db = context.bot_data["db"]
     # OHB2-09-06/A2-02: نفس عقد ملكية الشات قبل الإضافة (مفيش شات غير مملوك للمتابعة).
-    conv, message = await _authorized_conversation(client, context, conversation_id)
+    # F-1: `allow_deleted=True` — زر «متابعة» إعادة تفاعل صريح (طبقة القاعدة بتشيل الشاهد
+    # عبر `reengage=True`)، فمش مسار قراءة.
+    conv, message = await _authorized_conversation(
+        client, context, conversation_id, allow_deleted=True
+    )
     if conv is None:
         await _safe_edit(q, message)
         return
@@ -579,7 +599,11 @@ async def delete_conversation_confirm(update: Update, context: ContextTypes.DEFA
     client = context.bot_data["client"]
     db = context.bot_data["db"]
     # تفويض الملكية **قبل** أي حذف — العميل بيبعت المعرّف بس، والملكية بتتأكد server-side.
-    conv, message = await _authorized_conversation(client, context, conversation_id)
+    # F-1: `allow_deleted=True` — إعادة محاولة الحذف عملية صريحة على شات ممكن يكون متشاهد
+    # (deleting/uncertain)؛ الحماية الحقيقية في طبقة القاعدة (CAS الحذف)، مش في حجب القراءة.
+    conv, message = await _authorized_conversation(
+        client, context, conversation_id, allow_deleted=True
+    )
     if conv is None:
         await _safe_edit(q, message)
         return
@@ -831,6 +855,20 @@ async def _send_prompt(
         return
     db = context.bot_data["db"]
     chat_id = update.effective_chat.id
+    # F-1: الشات المتشاهد ممنوع من أي تفاعل — نرفض **قبل** تسجيل أي برومت. مسار البوت
+    # ده بينادي `reengage=True` (من غير client_ref)، واللي طبقة القاعدة بتعتبره إعادة
+    # تفاعل صريح (بيشيل الشاهد). فلو الشات اتحذف محليًا بعد ما التوجيه اتفتح (سباق)،
+    # لازم نرفض هنا بدل ما نحيي الشات — ده فرض F-1 على مسار الإرسال.
+    # الفحص **فشل مغلق**: أي خطأ قراءة ⇒ نرفض (مفيش برومت على شات ممكن يكون محذوف).
+    try:
+        deleted = db.is_deleted(conversation_id)
+    except Exception:  # noqa: BLE001 — قاعدة غير متاحة ⇒ فشل مغلق (نرفض الإرسال)
+        deleted = True
+    if deleted:
+        await update.message.reply_text(
+            "الشات ده اتحذف — مش ممكن نبعت له رسايل. افتح شات تاني."
+        )
+        return
     # نسجّل 'pending' قبل ما نبدأ أي إرسال، عشان البرومت مايضيعش لو العملية اتقطعت.
     # القرار 2: لو فيه برومت لنفس الوجهة اتسجّل خلال 1.5 ثانية، بيتجمّع معاه في سجل واحد.
     db.add_or_group_outbox(conversation_id, chat_id, text, outbox.now_iso(), reengage=True)
