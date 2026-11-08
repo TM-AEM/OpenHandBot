@@ -106,6 +106,14 @@ INBOX_MAX_PER_CONVERSATION = 50
 INBOX_MAX_TOTAL = 500
 # أقصى عدد عناصر في صفحة قايمة الصندوق (يتفرض في طبقة الـ API).
 INBOX_PAGE_SIZE = 10
+# أقصى عدد صحيح يقبله SQLite (INTEGER = 64-bit). أي رقم أكبر منه بيرمي OverflowError
+# وقت الـ binding. بنستخدمه كسقف مشترك للتحقق من الحدود (AUD-04/AUD-02).
+MAX_SQLITE_INT = 2**63 - 1
+# AUD-04: أقصى رقم صفحة مسموح لأي قايمة مُرقّمة (offset = page × page_size). بنحدّد رقم
+# الصفحة نفسه عشان يفضل offset = page × size داخل نطاق 64-bit حتى لو page_size كبير،
+# ومايتحوّلش لـ OverflowError جوّه SQLite. مليون صفحة × 10 = 10M صف أقصى — أوسع بكتير
+# من أي بيانات واقعية (سقوف الصندوق/المحادثات أصغر)، فمفيش تقييد عملي للاستخدام الطبيعي.
+MAX_PAGE = 1_000_000
 
 # OHB2-08-05 (Batch 3R): حالة تسليم الحدث (مستقلة تمامًا عن حالة القراءة `read_at`).
 #   pending   : الحدث اتسجّل بثبات (durable) ولسه ماتسلّمش لتليجرام. **مايتقلّمش أبدًا.**
@@ -1965,9 +1973,21 @@ class Database:
 
         OHB2-PHASE1D: نطاق المالك مفروض في الاستعلام نفسه، والترتيب ثابت
         (created_at DESC, id DESC) والترقيم بـ offset — نفس دلالات قايمة الشاتات.
+
+        AUD-04 (دفاع في العمق): رقم الصفحة لازم يكون عددًا صحيحًا داخل [0, MAX_PAGE]
+        قبل حساب `offset = page × size`، عشان القيم الكبيرة ما تعملش OverflowError
+        جوّه SQLite. رفض القيمة هنا آخر خط دفاع؛ طبقة الـ API بترفضها بـ 400 قبل كده.
         """
-        size = max(1, int(page_size))
-        offset = max(0, int(page)) * size
+        page = int(page)
+        if page < 0 or page > MAX_PAGE:
+            raise ValueError("رقم الصفحة خارج النطاق المسموح")
+        size = int(page_size)
+        # `size + 1` (جلب عنصر زيادة لمعرفة has_more) لازم يفضل داخل نطاق SQLite.
+        if size < 1 or size >= MAX_SQLITE_INT:
+            raise ValueError("حجم الصفحة خارج النطاق المسموح")
+        offset = page * size
+        if offset > MAX_SQLITE_INT:
+            raise ValueError("إزاحة الصفحة خارج نطاق SQLite")
         rows = self._conn.execute(
             "SELECT * FROM creation_jobs WHERE chat_id=? "
             "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
@@ -3205,7 +3225,14 @@ class Database:
 
         `archived=False` (الافتراضي) = الصندوق النشط (غير المؤرشف). `archived=True` =
         عرض الأرشيف بس. الأرشفة محور مستقل ⇒ ما بتغيّرش ترتيب `id DESC` ولا حالة القراءة.
+
+        AUD-04 (دفاع في العمق): `limit`/`offset` لازم يكونوا داخل نطاق SQLite قبل
+        الـ binding؛ أي قيمة أكبر ترفض بدل ما ترمي OverflowError (500).
         """
+        limit = int(limit)
+        offset = int(offset)
+        if limit < 0 or offset < 0 or limit > MAX_SQLITE_INT or offset > MAX_SQLITE_INT:
+            raise ValueError("حدود الصفحة خارج النطاق المسموح")
         clauses = [self._inbox_visibility_clause(archived)]
         if unread_only:
             clauses.append("read_at IS NULL")

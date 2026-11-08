@@ -631,3 +631,27 @@ def test_delete_eligibility_rechecked_inside_transaction(tmp_path):
     db.add_or_group_outbox("c1", 42, "late", "t1", client_ref="late-1")
     assert c.delete(f"/api/v1/notifications/{ident}", headers={"origin": ORIGIN}).status_code == 409
     assert db.get_inbox_item(ident) is not None
+
+
+# ================================ OHB2-PHASE1E-F2: huge numbers => 400, not 500
+HUGE = 10 ** 25  # أكبر من INTEGER (64-bit) ⇒ OverflowError في SQLite ⇒ 500 قبل الإصلاح
+
+
+def test_f2_huge_page_is_400(tmp_path):
+    """F2: `?page=10**25` كان بيضرب OverflowError (500) في `list_inbox` (OFFSET)."""
+    db = Database(str(tmp_path / "t.sqlite3"))
+    c, db = authed(tmp_path, db)
+    assert c.get(f"/api/v1/notifications?page={HUGE}").status_code == 400
+
+
+def test_f2_huge_inbox_item_id_is_400(tmp_path):
+    """F2: معرّف إشعار ضخم في كل مسارات القراءة/الأرشفة/الحذف ⇒ 400 مش 500."""
+    db = Database(str(tmp_path / "t.sqlite3"))
+    seed(db, message="x")
+    c, db = authed(tmp_path, db)
+    assert c.post(f"/api/v1/notifications/{HUGE}/read", headers={"origin": ORIGIN}).status_code == 400
+    assert c.post(f"/api/v1/notifications/{HUGE}/archive", json={}, headers={"origin": ORIGIN}).status_code == 400
+    assert c.post(f"/api/v1/notifications/{HUGE}/unarchive", json={}, headers={"origin": ORIGIN}).status_code == 400
+    assert c.delete(f"/api/v1/notifications/{HUGE}", headers={"origin": ORIGIN}).status_code == 400
+    assert db.count_inbox() == 1  # مفيش أي صف اتأثّر
+

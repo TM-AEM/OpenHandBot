@@ -137,14 +137,15 @@ python main.py
 pip install -r requirements-dev.txt
 python -m pyflakes bot/ automation/ main.py tests/  # لازم يخرج من غير أي تحذير
 python -m pip_audit -r requirements-dev.txt                # SCA: لازم «No known vulnerabilities found»
-python -m bandit -r bot/ main.py -lll -s B613              # SAST: مفيش نتائج عالية الخطورة
+python -m bandit -r bot/ automation/ main.py -lll -s B613  # SAST: مفيش نتائج عالية الخطورة
 python -m pytest -q                                        # كل الاختبارات لازم تعدّي
 ```
 
 - نفس الخطوات بتشتغل تلقائيًا في CI على `push`/`pull_request` لـ `main`، على
   **Python 3.11 و3.13** (وظيفتان: «Tests & lint» للـ Python + «Frontend tests (Node)»).
 - `pyflakes` بقى يغطّي `automation/` كمان (فحص ثابت AST، مش استيراد/تنفيذ ⇒ مفيش تشغيل
-  لأتمتة/autopush). `pip-audit` و`bandit` اتضافوا في OHB2-PHASE1E.
+  لأتمتة/autopush). `pip-audit` و`bandit` اتضافوا في OHB2-PHASE1E، و`bandit` كمان بقى
+  يغطّي `automation/` (AUD-07) — نفس سياسة الفشل عند أي نتيجة عالية الخطورة.
 - استثناء `B613` في bandit **مقصود**: علامات bidi (RTL) في التعليقات العربية، مش trojan-source.
 - تشغيلات سريعة مركّزة (اختيارية):
 

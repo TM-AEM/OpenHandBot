@@ -15,7 +15,7 @@ from starlette.testclient import TestClient
 from bot.config import Config
 from bot.db import Database
 from bot.web import build_web_app
-from bot.web.app import COOKIE_NAME
+from bot.web.app import COOKIE_NAME, MiniApp
 from bot.web.sessions import SessionStore, hash_token
 from tests._miniapp_helpers import BOT_TOKEN, make_init_data
 
@@ -387,3 +387,72 @@ def test_tokens_not_logged(tmp_path, caplog):
         store.revoke(s.token)
     joined = "\n".join(r.getMessage() for r in caplog.records)
     assert s.token not in joined
+
+
+# ================================ OHB2-PHASE1E-F4: limiter key is not the raw token
+def test_rate_limiter_key_is_hashed_not_raw_token(tmp_path):
+    """F4: التوثيق بيقول المفاتيح معرّفات مستعارة مش توكنات، لكن كان التوكن الخام نفسه
+    بيتخزّن كمفتاح الحد. دلوقتي لازم يكون هاش التوكن (مفيش توكن خام في المخزن).
+    """
+    db = make_db(tmp_path)
+    app = build_web_app(make_config(), db)
+    tc = TestClient(app, raise_server_exceptions=False)
+    assert tc.post("/api/v1/auth", json={"initData": make_init_data(OWNER)}).status_code == 200
+    raw = tc.cookies.get(COOKIE_NAME)
+    assert raw  # عندنا توكن جلسة فعلي
+
+    # نبني MiniApp جديد على **نفس** القاعدة (الجلسة دائمة) عشان نفحص المحدّد مباشرة.
+    from bot.web.app import MiniApp
+
+    m = MiniApp(make_config(), db)
+    tc2 = TestClient(m.router, raise_server_exceptions=False)
+    tc2.cookies.set(COOKIE_NAME, raw)
+    assert tc2.get("/api/v1/app/bootstrap").status_code == 200  # يعدّي على المحدّد
+
+    keys = list(m.api_limiter._events.keys())
+    assert raw not in keys, "التوكن الخام مستحيل يكون مفتاح الحد"
+    assert hash_token(raw) in keys, "المفتاح لازم يكون هاش التوكن"
+
+
+def test_rate_limiter_key_is_deterministic_and_not_reversible(tmp_path):
+    """AUD-05: نفس التوكن ⇒ نفس المفتاح دايمًا؛ والمفتاح هاش 64-hex مش التوكن الخام."""
+    import hashlib
+
+    token = "raw-session-token-abc123"
+    assert hash_token(token) == hash_token(token)  # حتمي
+    key = hash_token(token)
+    assert key != token and token not in key
+    assert key == hashlib.sha256(token.encode("utf-8")).hexdigest()
+    assert len(key) == 64 and all(c in "0123456789abcdef" for c in key)
+
+
+def test_rate_limiter_keys_are_isolated_per_session(tmp_path):
+    """AUD-05: جلسات مختلفة ⇒ مفاتيح مختلفة (العزل محفوظ)؛ وجلسة واحدة ما تستهلكش
+    ميزانية جلسة تانية."""
+    db = make_db(tmp_path)
+    m = MiniApp(make_config(), db)
+    t1 = m.sessions.create(OWNER).token
+    t2 = m.sessions.create(OWNER).token
+    k1, k2 = hash_token(t1), hash_token(t2)
+    assert k1 != k2 and t1 != t2
+    # استهلك ميزانية t1؛ لازم t2 تفضل مسموحة.
+    for _ in range(m._config.mini_app_api_rate_per_minute):
+        assert m.api_limiter.allow(k1)[0] is True
+    assert m.api_limiter.allow(k1)[0] is False  # t1 اتحدّت
+    assert m.api_limiter.allow(k2)[0] is True   # t2 ما اتأثّرش
+
+
+def test_rate_limiter_key_has_no_raw_token_after_expiry_cleanup(tmp_path):
+    """AUD-05: حتى بعد الانتهاء/التنظيف، ما يتخزّنش أي توكن خام كمفتاح."""
+    db = make_db(tmp_path)
+    m = MiniApp(make_config(), db)
+    raw = m.sessions.create(OWNER).token
+    # ننادي المحدّد مباشرة بالمفتاح المشتق (نفس ما بيعمل `_guarded`).
+    m.api_limiter.allow(hash_token(raw))
+    m.sessions.revoke(raw)  # إلغاء + تنظيف
+    keys = list(m.api_limiter._events.keys())
+    assert all(raw != k for k in keys)
+    assert all(len(k) == 64 for k in keys)  # كلها هاشات SHA-256
+
+
+

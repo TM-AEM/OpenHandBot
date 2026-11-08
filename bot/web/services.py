@@ -26,6 +26,8 @@ from ..db import (
     INBOX_DELETE_DELETED,
     INBOX_DELETE_MISSING,
     INBOX_PAGE_SIZE,
+    MAX_PAGE,
+    MAX_SQLITE_INT,
 )
 from ..files import (
     CONVERSATION_ERRORS,
@@ -159,8 +161,22 @@ def _require_id(value: str | None) -> str:
     return text
 
 
-def _require_text(value: str | None) -> str:
-    text = (value or "").strip()
+def _as_str(value, message: str) -> str:
+    """يرجّع الحقل كنص، أو يرفضه بـ ValidationError.
+
+    حقول JSON الخام ممكن تكون رقم/قائمة/كائن؛ `(value or "").strip()` عليها يضرب
+    AttributeError (500). نفس نمط إصلاح OHB2-PHASE1D-F3، لكن في طبقة الخدمة عشان
+    كل المسارات اللي بتمرّر حقول JSON تستفيد (مش مسار واحد).
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValidationError(message)
+    return value
+
+
+def _require_text(value) -> str:
+    text = _as_str(value, "النص لازم يكون نص").strip()
     if not text:
         raise ValidationError("النص مطلوب")
     if len(text) > MAX_PROMPT_CHARS:
@@ -168,8 +184,8 @@ def _require_text(value: str | None) -> str:
     return text
 
 
-def _require_repo(value: str | None) -> str:
-    text = (value or "").strip()
+def _require_repo(value) -> str:
+    text = _as_str(value, "اسم المستودع غير صالح").strip()
     if not text or len(text) > MAX_REPO_LEN:
         raise ValidationError("اسم المستودع غير صالح")
     parts = text.split("/")
@@ -186,20 +202,54 @@ def _optional_repo(value: str | None) -> str | None:
     فاضي/غايب ⇒ None (شات بدون مستودع). لو فيه قيمة ⇒ نفس تحقق `_require_repo`
     الصارم (شكل owner/repo). كده ما بنسمحش بمستودع مشوّه، وبنسمح صريحًا ببدونه.
     """
-    text = (value or "").strip()
+    text = _as_str(value, "اسم المستودع غير صالح").strip()
     if not text:
         return None
     return _require_repo(text)
 
 
-def _require_ref(value: str | None) -> str:
+def _require_ref(value) -> str:
     """يتحقّق من معرّف العملية اللي العميل يولّده (idempotency) أو يرجّع فاضي."""
-    text = (value or "").strip()
+    text = _as_str(value, "معرّف العملية غير صالح").strip()
     if not text:
         return ""
     if len(text) > MAX_REF_LEN or not all(ch.isalnum() or ch in "-_" for ch in text):
         raise ValidationError("معرّف العملية غير صالح")
     return text
+
+
+def _page_number(page) -> int:
+    """يرجّع رقم الصفحة كـ int داخل `[0, MAX_PAGE]` أو يرفضه بـ ValidationError.
+
+    AUD-04: نتحقق **قبل** أي ضرب. الرفض موحّد عبر كل مسارات الترقيم (400) — مفيش
+    تكميم صامت لقيمة سالبة/ضخمة، عشان المدخل غير الصالح يبان للمستخدم بدل ما يتحوّل
+    لصفحة أولى مضلّلة. القيم المسموحة (بما فيها 0 والصفحات الفاضية داخل السقف)
+    بتتحفظ بنفس دلالات الترقيم القائمة.
+    """
+    try:
+        value = int(page)
+    except (TypeError, ValueError):
+        raise ValidationError("رقم الصفحة غير صالح") from None
+    if isinstance(page, bool) or (not isinstance(page, (int, str))):
+        raise ValidationError("رقم الصفحة غير صالح")
+    if value < 0 or value > MAX_PAGE:
+        raise ValidationError("رقم الصفحة غير صالح")
+    return value
+
+
+def _page_offset(page, size: int) -> int:
+    """يحوّل رقم صفحة إلى offset آمن أو يرفضه بـ ValidationError.
+
+    AUD-04: كل مسارات الترقيم بتمرّ من هنا. بنتحقق إن `page` عدد صحيح داخل
+    `[0, MAX_PAGE]` **قبل** أي ضرب، ونتأكد إن `offset = page × size` داخل نطاق
+    SQLite (64-bit). كده مستحيل يوصل `offset` ضخم لـ SQLite ⇒ مفيش OverflowError/500،
+    ومفيش استعلام بيتنفّذ بقيمة غير صالحة. نفس دلالة الرفض لكل المسارات (400).
+    """
+    value = _page_number(page)
+    offset = value * int(size)
+    if offset < 0 or offset > MAX_SQLITE_INT:
+        raise ValidationError("رقم الصفحة غير صالح")
+    return offset
 
 
 def _conversation_dto(conv: dict, watched: bool) -> dict:
@@ -344,12 +394,24 @@ class MiniAppService:
         return CodedApiError(code, message, http)
 
     def _wake(self, key: str) -> None:
-        """ينبّه الـ worker المالك الموجود (نفس العملية) لو موجود — بدون إنشاء worker."""
+        """ينبّه الـ worker المالك الموجود (نفس العملية) لو موجود — بدون إنشاء worker.
+
+        بعض كيانات `bot_data` (Watcher/Notifier) **ملهاش** `wake()`؛ النداء الأعمى عليها
+        كان يضرب AttributeError (500) بعد حذف بعيد **نجح بالفعل**، فيبان للمستخدم فشل
+        مش موجود. بننادي `wake()` بس لو موجودة فعلاً، وأي استثناء من التنبيه نفسه
+        (مش من العملية الأصلية) بنبتلعه بعد تسجيله — التنبيه ثانوي ومستحيل يفشّل عملية
+        نجحت. (ده مش إخفاء خطأ: العملية الأصلية مسجّلة ومُرجَعة بحالتها الحقيقية.)
+        """
         if self._application is None:
             return
         worker = self._application.bot_data.get(key)
-        if worker is not None:
-            worker.wake()
+        wake = getattr(worker, "wake", None)
+        if not callable(wake):
+            return
+        try:
+            wake()
+        except Exception:  # noqa: BLE001 — تنبيه ثانوي لا يفشّل عملية نجحت
+            log.warning("فشل تنبيه الـ worker %r بعد عملية ناجحة؛ بنتجاهله.", key)
 
     def _list_cache(self):
         if self._application is None:
@@ -413,8 +475,8 @@ class MiniAppService:
         """
         if self._db is None:
             return {"page": 0, "has_more": False, "unread_count": 0, "items": []}
-        page = max(0, page)
-        offset = page * INBOX_PAGE_SIZE
+        page = _page_number(page)
+        offset = _page_offset(page, INBOX_PAGE_SIZE)
         items = self._db.list_inbox(
             limit=INBOX_PAGE_SIZE, offset=offset, unread_only=unread_only, archived=archived
         )
@@ -460,12 +522,7 @@ class MiniAppService:
     def mark_notification_read(self, item_id) -> dict:
         if self._db is None:
             raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
-        try:
-            ident = int(item_id)
-        except (TypeError, ValueError):
-            raise ValidationError("معرّف الإشعار غير صالح")
-        if ident <= 0:
-            raise ValidationError("معرّف الإشعار غير صالح")
+        ident = self._inbox_item_id(item_id)
         ok = self._db.mark_inbox_read(ident, outbox.now_iso())
         if not ok:
             raise ApiError("الإشعار مش موجود.", 404)
@@ -484,7 +541,7 @@ class MiniAppService:
             ident = int(item_id)
         except (TypeError, ValueError):
             raise ValidationError("معرّف الإشعار غير صالح")
-        if ident <= 0:
+        if ident <= 0 or ident > MAX_SQLITE_INT:
             raise ValidationError("معرّف الإشعار غير صالح")
         return ident
 
@@ -557,8 +614,8 @@ class MiniAppService:
         # مصدر القايمة بعيد (search) فمش عارف بالحذف المحلي؛ نفلترها قبل الترقيم عشان
         # الشات المحذوف ما يظهرش تاني بعد refresh (من غير انتظار دورة البوت).
         items = self._without_deleted(items)
-        page = max(0, page)
-        start = page * PAGE_SIZE
+        page = _page_number(page)
+        start = _page_offset(page, PAGE_SIZE)
         chunk = items[start : start + PAGE_SIZE]
         if not chunk and page > 0:
             page, start, chunk = 0, 0, items[:PAGE_SIZE]
@@ -861,7 +918,7 @@ class MiniAppService:
         """
         if self._db is None:
             raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
-        page = max(0, int(page))
+        page = _page_number(page)
         jobs, has_more = self._db.list_creation_jobs_for_owner(
             self._config.owner_id, page=page, page_size=PAGE_SIZE
         )
@@ -1078,8 +1135,8 @@ class MiniAppService:
         if self._db is None:
             raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
         items = self._db.list_watched()
-        page = max(0, page)
-        start = page * PAGE_SIZE
+        page = _page_number(page)
+        start = _page_offset(page, PAGE_SIZE)
         chunk = items[start : start + PAGE_SIZE]
         if not chunk and page > 0:
             page, start, chunk = 0, 0, items[:PAGE_SIZE]
@@ -1138,8 +1195,8 @@ class MiniAppService:
     async def list_repositories(self, query: str = "", page: int = 0) -> dict:
         client = self._require_client()
         repos = await client.search_repositories(query=(query or "").strip())
-        page = max(0, page)
-        start = page * 8
+        page = _page_number(page)
+        start = _page_offset(page, 8)
         chunk = repos[start : start + 8]
         if not chunk and page > 0:
             page, start, chunk = 0, 0, repos[:8]

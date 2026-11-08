@@ -484,10 +484,14 @@ Pagination and error behavior (as implemented):
 
 - Page size is fixed at `INBOX_PAGE_SIZE` = 10; offset = `page * 10`; ordering is
   `id DESC` (stable, since `id` is monotonic).
-- `page` is clamped to `>= 0`. If a requested page is empty because it exceeds the
-  range, the service falls back to page 0 and reports `page: 0` (mirrors the watches
-  list behavior). This is why the frontend must synchronize its page from the server
-  response (§6.5).
+- `page` must be an integer in `[0, MAX_PAGE]` (`MAX_PAGE = 1_000_000`, `bot/db.py`).
+  A negative, non-numeric, or out-of-range value is rejected with
+  `400 {"error":"bad_request"}` **before** any `page * size` arithmetic or SQLite
+  binding — it is never silently clamped (a huge `page` such as `2**62` would otherwise
+  overflow SQLite's 64-bit `OFFSET` and raise an internal error). If a requested page
+  within range is empty because it exceeds the row count, the service falls back to
+  page 0 and reports `page: 0` (mirrors the watches list behavior). This is why the
+  frontend must synchronize its page from the server response (§6.5).
 - `has_more` = `total > offset + len(items)`, where `total` respects `unread_only`
   and `archived`.
 - `unread_count` is always the unread-only count of the **active** inbox (archived

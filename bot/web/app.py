@@ -21,12 +21,13 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from ..config import Config
+from ..db import MAX_PAGE, MAX_SQLITE_INT
 from ..errors import ApiError, error_text
 from .clientip import parse_trusted_proxies, resolve_client_ip
 from .initdata import DEFAULT_MAX_AGE, InitDataError, TelegramUser, validate_init_data
 from .ratelimit import api_limiter, auth_limiter
 from .services import MiniAppService, ValidationError, EXPORT_CONTENT_TYPE
-from .sessions import SessionStore
+from .sessions import SessionStore, hash_token
 
 log = logging.getLogger(__name__)
 
@@ -34,9 +35,6 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 INDEX_FILE = STATIC_DIR / "index.html"
 COOKIE_NAME = "ohb_session"
 MAX_BODY_BYTES = 16 * 1024
-# OHB2-PHASE1D-F5: أقصى رقم نقبله للمعرّفات/الترقيم — أكبر من كده SQLite بيرمي
-# OverflowError (500). نرفضه بـ 400 بدل الانهيار.
-MAX_SQLITE_INT = 2**63 - 1
 API_PREFIX = "/api/v1"
 # OHB2-PHASE1B: المحارف المسموح بيها في اسم ملف التنزيل (ASCII آمن) — نمنع أي CR/LF
 # أو اقتباس أو محرف تحكّم من إنه يوصل لهيدر `Content-Disposition`.
@@ -422,7 +420,9 @@ class MiniApp:
         ترتيب الفحص: حد المعدّل (قبل أي شغل) ⇒ الجلسة ⇒ Origin (لو طلب بيغيّر الحالة).
         """
         session = self._session_from_cookie(request)
-        key = session.token if session is not None else f"ip:{self._client_ip(request)}"
+        # OHB2-PHASE1E-F4: مفتاح الحد لازم ما يكونش التوكن الخام نفسه (التوثيق بيقول
+        # «معرّفات مستعارة مش توكنات»). بنستخدم hash التوكن (نفس دالة تخزين الجلسة).
+        key = hash_token(session.token) if session is not None else f"ip:{self._client_ip(request)}"
         limited = self._rate_limited(self.api_limiter, key)
         if limited is not None:
             return None, limited
@@ -559,6 +559,8 @@ class MiniApp:
             page = int(request.query_params.get("page", "0") or 0)
         except ValueError:
             return _error(400, "bad_request", "رقم الصفحة غير صالح.")
+        if page < 0 or page > MAX_PAGE:
+            return _error(400, "bad_request", "رقم الصفحة غير صالح.")
         unread_only = request.query_params.get("unread") in ("1", "true")
         archived = request.query_params.get("archived") in ("1", "true")
         try:
@@ -635,6 +637,8 @@ class MiniApp:
         try:
             page = int(request.query_params.get("page", "0") or 0)
         except ValueError:
+            return _error(400, "bad_request", "رقم الصفحة غير صالح.")
+        if page < 0 or page > MAX_PAGE:
             return _error(400, "bad_request", "رقم الصفحة غير صالح.")
         refresh = request.query_params.get("refresh") == "1"
         try:
@@ -795,6 +799,8 @@ class MiniApp:
                 outbox_id = int(raw_id)
             except ValueError:
                 raise ValidationError("رقم العملية غير صالح") from None
+            if outbox_id < 0 or outbox_id > MAX_SQLITE_INT:
+                raise ValidationError("رقم العملية غير صالح")
             return self._service.outbox_operation(outbox_id)
         if ref:
             conversation_id = request.query_params.get("conversation_id") or ""
@@ -827,7 +833,7 @@ class MiniApp:
             page = int(raw_page)
         except ValueError:
             return _error(400, "bad_request", "رقم الصفحة غير صالح")
-        if page < 0 or page > MAX_SQLITE_INT:
+        if page < 0 or page > MAX_PAGE:
             return _error(400, "bad_request", "رقم الصفحة غير صالح")
         try:
             data = self._service.list_creation_jobs(page)
@@ -851,8 +857,15 @@ class MiniApp:
             outbox_id = int(raw_id)
         except (TypeError, ValueError):
             return _error(400, "bad_request", "رقم العملية غير صالح")
+        if outbox_id < 0 or outbox_id > MAX_SQLITE_INT:
+            return _error(400, "bad_request", "رقم العملية غير صالح")
+        # OHB2-PHASE1E-F2: الإجراء لازم يكون نص — قيمة JSON غير نصية (5/[1]/{}) كانت
+        # بتضرب AttributeError (500) جوّه `.strip()`؛ دلوقتي بنرفضها بـ 400 (نفس نمط F3).
+        raw_action = body.get("action")
+        if not isinstance(raw_action, str):
+            return _error(400, "bad_request", "إجراء غير معروف")
         try:
-            data = self._service.reconcile_outbox(outbox_id, (body.get("action") or "").strip())
+            data = self._service.reconcile_outbox(outbox_id, raw_action.strip())
         except ValidationError as exc:
             return _error(400, "bad_request", str(exc))
         except ApiError as exc:
@@ -975,7 +988,9 @@ class MiniApp:
         try:
             page = int(request.query_params.get("page", "0") or 0)
         except ValueError:
-            page = 0
+            return _error(400, "bad_request", "رقم الصفحة غير صالح.")
+        if page < 0 or page > MAX_PAGE:
+            return _error(400, "bad_request", "رقم الصفحة غير صالح.")
         try:
             data = self._service.list_watches(page=page)
         except ApiError as exc:
@@ -989,7 +1004,9 @@ class MiniApp:
         try:
             page = int(request.query_params.get("page", "0") or 0)
         except ValueError:
-            page = 0
+            return _error(400, "bad_request", "رقم الصفحة غير صالح.")
+        if page < 0 or page > MAX_PAGE:
+            return _error(400, "bad_request", "رقم الصفحة غير صالح.")
         try:
             data = await self._service.list_repositories(
                 query=request.query_params.get("q", ""), page=page

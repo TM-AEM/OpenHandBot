@@ -40,12 +40,14 @@ jobs:
         # OHB2-PHASE1E: SCA على requirements-dev.txt (بيسحب requirements.txt). بيفشل عند أي
         # ثغرة معروفة. محتاج شبكة (advisory DB) — متوفّرة على GitHub runners.
         run: python -m pip_audit -r requirements-dev.txt
-      - name: SAST (bandit, runtime code)
+      - name: SAST (bandit, runtime + automation code)
         # OHB2-PHASE1E: فحص أمني ثابت لكود التشغيل (bot/ + main.py) عند severity عالي فقط.
+        # AUD-07: بنوسّع النطاق ليشمل automation/ كمان (كان bot/ main.py بس) — نفس سياسة
+        # الفشل عند أي نتيجة عالية الخطورة في الكود اللي بيشتغل.
         # B613 (محارف bidi) مستثنى عمدًا: المشروع عربي والتعليقات فيها علامات RTL مقصودة
         # (مش trojan-source) — شوف docs/OPERATIONS_RUNBOOK.md. باقي نتائج bandit منخفضة/متوسطة
         # وكلها إيجابيات كاذبة موثّقة (SQL مُعامَل، bind-all مقصود، try/except pass مقصود).
-        run: python -m bandit -r bot/ main.py -lll -s B613
+        run: python -m bandit -r bot/ automation/ main.py -lll -s B613
       - name: Tests (pytest)
         run: python -m pytest -q
 

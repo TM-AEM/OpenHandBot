@@ -919,3 +919,113 @@ def test_miniapp_list_flags_truncation(tmp_path):
     r = tc.get("/api/v1/conversations?refresh=1")
     assert r.status_code == 200, r.text
     assert r.json()["truncated"] is True
+
+
+# ================================ OHB2-PHASE1E-F1: delete must not 500 after success
+class _DummyBot:
+    pass
+
+
+class _RealEntitiesApp:
+    """تطبيق فيه **كيانات حقيقية** في `bot_data` زي الإنتاج (Watcher/Notifier بدون wake)."""
+
+    def __init__(self, client, db):
+        from bot.watcher import Watcher
+        from bot.notifier import Notifier
+
+        self.bot = _DummyBot()
+        self.bot_data = {
+            "watcher": Watcher(client, db, self.bot, chat_id=OWNER),
+            "notifier": Notifier(client, db, self.bot, chat_id=OWNER),
+        }
+
+
+def test_delete_does_not_500_when_watcher_has_no_wake(tmp_path):
+    """F1: الحذف البعيد بينجح، لكن `_wake` كان بينادي `wake()` على Watcher/Notifier
+    (ملهاش الدالة) ⇒ AttributeError ⇒ 500 بعد نجاح الحذف. دلوقتي لازم يرجّع 200.
+    """
+    api, db = MockAPI(), _db(tmp_path)
+    db.add_watched(CID, "شات", chat_id=OWNER)
+    client = OpenHandsClient(
+        "https://example.test", "key", transport=httpx.MockTransport(api.handler)
+    )
+    app = _RealEntitiesApp(client, db)
+    assert not hasattr(app.bot_data["watcher"], "wake")
+    assert not hasattr(app.bot_data["notifier"], "wake")
+    tc = TestClient(
+        build_web_app(make_config(), db, client=client, application=app),
+        raise_server_exceptions=False,
+    )
+    login(tc)
+    r = tc.delete(f"/api/v1/conversations/{CID}", headers={"origin": ORIGIN})
+    assert r.status_code == 200, r.text
+    assert r.json()["remote_deleted"] is True
+    assert api.deleted_remote_calls == 1  # الحذف البعيد اتعمل فعلًا مرة واحدة
+    assert db.get_watched(CID) is None
+
+
+class _RaisingWorker:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def wake(self) -> None:
+        self.calls += 1
+        raise RuntimeError("wake failed")
+
+
+class _RaisingWakeApp:
+    """تطبيق فيه workers بـ `wake()` بترمي استثناء — أسوأ حالة للتنبيه الثانوي."""
+
+    def __init__(self) -> None:
+        self.bot = _DummyBot()
+        self.outbox_worker = _RaisingWorker()
+        self.bot_data = {
+            "outbox_worker": self.outbox_worker,
+            "creation_worker": _RaisingWorker(),
+            "completion_worker": _RaisingWorker(),
+            "watcher": _RaisingWorker(),
+            "notifier": _RaisingWorker(),
+        }
+
+
+def test_delete_succeeds_even_when_all_wakes_raise(tmp_path):
+    """AUD-01: تنبيه ثانوي بيرمي استثناء مستحيل يقلب حذفًا بعيدًا **نجح** لـ 500."""
+    api, db = MockAPI(), _db(tmp_path)
+    db.add_watched(CID, "شات", chat_id=OWNER)
+    client = OpenHandsClient(
+        "https://example.test", "key", transport=httpx.MockTransport(api.handler)
+    )
+    app = _RaisingWakeApp()
+    tc = TestClient(
+        build_web_app(make_config(), db, client=client, application=app),
+        raise_server_exceptions=False,
+    )
+    login(tc)
+    r = tc.delete(f"/api/v1/conversations/{CID}", headers={"origin": ORIGIN})
+    assert r.status_code == 200, r.text
+    assert r.json()["remote_deleted"] is True
+    assert api.deleted_remote_calls == 1
+    assert db.get_watched(CID) is None
+    # التنبيهات اتنادت فعلًا (مش متجاهلة) لكن فشلها اتّبلع.
+    assert app.outbox_worker.calls == 1
+
+
+def test_failed_remote_delete_is_not_reported_as_success_even_if_wake_raises(tmp_path):
+    """AUD-01: لو الحذف البعيد فشل فشلًا مؤكّدًا، لازم خطأ منظّم — مش نجاح،
+    حتى مع وجود تنبيه بيرمي استثناء (الحالة الحقيقية للعملية هي اللي تتحكم)."""
+    api, db = MockAPI(), _db(tmp_path)
+    api.conv_owner = "another-owner"  # مش مالك ⇒ رفض تفويض (403) قبل أي حذف
+    db.add_watched(CID, "شات", chat_id=OWNER)
+    client = OpenHandsClient(
+        "https://example.test", "key", transport=httpx.MockTransport(api.handler)
+    )
+    tc = TestClient(
+        build_web_app(make_config(), db, client=client, application=_RaisingWakeApp()),
+        raise_server_exceptions=False,
+    )
+    login(tc)
+    r = tc.delete(f"/api/v1/conversations/{CID}", headers={"origin": ORIGIN})
+    assert r.status_code == 403, r.text
+    assert api.deleted_remote_calls == 0  # مفيش حذف بعيد اتبعت خالص
+    assert db.get_watched(CID) is not None  # الشات لسه موجود محليًا
+

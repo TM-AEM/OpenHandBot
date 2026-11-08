@@ -61,7 +61,36 @@ def test_ci_static_check_covers_all_first_party_modules():
 
 def test_ci_runs_dependency_and_sast_checks():
     assert "pip_audit -r requirements-dev.txt" in CI
-    assert "bandit -r bot/ main.py -lll -s B613" in CI
+    assert "bandit -r bot/ automation/ main.py -lll -s B613" in CI
+
+
+def test_ci_sast_scope_includes_automation():
+    # AUD-07: كان bandit على bot/ main.py بس. لازم يغطّي automation/ كمان.
+    assert "bandit -r bot/ automation/ main.py -lll -s B613" in CI
+    # ومفيش استدعاء bandit بنطاق أضيق سايب في السير عمل.
+    assert "bandit -r bot/ main.py" not in CI
+
+
+def test_bandit_flags_high_severity_in_automation(tmp_path):
+    """AUD-07: يثبت إن النطاق الموسّع فعّال — bandit بيفشل (non-zero) عند نتيجة
+    عالية الخطورة في كود automation/. بنستخدم subprocess على ملف مصغّر آمن (مفيش تنفيذ
+    للكود) ونتأكد إن exit code != 0 عند -lll. كده البوابة مش شكلية."""
+    import subprocess
+    import sys
+
+    probe = tmp_path / "probe_high.py"
+    # subprocess.Popen(shell=True) = B602 (high severity) — كافٍ لإثبات إن البوابة بتفشل.
+    probe.write_text(
+        "import subprocess\n\n\ndef f(cmd):\n    return subprocess.Popen(cmd, shell=True)\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [sys.executable, "-m", "bandit", "-r", str(probe), "-lll"],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert "B602" in proc.stdout
 
 
 def test_ci_runs_tests_and_frontend_without_secrets():
