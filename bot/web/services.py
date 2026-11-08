@@ -106,6 +106,18 @@ _CREATION_POST_STATE = {
 }
 
 
+def _creation_post_started(job) -> bool:
+    """هل POST البدء **بدأ فعلاً** (أو ممكن يكون بدأ) لهذا الطلب؟
+
+    `task_id` دليل قاطع: الكود بيسجّله **بس** بعد ما `client.start_conversation`
+    يرجّعه (`outbox.py`)، وبيفضل محفوظ بعد التعافي (بيتحجز `claimed` بـ `RETURNING *`
+    والاستعادة بترجّعه `pending`). فأي صف عليه `task_id` = الـ POST اترجع ⇒ **مستحيل**
+    نعتبره "لسه مابدأش" حتى لو حالته `pending`/`claimed` (قبل الإصلاح ده كان بيدّي
+    إلغاء كاذب ويحوّل شات بعيد حقيقي لـ 'discarded' من غير تسجيل conversation_id).
+    """
+    return bool(getattr(job, "task_id", None)) or job.status not in _DISCARDABLE_CREATION
+
+
 class ValidationError(ValueError):
     """مدخل غير صالح من العميل (بترجع 400 بشكل منظّم)."""
 
@@ -954,7 +966,10 @@ class MiniAppService:
         if action == "cancel":
             if status in _TERMINAL_CREATION:
                 raise CodedApiError("already_terminal", "العملية خلاص في حالة نهائية.", 409)
-            if status in _NOT_CONFIRMED_CREATION:
+            # OHB2-PHASE1D-F1: وجود `task_id` = الـ POST البدء رجع فعلاً ⇒ مفيش ادّعاء
+            # "قبل الإرسال" وممنوع الشطب (كان بيضيّع conversation_id ويحوّل شات بعيد
+            # حقيقي لـ discarded). نرجّع الحالة الحالية + علامة "not_confirmed".
+            if status in _NOT_CONFIRMED_CREATION or _creation_post_started(job):
                 # الـ POST ممكن يكون بدأ ⇒ مفيش ادّعاء إلغاء. نرجّع الحالة الحالية + علامة.
                 log.info("reconcile: creation=%s cancel not confirmed (state=%s)", job_id, status)
                 dto = self._creation_dto(job)
@@ -1033,6 +1048,11 @@ class MiniAppService:
     def _creation_dto(job) -> dict:
         status = job.status
         terminal = status in _TERMINAL_CREATION
+        # OHB2-PHASE1D-F1: حدّ الإرسال بيتحسب بالحالة **ووجود task_id**. أي صف عليه
+        # task_id = الـ POST البدء رجع فعلاً ⇒ ممنوع ندّعي "لسه مابدأش" وممنوع نسمح
+        # بإلغاء يدّعي إنه قبل الإرسال (كان بيحوّل شات بعيد حقيقي لـ discarded ويضيّع
+        # conversation_id). مفيش أي تراجع في at-most-once: الإلغاء لسه CAS على الحالات.
+        post_started = _creation_post_started(job)
         return {
             "kind": "creation",
             "id": job.id,
@@ -1040,9 +1060,11 @@ class MiniAppService:
             "state": _CREATION_STATES.get(status, "unknown"),
             # OHB2-PHASE1D: حقول آمنة مشتقّة على السيرفر (مش من الواجهة) لوصف حدّ الإرسال
             # والعمليات المتاحة. القرار النهائي يفضل جوّه `reconcile_creation` (إعادة فحص).
-            "post_state": _CREATION_POST_STATE.get(status, "uncertain"),
+            "post_state": ("uncertain" if post_started else "not_started")
+            if status in _DISCARDABLE_CREATION
+            else _CREATION_POST_STATE.get(status, "uncertain"),
             "terminal": terminal,
-            "cancellable": status in _DISCARDABLE_CREATION,
+            "cancellable": status in _DISCARDABLE_CREATION and not post_started,
             "resolvable": status == db_module.CREATION_UNKNOWN,
             "conversation_id": job.conversation_id or "",
             "created_at": job.created_at,

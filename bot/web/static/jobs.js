@@ -40,6 +40,7 @@
   var NOTES = {
     pending: "الطلب في الطابور. لو لسه مابدأش تقدر تلغيه بأمان.",
     accepted: "الشات بدأ فعلاً واتأكد. مفيش أي إعادة إرسال.",
+    accepted_asserted: "المالك أكّد إنه بدأ (من غير معرّف محادثة). مفيش أي إعادة إرسال.",
     failed: "البدء فشل بشكل مؤكد (مفيش إعادة تلقائية).",
     ambiguous: "النتيجة غامضة: ممكن يكون الشات بدأ فعلاً. استعلم عن الحالة من الموقع، ولو مش متأكد علّم الطلب كـ«بدأ».",
     discarded: "اتلغى قبل ما يتبعت. مفيش أي إرسال حصل.",
@@ -56,6 +57,9 @@
 
   function note(item) {
     var state = (item && item.state) || "unknown";
+    // OHB2-PHASE1D-F2: "accepted" من غير معرّف محادثة = المالك أكّده يدويًا (mark_sent)،
+    // مش إثبات بدء من OpenHands ⇒ رسالة أضعف (مفيش ادّعاء "بدأ فعلاً واتأكد").
+    if (state === "accepted" && !hasConversation(item)) { return NOTES.accepted_asserted; }
     return NOTES[state] || NOTES.unknown;
   }
 

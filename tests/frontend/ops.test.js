@@ -139,3 +139,24 @@ test("wiring: app.js uses the shared manager and dropped the old local state", (
   assert.ok(!/\bcurrentText\b/.test(js), "currentText القديم لازم يختفي");
   assert.ok(!/\bcreateOpRef\b/.test(js), "createOpRef القديم لازم يختفي");
 });
+
+// OHB2-PHASE1D-F4: العملية الملغاة نهائية ⇒ أول إرسال جديد بنفس المفتاح ياخد معرّف
+// جديد (وإلا معرّف ملغي كان بيسدّ نفس (مستودع+نص) للأبد).
+test("discarded is terminal -> a new acquire after discard gets a fresh ref", () => {
+  const mgr = OPS.createRefManager(countingRefFn());
+  const key = createKey("o/r", "شات");
+  const r1 = mgr.acquire(key, "شات");
+  mgr.resolve(r1, "discarded");
+  const r2 = mgr.acquire(key, "شات");
+  assert.notEqual(r1, r2, "معرّف ملغي مايفضلش نشط");
+});
+
+test("a late pending for the discarded ref does not reactivate it", () => {
+  const mgr = OPS.createRefManager(countingRefFn());
+  const key = createKey("o/r", "شات");
+  const r1 = mgr.acquire(key, "شات");
+  mgr.resolve(r1, "discarded");
+  mgr.resolve(r1, "pending");  // وصول متأخّر للعملية القديمة
+  const r2 = mgr.acquire(key, "شات");
+  assert.notEqual(r1, r2);
+});

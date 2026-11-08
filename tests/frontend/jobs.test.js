@@ -54,3 +54,13 @@ test("postStateLabel: وصف آمن لحدّ الإرسال", () => {
   assert.equal(JOBS.postStateLabel("started"), "بدأ فعلاً");
   assert.equal(JOBS.postStateLabel("bogus"), "");
 });
+
+// OHB2-PHASE1D-F2: "accepted" من غير معرّف محادثة = تأكيد مالك (mark_sent) ⇒ رسالة
+// أضعف، من غير ادّعاء "بدأ فعلاً واتأكد".
+test("note: accepted من غير معرّف محادثة مايدّعيش 'بدأ فعلاً واتأكد'", () => {
+  const asserted = JOBS.note({ state: "accepted", conversation_id: "" });
+  assert.ok(asserted.includes("أكّد"), "لازم يقول إن المالك أكّد");
+  assert.ok(!asserted.includes("بدأ فعلاً واتأكد"), "مايدّعيش إثبات بدء من غير دليل");
+  const real = JOBS.note({ state: "accepted", conversation_id: "c1" });
+  assert.ok(real.includes("بدأ فعلاً واتأكد"), "مع معرّف محادثة ⇒ ادّعاء البدء مسموح");
+});

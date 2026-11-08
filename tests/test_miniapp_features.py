@@ -171,6 +171,7 @@ class FakeDb:
                 return _Row(
                     id=job["id"], repo=job["repo"], status=job["status"],
                     conversation_id=job["conversation_id"], created_at="t", updated_at="t",
+                    task_id=job.get("task_id"),
                 )
         return None
 

@@ -614,3 +614,39 @@ unknown (غامض) · failed (فشل مؤكد) · discarded (اتلغى قبل �
 
 ## Next
 - فتح PR (لما المستخدم يطلب) ⇒ CI هيشتغل ويأكّد على GitHub Actions.
+
+---
+
+## OHB2-PHASE1D-FIX — independent-review findings (branch agent/ohb2-phase1c-inbox-filter-archive-delete)
+
+مراجعة مستقلة (نموذج مختلف: deepseek-v4.1-flash عبر agent-server محلي) على الـ commit
+`75e5b40` طلّعت HIGH واحد + MEDIUM. اتأكدت كلها تجريبيًا واتصلّحت:
+
+- **F1 (HIGH) — إلغاء كاذب لطلب الـ POST بتاعه رجع فعلاً.** `_creation_dto` كان بيصنّف
+  `pending`/`claimed` كـ `not_started`/`cancellable` **حتى لو فيه `task_id`** (دليل قاطع
+  إن `start_conversation` رجع). الإلغاء كان بيحوّل شات بعيد حقيقي لـ `discarded` من غير
+  تسجيل `conversation_id` ⇒ شات يتيم. الإصلاح: `_creation_post_started(job)` (task_id أو
+  حالة غير قابلة للشطب) بيمنع `not_started`/`cancellable`، + حرس دفاع في العمق في
+  `discard_creation_job` (`AND task_id IS NULL` + قراءة `task_id` ⇒ `not_confirmed`).
+- **F2 (MEDIUM) — ادّعاء "بدأ فعلاً واتأكد" لطلب `done` من `mark_sent`** (بدون معرّف
+  محادثة). jobs.js بقى يعرض رسالة أضعف ("المالك أكّد إنه بدأ") لما مفيش `conversation_id`.
+- **F3 (MEDIUM) — `action` غير نصي ⇒ 500.** `(body.get("action") or "").strip()` كان
+  بيرمي `AttributeError` لقيمة رقم/مصفوفة/كائن. دلوقتي `isinstance(..., str)` ⇒ 400.
+- **F4 (MEDIUM) — طلب ملغي بيسدّ نفس (مستودع+نص) للأبد.** `TERMINAL` في ops.js كان ناقص
+  `discarded`؛ + `add_creation_job` بقى يعمل صف جديد لو الصف الموجود `failed`/`discarded`
+  (مفيش شات بعيد). **`done` مش استثناء** — نفس المعرّف ⇒ نفس الصف (at-most-once).
+- **F5 (LOW) — أرقام ضخمة ⇒ 500** (`OverflowError` من SQLite). حدّ `MAX_SQLITE_INT`
+  في `page`/`id` ⇒ 400.
+- **F6 (LOW) — توثيق حجم الصفحة** 20 ⇒ 10 (الصحيح).
+
+### Tests (بعد الإصلاح)
+- `.venv/bin/python -m pytest -q` ⇒ **1839 passed** (كان 1830؛ +9 اختبارات انحدار F1–F5).
+- `node --test tests/frontend/*.test.js` ⇒ **206 pass / 0 fail** (كان 203؛ +3).
+- pyflakes **0**, compileall **0**, `git diff --check` clean.
+- **Mutation testing**: كل إصلاح اتأكّد إنه غير تافه (شيل الحرس ⇒ اختبار واحد على الأقل
+  بيفشل): M9/M10 (F1، طبقتين)، F3، F5، F4-backend، F2-frontend، F4-frontend.
+
+### Safety (لسه محفوظ)
+- at-most-once: مفيش أي مسار بيحوّل غموض ⇒ إعادة POST؛ الإلغاء لسه CAS على الحالة + task_id.
+- الـ F4-backend بيتصرّف بس على `failed`/`discarded` (مفيش شات بعيد) — `done` بيتعامل
+  idempotent زي الأول.

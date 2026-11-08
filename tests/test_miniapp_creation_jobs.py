@@ -478,3 +478,102 @@ def test_db_cas_without_scope_still_works(tmp_path):
     jid = db.add_creation_job(OTHER, "o/r", "x", "t", client_ref="r1")
     db.set_creation_status(jid, "unknown", "t1")
     assert db.set_creation_status_if_in(jid, "done", "t2", {"unknown"}) is True
+
+
+# ============================ OHB2-PHASE1D-FIX regression (independent review) ===
+# F1 (HIGH): `task_id` = دليل قاطع إن POST البدء رجع ⇒ ممنوع ادّعاء "لسه مابدأش" وممنوع
+# الإلغاء (كان بيضيّع conversation_id ويحوّل شات بعيد حقيقي لـ discarded).
+def test_f1_pending_with_task_id_not_cancellable(tmp_path):
+    db = Database(str(tmp_path / "d.sqlite3"))
+    jid = db.add_creation_job(OWNER, "o/r", "x", "t", client_ref="r1")
+    db.set_creation_status(jid, "starting", "t1")
+    db.set_creation_starting(jid, "t1", task_id="task-abc")   # POST رجع فعلاً
+    db.set_creation_status(jid, "pending", "t2", "استكمال استطلاع البدء")  # تعافي
+    c = _authed(tmp_path, db)
+    body = c.get(f"{DETAIL}?id={jid}").json()
+    assert body["state"] == "pending"
+    assert body["post_state"] == "uncertain", "task_id ⇒ مش 'لسه مابدأش'"
+    assert body["cancellable"] is False
+
+
+def test_f1_cancel_pending_with_task_id_not_confirmed(tmp_path):
+    db = Database(str(tmp_path / "d.sqlite3"))
+    jid = db.add_creation_job(OWNER, "o/r", "x", "t", client_ref="r1")
+    db.set_creation_status(jid, "starting", "t1")
+    db.set_creation_starting(jid, "t1", task_id="task-abc")
+    db.set_creation_status(jid, "pending", "t2", "استكمال")
+    c = _authed(tmp_path, db)
+    r = _post(c, {"id": jid, "action": "cancel"})
+    assert r.status_code == 200 and r.json()["cancellation"] == "not_confirmed"
+    assert db.get_creation_job(jid).status == "pending", "الصف مايتلغيش لما الـ POST رجع"
+
+
+def test_f1_db_discard_refuses_task_id_row(tmp_path):
+    """دفاع في العمق على مستوى db: شطب صف عليه task_id ⇒ not_confirmed (مفيش تغيير)."""
+    db = Database(str(tmp_path / "d.sqlite3"))
+    jid = db.add_creation_job(OWNER, "o/r", "x", "t", client_ref="r1")
+    db.set_creation_status(jid, "starting", "t1")
+    db.set_creation_starting(jid, "t1", task_id="task-abc")
+    db.set_creation_status(jid, "pending", "t2", "استكمال")
+    assert db.discard_creation_job(jid, "t3", "x") == "not_confirmed"
+    assert db.get_creation_job(jid).status == "pending"
+
+
+# F3 (MEDIUM): إجراء غير نصي ⇒ 400 مش 500.
+def test_f3_non_string_action_is_400(tmp_path):
+    db = Database(str(tmp_path / "d.sqlite3"))
+    jid = db.add_creation_job(OWNER, "o/r", "x", "t", client_ref="r1")
+    c = _authed(tmp_path, db)
+    for bad in (5, [1], {"a": 1}, True, None):
+        assert _post(c, {"id": jid, "action": bad}).status_code == 400, bad
+    assert db.get_creation_job(jid).status == "pending"
+
+
+# F5 (LOW): أرقام ضخمة ⇒ 400 مش 500 (تجنّب OverflowError من SQLite).
+def test_f5_huge_numbers_are_400(tmp_path):
+    db = Database(str(tmp_path / "d.sqlite3"))
+    jid = db.add_creation_job(OWNER, "o/r", "x", "t", client_ref="r1")
+    c = _authed(tmp_path, db)
+    huge = 10 ** 25
+    assert c.get(f"{LIST}?page={huge}").status_code == 400
+    assert c.get(f"{DETAIL}?id={huge}").status_code == 400
+    assert _post(c, {"id": huge, "action": "cancel"}).status_code == 400
+    assert db.get_creation_job(jid).status == "pending"
+
+
+# F4 (MEDIUM): إعادة استخدام client_ref بعد طلب ملغي ⇒ صف جديد (الشات مايتسدّش للأبد).
+def test_f4_terminal_ref_mints_fresh_row(tmp_path):
+    db = Database(str(tmp_path / "d.sqlite3"))
+    first = db.add_creation_job(OWNER, "o/r", "x", "t", client_ref="r1")
+    db.discard_creation_job(first, "t2", "اتلغى")
+    second = db.add_creation_job(OWNER, "o/r", "x", "t3", client_ref="r1")
+    assert second != first
+    assert db.get_creation_job(second).status == "pending"
+    # لسه نشط ⇒ نفس المعرّف (idempotency محفوظة).
+    third = db.add_creation_job(OWNER, "o/r", "x", "t4", client_ref="r1")
+    assert third == second
+
+
+def test_f4_active_ref_still_dedups(tmp_path):
+    db = Database(str(tmp_path / "d.sqlite3"))
+    a = db.add_creation_job(OWNER, "o/r", "x", "t", client_ref="r1")
+    b = db.add_creation_job(OWNER, "o/r", "x", "t2", client_ref="r1")
+    assert a == b  # pending ⇒ نفس الصف (مفيش تكرار)
+
+
+def test_f4_done_ref_does_not_mint_fresh_row(tmp_path):
+    """at-most-once: صف `done` بنفس المعرّف مايتكررش (لو الرد ضاع والعميل أعاد)."""
+    db = Database(str(tmp_path / "d.sqlite3"))
+    first = db.add_creation_job(OWNER, "o/r", "x", "t", client_ref="r1")
+    db.set_creation_done(first, "t2", "conv-1")
+    again = db.add_creation_job(OWNER, "o/r", "x", "t3", client_ref="r1")
+    assert again == first, "`done` ⇒ نفس الصف (ممنوع إنشاء شات مكرّر)"
+    assert db.get_creation_job(first).status == "done"
+
+
+def test_f4_failed_ref_mints_fresh_row(tmp_path):
+    db = Database(str(tmp_path / "d.sqlite3"))
+    first = db.add_creation_job(OWNER, "o/r", "x", "t", client_ref="r1")
+    db.set_creation_status(first, "failed", "t2", "HTTP 400")
+    second = db.add_creation_job(OWNER, "o/r", "x", "t3", client_ref="r1")
+    assert second != first and db.get_creation_job(second).status == "pending"

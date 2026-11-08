@@ -98,6 +98,10 @@ Telegram WebView ──HTTPS──▶ ingress (TLS) ──HTTP──▶ الحا
 - **idempotency على مستوى القاعدة**: `add_or_group_outbox` و`add_creation_job`
   بيرجّعوا نفس السجل لو نفس `(conversation_id/chat_id, client_ref)` موجود —
   فإعادة الإرسال بنفس المعرّف ما بتعملش سجل تاني (عمود `client_ref` جديد، غير مدمّر).
+  استثناء `add_creation_job` (OHB2-PHASE1D-F4): لو الصف الموجود `failed`/`discarded`
+  (**مفيش شات بعيد**)، إعادة الإرسال بنفس المعرّف بتعمل صف جديد — عشان طلب ملغي من
+  تبويب «طلبات البدء» مايسدّش نفس (مستودع+نص) للأبد. `done` **مش** استثناء: لو الرد
+  ضاع بعد نجاح الإنشاء، نفس المعرّف ⇒ نفس الصف (at-most-once، مفيش شات مكرّر).
 - **حالات العملية**: `GET /operations/outbox` و`GET /operations/creation` بيرجّعوا
   DTO آمن (مفيش نص البرومت ولا تفاصيل داخلية): `pending` / `accepted` / `failed` /
   `ambiguous` / `unknown`. الاستعلام ممكن بـ `id=` أو بـ `client_ref=` (بعد نتيجة غامضة
@@ -523,14 +527,18 @@ node --test tests/frontend/*.test.js
 | `failed` | رفض نهائي مؤكد (4xx غير 429) | ✔ | لأ (اتأكد فشل) |
 | `discarded` | اتلغى قبل الإرسال | ✔ | **لأ (مؤكد)** |
 
-**حدّ الإرسال المشتقّ (`post_state` في الـ DTO):** `not_started` (pending/claimed) ·
-`uncertain` (starting) · `started` (done) · `failed` (failed) · `cancelled` (discarded).
+**حدّ الإرسال المشتقّ (`post_state` في الـ DTO):** `not_started` (pending/claimed **بلا**
+`task_id`) · `uncertain` (starting/unknown، أو pending/claimed **عليه** `task_id`) ·
+`started` (done) · `failed` (failed) · `cancelled` (discarded).
+**`task_id` = دليل قاطع إن POST البدء رجع فعلاً** (الكود بيسجّله بس بعد ما الـ API يرجّعه،
+وبيفضل محفوظ بعد التعافي) ⇒ أي صف عليه `task_id` **مش** قابل للإلغاء ولا بيتوصف
+بـ `not_started`، حتى لو حالته `pending`/`claimed`.
 الـ DTO مابيرجّعش **نص** الطلب ولا `client_ref` ولا أي أسرار — بس معرّفات وحالات
 ومشتقات آمنة، و`conversation_id` **بس** لما `status=done` (الدليل الوحيد المعتمد).
 
 ### 2. القايمة والتفاصيل (قراءة فقط)
 
-- `GET /api/v1/operations/creation/list?page=` — قايمة المالك (ترقيم 20/صفحة).
+- `GET /api/v1/operations/creation/list?page=` — قايمة المالك (ترقيم 10/صفحة).
 - `GET /api/v1/operations/creation?id=` أو `?client_ref=` — تفاصيل طلب واحد.
 - **كل** بحث مقيّد بالمالك على السيرفر (`owner_id`) — id بتاع مستخدم تاني ⇒ **404**،
   والترقيم/الفلترة مايقدروش يتجاوزوا الملكية.
@@ -540,8 +548,9 @@ node --test tests/frontend/*.test.js
 
 ### 3. الإلغاء (`action=cancel`)
 
-- **الأهلية (سيرفر):** مسموح **بس** في `pending`/`claimed` — الحالتين اللي الكود بيثبت
-  فيهم إن POST البدء **مابدأش**.
+- **الأهلية (سيرفر):** مسموح **بس** في `pending`/`claimed` **وبلا `task_id`** — الحالتين
+  اللي الكود بيثبت فيهم إن POST البدء **مابدأش**. وجود `task_id` ⇒ `not_confirmed`
+  (مفيش إلغاء) حتى لو الحالة `pending`/`claimed`، لأن `task_id` = الـ POST رجع فعلاً.
 - **ذرّي (CAS):** `discard_creation_job` بتعمل `UPDATE ... WHERE status IN (pending,claimed)`
   في جملة واحدة ⇒ لو الـ worker حجز/بدأ بين القراءة والكتابة، `rowcount=0` (مفيش clobber).
 - **`starting`/`unknown`:** مفيش ادّعاء إلغاء — نرجّع الحالة الحالية + `cancellation="not_confirmed"`

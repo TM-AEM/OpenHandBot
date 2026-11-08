@@ -34,6 +34,9 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 INDEX_FILE = STATIC_DIR / "index.html"
 COOKIE_NAME = "ohb_session"
 MAX_BODY_BYTES = 16 * 1024
+# OHB2-PHASE1D-F5: أقصى رقم نقبله للمعرّفات/الترقيم — أكبر من كده SQLite بيرمي
+# OverflowError (500). نرفضه بـ 400 بدل الانهيار.
+MAX_SQLITE_INT = 2**63 - 1
 API_PREFIX = "/api/v1"
 # OHB2-PHASE1B: المحارف المسموح بيها في اسم ملف التنزيل (ASCII آمن) — نمنع أي CR/LF
 # أو اقتباس أو محرف تحكّم من إنه يوصل لهيدر `Content-Disposition`.
@@ -824,7 +827,7 @@ class MiniApp:
             page = int(raw_page)
         except ValueError:
             return _error(400, "bad_request", "رقم الصفحة غير صالح")
-        if page < 0:
+        if page < 0 or page > MAX_SQLITE_INT:
             return _error(400, "bad_request", "رقم الصفحة غير صالح")
         try:
             data = self._service.list_creation_jobs(page)
@@ -872,8 +875,15 @@ class MiniApp:
             job_id = int(raw_id)
         except (TypeError, ValueError):
             return _error(400, "bad_request", "رقم العملية غير صالح")
+        if job_id < 0 or job_id > MAX_SQLITE_INT:
+            return _error(400, "bad_request", "رقم العملية غير صالح")
+        # OHB2-PHASE1D-F3: الإجراء لازم يكون نص — قيمة JSON غير نصية (5/[1]/{}) كانت
+        # بتضرب AttributeError (500) جوّه `.strip()`؛ دلوقتي بنرفضها بـ 400.
+        raw_action = body.get("action")
+        if not isinstance(raw_action, str):
+            return _error(400, "bad_request", "إجراء غير معروف")
         try:
-            data = self._service.reconcile_creation(job_id, (body.get("action") or "").strip())
+            data = self._service.reconcile_creation(job_id, raw_action.strip())
         except ValidationError as exc:
             return _error(400, "bad_request", str(exc))
         except ApiError as exc:
@@ -888,6 +898,8 @@ class MiniApp:
                 job_id = int(raw_id)
             except ValueError:
                 raise ValidationError("رقم العملية غير صالح") from None
+            if job_id < 0 or job_id > MAX_SQLITE_INT:
+                raise ValidationError("رقم العملية غير صالح")
             return self._service.creation_operation(job_id)
         if ref:
             found = self._service.find_creation_operation(ref)

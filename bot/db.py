@@ -1907,14 +1907,24 @@ class Database:
         OHB2-07 (idempotency): لو `client_ref` اتزوّد وفيه طلب موجود بنفس
         (chat_id, client_ref)، بنرجّع الـ id بتاعه من غير إنشاء طلب جديد — فإعادة
         المحاولة بعد انقطاع الرد ما بتبدأش شات تاني.
+
+        OHB2-PHASE1D-F4: الحماية دي للحالات **النشطة** بس. لو الصف الموجود خلص **من غير
+        شات بعيد** (failed/discarded)، إرسال جديد بنفس المعرّف = محاولة إنشاء **جديدة**،
+        فبنعمل صف جديد (وإلا طلب ملغي كان بيسدّ نفس (مستودع+نص) للأبد).
+        **مهم:** `done` **مش** ضمن دول — لو الرد ضاع بعد نجاح الإنشاء والعميل أعاد
+        نفس المعرّف، لازم نرجّع نفس الصف (مفيش شات مكرّر). ops.js بيعمل معرّف جديد بعد
+        `done` فمفيش إعادة استخدام في المسار العادي.
         """
         if client_ref:
             existing = self._conn.execute(
-                "SELECT id FROM creation_jobs WHERE chat_id=? AND client_ref=? "
+                "SELECT id, status FROM creation_jobs WHERE chat_id=? AND client_ref=? "
                 "ORDER BY id DESC LIMIT 1",
                 (chat_id, client_ref),
             ).fetchone()
-            if existing is not None:
+            if existing is not None and existing["status"] not in (
+                CREATION_FAILED,
+                CREATION_DISCARDED,
+            ):
                 return int(existing["id"])
         cur = self._conn.execute(
             "INSERT INTO creation_jobs(chat_id, repo, text, status, created_at, updated_at, client_ref) "
@@ -2163,13 +2173,13 @@ class Database:
         if chat_id is None:
             cur = self._conn.execute(
                 "UPDATE creation_jobs SET status=?, error=?, updated_at=? "
-                "WHERE id=? AND status IN (?, ?)",
+                "WHERE id=? AND status IN (?, ?) AND task_id IS NULL",
                 (CREATION_DISCARDED, reason, now, job_id, CREATION_PENDING, CREATION_CLAIMED),
             )
         else:
             cur = self._conn.execute(
                 "UPDATE creation_jobs SET status=?, error=?, updated_at=? "
-                "WHERE id=? AND chat_id=? AND status IN (?, ?)",
+                "WHERE id=? AND chat_id=? AND status IN (?, ?) AND task_id IS NULL",
                 (
                     CREATION_DISCARDED,
                     reason,
@@ -2185,17 +2195,21 @@ class Database:
             return "discarded"
         if chat_id is None:
             row = self._conn.execute(
-                "SELECT status FROM creation_jobs WHERE id=?", (job_id,)
+                "SELECT status, task_id FROM creation_jobs WHERE id=?", (job_id,)
             ).fetchone()
         else:
             row = self._conn.execute(
-                "SELECT status FROM creation_jobs WHERE id=? AND chat_id=?",
+                "SELECT status, task_id FROM creation_jobs WHERE id=? AND chat_id=?",
                 (job_id, int(chat_id)),
             ).fetchone()
         self._conn.commit()
         if row is None:
             return "terminal"
         if row["status"] in (CREATION_STARTING, CREATION_UNKNOWN):
+            return "not_confirmed"
+        # OHB2-PHASE1D-F1: `pending`/`claimed` بس عليه `task_id` ⇒ الـ POST البدء رجع
+        # فعلاً ⇒ الإلغاء غير مؤكد (مفيش شطب). حرس دفاع في العمق لكل المستدعين.
+        if row["status"] in (CREATION_PENDING, CREATION_CLAIMED) and row["task_id"]:
             return "not_confirmed"
         return "terminal"
 
