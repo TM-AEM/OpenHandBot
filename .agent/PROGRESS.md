@@ -600,5 +600,17 @@ unknown (غامض) · failed (فشل مؤكد) · discarded (اتلغى قبل �
 - pyflakes **0**, compileall **0**, `git diff --check` clean.
 - Mutation testing (M1–M6) أثبت إن اختبارات الحمايات غير تافهة (تفشل عند كسر الحرس).
 
+## Independent review (adversarial, different model: NVIDIA Nemotron Ultra 550B)
+- مراجعة مستقلة على الكود **الكامل** (مش مقتطع) — النتيجة: **NONE** (مفيش CRITICAL/HIGH/MEDIUM).
+- المراجعة الأولى كانت على حزمة مقتطعة فطلّعت نتائج كاذبة؛ اتصلّحت بإعادة المراجعة على الكود الكامل.
+- الثغرة الحقيقية الوحيدة اللي ظهرت (دفاع في العمق): دوال الكتابة في `db.py` كانت بمفتاح
+  `job_id` بس. اتضاف نطاق المالك (`chat_id`) + اختبارات + mutation-testing.
+
+## Branch / commits
+- Branch: `agent/ohb2-phase1c-inbox-filter-archive-delete` (متدفوع لـ origin).
+- Commit: `75e5b40af98d3146de7ee9725f12fc9b116435a9`
+  (`feat: Mini App creation-job visibility and safe manual reconciliation (OHB2-PHASE1D)`).
+- CI: workflow `CI` بيشتغل على push لـ main أو PR لـ main بس — فدفع الفرع مايشغّلش CI (متوقّع).
+
 ## Next
-- مراجعة مستقلة نهائية (agent-server session منفصلة) على SHA الحالي.
+- فتح PR (لما المستخدم يطلب) ⇒ CI هيشتغل ويأكّد على GitHub Actions.
