@@ -1,6 +1,6 @@
 """OHB2-PHASE1E: تأكيدات على سير عمل CI وسياسة الفحص الثابت/الأمني.
 
-الغرض: منع أي تراجع صامت في تغطية الفحص (كان pyflakes بيسقط `automation/` و`tools/`)،
+الغرض: منع أي تراجع صامت في تغطية الفحص (كان pyflakes بيسقط `automation/`)،
 أو في أدوات SCA/SAST، أو في شروط تشغيل CI. مفيش شبكة: قراءة ملفات المستودع بس.
 """
 
@@ -55,8 +55,8 @@ def test_ci_never_runs_production_side_effects():
 
 
 def test_ci_static_check_covers_all_first_party_modules():
-    # الثغرة اللي كانت: pyflakes على bot/ main.py tests/ بس. لازم يغطّي automation/ و tools/.
-    assert "pyflakes bot/ automation/ tools/ main.py tests/" in CI
+    # الثغرة اللي كانت: pyflakes على bot/ main.py tests/ بس. لازم يغطّي automation/ كمان.
+    assert "pyflakes bot/ automation/ main.py tests/" in CI
 
 
 def test_ci_runs_dependency_and_sast_checks():

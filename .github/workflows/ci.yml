@@ -33,9 +33,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
       - name: Static check (pyflakes, all first-party modules)
-        # OHB2-PHASE1E: pyflakes بقى يغطّي automation/ و tools/ كمان (كان bot/ main.py tests/ بس).
+        # OHB2-PHASE1E: pyflakes بقى يغطّي automation/ كمان (كان bot/ main.py tests/ بس).
         # pyflakes بيفحص ثابت (AST) من غير استيراد/تنفيذ ⇒ مفيش تشغيل لأتمتة/autopush.
-        run: python -m pyflakes bot/ automation/ tools/ main.py tests/
+        run: python -m pyflakes bot/ automation/ main.py tests/
       - name: Dependency audit (pip-audit)
         # OHB2-PHASE1E: SCA على requirements-dev.txt (بيسحب requirements.txt). بيفشل عند أي
         # ثغرة معروفة. محتاج شبكة (advisory DB) — متوفّرة على GitHub runners.

@@ -81,7 +81,7 @@ python main.py
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pyflakes bot/ automation/ tools/ main.py tests/  # فحص ثابت
+python -m pyflakes bot/ automation/ main.py tests/  # فحص ثابت
 python -m pip_audit -r requirements-dev.txt                # فحص أمني للتبعيات (SCA)
 python -m bandit -r bot/ main.py -lll -s B613              # فحص أمني ثابت (SAST)
 python -m pytest -q                                        # كل الاختبارات

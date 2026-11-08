@@ -7,7 +7,7 @@
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pyflakes bot/ automation/ tools/ main.py tests/  # فحص ثابت: مفيش imports/متغيرات ميتة
+python -m pyflakes bot/ automation/ main.py tests/  # فحص ثابت: مفيش imports/متغيرات ميتة
 python -m pip_audit -r requirements-dev.txt                # فحص أمني للتبعيات (SCA)
 python -m bandit -r bot/ main.py -lll -s B613              # فحص أمني ثابت لكود التشغيل (SAST)
 python -m pytest -q                                        # كل الاختبارات لازم تعدّي
@@ -16,7 +16,7 @@ node --test tests/frontend/*.test.js                       # اختبارات ا
 
 ## معايير القبول
 
-1. **فحص ثابت نضيف**: `pyflakes` ما يطلّعش أي تحذير على `bot/` و`automation/` و`tools/`
+1. **فحص ثابت نضيف**: `pyflakes` ما يطلّعش أي تحذير على `bot/` و`automation/`
    و`main.py` و`tests/`.
 2. **كل الاختبارات خضراء**: `pytest` و`node --test` بيعدّوا كامل من غير أي فشل/خطأ.
 3. **مفيش ثغرات تبعيات معروفة**: `pip-audit` يرجّع «No known vulnerabilities found».
