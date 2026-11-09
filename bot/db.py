@@ -10,6 +10,37 @@ from datetime import datetime, timedelta, timezone
 
 log = logging.getLogger(__name__)
 
+# OHB2-SW03: سياسة إعادة محاولة **مشتركة** لقراءات SQLite العابرة (busy/locked). معرّفة في
+# طبقة القاعدة عشان البوت والـ Mini App يستخدموا نفس الميزانية بالظبط (مفيش تكرار سياسة).
+# ميزانية صغيرة عمدًا: مجموع الانتظار ≈ 0.25+0.5+1 = 1.75 ثانية كحد أقصى، وبعدها بنرفع
+# الاستثناء الأصلي (مفيش فشل مقفول صامت). في وضع WAL القراءة مش بتتحاصر بالكتّاب، فالفشل
+# العابر الحقيقي ضيّق جدًا؛ الفشل الدائم (قاعدة تالفة/مقفولة) **مش** هيتعاد.
+DEDUPE_RETRY_DELAYS = (0.25, 0.5, 1.0)
+# أكواد SQLite العابرة: BUSY (5) و LOCKED (6). بنطابق بالكود لو متاح (Python 3.11+)،
+# وبالنص كاحتياطي (نسخ أقدم/أخطاء بدون كود).
+_TRANSIENT_SQLITE_CODES = frozenset(
+    code
+    for code in (getattr(sqlite3, "SQLITE_BUSY", None), getattr(sqlite3, "SQLITE_LOCKED", None))
+    if code is not None
+)
+
+
+def is_transient_sqlite_error(exc: Exception) -> bool:
+    """هل الخطأ فشل SQLite **عابر** (قفل/انشغال) يستحق إعادة محاولة محدودة؟
+
+    بنطابق كود SQLite (`sqlite_errorcode`) لو متاح — الطريقة المتينة. لو مش متاح،
+    بنطابق نص الرسالة المعروف. أي خطأ تاني (قاعدة تالفة، اتصال مقفول، جدول مش موجود)
+    **دائم** ⇒ False (فشل مقفول فورًا، مفيش إعادة محاولة).
+    """
+    if not isinstance(exc, sqlite3.Error):
+        return False
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is not None:
+        return code in _TRANSIENT_SQLITE_CODES
+    msg = str(exc).lower()
+    return "locked" in msg or "busy" in msg
+
+
 # حالات صندوق الصادر (outbox) — كل انتقال مع سلوك التعافي بعد إعادة التشغيل:
 #   pending  : اتسجّل بثبات ولسه ماتحاولش الإرسال. آمن يتعاود بعد restart.
 #   claimed  : الـ worker اخده ذرّياً (ملكه)، والـ POST لسه مابدأش. آمن يرجع
@@ -515,6 +546,16 @@ class Database:
                 profile     TEXT NOT NULL DEFAULT '{}'
             );
             CREATE INDEX IF NOT EXISTS idx_web_sessions_expires ON web_sessions(expires_at);
+            -- OHB2-DUPLICATE-TELEGRAM-PROMPT-DISPATCH: سجل **دائم** لمعرّفات تحديثات تيليجرام
+            -- اللي اتعالجت، عشان ضمان «تحديث واحد ⇒ قرار معالجة واحد». `update_id` مفتاح
+            -- أساسي (فريد على مستوى تيليجرام)، فإعادة تسليم نفس التحديث (شبكة/إعادة تشغيل/
+            -- تزامن) بتتصدّ قبل أي عملية خارجية (إرسال أو إنشاء). ده **كشف تكرار** مش ضمان
+            -- exactly-once خارجي (نفس عقد المشروع الموثّق). `processed_at` وصفى للتشغيل
+            -- والتنظيف. `CREATE TABLE IF NOT EXISTS` ⇒ إضافي وغير مدمّر للقواعد القديمة.
+            CREATE TABLE IF NOT EXISTS processed_updates (
+                update_id    INTEGER PRIMARY KEY,
+                processed_at TEXT NOT NULL
+            );
             """
         )
         self._migrate()
@@ -1033,6 +1074,30 @@ class Database:
         ).fetchone()
         return row is not None
 
+    def is_deleted_with_retry(self, conversation_id: str) -> bool:
+        """قراءة شاهد الحذف مع إعادة محاولة **محدودة** للفشل العابر بس (OHB2-SW03).
+
+        سياسة مشتركة (البوت + الـ Mini App): محاولة أولى + حتى 3 إعادات بمُدد
+        `DEDUPE_RETRY_DELAYS` (0.25/0.5/1.0ث) **للفشل العابر** (SQLite BUSY/LOCKED) بس.
+        الفشل الدائم يُرفع فورًا بلا إعادة، وبعد استنفاد الميزانية بنرفع **الاستثناء الأصلي**.
+        ممنوع نرجّع `False` (أو أي نتيجة تشبه النجاح) عند فشل القراءة — القراءة الناجحة بس
+        هي اللي بتحدّد «متشاهد» من «مش متشاهد» (مفيش فشل يُلبَس لبوس الفراغ).
+        """
+        attempt = 0
+        while True:
+            try:
+                return self.is_deleted(conversation_id)
+            except Exception as exc:  # noqa: BLE001 — التصنيف بيقرّر: عابر يُعاد، دائم يُرفع
+                if not is_transient_sqlite_error(exc) or attempt >= len(DEDUPE_RETRY_DELAYS):
+                    raise
+                delay = DEDUPE_RETRY_DELAYS[attempt]
+                attempt += 1
+                log.warning(
+                    "فحص شاهد الحذف (%s): فشل SQLite عابر (%s) — إعادة محاولة %d/%d بعد %.2fث",
+                    conversation_id, type(exc).__name__, attempt, len(DEDUPE_RETRY_DELAYS), delay,
+                )
+                time.sleep(delay)
+
     def _tombstone_nocommit(self, conversation_id: str, now: str) -> None:
         """يسجّل شاهد الحذف **داخل معاملة المستدعي** (idempotent: أول مرة بس تحفظ وقت الحذف)."""
         self._conn.execute(
@@ -1410,9 +1475,19 @@ class Database:
         return int(row["n"])
 
     def list_watched(self) -> list[Watched]:
+        """كل صفوف المتابعة **غير المتشاهدة حذفًا** (منع إفصاح عنوان شات محذوف).
+
+        OHB2-RESIDUAL: بنستبعد أي `conversation_id` عليه شاهد حذف دائم — الحذف المؤكّد
+        بيشيل صف المتابعة أصلًا، لكن خلال نافذة `deleting`/`uncertain` الصف بيفضل موجود؛
+        الاستبعاد هنا يمنع ظهور عنوانه في قوايم البوت/الـ Mini App (وبيمنح المراقب نفس
+        النتيجة اللي بيفرضها حرسه الخاص). الصفوف نفسها ما بتتحذفش (استرجاع الحذف/الإحياء
+        الصريح يفضلوا شغالين)، بنستبعدها من العرض بس.
+        """
         rows = self._conn.execute(
             "SELECT conversation_id, title, last_state, chat_id, submitted_at, added_at, "
-            "retry_count, pending_delivery_state, watch_seq FROM watched"
+            "retry_count, pending_delivery_state, watch_seq FROM watched "
+            "WHERE NOT EXISTS (SELECT 1 FROM deleted_conversations d "
+            "WHERE d.conversation_id = watched.conversation_id)"
         ).fetchall()
         return [
             Watched(
@@ -1528,6 +1603,8 @@ class Database:
         kind: str | None,
         title: str | None = None,
         now: datetime | None = None,
+        *,
+        commit: bool = True,
     ) -> None:
         stamp = (now or datetime.now(timezone.utc)).isoformat() if kind else None
         self._conn.execute(
@@ -1538,10 +1615,166 @@ class Database:
             "awaiting_title=excluded.awaiting_title",
             (telegram_id, conversation_id, kind, stamp, title),
         )
-        self._conn.commit()
+        if commit:
+            self._conn.commit()
 
     def clear_awaiting(self, telegram_id: int) -> None:
         self.set_awaiting(telegram_id, None, None)
+
+    def renew_awaiting(self, telegram_id: int, now: datetime | None = None) -> None:
+        """يجدّد مهلة توجيه `route` **بدون استهلاك** (route مستمر مش لمرة واحدة).
+
+        بنستخدمها في `handle_text` بدل `take_awaiting` عشان مسار route مايعملش أي
+        استهلاك؛ الاستهلاك الذرّي بقى للحالات لمرة واحدة بس جوه كتابة السجل الدائم.
+        """
+        stamp = (now or datetime.now(timezone.utc)).isoformat()
+        self._conn.execute(
+            "UPDATE user_state SET awaiting_at=? WHERE telegram_id=?", (stamp, telegram_id)
+        )
+        self._conn.commit()
+
+    @staticmethod
+    def awaiting_is_expired(since: datetime | None, now: datetime | None = None) -> bool:
+        """هل انتهت مهلة حالة الانتظار؟ (نفس معيار `take_awaiting` بالحرف)."""
+        if since is None:
+            return True
+        return (now or datetime.now(timezone.utc)) - since > AWAITING_TTL
+
+    def awaiting_state(
+        self, telegram_id: int
+    ) -> tuple[str | None, str | None, str | None, datetime | None]:
+        """يقرأ حالة الانتظار **بدون استهلاك** (قراءة فقط، بدون أي كتابة).
+
+        P1: بديل `take_awaiting` في `handle_text` — الاستهلاك (مسح الحالة لمرة واحدة أو
+        تجديد route) بقى منفصلًا وذرّيًا مع كتابة السجل الدائم. بترجّع
+        (conversation_id, kind, title, awaiting_at) أو (None, None, None, None).
+        """
+        row = self._conn.execute(
+            "SELECT awaiting_conversation_id, awaiting_kind, awaiting_title, awaiting_at "
+            "FROM user_state WHERE telegram_id=?",
+            (telegram_id,),
+        ).fetchone()
+        if not row or not row["awaiting_kind"]:
+            return None, None, None, None
+        return (
+            row["awaiting_conversation_id"],
+            row["awaiting_kind"],
+            row["awaiting_title"],
+            _parse_iso(row["awaiting_at"]),
+        )
+
+    def _clear_awaiting_nocommit(self, telegram_id: int) -> None:
+        """يمسح حالة الانتظار **جوه معاملة المستدعي** (بدون commit)."""
+        self._conn.execute(
+            "UPDATE user_state SET awaiting_conversation_id=NULL, awaiting_kind=NULL, "
+            "awaiting_at=NULL, awaiting_title=NULL WHERE telegram_id=?",
+            (telegram_id,),
+        )
+
+    def consume_one_shot_awaiting(
+        self, telegram_id: int, expected_kind: str, update_id: int | None, now: str
+    ) -> bool:
+        """يستهلك حالة انتظار **لمرة واحدة** ويسجّل «معالَج» **ذرّيًا** (معاملة واحدة).
+
+        P1 (مسارات بلا سجل عمل دائم، زي بحث المستودعات): الحالة والعلامة إما يتحفظوا معًا
+        أو ولا واحد. تُرجّع True لو استهلكناها فعلًا، False لو الحالة اتغيّرت/انتهت/مستهلكة
+        قبل كده. **بعد** ما الأثر (إرسال القائمة) ينجح — عشان عطل قبل كده يخلّي إعادة
+        التسليم تعيد التنفيذ (مفيش فقد)، والتكرار المحتمل (قائمة مكرّرة) غير ضار.
+        """
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if update_id is not None and self.update_is_processed(update_id):
+                conn.rollback()
+                return False
+            row = conn.execute(
+                "SELECT awaiting_kind, awaiting_at FROM user_state WHERE telegram_id=?",
+                (telegram_id,),
+            ).fetchone()
+            if row is None or row["awaiting_kind"] != expected_kind:
+                conn.rollback()
+                return False
+            if self.awaiting_is_expired(_parse_iso(row["awaiting_at"]), _parse_iso(now)):
+                conn.rollback()
+                return False
+            self._clear_awaiting_nocommit(telegram_id)
+            self._mark_processed_nocommit(update_id, now)
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+
+    # ------------------------------------------------- telegram update dedup
+    # OHB2-DUPLICATE-TELEGRAM-PROMPT-DISPATCH: مفتاح منع التكرار على مستوى **التحديث**.
+    # الضمان: تحديث تيليجرام واحد ⇒ قرار معالجة واحد (إرسال واحد لشات موجود، أو إنشاء
+    # شات واحد، أو رد واحد) حتى لو وصل مرتين (إعادة تسليم/إعادة تشغيل/تزامن). المفتاح
+    # `update_id` فريد على مستوى تيليجرام، فالإدراج ذرّي (`INSERT OR IGNORE`) بيخلّي أول
+    # معالج يفوز والبقية تُرفض قبل أي عملية خارجية. ده **كشف تكرار**، مش ضمان exactly-once
+    # خارجي (نفس عقد المشروع: at-most-once + تسوية يدوية للنتائج الغامضة).
+    def update_is_processed(self, update_id: int) -> bool:
+        """هل التحديث مسجّل «معالَج» بالفعل؟ (فحص قراءة فقط، بدون أي كتابة).
+
+        P1: الحاجز بقى **فحص قراءة** — التسجيل نفسه بيحصل **ذرّيًا مع كتابة السجل الدائم**
+        جوه معاملة `add_or_group_outbox`/`add_creation_job`. كده مايحصلش أبدًا إن تحديث
+        يتسجّل «معالَج» من غير ما يكون سجله الدائم اتكتب: إما الاتنين يتكتبوا مع بعض (نفس
+        المعاملة)، أو ولا واحد (لو العملية ماتت/فشلت قبل الـ commit) ⇒ إعادة التسليم بتنفّذ.
+        """
+        row = self._conn.execute(
+            "SELECT 1 FROM processed_updates WHERE update_id=?", (int(update_id),)
+        ).fetchone()
+        return row is not None
+
+    def mark_update_processed(self, update_id: int, now: str) -> bool:
+        """يسجّل التحديث «معالَج» **ذرّيًا** (INSERT OR IGNORE على مفتاح أساسي).
+
+        True لو أول مرة، False لو موجود قبل كده. الدالة دي مسار **وحدة/متوافق** (بتستخدمها
+        اختبارات الحاجز)؛ المسار الحقيقي في البوت بيسجّل ذرّيًا مع السجل الدائم عبر
+        `_mark_processed_nocommit` جوه معاملة كتابة العملية.
+        """
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO processed_updates(update_id, processed_at) VALUES(?, ?)",
+            (int(update_id), now),
+        )
+        self._conn.commit()
+        return cur.rowcount == 1
+
+    def _mark_processed_nocommit(self, update_id: int | None, now: str) -> None:
+        """يسجّل «معالَج» داخل معاملة المستدعي (no-op لو `update_id` None).
+
+        P1: بيتنادى **في نفس معاملة** كتابة السجل الدائم (outbox/creation) ⇒ التسجيل
+        والكتابة إما ينجحوا معًا أو يفشلوا معًا (ذرّية حقيقية، مش ادّعاء).
+        """
+        if update_id is None:
+            return
+        self._conn.execute(
+            "INSERT OR IGNORE INTO processed_updates(update_id, processed_at) VALUES(?, ?)",
+            (int(update_id), now),
+        )
+
+    def prune_processed_updates(self, keep: int) -> int:
+        """يقلّم سجل التحديثات المعالَجة (إضافي، غير حرج): يسيب أحدث `keep` صف.
+
+        بنحافظ على نافذة كافية (الافتراضي ضخم) عشان منعرّضش إعادة تسليم قديمة لمعالجة
+        تانية، وفي نفس الوقت السجل مايكبرش بلا حدود. بترجّع عدد الصفوف المشالة.
+        """
+        if keep <= 0:
+            return 0
+        # بنرتّب بـ (processed_at, update_id): update_id هو الترتيب الطبيعي للتحديثات،
+        # وبنضمّه مع الوقت لتفادي أي التباس لو الساعة اتأخّرت.
+        cur = self._conn.execute(
+            "DELETE FROM processed_updates WHERE update_id NOT IN ("
+            "  SELECT update_id FROM processed_updates "
+            "  ORDER BY processed_at DESC, update_id DESC LIMIT ?"
+            ")",
+            (int(keep),),
+        )
+        self._conn.commit()
+        return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+    def count_processed_updates(self) -> int:
+        row = self._conn.execute("SELECT COUNT(*) AS n FROM processed_updates").fetchone()
+        return int(row["n"]) if row else 0
 
     def take_awaiting(
         self, telegram_id: int, now: datetime | None = None
@@ -1593,13 +1826,6 @@ class Database:
             raise
         return result
 
-    def pop_awaiting(self, telegram_id: int) -> tuple[str | None, str | None]:
-        """نفس take_awaiting من غير العنوان؛ المنتهي بيرجّع (None, None)."""
-        conv, kind, _title = self.take_awaiting(telegram_id)
-        if kind == "expired":
-            return None, None
-        return conv, kind
-
     def get_awaiting(self, telegram_id: int) -> tuple[str | None, str | None]:
         row = self._conn.execute(
             "SELECT awaiting_conversation_id, awaiting_kind FROM user_state WHERE telegram_id=?",
@@ -1629,6 +1855,8 @@ class Database:
         window: timedelta | None = None,
         client_ref: str | None = None,
         reengage: bool = False,
+        update_id: int | None = None,
+        consume_awaiting: tuple[int, str] | None = None,
     ) -> int:
         """تجميع (القرار 2): لو فيه برومت 'pending' لنفس الوجهة اتحدّث خلال `window`،
 
@@ -1649,11 +1877,38 @@ class Database:
         الـ POST المتأخّر (أو إعادة المحاولة/الضغط المزدوج) من إحياء شات اتحذف. العمليات من
         غير `client_ref` (مسار البوت) زي ما هي: الصريح (`reengage=True`) يشيل الشاهد، وغير
         الصريح يُرفض. الفحص كله جوه BEGIN IMMEDIATE ⇒ محصّن ضد حذف متزامن.
+
+        P1 (OHB2-ONE-SHOT-CRASH): `consume_awaiting=(telegram_id, expected_kind)` بيخلّي
+        **استهلاك حالة انتظار لمرة واحدة** (reply) يحصل **جوه نفس المعاملة** اللي بتكتب
+        السجل الدائم. لو الحالة اتغيّرت/انتهت/مستهلكة، بنرجّع 0 من غير أي كتابة (ما
+        نستهلكش حالة مش متوقّعة). لو العملية فشلت، الاتنين يتراجعوا معًا ⇒ مفيش نافذة فقد
+        (الحالة تفضل قائمة فإعادة التسليم تنفّذ).
         """
         window = window if window is not None else GROUP_WINDOW
         conn = self._conn
         conn.execute("BEGIN IMMEDIATE")
         try:
+            # P1 (إغلاق سباق التزامن): الحاجز في group=-1 فحص قراءة، فنداءين متزامنين لنفس
+            # `update_id` ممكن يوصلوا هنا الاتنين. الفحص جوه قفل الكتابة (`BEGIN IMMEDIATE`)
+            # بيخلّي التاني يشوف «معالَج» ويرجع 0 (مفيش ازدواج). التزامن مُسلسَل: التاني
+            # بياخد القفل بعد ما الأول يـcommit.
+            if update_id is not None and self.update_is_processed(update_id):
+                conn.rollback()
+                return 0
+            if consume_awaiting is not None:
+                # P1: استهلاك حالة الانتظار (لمرة واحدة) ذرّيًا مع كتابة السجل الدائم.
+                tg_id, expected_kind = consume_awaiting
+                arow = conn.execute(
+                    "SELECT awaiting_kind, awaiting_at FROM user_state WHERE telegram_id=?",
+                    (tg_id,),
+                ).fetchone()
+                if arow is None or arow["awaiting_kind"] != expected_kind:
+                    conn.rollback()
+                    return 0
+                if self.awaiting_is_expired(_parse_iso(arow["awaiting_at"]), _parse_iso(now)):
+                    self._clear_awaiting_nocommit(tg_id)
+                    conn.commit()
+                    return 0
             if self.is_deleted(conversation_id):
                 # شات متشاهد: مفيش إحياء. عمليات `client_ref` (Mini App) مرفوضة دايمًا،
                 # والعمليات من غير `client_ref` (البوت) لازم تكون صريحة (`reengage`).
@@ -1669,6 +1924,7 @@ class Database:
                     (conversation_id, chat_id, client_ref),
                 ).fetchone()
                 if existing is not None:
+                    self._mark_processed_nocommit(update_id, now)
                     conn.commit()
                     return int(existing["id"])
             row = conn.execute(
@@ -1708,6 +1964,14 @@ class Database:
                     (conversation_id, chat_id, text, OUTBOX_PENDING, now, now, client_ref),
                 )
                 out_id = int(cur.lastrowid)
+            # P1: استهلاك حالة الانتظار (لمرة واحدة) **في نفس المعاملة** مع الكتابة الدائمة
+            # (outbox/creation) وعلامة «معالَج» ⇒ إما الثلاثة يتحفظوا معًا أو ولا واحد.
+            if consume_awaiting is not None:
+                self._clear_awaiting_nocommit(consume_awaiting[0])
+            # P1: تسجيل «معالَج» **في نفس معاملة** كتابة السجل الدائم ⇒ ذرّية حقيقية
+            # (التسجيل والكتابة إما ينجحوا معًا أو يفشلوا معًا). مسارات Mini App:
+            # `update_id` None ⇒ no-op (مفيش حاجز تحديث أصلًا).
+            self._mark_processed_nocommit(update_id, now)
             conn.commit()
         except Exception:
             conn.rollback()
@@ -1908,7 +2172,14 @@ class Database:
 
     # ----------------------------------------------------------- creation jobs
     def add_creation_job(
-        self, chat_id: int, repo: str | None, text: str, now: str, client_ref: str | None = None
+        self,
+        chat_id: int,
+        repo: str | None,
+        text: str,
+        now: str,
+        client_ref: str | None = None,
+        update_id: int | None = None,
+        consume_awaiting: tuple[int, str] | None = None,
     ) -> int:
         """يسجّل طلب شات جديد (status='pending') قبل أي POST بدء (مفيش conversation_id).
 
@@ -1922,24 +2193,60 @@ class Database:
         **مهم:** `done` **مش** ضمن دول — لو الرد ضاع بعد نجاح الإنشاء والعميل أعاد
         نفس المعرّف، لازم نرجّع نفس الصف (مفيش شات مكرّر). ops.js بيعمل معرّف جديد بعد
         `done` فمفيش إعادة استخدام في المسار العادي.
+
+        P1 (OHB2-ONE-SHOT-CRASH): `consume_awaiting=(telegram_id, expected_kind)` بخلّي
+        استهلاك حالة انتظار لمرة واحدة (newchat) ذرّيًا مع كتابة الطلب الدائم.
         """
-        if client_ref:
-            existing = self._conn.execute(
-                "SELECT id, status FROM creation_jobs WHERE chat_id=? AND client_ref=? "
-                "ORDER BY id DESC LIMIT 1",
-                (chat_id, client_ref),
-            ).fetchone()
-            if existing is not None and existing["status"] not in (
-                CREATION_FAILED,
-                CREATION_DISCARDED,
-            ):
-                return int(existing["id"])
-        cur = self._conn.execute(
-            "INSERT INTO creation_jobs(chat_id, repo, text, status, created_at, updated_at, client_ref) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?)",
-            (chat_id, repo, text, CREATION_PENDING, now, now, client_ref),
-        )
-        self._conn.commit()
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # P1 (إغلاق سباق التزامن): نفس منطق `add_or_group_outbox` — الفحص جوه قفل
+            # الكتابة يمنع إنشاء شات مكرّر لو نفس التحديث وصل مرتين متزامنتين.
+            if update_id is not None and self.update_is_processed(update_id):
+                conn.rollback()
+                return 0
+            if consume_awaiting is not None:
+                # P1: استهلاك حالة الانتظار (لمرة واحدة) ذرّيًا مع كتابة الطلب الدائم.
+                tg_id, expected_kind = consume_awaiting
+                arow = conn.execute(
+                    "SELECT awaiting_kind, awaiting_at FROM user_state WHERE telegram_id=?",
+                    (tg_id,),
+                ).fetchone()
+                if arow is None or arow["awaiting_kind"] != expected_kind:
+                    conn.rollback()
+                    return 0
+                if self.awaiting_is_expired(_parse_iso(arow["awaiting_at"]), _parse_iso(now)):
+                    self._clear_awaiting_nocommit(tg_id)
+                    conn.commit()
+                    return 0
+            if client_ref:
+                existing = conn.execute(
+                    "SELECT id, status FROM creation_jobs WHERE chat_id=? AND client_ref=? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (chat_id, client_ref),
+                ).fetchone()
+                if existing is not None and existing["status"] not in (
+                    CREATION_FAILED,
+                    CREATION_DISCARDED,
+                ):
+                    self._mark_processed_nocommit(update_id, now)
+                    conn.commit()
+                    return int(existing["id"])
+            cur = conn.execute(
+                "INSERT INTO creation_jobs(chat_id, repo, text, status, created_at, updated_at, client_ref) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?)",
+                (chat_id, repo, text, CREATION_PENDING, now, now, client_ref),
+            )
+            # P1: استهلاك حالة الانتظار (لمرة واحدة) **في نفس المعاملة** مع الكتابة الدائمة
+            # (outbox/creation) وعلامة «معالَج» ⇒ إما الثلاثة يتحفظوا معًا أو ولا واحد.
+            if consume_awaiting is not None:
+                self._clear_awaiting_nocommit(consume_awaiting[0])
+            # P1: تسجيل «معالَج» **في نفس معاملة** كتابة السجل الدائم ⇒ ذرّية حقيقية.
+            self._mark_processed_nocommit(update_id, now)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         return int(cur.lastrowid)
 
     def find_creation_job_by_ref(self, chat_id: int, client_ref: str) -> CreationJob | None:
@@ -1990,6 +2297,8 @@ class Database:
             raise ValueError("إزاحة الصفحة خارج نطاق SQLite")
         rows = self._conn.execute(
             "SELECT * FROM creation_jobs WHERE chat_id=? "
+            "AND NOT EXISTS (SELECT 1 FROM deleted_conversations d "
+            "WHERE d.conversation_id = creation_jobs.conversation_id) "
             "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
             (int(chat_id), size + 1, offset),
         ).fetchall()
@@ -2641,6 +2950,41 @@ class Database:
     def set_notifications_enabled(self, enabled: bool) -> None:
         self.set_setting(self.NOTIFICATIONS_KEY, "1" if enabled else "0")
 
+    def toggle_notifications_once(self, update_id: int | None, now: str) -> bool | None:
+        """يبدّل تفضيل الإشعارات **مرة واحدة** لكل `update_id` (P3).
+
+        التبديل وعلامة «معالَج» في **نفس المعاملة** ⇒ إعادة تسليم نفس التحديث
+        (`update_id` متكرر) ما بتعكسش الحالة تاني. بترجّع:
+        - True  : بقى **مفعّل** (تبديل ناجح من متوقف).
+        - False : بقى **متوقف** (تبديل ناجح من مفعّل).
+        - None  : مرفوض — نفس التحديث اتعالج قبل كده (مفيش تبديل تاني).
+
+        `update_id` None (مسار غير تيليجرام/اختبار) ⇒ تبديل عادي بدون حاجز.
+        """
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if update_id is not None and self.update_is_processed(update_id):
+                conn.rollback()
+                return None
+            row = conn.execute(
+                "SELECT value FROM settings WHERE key=?", (self.NOTIFICATIONS_KEY,)
+            ).fetchone()
+            raw = row["value"] if row else None
+            current = True if raw is None else raw.strip().lower() in self._TRUE_VALUES
+            new_state = not current
+            conn.execute(
+                "INSERT INTO settings(key, value) VALUES(?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (self.NOTIFICATIONS_KEY, "1" if new_state else "0"),
+            )
+            self._mark_processed_nocommit(update_id, now)
+            conn.commit()
+            return new_state
+        except Exception:
+            conn.rollback()
+            raise
+
     # ------------------------------------------------- notification snapshots
     # لقطة حالة كل محادثة (للمُبلّغ العام). `notified_status` = آخر حالة اتّبعت/اتخطّى
     # لها إشعار، وده اللي يمنع التكرار. منفصلة عن جدول watched (مفيش اقتران ضمني).
@@ -3210,8 +3554,19 @@ class Database:
 
     @staticmethod
     def _inbox_visibility_clause(archived: bool) -> str:
-        """شرط محور الأرشفة: عرض النشط بس، أو عرض الأرشيف بس."""
-        return "archived_at IS NOT NULL" if archived else "archived_at IS NULL"
+        """شرط محور الأرشفة + استبعاد الشاتات المتشاهدة حذفًا (منع إفصاح محتوى شات محذوف).
+
+        `archived=False` (الافتراضي) = الصندوق النشط (غير المؤرشف)؛ `archived=True` =
+        الأرشيف بس. وفي **الحالتين** بنستبعد أي صف `conversation_id` عليه شاهد حذف دائم
+        (نفس معنى `is_deleted`) — كشرط SQL واحد ⇒ مايظهرش عنوان/نص شات محذوف في الصندوق
+        (ولا في عدّاد غير المقروء). الصفوف نفسها **ما بتتحذفش** (بتفضل أثر تدقيق للـ
+        تسوية/المنع) وبنستبعدها من العرض بس.
+        """
+        axis = "archived_at IS NOT NULL" if archived else "archived_at IS NULL"
+        return (
+            f"({axis}) AND NOT EXISTS (SELECT 1 FROM deleted_conversations d "
+            "WHERE d.conversation_id = notification_inbox.conversation_id)"
+        )
 
     def list_inbox(
         self,

@@ -1,6 +1,7 @@
 """أوامر تيليجرام وأزرارها. كل الرسايل عربي، والمستخدم المالك بس يترد عليه."""
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import sqlite3
@@ -8,11 +9,17 @@ import time
 
 from telegram import InputFile, Update
 from telegram.constants import ParseMode
-from telegram.ext import ContextTypes
+from telegram.ext import ApplicationHandlerStop, ContextTypes
 
 from . import keyboards as kb
 from . import outbox
 from . import deletion
+# OHB2-SW03: سياسة إعادة المحاولة **المشتركة** معرّفة في طبقة القاعدة (مصدر واحد)، وبنعيد
+# تصديرها بأسماء الوحدة دي عشان التوافق الخلفي مع الاستدعاءات/الاختبارات القائمة.
+from .db import (
+    DEDUPE_RETRY_DELAYS as _DEDUPE_RETRY_DELAYS,
+    is_transient_sqlite_error as _is_transient_sqlite_error,
+)
 from .errors import ApiError, ResponseTooLargeError, error_text
 from .file_cache import FileCache
 from .openhands_client import collect_conversations
@@ -24,7 +31,7 @@ from .files import (
     file_status_message,
 )
 from .messages import escape_html, format_conversation_view, format_cost, pr_url, state_label
-from .sender import send_copyable, send_long
+from .sender import TextDocumentTooLargeError, send_copyable, send_long, send_text_document
 
 log = logging.getLogger(__name__)
 
@@ -72,9 +79,10 @@ async def _edit_or_send(query, text: str, chat_id: int, bot, **kwargs) -> bool:
     """يعدّل الرسالة الحالية؛ ولو طويلة عليها يبعتها مقسّمة من جديد.
 
     بيرجّع True لو اتعرض العرض فعلاً (اتعدّلت الرسالة أو اتبعتت من جديد)، وFalse لو
-    فشل العرض (خطأ تيليجرام زي رسالة قديمة/مش قابلة للتعديل). الفشل بيتسجّل بنوعه بس
-    (من غير نص الاستثناء، ممكن يحتوي أسرار) عشان ما يتخفيش — بس ما يوقّفش معالج الـ
-    callback. اللي بينده لازم ياخد باله من القيمة الراجعة قبل أي تغيير في الحالة.
+    فشل العرض (خطأ تيليجرام زي رسالة قديمة/مش قابلة للتعديل، أو فشل الإرسال البديل عند
+    الطول). الفشل بيتسجّل بنوعه بس (من غير نص الاستثناء، ممكن يحتوي أسرار) عشان ما يتخفيش
+    — بس ما يوقّفش معالج الـ callback (مفيش استثناء بيطلع للمستدعي). اللي بينده لازم ياخد
+    باله من القيمة الراجعة قبل أي تغيير في الحالة.
     """
     try:
         await query.edit_message_text(escape_html(text), parse_mode=ParseMode.HTML, **kwargs)
@@ -84,8 +92,12 @@ async def _edit_or_send(query, text: str, chat_id: int, bot, **kwargs) -> bool:
         if "not modified" in message:
             return True  # العرض نفسه موجود بالفعل — مش فشل
         if "too long" in message:
-            await send_long(chat_id, text, bot)
-            return True
+            try:
+                await send_long(chat_id, text, bot)
+                return True
+            except Exception as send_exc:  # noqa: BLE001 — فشل الإرسال البديل = فشل عرض
+                log.warning("فشل إرسال العرض البديل (%s)", type(send_exc).__name__)
+                return False
         log.warning("فشل عرض الشات (%s)", type(exc).__name__)
         return False
 
@@ -187,6 +199,154 @@ async def _guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         )
         return False
     return True
+
+
+# OHB2-DUPLICATE-TELEGRAM-PROMPT-DISPATCH: سقف نافذة الاحتفاظ بمعرّفات التحديثات المعالَجة.
+# ضخم عمدًا (مش «آخر N ثانية» زمني) عشان منعرّضش إعادة تسليم قديمة لمعالجة تانية، وفي
+# نفس الوقت السجل مايكبرش بلا حدود (تقليم دوري عند الإقلاع بس — مفيش جدولة جديدة).
+PROCESSED_UPDATES_KEEP = 50_000
+
+# OHB2-TRANSIENT-DB-FAILURE: ميزانية إعادة محاولة **محدودة** لفشل SQLite **عابر** بس
+# (busy/locked)، عند فحص حاجز التحديث. الميزانية صغيرة عمدًا: الحاجز مسار ساخن (كل تحديث)،
+# والانتظار بيأخّر كل التحديثات التانية (المعالجة تسلسلية). `busy_timeout=5000` في القاعدة
+# بيغطّي معظم حالات القفل، فالمحاولات دي احتياطية لحالات نادرة. مجموع الانتظار ≈ 0.25+0.5+1
+# = 1.75 ثانية كحد أقصى، وبعدها **فشل مقفول** (زي السلوك الأصلي). ملاحظة: في وضع WAL القراءة
+# مش بتتحاصر بالكتّاب، فالفشل العابر الحقيقي ضيّق جدًا؛ الفشل الدائم (قاعدة تالفة/مقفولة) **مش**
+# هيتعاد، فبيرجع فشل مقفول فورًا.
+# OHB2-SW03: `_DEDUPE_RETRY_DELAYS` و`_is_transient_sqlite_error` بقت مستوردة من `bot/db.py`
+# (سياسة واحدة مشتركة مع الـ Mini App). التصدير باسم الوحدة دي محفوظ للتوافق الخلفي.
+
+
+async def _check_update_processed_with_retry(db, update_id: int) -> bool:
+    """يفحص «معالَج» مع إعادة محاولة **محدودة** للفشل العابر بس.
+
+    ده **مش** ضمان no-loss: بعد استنفاد الميزانية (أو عند فشل دائم) بنرفع الاستثناء عشان
+    المتصل يفشل **مقفول** (نفس السلوك الأصلي). القيمة المضافة: نافذة فشل عابر ضيّقة جدًا
+    بتتغطّى بمحاولات قصيرة بدل ما تتسبّب في إسقاط تحديث فورًا.
+    """
+    delay = 0.0
+    attempt = 0
+    while True:
+        try:
+            return db.update_is_processed(update_id)
+        except Exception as exc:  # noqa: BLE001 — التصنيف بيقرّر: عابر يُعاد، دائم يُرفع
+            if not _is_transient_sqlite_error(exc) or attempt >= len(_DEDUPE_RETRY_DELAYS):
+                raise
+            delay = _DEDUPE_RETRY_DELAYS[attempt]
+            attempt += 1
+            log.warning(
+                "حاجز التحديث (%s): فشل SQLite عابر (%s) — إعادة محاولة %d/%d بعد %.2fث",
+                update_id, type(exc).__name__, attempt, len(_DEDUPE_RETRY_DELAYS), delay,
+            )
+            await asyncio.sleep(delay)
+
+
+async def _is_deleted_with_retry(db, conversation_id: str) -> bool:
+    """يقرأ شاهد الحذف مع إعادة محاولة **محدودة** للفشل العابر بس (SW-01).
+
+    نفس سياسة `_check_update_processed_with_retry`: الفشل العابر (SQLite BUSY/LOCKED)
+    بيتغطّى بمحاولات قصيرة (`_DEDUPE_RETRY_DELAYS`)، وبعد استنفاد الميزانية (أو عند فشل
+    دائم) **بنرفع الاستثناء الأصلي**. ممنوع نرجّع `False` عند الفشل (ده كان بيحوّل الفشل
+    إلى «متشاهد» ويولّد رسالة حذف كاذبة)؛ وممنوع نرجّع `True` كمان. القراءة الناجحة بس هي
+    اللي بتحدّد «متشاهد» من «مش متشاهد».
+    """
+    delay = 0.0
+    attempt = 0
+    while True:
+        try:
+            return db.is_deleted(conversation_id)
+        except Exception as exc:  # noqa: BLE001 — التصنيف بيقرّر: عابر يُعاد، دائم يُرفع
+            if not _is_transient_sqlite_error(exc) or attempt >= len(_DEDUPE_RETRY_DELAYS):
+                raise
+            delay = _DEDUPE_RETRY_DELAYS[attempt]
+            attempt += 1
+            log.warning(
+                "فحص شاهد الحذف (%s): فشل SQLite عابر (%s) — إعادة محاولة %d/%d بعد %.2fث",
+                conversation_id, type(exc).__name__, attempt, len(_DEDUPE_RETRY_DELAYS), delay,
+            )
+            await asyncio.sleep(delay)
+
+
+async def dedupe_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """حاجز الإدخال: يضمن «تحديث تيليجرام واحد ⇒ قرار معالجة واحد» (OHB2-DUP-DISPATCH).
+
+    مسجّل في **مجموعة أعلى أولوية** (group=-1) عشان يشتغل قبل كل الـ handlers التانية،
+    ولأن PTB بينفّذ handler واحد بس لكل مجموعة، ده أول و آخر handler في المجموعة دي.
+
+    السلوك:
+    - تحديث من غير `update_id` صالح (مش Update حقيقي) ⇒ نتخطّى (ما بنمنعش أي حاجة).
+    - `update_id` شُفناه قبل كده (مسجّل «معالَج») ⇒ **تحديث مكرّر** ⇒ نوقف المعالجة تمامًا
+      (`ApplicationHandlerStop`) قبل أي عملية خارجية.
+    - غير كده ⇒ نكمّل لمعالج واحد (المجموعة 0).
+
+    P1 (إغلاق نافذة الفقد): الحاجز **فحص قراءة فقط** (`db.update_is_processed`). التسجيل
+    نفسه بيحصل **ذرّيًا مع كتابة السجل الدائم** جوه معاملة `add_or_group_outbox` /
+    `add_creation_job`. النتيجة:
+    - لو العملية ماتت **قبل** كتابة السجل الدائم ⇒ مفيش تسجيل «معالَج» ⇒ إعادة التسليم
+      بتنفّذ (مفيش فقد).
+    - لو ماتت **بعد** الكتابة (اللي بتشمل التسجيل في نفس المعاملة) ⇒ السجل موجود ⇒ إعادة
+      التسليم مكرّرة ⇒ تتخطّى (مفيش ازدواج).
+
+    ملاحظة نطاق (مقصودة، وليست سهوًا): العمليات اللي **مابتعملش** سجل عمل دائم (رد/توجيه
+    فقط: أوامر، تنقّل، أزرار قراءة) مش مسجّلة «معالَج»، فإعادة تسليمها بتعيد الرد. أغلبها
+    قراءة/idempotent. التبديل `notif:toggle` (اللي بيغيّر حالة دائمة صغيرة) **بقى**
+    مسجّلًا ذرّيًا مع التبديل (`Database.toggle_notifications_once`) — P3. باقي الأزرار
+    اللي بتغيّر حالة صغيرة (`watch:`/`unwatch:`) قابلة للتكرار عمدًا: الضغطة المكرّرة
+    بتعيد نفس الأثر (upsert/إزالة) فمفيش ضرر، ومنعها كان يحتاج مسارًا موازيًا بلا قيمة.
+    الالتزام القائم «تحديث واحد ⇒ قرار إرسال/إنشاء واحد» محفوظ بالكامل.
+
+    P2 (فشل القاعدة): فحص الحاجز بيتنفّذ عبر `_check_update_processed_with_retry`، اللي
+    بيعيد المحاولة **محدودًا** (ميزانية صغيرة ≈ 1.75ث) للفشل **العابر** بس (SQLite
+    busy/locked). لو الفشل **دائم** (قاعدة تالفة/مقفولة/جدول مش موجود) أو استنفدت الميزانية،
+    بنفشل **مقفول**: بنسجّل التتبّع الكامل بنفسنا (`log.exception`)، وبنمنع الـ handlers
+    الباقية (`ApplicationHandlerStop`) عشان مايحصلش معالجة مزدوجة. الإيقاف صريح (مش اعتمادًا على
+    إن PTB بيوقف عند الاستثناء — اتأكّد إن PTB **بيكمّل** للمجموعة الجاية لو الاستثناء
+    مش `ApplicationHandlerStop`، وبيبتلع الـ stop نفسه من غير ما يسجّله).
+
+    **حدود P2 (موثّقة، غير مُصلَحة):** ده **مش** ضمان no-loss. `ApplicationHandlerStop`
+    بيوقف المعالجة بس؛ مافيش requeue ولا تخزين للفشل. ومع `run_polling(drop_pending_updates=True)`
+    الـ offset بيتقدّم عند **السحب** (قبل التنفيذ)، فالتحديث **مش** هيتسلّم تاني لو الإقلاع حصل بعده. كمان لو
+    القاعدة غير متاحة، فمافيش وسيلة **آمنة** نثبّت بيها «التحديث ده مقبول ولسه محتاج معالجة»
+    بدون كتابة في **نفس** القاعدة المعطوبة (أي وسيلة تانية = مخزن/worker جديد = ممنوع).
+    لذا السلوك يفضل: **رفض آمن + تسجيل واضح**، مع احتمال **إسقاط** نادر لتحديث واحد وقت فشل
+    **دائم/طويل**. إعادة المحاولة المحدودة بتضيّق نافذة الفشل **العابر** فقط؛ ما بتغطّيش الفشل
+    الدائم. المسار المقبول الوحيد للتعافي هو ما تعالجه مسارات الاسترجاع الموجودة
+    (outbox/creation) للسجلات اللي **اتكتبت** فعلًا؛ اللي **مااتكتبش** ما بيتعالجش.
+    ضمان no-loss كامل يحتاج قرارًا معماريًا (إدارة offset مخصّصة أو طابور دائم قبل المعالجة)
+    — بره نطاق ده التغيير ومحتاج موافقة صريحة.
+    """
+    update_id = getattr(update, "update_id", None)
+    if not isinstance(update_id, int):
+        return
+    db = context.bot_data.get("db")
+    if db is None:
+        return  # مفيش قاعدة (استخدام غير معتاد/اختبار) ⇒ ما نمنعش المعالجة
+    try:
+        processed = await _check_update_processed_with_retry(db, update_id)
+    except Exception:  # noqa: BLE001 — فشل الحاجز ⇒ فشل مقفول صريح
+        # لا نسيبه يكمّل كأن الفحص نجح. `ApplicationHandlerStop` بيوقف كل المجموعات (مفيش
+        # معالجة مزدوجة)، بس PTB بيبتلعه من غير ما يسجّل أي حاجة — فبنسجّل التتبّع الكامل
+        # بنفسنا هنا (مفيش توه صامت)، وبعدين بنوقف المعالجة صراحةً.
+        log.exception(
+            "فشل فحص حاجز التحديث (%s) — اتوقف معالجة التحديث (فشل مقفول)",
+            update_id,
+        )
+        raise ApplicationHandlerStop
+    if not processed:
+        return
+    log.info("تحديث تيليجرام مكرّر (%s) — اتخطّى قبل أي عملية", update_id)
+    # أوقف أي handler تاني (بأي مجموعة) لنفس التحديث المكرّر.
+    raise ApplicationHandlerStop
+
+
+def _update_id(update: Update) -> int | None:
+    """معرّف التحديث لو موجود وصالح، وإلا None (تحديثات الاختبار/الـ adapters).
+
+    P1: بيتمرّر لـ `add_or_group_outbox`/`add_creation_job` عشان تسجيل «معالَج» يحصل
+    **ذرّيًا** مع كتابة السجل الدائم.
+    """
+    value = getattr(update, "update_id", None)
+    return value if isinstance(value, int) else None
 
 
 def _mini_app_url(context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -325,8 +485,12 @@ async def notifications_toggle(update: Update, context: ContextTypes.DEFAULT_TYP
         await q.answer()
         return
     db = context.bot_data["db"]
-    new_state = not db.get_notifications_enabled()
-    db.set_notifications_enabled(new_state)
+    # P3: التبديل + علامة «معالَج» في **معاملة واحدة** ⇒ إعادة تسليم نفس التحديث
+    # (`update_id` متكرر) ما بتعكسش الحالة تاني؛ تحديث مختلف بيكمل التبديل عادي.
+    new_state = db.toggle_notifications_once(_update_id(update), outbox.now_iso())
+    if new_state is None:
+        await q.answer()  # تحديث مكرّر: مفيش تبديل تاني (ومافيش عرض مضلّل)
+        return
     await q.answer("تم التحديث ✅")
     await q.edit_message_text(
         _notifications_text(new_state), reply_markup=kb.notifications_menu(new_state)
@@ -339,18 +503,15 @@ def _without_deleted(db, items: list[dict]) -> list[dict]:
     القايمة بتيجي من بحث بعيد مش عارف بالحذف المحلي، فبندمجها مع شاهد الحذف قبل الترقيم
     عشان الشات المحذوف ما يظهرش لا من كاش قديم ولا من بحث جديد.
 
-    OHB2-AUDIT-FIX-04 (فشل مغلق): لو تعذّر قراءة شواهد الحذف (قاعدة غير متاحة)، بنرجّع
-    قايمة **فاضية** بدل القايمة غير المفلترة. الادّعاء إن شات «مش محذوف» لما إحنا مش قادرين
-    نتأكّد أسوأ من إظهار «مفيش شاتات» مؤقتًا — الإظهار بالغلط أثر أمني/خصوصية (شات اتحذف
-    بيبان تاني)، بينما الإخفاء بالغلط transient وبيتحلّ بمجرد رجوع القاعدة.
+    OHB2-SW03 (كان OHB2-AUDIT-FIX-04): فشل قراءة شواهد الحذف **مايتحوّلش** لقايمة فاضية.
+    بنستخدم `db.is_deleted_with_retry` (إعادة محدودة للعابر BUSY/LOCKED ثم رفع الاستثناء
+    الأصلي). الفشل **بينتشر** للمستدعي بدل ما يُلبَس لبوس «مفيش شاتات» — الفراغ الحقيقي
+    (مدخل فاضي أو كل الشاتات متشاهدة) لسه بيرجّع `[]` بشكل مشروع، لكن فشل القاعدة **مش**
+    فراغ. حماية F-1 نفسها ما اتغيّرتش: الشات المتشاهد لسه بيُفلتر.
     """
     if not items:
         return items
-    try:
-        return [c for c in items if not db.is_deleted(c.get("id") or "")]
-    except Exception:  # noqa: BLE001 — قاعدة غير متاحة ⇒ نفشل مقفولين (مفيش إظهار بالغلط)
-        log.warning("تعذّر قراءة شواهد الحذف؛ بنخفي القايمة مؤقتًا (فشل مغلق).")
-        return []
+    return [c for c in items if not db.is_deleted_with_retry(c.get("id") or "")]
 
 
 async def list_conversations(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -381,7 +542,17 @@ async def list_conversations(update: Update, context: ContextTypes.DEFAULT_TYPE)
             context.bot_data["list_cache"] = (time.monotonic(), items, truncated)
     # OHB2-F1: الشاتات المحذوفة محليًا لازم تختفي من القايمة قبل الترقيم — سواء جاية من
     # كاش قديم أو من بحث بعيد جديد (البحث مش عارف بالحذف المحلي).
-    items = _without_deleted(context.bot_data["db"], items)
+    # OHB2-SW03: فشل قراءة الشواهد (بعد الإعادة المحدودة) **مايتحوّلش** لقايمة فاضية ولا
+    # لرسالة «ما فيهاش شاتات» الكاذبة — بنعرض رسالة فشل عامة (من غير تفاصيل داخلية) وبنرجع.
+    try:
+        items = _without_deleted(context.bot_data["db"], items)
+    except Exception as exc:  # noqa: BLE001 — فشل قاعدة بعد الإعادة المحدودة ⇒ فشل صريح
+        log.exception("تعذّر فلترة الشواهد في قايمة الشاتات (%s)", type(exc).__name__)
+        await _safe_edit(
+            q, "تعذّر عرض الشاتات دلوقتي، جرّب تاني.",
+            reply_markup=kb.main_menu(_mini_app_url(context)),
+        )
+        return
     if not items:
         await _safe_edit(q, "ما فيهاش شاتات.", reply_markup=kb.main_menu(_mini_app_url(context)))
         return
@@ -413,13 +584,16 @@ async def open_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     # (فتح الشات بيقرا طازة دايماً — مش من كاش copy/full.)
     conv, message = await _authorized_conversation(client, context, conversation_id)
     if conv is None:
-        await _edit_or_send(q, message, q.message.chat_id, context.bot)
+        # OHB2-SW-05: ناخد بالنا من نتيجة العرض؛ فشل عرض رسالة الرفض يتسجّل بدل ما يتخفي.
+        if not await _edit_or_send(q, message, q.message.chat_id, context.bot):
+            log.warning("تعذّر عرض رسالة رفض فتح الشات %s (فشل تسليم تيليجرام).", conversation_id)
         return
     try:
         user_text, reply = await client.get_last_exchange(conversation_id)
     except ApiError as exc:
         # نفس المسار المتسامح لرسالة الخطأ: مفيش توجيه جديد ولا انهيار في الـ callback.
-        await _edit_or_send(q, error_text(exc), q.message.chat_id, context.bot)
+        if not await _edit_or_send(q, error_text(exc), q.message.chat_id, context.bot):
+            log.warning("تعذّر عرض خطأ آخر تبادل للشات %s (فشل تسليم تيليجرام).", conversation_id)
         return
     _store_exchange(context, conversation_id, user_text, reply)
     db = context.bot_data["db"]
@@ -482,6 +656,47 @@ async def full_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await context.bot.send_message(chat_id, "لسه مفيش رد للشات ده.")
         return
     await send_long(chat_id, reply, context.bot)
+
+
+async def send_reply_txt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """OHB2-BOT-REPLY-TXT-FILE-BUTTON: يبعت **الرد الكامل** كملف `.txt` قابل للتنزيل.
+
+    إجراء منفصل تمامًا عن «نسخ الرد» (callback مختلف `txt:`، ومسار إرسال مختلف:
+    `send_document` بدل `<pre>`). المصدر هو **نفس** مصدر copy/full — آخر تبادل كامل من
+    الـ API (`get_last_exchange`، بلا حدّ تقسيم الرسايل)، مش نص رسالة تيليجرام واحدة.
+
+    التفويض: نفس عقد `_authorized_conversation` (ملكية/معرّف/شاهد حذف/فشل مغلق) قبل أي
+    قراءة أو إرسال — فمستحيل مستخدم يجيب رد حد تاني بتغيير الـ callback data.
+    """
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception as exc:  # noqa: BLE001 — فشل إجابة الكولباك (استعلام قديم) مايوقفش التنزيل
+        log.warning("تعذّر الرد على الكولباك (%s)", type(exc).__name__)
+    if not _allowed(update, context.bot_data["config"]):
+        return
+    conversation_id = q.data.split(":", 1)[1]
+    chat_id = q.message.chat_id
+    _conv, message = await _authorized_conversation(context.bot_data["client"], context, conversation_id)
+    if _conv is None:
+        await context.bot.send_message(chat_id, escape_html(message), parse_mode=ParseMode.HTML)
+        return
+    try:
+        _, reply = await _get_exchange(context, conversation_id)
+    except ApiError as exc:
+        await context.bot.send_message(chat_id, escape_html(error_text(exc)), parse_mode=ParseMode.HTML)
+        return
+    if not reply:
+        await context.bot.send_message(chat_id, "لسه مفيش رد للشات ده.")
+        return
+    reply_to = getattr(q.message, "message_id", None)
+    try:
+        await send_text_document(chat_id, reply, context.bot, reply_to_message_id=reply_to)
+    except TextDocumentTooLargeError:
+        await context.bot.send_message(chat_id, "الرد كبير أوي للتنزيل كملف نصي.")
+    except Exception as exc:  # noqa: BLE001 — فشل الإرسال ⇒ ما ندّعيش النجاح؛ رسالة صريحة
+        log.warning("فشل إرسال ملف الرد النصي (%s)", type(exc).__name__)
+        await context.bot.send_message(chat_id, "تعذّر إرسال ملف النص دلوقتي، جرّب تاني.")
 
 
 async def list_watches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -574,8 +789,12 @@ async def delete_conversation_prompt(update: Update, context: ContextTypes.DEFAU
     if not _allowed(update, context.bot_data["config"]):
         return
     conversation_id = q.data.split(":", 1)[1]
+    # F-1: `allow_deleted=True` — أول ضغطة على 🗑 عملية صريحة على شات ممكن يكون متشاهد
+    # (deleting/uncertain). الحذف المحلي بيسيب الشات في `deleted_conversations`، فحجب
+    # شاشة التأكيد كان بيقطع إعادة المحاولة الموثّقة (نفس ما اتصلح في زر التأكيد
+    # `deleteok:` والـ Mini App). الحماية الحقيقية في CAS الحذف جوه `delete_conversation`.
     conv, message = await _authorized_conversation(
-        context.bot_data["client"], context, conversation_id
+        context.bot_data["client"], context, conversation_id, allow_deleted=True
     )
     if conv is None:
         await _safe_edit(q, message)
@@ -645,10 +864,13 @@ async def show_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     link = pr_url(conv)
     if link:
         lines.append(f"الـ PR: {link}")
-    await _edit_or_send(
+    # OHB2-SW-05: لازم ناخد بالنا من القيمة الراجعة — العرض ده هو المحتوى الوحيد اللي
+    # المستخدم طلبه، ففشل عرضه (False) لازم يتسجّل صريح بدل ما نرجّع وكأننا نجحنا.
+    if not await _edit_or_send(
         q, "\n".join(lines), q.message.chat_id, context.bot,
         reply_markup=kb.conversation_actions(conversation_id),
-    )
+    ):
+        log.warning("تعذّر عرض حالة الشات %s (فشل تعديل/إرسال تيليجرام).", conversation_id)
 
 
 async def show_cost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -664,10 +886,12 @@ async def show_cost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if conv is None:
         await _safe_edit(q, message)
         return
-    await _edit_or_send(
+    # OHB2-SW-05: نفس منطق show_status — فشل عرض التكلفة يتسجّل بدل ما يتجاهله الكود.
+    if not await _edit_or_send(
         q, format_cost(conv.get("metrics")), q.message.chat_id, context.bot,
         reply_markup=kb.conversation_actions(conversation_id),
-    )
+    ):
+        log.warning("تعذّر عرض تكلفة الشات %s (فشل تعديل/إرسال تيليجرام).", conversation_id)
 
 
 async def export_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -807,20 +1031,40 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     db = context.bot_data["db"]
     telegram_id = update.effective_user.id
-    # U04: القراءة والاستهلاك (أو تجديد المهلة لو route) معاملة واحدة ذرّية، فرسالتين
-    # متزامنتين ما يقدروش يستهلكوا نفس حالة الانتظار ولا يتوجّهوا لشات غلط.
-    pending, kind, title = db.take_awaiting(telegram_id)
+    # P1 (OHB2-ONE-SHOT-CRASH): قراءة **بدون استهلاك**. الحالات لمرة واحدة (reply/newchat/
+    # reposearch) بتتستهلك **ذرّيًا مع كتابة السجل الدائم** جوه
+    # add_or_group_outbox/add_creation_job (أو consume_one_shot_awaiting لبحث المستودعات)
+    # ⇒ مفيش نافذة بين استهلاك الحالة وكتابة العمل يضيع فيها البرومت لو العملية ماتت.
+    # `route` مستمر (مش لمرة واحدة): بنجدّد مهلته هنا فقط.
+    pending, kind, title, awaiting_at = db.awaiting_state(telegram_id)
+    if kind in ("reply", "newchat", "reposearch", "route") and db.awaiting_is_expired(awaiting_at):
+        # حالة منتهية: نمسحها ونبلّغ (نفس سلوك `take_awaiting` القديم، بدون استهلاك مسبق).
+        db.clear_awaiting(telegram_id)
+        await update.message.reply_text(
+            "انتهت مهلة التوجيه (10 دقايق من آخر نشاط). افتح الشات تاني وابعت برومتك."
+        )
+        return
+    if kind == "route" and pending:
+        db.renew_awaiting(telegram_id)  # route مستمر: كل رسالة بتجدّد المهلة
     if kind in ("reply", "route") and pending:
-        await _send_prompt(update, context, pending, update.message.text, title if kind == "route" else None)
+        consume = (telegram_id, "reply") if kind == "reply" else None
+        await _send_prompt(
+            update, context, pending, update.message.text,
+            title if kind == "route" else None, consume_awaiting=consume,
+        )
     elif kind == "newchat":
-        await _start_new_chat(update, context, pending, update.message.text)
+        await _start_new_chat(
+            update, context, pending, update.message.text,
+            consume_awaiting=(telegram_id, "newchat"),
+        )
     elif kind == "reposearch":
         query = update.message.text.strip()
         sent = await update.message.reply_text("اختار مستودع للشات الجديد:\nبحث: " + query)
         await _show_repos(_MessageAdapter(sent), context, page=0, query=query)
-    elif kind == "expired":
-        await update.message.reply_text(
-            "انتهت مهلة التوجيه (10 دقايق من آخر نشاط). افتح الشات تاني وابعت برومتك."
+        # P1: نستهلك حالة البحث **بعد** ما القايمة تتبعت (عطل قبل كده ⇒ إعادة التسليم تعيد
+        # التنفيذ؛ قايمة مكرّرة غير ضارة)، والاستهلاك + علامة «معالَج» في معاملة واحدة.
+        db.consume_one_shot_awaiting(
+            telegram_id, "reposearch", _update_id(update), outbox.now_iso()
         )
     else:
         await update.message.reply_text("ابعت /start للقائمة، أو افتح شات عشان تبعتله برومت.")
@@ -849,6 +1093,7 @@ async def _send_prompt(
     conversation_id: str,
     text: str,
     title: str | None = None,
+    consume_awaiting: tuple[int, str] | None = None,
 ) -> None:
     """يسجّل البرومت في الصندوق (بثبات) قبل أي إرسال، ويرد 'وصل' فوراً."""
     if not text.strip():
@@ -859,11 +1104,10 @@ async def _send_prompt(
     # ده بينادي `reengage=True` (من غير client_ref)، واللي طبقة القاعدة بتعتبره إعادة
     # تفاعل صريح (بيشيل الشاهد). فلو الشات اتحذف محليًا بعد ما التوجيه اتفتح (سباق)،
     # لازم نرفض هنا بدل ما نحيي الشات — ده فرض F-1 على مسار الإرسال.
-    # الفحص **فشل مغلق**: أي خطأ قراءة ⇒ نرفض (مفيش برومت على شات ممكن يكون محذوف).
-    try:
-        deleted = db.is_deleted(conversation_id)
-    except Exception:  # noqa: BLE001 — قاعدة غير متاحة ⇒ فشل مغلق (نرفض الإرسال)
-        deleted = True
+    # SW-01: «متشاهد» بتتقرّر من **نجاح** القراءة بس. أي فشل قراءة (عابر بعد استنفاد
+    # المحاولات المحدودة، أو دائم) **بيطلع** للمستدعي ⇒ مفيش رسالة حذف كاذبة، ومفيش رجوع
+    # عادي كأن البرومت اتحفظ. الفشل العابر (BUSY/LOCKED) بس هو اللي بيُعاد محدودًا.
+    deleted = await _is_deleted_with_retry(db, conversation_id)
     if deleted:
         await update.message.reply_text(
             "الشات ده اتحذف — مش ممكن نبعت له رسايل. افتح شات تاني."
@@ -871,7 +1115,16 @@ async def _send_prompt(
         return
     # نسجّل 'pending' قبل ما نبدأ أي إرسال، عشان البرومت مايضيعش لو العملية اتقطعت.
     # القرار 2: لو فيه برومت لنفس الوجهة اتسجّل خلال 1.5 ثانية، بيتجمّع معاه في سجل واحد.
-    db.add_or_group_outbox(conversation_id, chat_id, text, outbox.now_iso(), reengage=True)
+    # P1: بنمرّر `update_id` عشان تسجيل «معالَج» يحصل **ذرّيًا مع** كتابة السجل الدائم (نفس
+    # المعاملة) ⇒ لو العملية ماتت قبل الكتابة، الحاجز مايتسجّلش ⇒ إعادة التسليم بتنفّذ (مفيش
+    # فقد)؛ ولو اتكتب، إعادة التسليم مكرّرة ⇒ تتخطّى (مفيش ازدواج). القيمة 0 معناها إن
+    # التحديث ده اتسجّل للتوّ (فوز بسباق تزامن) ⇒ مانبعثش تأكيد كاذب، اللي فاز بيتأكد.
+    out_id = db.add_or_group_outbox(
+        conversation_id, chat_id, text, outbox.now_iso(), reengage=True,
+        update_id=_update_id(update), consume_awaiting=consume_awaiting,
+    )
+    if out_id == 0:
+        return
     # TASK 55 (C): ترتيب القايمة بيتغيّر بعد البرومت ⇒ نبطّل كاش القايمة.
     context.bot_data.pop("list_cache", None)
     # تأكيد الحفظ بيذكر الشات المستهدف (القرار 1) عشان رسالة ماتروحش لشات غلط من غير ما تلاحظ.
@@ -1008,13 +1261,28 @@ async def new_chat_no_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
 
-async def _start_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, repo: str | None, text: str) -> None:
+async def _start_new_chat(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    repo: str | None,
+    text: str,
+    consume_awaiting: tuple[int, str] | None = None,
+) -> None:
     if not text.strip():
         return
     db = context.bot_data["db"]
     chat_id = update.effective_chat.id
     # نسجّل طلب الشات الجديد (بثبات) قبل أي POST بدء، عشان مايضيعش لو العملية اتقطعت.
-    db.add_creation_job(chat_id, repo, text, outbox.now_iso())
+    # P1: `update_id` ⇒ تسجيل «معالَج» **ذرّيًا مع** كتابة السجل الدائم (نفس المعاملة).
+    # P1: `consume_awaiting` ⇒ استهلاك حالة `newchat` **في نفس المعاملة** (مفيش نافذة فقد).
+    # القيمة 0 معناها إن نفس التحديث اتسجّل للتوّ (فوز بسباق تزامن) ⇒ مانبدأش شات تاني
+    # ولا نأكّد تأكيد كاذب.
+    job_id = db.add_creation_job(
+        chat_id, repo, text, outbox.now_iso(),
+        update_id=_update_id(update), consume_awaiting=consume_awaiting,
+    )
+    if job_id == 0:
+        return
     await update.message.reply_text("وصل ✅ جاري بدء شات جديد.")
     worker = context.bot_data.get("creation_worker")
     if worker is not None:

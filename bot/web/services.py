@@ -638,17 +638,14 @@ class MiniAppService:
     def _without_deleted(self, items: list[dict]) -> list[dict]:
         """يشيل أي شات عليه شاهد حذف محلي (OHB2-C7) من قايمة الـ Mini App.
 
-        OHB2-AUDIT-FIX-04 (فشل مغلق): لو تعذّر قراءة شواهد الحذف (قاعدة غير متاحة)،
-        بنرجّع قايمة **فاضية** بدل القايمة غير المفلترة — ما نعرّضش شات محذوف للظهور
-        بالغلط. الإخفاء المؤقت أأمن من الإظهار الخاطئ.
+        OHB2-SW03 (كان OHB2-AUDIT-FIX-04): فشل قراءة الشواهد **مايتحوّلش** لقايمة فاضية.
+        بنستخدم `db.is_deleted_with_retry` (إعادة محدودة للعابر BUSY/LOCKED ثم رفع الاستثناء
+        الأصلي)، والفشل بينتشر لحد ما الـ route يحوّله لـ 500 عام — بدل رد 200 فاضي مضلّل.
+        الفراغ الحقيقي (مدخل فاضي أو كل الشاتات متشاهدة) لسه بيرجّع `[]` بشكل مشروع.
         """
         if self._db is None or not items:
             return items
-        try:
-            return [c for c in items if not self._db.is_deleted(c.get("id") or "")]
-        except Exception:  # noqa: BLE001 — قاعدة غير متاحة ⇒ نفشل مقفولين
-            log.warning("تعذّر قراءة شواهد الحذف؛ بنخفي القايمة مؤقتًا (فشل مغلق).")
-            return []
+        return [c for c in items if not self._db.is_deleted_with_retry(c.get("id") or "")]
 
     def _list_item(self, conv: dict, watched: set[str]) -> dict:
         status = get_status(conv)

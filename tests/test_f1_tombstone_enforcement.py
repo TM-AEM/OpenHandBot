@@ -29,8 +29,9 @@ from starlette.testclient import TestClient
 import bot.handlers as h
 from bot import outbox
 from bot.config import Config
-from bot.db import Database
+from bot.db import INBOX_KIND_TERMINAL, Database
 from bot.openhands_client import OpenHandsClient
+from bot.watcher import Watcher
 from bot.web import build_web_app
 from tests._miniapp_helpers import BOT_TOKEN, make_init_data
 from tests.test_handlers import FakeMessage, _cb_update, _ctx_with
@@ -502,7 +503,11 @@ def test_bot_send_prompt_blocked_for_tombstoned(tmp_path):
 
 
 def test_bot_send_prompt_fails_closed_on_db_error(tmp_path, monkeypatch):
-    """قاعدة غير متاحة أثناء فحص الشاهد ⇒ رفض الإرسال (فشل مغلق)، مفيش صف صندوق."""
+    """SW-01: قاعدة غير متاحة أثناء فحص الشاهد ⇒ الاستثناء **بيطلع** (مفيش رسالة حذف كاذبة).
+
+    السلوك الصحيح: فشل قراءة الشاهد **مش** دليل على إن الشات متشاهد. بنرفع الاستثناء
+    (فشل مقفول صريح) بدل ما نحوّله لـ `deleted=True` ونبعت رسالة حذف مضلّلة ونرجع عاديًّا.
+    """
     client = CountingClient()
     ctx = _ctx_with(tmp_path, client)
     db = ctx.bot_data["db"]
@@ -515,10 +520,12 @@ def test_bot_send_prompt_fails_closed_on_db_error(tmp_path, monkeypatch):
     update = _cb_update(1, "x")
     update.message = FakeMessage()
     update.message.text = "برومت"
-    asyncio.run(h.handle_text(update, ctx))
-    assert db.count_outbox() == 0
-    assert client.calls == []
-    assert any("اتحذف" in r for r in update.message.replies)
+    with pytest.raises(RuntimeError):
+        asyncio.run(h.handle_text(update, ctx))
+    assert db.count_outbox() == 0  # مفيش برومت اتسجّل
+    assert client.calls == []  # مفيش أي نداء بعيد
+    assert not any("اتحذف" in r for r in update.message.replies)  # مفيش رسالة حذف كاذبة
+    assert db.get_awaiting(1) == (CID, "reply")  # التوجيه ما اتستهلكش (لا فقد)
 
 
 def test_bot_watch_on_tombstoned_still_reengages(tmp_path):
@@ -546,3 +553,227 @@ def test_bot_delete_retry_on_tombstoned_reaches_remote(tmp_path):
     asyncio.run(h.delete_conversation_confirm(update, ctx))
     assert ("delete_conversation", CID) in client.calls
     assert db.remote_deletion_state(CID) == db.REMOTE_CONFIRMED
+
+
+def test_bot_delete_prompt_reachable_on_tombstoned(tmp_path):
+    """أول ضغطة 🗑 (`delete:`) على شات متشاهد لسه بتعرض شاشة التأكيد (إعادة محاولة موثّقة).
+
+    الفجوة (MEDIUM من المراجعة المستقلة): `delete_conversation_prompt` ماكانش بياخد
+    `allow_deleted=True` (عكس `deleteok:`)، فالحذف الجاري (deleting/uncertain) كان بيتحجب
+    عند أول خطوة ⇒ إعادة المحاولة مستحيلة من البوت. الاختبار بيثبت إن شاشة التأكيد بتوصل
+    (markup فيه زر التأكيد) وإن التفويض لسه شغّال.
+    """
+    for state in ("deleting", "uncertain", "deleted"):
+        client = CountingClient()
+        sub = tmp_path / state
+        sub.mkdir()
+        ctx = _ctx_with(sub, client)
+        db = ctx.bot_data["db"]
+        _seed_tombstone(db, state)
+        update = _cb_update(1, f"delete:{CID}")
+        asyncio.run(h.delete_conversation_prompt(update, ctx))
+        assert update.callback_query.edits, (state, "مفيش شاشة تأكيد")
+        assert "متأكد" in update.callback_query.edits[-1], (state, update.callback_query.edits)
+        assert update.callback_query.edits_markup[-1] is not None, (state, "مفيش زر تأكيد")
+
+
+def test_bot_delete_prompt_non_owner_still_rejected(tmp_path):
+    """الفجوة اتصلحت من غير ما نكسر التفويض: مالك تاني لسه مرفوض عند شاشة التأكيد."""
+    from tests.test_b06_file_routing import FileFlowClient
+
+    client = FileFlowClient(conv_owner="someone-else")
+    ctx = _ctx_with(tmp_path, client)
+    db = ctx.bot_data["db"]
+    _seed_tombstone(db, "uncertain")
+    update = _cb_update(1, f"delete:{CID}")
+    asyncio.run(h.delete_conversation_prompt(update, ctx))
+    assert update.callback_query.edits[-1] == "مش مسموح لك بالوصول للشات ده."
+    assert update.callback_query.edits_markup[-1] is None
+
+
+# ============================================================ watcher (HIGH من المراجعة)
+class WatcherClient:
+    """عميل مراقب بيعدّ النداءات البعيدة (get_conversations/get_last_reply) + عنوان سرّي."""
+
+    def __init__(self):
+        self.conv_calls: list[tuple] = []
+        self.reply_calls: list[str] = []
+        self.title = SECRET_TITLE
+        self.reply = SECRET_REPLY
+
+    async def get_conversations(self, ids):
+        self.conv_calls.append(tuple(ids))
+        return [
+            {"id": i, "title": self.title, "execution_status": "finished"} for i in ids
+        ]
+
+    async def get_last_reply(self, conversation_id):
+        self.reply_calls.append(conversation_id)
+        return self.reply
+
+
+class WatcherBot:
+    def __init__(self):
+        self.sent: list[str] = []
+
+    async def send_message(self, chat_id=None, text=None, parse_mode=None, **kw):
+        self.sent.append(text)
+
+    async def send_document(self, chat_id=None, document=None, **kw):
+        self.sent.append("DOC")
+
+
+@pytest.mark.parametrize("state", TOMBSTONE_STATES)
+def test_watcher_skips_tombstoned_no_remote_no_send(state, tmp_path):
+    """HIGH من المراجعة: المراقب مايلمسش شات متشاهد — صفر نداء بعيد وصفر إرسال.
+
+    قبل الإصلاح: صف المتابعة بيفضل موجود في deleting/uncertain، فالمراقب كان بيجيب الحالة
+    ويبعت «انتهى الشات» بمحتوى الشات المحذوف. بعد الإصلاح: بيتخطّى بالكامل.
+    """
+    db = Database(str(tmp_path / f"w-{state}.sqlite3"))
+    db.add_watched(CID, SECRET_TITLE)
+    _seed_tombstone(db, state)
+    client = WatcherClient()
+    bot = WatcherBot()
+    asyncio.run(Watcher(client, db, bot, chat_id=1).tick())
+    assert client.conv_calls == [], (state, client.conv_calls)
+    assert client.reply_calls == [], (state, client.reply_calls)
+    assert bot.sent == [], (state, bot.sent)
+    assert SECRET_TITLE not in " ".join(bot.sent)
+
+
+def test_watcher_fails_closed_on_db_error(tmp_path, monkeypatch):
+    """قاعدة غير متاحة أثناء فحص الشاهد ⇒ المراقب يتخطّى (فشل مغلق)، صفر نداء/إرسال."""
+    db = Database(str(tmp_path / "w-dberr.sqlite3"))
+    db.add_watched(CID, SECRET_TITLE)
+    client = WatcherClient()
+    bot = WatcherBot()
+    w = Watcher(client, db, bot, chat_id=1)
+
+    def boom(*_a, **_k):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(db, "is_deleted", boom)
+    asyncio.run(w.tick())
+    assert client.conv_calls == []
+    assert bot.sent == []
+
+
+def test_watcher_normal_conversation_still_watched(tmp_path):
+    """تحكّم موجب: شات غير محذوف لسه بيتتابع (مفيش كسر للسلوك العادي)."""
+    db = Database(str(tmp_path / "w-ok.sqlite3"))
+    db.add_watched(CID, "عنوان")
+    client = WatcherClient()
+    bot = WatcherBot()
+    asyncio.run(Watcher(client, db, bot, chat_id=1).tick())
+    assert client.conv_calls == [(CID,)]
+    assert len(bot.sent) == 1 and "انتهى الشات" in bot.sent[0]
+
+
+def test_watcher_pending_event_for_tombstoned_not_delivered(tmp_path):
+    """حدث صندوق معلّق لشات اتشاهد **بعد** تسجيل الحدث مايتسلّمش (صفر إرسال).
+
+    الاختبار بيُنشئ الحدث والشات **حيّين** الأول (لأن `_insert_inbox` نفسه يرفض الإدراج
+    لشات متشاهد)، وبعدين يضع الشاهد ويشغّل دورة. من غير حرس المراقب الحدث كان هيتسلّم
+    ويبعت `SECRET_REPLY`؛ بعده بيتخطّى.
+    """
+    db = Database(str(tmp_path / "w-pending.sqlite3"))
+    # حدث معلّق لمحادثة **غير متابَعة** (عشان مسار الاسترجاع ياخده، مش مسار المتابعة النشط).
+    iid = db.add_inbox_event(
+        CID, SECRET_TITLE, INBOX_KIND_TERMINAL, SECRET_REPLY, outbox.now_iso(), chat_id=1
+    )
+    assert iid is not None, "الحدث ما اتسجّلش (لازم يتسجّل والشات حيّ)"
+    _seed_tombstone(db, "uncertain")
+    client = WatcherClient()
+    bot = WatcherBot()
+    asyncio.run(Watcher(client, db, bot, chat_id=1).tick())
+    assert bot.sent == []
+    assert client.conv_calls == [] and client.reply_calls == []
+
+
+# ===================================================== notifier recovery (NEW-1 من المراجعة)
+class NotifierSearchClient:
+    """عميل بحث فاضي (مفيش محادثات ظاهرة) عشان مسار الاسترجاع يتولّى الحدث المعلّق."""
+
+    def __init__(self):
+        self.search_calls: list = []
+
+    async def search_conversations(self, limit=20, page_id=None):
+        self.search_calls.append(page_id)
+        return {"items": [], "next_page_id": None}
+
+
+class NotifierBot:
+    def __init__(self):
+        self.sent: list[str] = []
+
+    async def send_message(self, chat_id=None, text=None, parse_mode=None, **kw):
+        self.sent.append(text)
+
+    async def send_document(self, chat_id=None, document=None, **kw):
+        self.sent.append("DOC")
+
+
+def _seed_pending_then_tombstone(db, state):
+    """يُسجّل حدثًا استباقيًا **والشات حيّ**، ثم يضع الشاهد (ترتيب واقعي)."""
+    from bot.db import INBOX_KIND_PROACTIVE
+
+    iid = db.add_inbox_event(
+        CID, SECRET_TITLE, INBOX_KIND_PROACTIVE, SECRET_REPLY, outbox.now_iso(), chat_id=1
+    )
+    assert iid is not None, "الحدث ما اتسجّلش (لازم يتسجّل والشات حيّ)"
+    _seed_tombstone(db, state)
+    return iid
+
+
+@pytest.mark.parametrize("state", ["deleting", "uncertain"])
+def test_notifier_recovery_skips_tombstoned(state, tmp_path):
+    """NEW-1: المُبلّل مايسترجِعش حدثًا معلّقًا لشات متشاهد — صفر إرسال.
+
+    قبل الإصلاح: صف الحدث بيفضل `pending` في deleting/uncertain، فالمُبلّل كان بيبعته
+    (LEAK). بعده: بيتخطّى.
+    """
+    db = Database(str(tmp_path / f"n-{state}.sqlite3"))
+    _seed_pending_then_tombstone(db, state)
+    bot = NotifierBot()
+    client = NotifierSearchClient()
+    from bot.notifier import Notifier
+
+    asyncio.run(Notifier(client, db, bot, chat_id=1, base_url="https://app.test").tick())
+    assert bot.sent == [], (state, bot.sent)
+    assert SECRET_REPLY not in " ".join(bot.sent)
+
+
+def test_notifier_recovery_normal_event_still_delivered(tmp_path):
+    """تحكّم موجب: حدث معلّق لشات **غير محذوف** لسه بيتسلّم (مفيش كسر للسلوك)."""
+    from bot.db import INBOX_KIND_PROACTIVE
+    from bot.notifier import Notifier
+
+    db = Database(str(tmp_path / "n-ok.sqlite3"))
+    db.add_inbox_event(
+        CID, "عنوان", INBOX_KIND_PROACTIVE, "رسالة إشعار", outbox.now_iso(), chat_id=1
+    )
+    bot = NotifierBot()
+    client = NotifierSearchClient()
+    asyncio.run(Notifier(client, db, bot, chat_id=1, base_url="https://app.test").tick())
+    assert len(bot.sent) == 1 and "رسالة إشعار" in bot.sent[0]
+
+
+def test_notifier_recovery_fails_closed_on_db_error(tmp_path, monkeypatch):
+    """قاعدة غير متاحة أثناء فحص الشاهد ⇒ المُبلّل يتخطّى (فشل مغلق)، صفر إرسال."""
+    from bot.db import INBOX_KIND_PROACTIVE
+    from bot.notifier import Notifier
+
+    db = Database(str(tmp_path / "n-dberr.sqlite3"))
+    db.add_inbox_event(
+        CID, "عنوان", INBOX_KIND_PROACTIVE, SECRET_REPLY, outbox.now_iso(), chat_id=1
+    )
+
+    def boom(*_a, **_k):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(db, "is_deleted", boom)
+    bot = NotifierBot()
+    client = NotifierSearchClient()
+    asyncio.run(Notifier(client, db, bot, chat_id=1, base_url="https://app.test").tick())
+    assert bot.sent == []

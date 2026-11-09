@@ -48,6 +48,17 @@ def test_health_security_headers(client):
     assert r.headers["cache-control"] == "no-store"
 
 
+def test_api_responses_carry_restrictive_csp(client):
+    """OHB2-RESIDUAL: `_API_CSP` كان معرّف وغير مستخدم (كود ميت = ضابط ناقص).
+
+    ردود الـ API لازم تاخد CSP صارم (`default-src 'none'`) يمنع أي تحميل/تأطير.
+    """
+    for path in ("/health", "/api/v1/nope"):
+        csp = client.get(path).headers.get("content-security-policy", "")
+        assert csp.startswith("default-src 'none'")
+        assert "frame-ancestors" in csp and "telegram.org" in csp
+
+
 # ------------------------------------------------------------------- auth
 def test_auth_valid_sets_httponly_strict_cookie(client):
     r = client.post("/api/v1/auth", json={"initData": make_init_data(OWNER)})

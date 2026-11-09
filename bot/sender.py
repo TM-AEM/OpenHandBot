@@ -14,6 +14,15 @@ from .messages import MAX_PARTS, escape_html, split_message
 
 COPY_PART_LIMIT = 3900  # هامش أمان تحت 4096
 
+# OHB2-BOT-REPLY-TXT-FILE-BUTTON: ملف الرد الكامل كـ .txt (إجراء منفصل عن «نسخ الرد»).
+TXT_FILENAME = "reply.txt"
+# حد رفع المستندات في Bot API = 50 ميجابايت. بنرفض بوضوح بدل ما نرفع ملف مقصوص.
+TELEGRAM_DOCUMENT_MAX_BYTES = 50 * 1024 * 1024
+
+
+class TextDocumentTooLargeError(Exception):
+    """الرد الكامل أكبر من حد رفع المستندات في تيليجرام (مفيش قصّ صامت)."""
+
 
 async def _send_report_file(chat_id: int, text: str, bot) -> None:
     """إرسال النص كملف report.md (المسار المشترك لما يزيد عن MAX_PARTS)."""
@@ -43,3 +52,25 @@ async def send_copyable(chat_id: int, text: str, bot) -> None:
             )
         return
     await _send_report_file(chat_id, text, bot)
+
+
+async def send_text_document(chat_id: int, text: str, bot, *, reply_to_message_id: int | None = None) -> None:
+    """OHB2-BOT-REPLY-TXT-FILE-BUTTON: يبعت الرد الكامل كملف `.txt` (UTF-8، بلا قصّ).
+
+    - نفس المحتوى الخام الكامل (مفيش تهريب HTML ولا تقسيم).
+    - رفع في الذاكرة عبر `InputFile` (مفيش ملفات مؤقتة على القرص).
+    - `reply_to_message_id` يربط المستند برسالة الرد الأصلية، مع `allow_sending_without_reply`
+      عشان مايفشلش لو الرسالة الأصلية قديمة/اتشالت.
+    - لو المحتوى أكبر من حد رفع المستندات ⇒ `TextDocumentTooLargeError` (مفيش قصّ صامت).
+    """
+    data = text.encode("utf-8")
+    if len(data) > TELEGRAM_DOCUMENT_MAX_BYTES:
+        raise TextDocumentTooLargeError(
+            f"document is {len(data)} bytes > limit {TELEGRAM_DOCUMENT_MAX_BYTES}"
+        )
+    document = InputFile(data, filename=TXT_FILENAME)
+    kwargs: dict = {"chat_id": chat_id, "document": document}
+    if reply_to_message_id is not None:
+        kwargs["reply_to_message_id"] = reply_to_message_id
+        kwargs["allow_sending_without_reply"] = True
+    await bot.send_document(**kwargs)

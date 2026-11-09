@@ -53,21 +53,26 @@ _MIME_TYPES = {
     ".webmanifest": "application/manifest+json",
 }
 
+# OHB2-RESIDUAL: ردود الـ API/المرفقات (JSON/zip) لازم تكون غير قابلة للتأطير أصلًا
+# (`default-src 'none'` + `frame-ancestors` لتيليجرام بس). القيمة دي كانت **معرّفة وغير
+# مستخدمة** (كود ميت = ضابط أمني ناقص)؛ بقت جزء من الهيدرز الأمنية المشتركة عشان كل ردود
+# `_json`/`_attachment` تاخدها فعلاً.
+_API_CSP = (
+    "default-src 'none'; frame-ancestors https://web.telegram.org https://*.telegram.org; "
+    "base-uri 'none'; form-action 'none'"
+)
 # مسارات الـ API مسموح تشارك عبر نفس الأصل بس (same-origin)، وممنوع تتكاش.
 _SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
     "X-Frame-Options": "SAMEORIGIN",
+    "Content-Security-Policy": _API_CSP,
     "Cache-Control": "no-store",
     "Pragma": "no-cache",
     "Cross-Origin-Opener-Policy": "same-origin",
     "Cross-Origin-Resource-Policy": "same-origin",
 }
 # نفس الأصل + تحميل Telegram WebApp من cdn + ستايل/سكربت داخليين. مفيش مصادر خارجية تانية.
-_API_CSP = (
-    "default-src 'none'; frame-ancestors https://web.telegram.org https://*.telegram.org; "
-    "base-uri 'none'; form-action 'none'"
-)
 _STATIC_CSP = (
     "default-src 'self'; script-src 'self' https://telegram.org; "
     "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
@@ -645,6 +650,12 @@ class MiniApp:
             data = await self._service.list_conversations(page=page, refresh=refresh)
         except ApiError as exc:
             return self._api_error(exc)
+        except Exception:  # noqa: BLE001 — OHB2-SW03: فشل قراءة الشواهد ⇒ 500 عام
+            # فشل قاعدة عند فلترة الشواهد (بعد الإعادة المحدودة) مايتحوّلش لرد 200 فاضي
+            # مضلّل. بنرجّع نفس عقد الخطأ العام المعتاد (`server_error`) من غير أي تفاصيل
+            # داخلية (استثناء/SQL/مسارات) في الرد.
+            log.exception("فشل فلترة الشواهد في قايمة الشاتات (Mini App)")
+            return _error(500, "server_error", "الخدمة مش متاحة دلوقتي.")
         return _json(data)
 
     async def conversation_detail(self, request):

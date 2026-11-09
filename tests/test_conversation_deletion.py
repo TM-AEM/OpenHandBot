@@ -17,6 +17,7 @@ import os
 from types import SimpleNamespace
 
 import httpx
+import pytest
 from starlette.testclient import TestClient
 
 import bot.handlers as h
@@ -764,36 +765,49 @@ def test_miniapp_list_cache_refresh_still_hides_deleted(tmp_path):
     assert "c1" not in [i["id"] for i in r.json()["items"]]
 
 
-# ===================================== OHB2-AUDIT-FIX-04: fail-closed tombstone filter
+# ==================== OHB2-SW03: tombstone read failures propagate (explicit failure)
 class _RaisingDB:
     """قاعدة وهمية: `is_deleted` بترمي (محاكاة قاعدة غير متاحة/تالفة)."""
 
+    def __init__(self, exc=None):
+        self._exc = exc or RuntimeError("database unavailable")
+        self.calls = 0
+
     def is_deleted(self, conversation_id):
-        raise RuntimeError("database unavailable")
+        self.calls += 1
+        raise self._exc
+
+    def is_deleted_with_retry(self, conversation_id):
+        # نفس عقد القاعدة الحقيقية: ترفع بعد الإعادة المحدودة.
+        return self.is_deleted(conversation_id)
 
 
-def test_bot_without_deleted_fails_closed_on_db_error():
-    """handlers._without_deleted: خطأ قاعدة ⇒ قايمة فاضية (مش القايمة غير المفلترة)."""
+def test_bot_without_deleted_propagates_db_error():
+    """handlers._without_deleted: خطأ قاعدة ⇒ **يُرفع** (مش قايمة فاضية مضلّلة)."""
     items = [{"id": "c1"}, {"id": "c2"}]
-    assert h._without_deleted(_RaisingDB(), items) == []
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        h._without_deleted(_RaisingDB(), items)
 
 
 def test_bot_without_deleted_empty_input_short_circuits():
     """مدخل فاضي ⇒ فاضي (مفيش نداء للقاعدة أصلًا)."""
-    assert h._without_deleted(_RaisingDB(), []) == []
+    db = _RaisingDB()
+    assert h._without_deleted(db, []) == []
+    assert db.calls == 0  # مسار سريع: مفيش قراءة
 
 
-def test_miniapp_without_deleted_fails_closed_on_db_error(tmp_path):
-    """MiniAppService._without_deleted: خطأ قاعدة ⇒ قايمة فاضية (فشل مغلق)."""
+def test_miniapp_without_deleted_propagates_db_error(tmp_path):
+    """MiniAppService._without_deleted: خطأ قاعدة ⇒ **يُرفع** (مش 200 فاضي)."""
     from bot.web.services import MiniAppService
 
     svc = MiniAppService(make_config(), _RaisingDB())
     items = [{"id": "c1"}, {"id": "c2"}]
-    assert svc._without_deleted(items) == []
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        svc._without_deleted(items)
 
 
-def test_miniapp_list_hides_all_on_db_error(tmp_path):
-    """تكاملي: قاعدة بتفشل في is_deleted ⇒ الـ API يرجّع قايمة فاضية (مفيش إظهار بالغلط)."""
+def test_miniapp_list_returns_500_on_db_error(tmp_path):
+    """تكاملي: قاعدة بتفشل في is_deleted ⇒ الـ API يرجّع **500 server_error** (مش 200 فاضي)."""
     db = _db(tmp_path)
     items = [
         {"id": "c1", "title": "واحد", "execution_status": "running", "created_by_user_id": OWNER_UUID},
@@ -808,19 +822,23 @@ def test_miniapp_list_hides_all_on_db_error(tmp_path):
     login(tc)
     assert tc.get("/api/v1/conversations?refresh=1").status_code == 200  # يملأ الكاش
 
-    # نخرّب قراءة الشواهد فقط (بعد ما الكاش اتملى) ⇒ الفلترة تفشل ⇒ فشل مغلق.
+    # نخرّب قراءة الشواهد فقط (بعد ما الكاش اتملى) ⇒ الفلترة تفشل ⇒ 500 عام.
     def _boom(_cid):
         raise RuntimeError("db down")
 
     db.is_deleted = _boom  # type: ignore[assignment]
     r = tc.get("/api/v1/conversations?refresh=1")
-    assert r.status_code == 200
-    assert r.json()["items"] == [], "لازم نخفي القايمة كلها بدل ما نعرّض شات محذوف"
+    assert r.status_code == 500
+    body = r.json()
+    assert body["error"] == "server_error"
+    # مفيش كشف لأي تفاصيل داخلية (اسم الاستثناء/SQL/مسار).
+    blob = str(body)
+    assert "db down" not in blob and "RuntimeError" not in blob and "Traceback" not in blob
 
 
-# ===================== OHB2-PHASE5-FIX-04: fail-closed then recovery (P3-02)
+# ================= OHB2-SW03: explicit failure then recovery (supersedes P3-02 fail-closed)
 def test_miniapp_list_recovers_after_transient_db_failure(tmp_path):
-    """Mini App: فشل مؤقت في قراءة الشواهد ⇒ فشل مغلق (قايمة فاضية)، وبعد الرجوع ⇒ القايمة ترجع."""
+    """Mini App: فشل قراءة الشواهد ⇒ **500** (مش 200 فاضي)، وبعد الرجوع ⇒ القايمة ترجع مفلترة."""
     db = _db(tmp_path)
     items = [_conv("c1"), _conv("c2")]
     app = _FakeApp()
@@ -843,16 +861,59 @@ def test_miniapp_list_recovers_after_transient_db_failure(tmp_path):
 
     db.is_deleted = flaky  # type: ignore[assignment]
 
-    # 1) الفشل المؤقت: الفلترة تفشل ⇒ فشل مغلق (مفيش إظهار لأي شات).
+    # 1) الفشل: الفلترة تفشل ⇒ 500 عام (مفيش رد 200 فاضي مضلّل).
     r1 = tc.get("/api/v1/conversations?refresh=1")
-    assert r1.status_code == 200
-    assert r1.json()["items"] == [], "الفشل المؤقت ⇒ مفيش إظهار لأي شات"
+    assert r1.status_code == 500
+    assert r1.json()["error"] == "server_error"
 
     # 2) التعافي: القاعدة رجعت ⇒ القايمة ترجع مفلترة (مفيش انقطاع دائم).
     state["failing"] = False
     r2 = tc.get("/api/v1/conversations?refresh=1")
     assert r2.status_code == 200
     assert [i["id"] for i in r2.json()["items"]] == ["c1", "c2"]
+
+
+def test_miniapp_list_genuine_empty_returns_200_empty(tmp_path):
+    """فراغ حقيقي (البحث رجع مفيش شاتات) ⇒ 200 + `items=[]` (سلوك ناجح مش فشل)."""
+    db = _db(tmp_path)
+    app = _FakeApp()
+    tc = TestClient(
+        build_web_app(make_config(), db, client=_ListClient([]), application=app),
+        raise_server_exceptions=False,
+    )
+    login(tc)
+    r = tc.get("/api/v1/conversations?refresh=1")
+    assert r.status_code == 200
+    assert r.json()["items"] == []
+    assert r.json()["has_more"] is False
+
+
+def test_miniapp_list_all_tombstoned_returns_200_empty(tmp_path):
+    """كل الشاتات متشاهدة ⇒ 200 + `items=[]` (فلترة F-1 ناجحة، مش فشل قاعدة)."""
+    db = _db(tmp_path)
+    items = [_conv("c1"), _conv("c2")]
+    for cid in ("c1", "c2"):
+        db.delete_conversation(cid, outbox.now_iso(), remote_confirmed=True)
+    app = _FakeApp()
+    tc = TestClient(
+        build_web_app(make_config(), db, client=_ListClient(items), application=app),
+        raise_server_exceptions=False,
+    )
+    login(tc)
+    r = tc.get("/api/v1/conversations?refresh=1")
+    assert r.status_code == 200
+    assert r.json()["items"] == []
+
+
+def test_miniapp_without_deleted_filters_and_preserves_order(tmp_path):
+    """فلترة ناجحة: واحد متشاهد يُزال، والباقي بترتيبه (سلوك F-1 ما اتغيّرش)."""
+    from bot.web.services import MiniAppService
+
+    db = _db(tmp_path)
+    db.delete_conversation("c2", outbox.now_iso(), remote_confirmed=True)
+    svc = MiniAppService(make_config(), db)
+    items = [_conv("c1"), _conv("c2"), _conv("c3")]
+    assert [c["id"] for c in svc._without_deleted(items)] == ["c1", "c3"]
 
 
 # ================================== OHB2-AUDIT-FIX-05: Mini App list collects all pages

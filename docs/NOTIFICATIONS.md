@@ -323,6 +323,24 @@ original `archived_at`). Archiving is a deliberate user action to keep a notific
 so retention (§3.5) **never prunes archived rows**; after unarchiving, a read row
 becomes prunable again like any other read row.
 
+### 3.8 Deleted-conversation visibility (OHB2-RESIDUAL)
+
+`delete_conversation` keeps `notification_inbox` rows as an **audit trace** (it only
+flags a still-pending delivery as `superseded`; the row and its `title`/`message`
+remain). To avoid exposing content of a deleted chat, inbox **reads** exclude any row
+whose `conversation_id` has a deletion witness (`deleted_conversations`):
+
+- `list_inbox` and `count_inbox` add `NOT EXISTS (SELECT 1 FROM deleted_conversations d
+  WHERE d.conversation_id = notification_inbox.conversation_id)` (via
+  `_inbox_visibility_clause`), in **both** the active and archived views. So a deleted
+  chat's notification never appears in `GET /api/v1/notifications` and never counts
+  toward `unread_count`.
+- The row itself is **not deleted** (retention and the `superseded` trace are intact),
+  and the tombstone semantics are unchanged; this is a read-time filter only.
+- The same exclusion applies to `list_watched` (watch lists in the bot and the Mini App
+  never show the title of a tombstoned conversation during the `deleting`/`uncertain`
+  window; after a confirmed delete the watch row is removed anyway).
+
 Deleting an inbox row permanently is **eligibility-gated on the server** (never on the
 client) and **fail-closed**. `notification_inbox.kind` is the deciding axis: only the
 **status/outcome report kinds** that have no linked executable operation are eligible

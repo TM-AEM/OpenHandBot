@@ -21,6 +21,7 @@ from .db import (
     CREATION_STARTING,
     CREATION_UNKNOWN,
     OUTBOX_CLAIMED,
+    OUTBOX_DISCARDED,
     OUTBOX_FAILED,
     OUTBOX_PENDING,
     OUTBOX_SENDING,
@@ -222,6 +223,27 @@ async def deliver_outbox(client, db, bot, outbox_id: int) -> None:
     await _post_claimed(client, db, bot, claimed)
 
 
+def _tombstoned(db, conversation_id: str) -> bool:
+    """هل الشات عليه شاهد حذف فعّال؟ **فشل مغلق**: أي خطأ قراءة ⇒ نعتبره متشاهد.
+
+    نفس سلوك حرّاس المراقب/المُبلّل: مسار إشعار المستخدم مايتكلّمش مع شات محذوف، وفشل
+    قراءة الشاهد أأمن نتيجته تخطّي الإرسال (مش إرسال محتمل لشات محذوف).
+
+    **قصدًا** حرّاس **القرار** في `_post_claimed` (المدخل + حدّ CAS) بتستخدم `db.is_deleted`
+    مباشرةً: خطأ قراءة هناك المفروض يطلع استثناء (الـ worker يرجّع السجل 'pending'/يعيد
+    المحاولة) بدل ما يعلّمه نهائيًا؛ وده كمان آمن — الاستثناء قبل أي إرسال. الحرس fail-closed
+    ده للـ **إشعارات** بس، عشان خطأ عابر مايخلّيش الإشعار يروح لشات محذوف.
+    """
+    try:
+        return db.is_deleted(conversation_id)
+    except Exception:  # noqa: BLE001 — قاعدة غير متاحة ⇒ فشل مغلق (تخطّي)
+        log.warning(
+            "تعذّر قراءة شاهد الحذف للشات %s؛ هيتخطّى إشعار المستخدم (فشل مغلق).",
+            conversation_id,
+        )
+        return True
+
+
 async def _post_claimed(client, db, bot, item) -> None:
     """يحاول الـ POST لعنصر محجوز (claimed) ولسه الإرسال مابدأش.
 
@@ -230,11 +252,34 @@ async def _post_claimed(client, db, bot, item) -> None:
     هيفشل (rowcount=0) وما بنبعتش الـ POST خالص — فمفيش إرسال بعد إلغاء، ومفيش ادّعاء إلغاء
     وهمي. أي إلغاء/انقطاع قبل كده بيسيب 'claimed' ⇒ يتعافى 'pending' (آمن، الـ POST مابدأش).
     أي إلغاء/انقطاع بعد الـ CAS بيسيب 'sending' ⇒ يتعافى 'unknown' (غامض، مايتعادش تلقائياً).
+
+    F-1: بنفرض **شاهد الحذف** (fail-closed) مرتين قبل أي إرسال حامل للمحتوى: عند المدخل
+    (قبل أي نداء بعيد) وفورًا قبل CAS الإرسال (بعد التحضير اللي فيه `await` طويل). كده
+    أي شاهد يُكتب في **أي لحظة قبل** نجاح CAS `claimed`⇒`sending` بيمنع الإرسال تمامًا —
+    ونعلّم السجل `discarded` (CAS من `claimed`). الحدّ الوحيد اللي مابيتغطّاش محليًا هو
+    شاهد يُكتب **بعد** نجاح الـ CAS/بدء الـ POST فعلًا: ساعتها الحسم خارجي (شبكة/خدمة
+    بعيدة) ومابيتسحبش — والـ CAS في المسار بيتعامل معاه بأمان (النتيجة الغامضة ⇒ 'unknown'
+    بلا إعادة إرسال تلقائية).
     """
     outbox_id = item.id
     conversation_id = item.conversation_id
     chat_id = item.chat_id
     text = item.text
+
+    # F-1 (إغلاق TOCTOU الحذف): الشات ممكن ياخد شاهد حذف **قبل** ما نوصل هنا. حذف الـ Mini App
+    # بيكتب الشاهد و'deleting' **قبل** النداء البعيد (`deletion.delete_conversation_remote`
+    # عبر `begin_remote_deletion`)، وسجلات الصندوق **ما بتتشطبش** غير في الإنهاء النهائي
+    # (`delete_conversation`) — يعني خلال نافذة deleting/uncertain السجل يفضل 'pending'/'claimed'
+    # والـ CAS 'claimed'⇒'sending' بينجح، فيتبعت محتوى شات اتحذف. الحرس ده أول حاجة (fail-closed
+    # عند فشل القراءة): لو فيه شاهد ⇒ مفيش أي نداء بعيد خالص، ونعلّم السجل 'discarded' (CAS من
+    # 'claimed') عشان مايتعاودش تلقائيًا ومايفضلش عالقًا. فيه حرس **تاني** عند حدّ الـ CAS
+    # (قبل الإرسال مباشرة) لتغطية شاهد يُكتب أثناء التحضير (الحالة 3).
+    if db.is_deleted(conversation_id):
+        db.set_outbox_status_if_in(
+            outbox_id, OUTBOX_DISCARDED, now_iso(), {OUTBOX_CLAIMED}, "اتحذف قبل الإرسال"
+        )
+        log.info("تخطّي الإرسال: الشات %s عليه شاهد حذف (قبل أي نداء بعيد)", conversation_id)
+        return
 
     try:
         conv = await get_conversation(client, conversation_id)
@@ -258,7 +303,11 @@ async def _post_claimed(client, db, bot, item) -> None:
                     outbox_id, OUTBOX_FAILED, now_iso(), {OUTBOX_CLAIMED},
                     f"استنفد {attempts} محاولات (sandbox غير جاهز)",
                 )
-                await safe_send(bot, chat_id, _OUTBOX_EXHAUSTED_NOTICE)
+                # F-1 (فرض الشاهد على مسار إشعار المستخدم): لو الشات اتشاهد **أثناء**
+                # التحضير (شاهد اتكتب بعد حرس المدخل)، مانبعتش إشعارًا لشات محذوف — حتى
+                # لو النص خالٍ من المحتوى. fail-closed: أي خطأ قراءة ⇒ نتخطّى الإرسال.
+                if not _tombstoned(db, conversation_id):
+                    await safe_send(bot, chat_id, _OUTBOX_EXHAUSTED_NOTICE)
             else:
                 # محاولة آمنة فاشلة (قبل الـ POST) ⇒ نرجّع السجل مؤهّل 'pending' بـ CAS
                 # (الـ worker ياخده تاني بعد backoff). CAS من 'claimed' بس.
@@ -266,13 +315,26 @@ async def _post_claimed(client, db, bot, item) -> None:
                     outbox_id, OUTBOX_PENDING, now_iso(), {OUTBOX_CLAIMED},
                     "sandbox غير جاهز",
                 )
-                if attempts == 1:
+                if attempts == 1 and not _tombstoned(db, conversation_id):
                     await safe_send(bot, chat_id, _SANDBOX_NOT_READY_NOTICE)
             return
 
         # الإرسال هيبدأ حالاً: CAS 'claimed'⇒'sending' بثبات قبل الـ POST مباشرة (الـ commit
         # جوّه set_outbox_status_if_in). ده آخر حد آمن: بعده النتيجة غامضة. لو الـ CAS
         # فشل (المستخدم شطب العنصر في الأثناء) ⇒ مفيش POST خالص.
+        #
+        # F-1 (إغلاق السباق في النافذة): حرس المدخل فوق بيفحص الشاهد **مرة** قبل التحضير،
+        # لكن التحضير (get_conversation ثم resume_sandbox/wait_running — لحد 120 ثانية)
+        # فيه `await` طويل. لو الحذف اتخلّل خلاله (الحالة 3)، حرس المدخل بيبقى عدّى. نعيد
+        # الفحص هنا **فورًا قبل CAS الإرسال**، ومفيش `await` بين الفحص والـ CAS ⇒ الإرسال
+        # مايبدأش أبدًا لو الشاهد اتكتب في أي لحظة قبل حدّ الـ CAS. ده أقوى حدّ محلي ممكن
+        # (بعد الـ CAS الحسم خارجي ولا يمكن سحبه). CAS من 'claimed' بس (ما نلخبطش حسمًا أحدث).
+        if db.is_deleted(conversation_id):
+            db.set_outbox_status_if_in(
+                outbox_id, OUTBOX_DISCARDED, now_iso(), {OUTBOX_CLAIMED}, "اتحذف قبل الإرسال"
+            )
+            log.info("تخطّي الإرسال: الشات %s اتشاهد أثناء التحضير (قبل الـ CAS)", conversation_id)
+            return
         submitted_at = now_iso()  # قبل الـ POST: أي حدث للـ run الجديد لازم يكون أحدث منه
         if not db.set_outbox_status_if_in(
             outbox_id, OUTBOX_SENDING, submitted_at, {OUTBOX_CLAIMED}
@@ -341,14 +403,17 @@ async def _post_claimed(client, db, bot, item) -> None:
                 outbox_id, OUTBOX_FAILED, now_iso(), {OUTBOX_CLAIMED},
                 f"استنفد {attempts} محاولات",
             )
-            await safe_send(bot, chat_id, _OUTBOX_EXHAUSTED_NOTICE)
+            # F-1: نفس حرس الإشعار — لو الشات أخد شاهد حذف أثناء التحضير (شاهد اتكتب
+            # خلال `await` النداء البعيد اللي رمى ApiError)، ما نبلّغش شات محذوف.
+            if not _tombstoned(db, conversation_id):
+                await safe_send(bot, chat_id, _OUTBOX_EXHAUSTED_NOTICE)
         else:
             # محاولة آمنة فاشلة (قبل الـ POST) ⇒ نرجّع السجل 'pending' بـ CAS من 'claimed'.
             db.set_outbox_status_if_in(
                 outbox_id, OUTBOX_PENDING, now_iso(), {OUTBOX_CLAIMED},
                 safe_error_label(exc),
             )
-            if attempts == 1:
+            if attempts == 1 and not _tombstoned(db, conversation_id):
                 await safe_send(bot, chat_id, f"فشل الإرسال: {error_text(exc)}")
 
 

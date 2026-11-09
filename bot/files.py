@@ -158,20 +158,38 @@ class IdentityCache:
         self._lock = asyncio.Lock()
 
     async def owner_id(self) -> str | None:
+        """هوية المالك (UUID) للنجاح، أو None لأي فشل — **بدون تخزين الفشل**.
+
+        غلاف متوافق للخلفية: يرجّع الهوية بس (مفيش تفصيل للفشل). اللي محتاج يفرّق بين
+        «فشل upstream» و«هوية مش متأكّدة» يستخدم `owner_id_detailed` (OHB2-SW-04) بدل
+        ما يخسّر التفصيل.
+        """
+        owner, _status = await self.owner_id_detailed()
+        return owner
+
+    async def owner_id_detailed(self) -> tuple[str | None, FileStatus]:
+        """يفرّق بين فشل upstream (`UPSTREAM_ERROR`) والهوية المشكوك فيها (`UNAUTHORIZED`).
+
+        OHB2-SW-04: قبل كده كان أي `ApiError` من `/users/me` (429/503/مهلة/انقطاع)
+        بيرجّع None، فبيتحوّل عند الطبقة اللي فوق لحالة `UNAUTHORIZED` (403) — أي إن
+        عطل خدمة upstream كان يبان زي رفض تفويض عادي (تلبيس خاطئ). دلوقتي فشل upstream
+        بيتحفظ كـ `UPSTREAM_ERROR` (502)؛ غياب الهوية (`{}`/بلا id) لسه `UNAUTHORIZED`
+        (فشل مغلق). الحالتان **مش نجاح** — القرار المهم (ممنوع) زي ما هو.
+        """
         if self._owner_id is not None:
-            return self._owner_id
+            return self._owner_id, FileStatus.OK
         async with self._lock:
             if self._owner_id is not None:  # إعادة فحص بعد اكتساب القفل
-                return self._owner_id
+                return self._owner_id, FileStatus.OK
             try:
                 me = await self._client.get_current_user()
             except ApiError:
-                return None  # فشل مؤقّت ⇒ ما نسمّمش الكاش
+                return None, FileStatus.UPSTREAM_ERROR  # فشل upstream ⇒ ما نسمّمش الكاش
             uid = me.get("id") if isinstance(me, dict) else None
             if not uid:
-                return None  # هوية مفقودة/غير صالحة ⇒ فشل مغلق (بدون تخزين)
+                return None, FileStatus.UNAUTHORIZED  # هوية مفقودة/غير صالحة (بدون تخزين)
             self._owner_id = str(uid)
-            return self._owner_id
+            return self._owner_id, FileStatus.OK
 
 
 async def authorize_conversation(
@@ -228,9 +246,11 @@ async def authorize_conversation_detailed(
         return None, FileStatus.UPSTREAM_ERROR, error_text(exc)
     if not convs:
         return None, FileStatus.NOT_FOUND, None
-    owner = await identity.owner_id()
+    # OHB2-SW-04: نحافظ على التفصيل — فشل upstream في `/users/me` يفضل UPSTREAM_ERROR
+    # (مش UNAUTHORIZED)، وغياب الهوية يفضل UNAUTHORIZED. الاتنين رفض مغلق (مش نجاح).
+    owner, identity_status = await identity.owner_id_detailed()
     if not owner:
-        return None, FileStatus.UNAUTHORIZED, None
+        return None, identity_status, None
     created_by = convs[0].get("created_by_user_id")
     if not isinstance(created_by, str) or created_by != owner:
         return None, FileStatus.UNAUTHORIZED, None

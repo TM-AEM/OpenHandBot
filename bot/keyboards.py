@@ -46,6 +46,8 @@ UNWATCH = "إلغاء"
 CANCEL_ROUTE = "إلغاء التوجيه"
 COPY_REPLY = "📋 نسخ الرد"
 FULL_REPLY = "عرض كامل"
+# OHB2-BOT-REPLY-TXT-FILE-BUTTON: زر منفصل لتنزيل الرد الكامل كملف .txt (مش نسخ).
+TXT_REPLY = "ملف النص"
 NOTIFICATIONS = "الإشعارات"
 NOTIF_MENU = "notif:menu"
 NOTIF_TOGGLE = "notif:toggle"
@@ -143,6 +145,9 @@ def conversation_actions(
         if reply_cut:
             copy_row.append(_btn(FULL_REPLY, callback_data=f"full:{conversation_id}"))
         rows.append(copy_row)
+        # OHB2-BOT-REPLY-TXT-FILE-BUTTON: زر منفصل تمامًا (callback مختلف) لتنزيل الرد
+        # الكامل كملف .txt. في صف مستقل عشان مايتلخبطش مع «نسخ الرد».
+        rows.append([_btn(TXT_REPLY, callback_data=f"txt:{conversation_id}")])
     rows.append(
         [
             _btn(REPLY, callback_data=f"reply:{conversation_id}"),

@@ -4,12 +4,13 @@ from __future__ import annotations
 import logging
 from contextlib import AsyncExitStack
 
-from telegram import BotCommand, BotCommandScopeChat, MenuButtonCommands
+from telegram import BotCommand, BotCommandScopeChat, MenuButtonCommands, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -54,7 +55,8 @@ async def _register_commands(application: Application, owner_id: int) -> None:
 def build_application(config: Config) -> Application:
     # U04: بدون concurrent_updates أي أمر بطيء (تصدير/قايمة ملفات) بيأخّر تأكيد
     # "وصل ✅" لأن التحديثات بتتعالج واحد ورا التاني. التزامن آمن هنا لأن حالة
-    # التوجيه بتتستهلك ذرّياً (db.pop_awaiting) وكتابة الصندوق معاملة واحدة.
+    # التوجيه بتتقرأ قراءة فقط (db.awaiting_state)، واستهلاكها المتوقّع النوع مع كتابة
+    # العمل الدائم (صندوق/طلب إنشاء) وعلامة «معالَج» بيحصلوا ذرّياً في معاملة واحدة.
     app = Application.builder().token(config.telegram_bot_token).concurrent_updates(True).build()
     client = OpenHandsClient(config.openhands_base_url, config.openhands_api_key)
     db = Database(config.db_path)
@@ -66,6 +68,11 @@ def build_application(config: Config) -> Application:
     # الـ readiness بيقراه عشان يعلن الحالة الحقيقية.
     app.bot_data["startup_failed"] = None
 
+    # OHB2-DUPLICATE-TELEGRAM-PROMPT-DISPATCH: حاجز الإدخال في **أعلى أولوية** (group=-1)
+    # لكل أنواع التحديثات (نص/كولباك/أمر). PTB بينفّذ handler واحد بس لكل مجموعة، فهو
+    # أول حاجة تتشغّل وآخر حاجة في مجموعته؛ ولو التحديث مكرّر بيرمي `ApplicationHandlerStop`
+    # فيوقف كل المجموعات ⇒ تحديث واحد = قرار معالجة واحد (إرسال أو إنشاء، مش الاتنين).
+    app.add_handler(TypeHandler(Update, handlers.dedupe_update), group=-1)
     app.add_handler(CommandHandler("start", handlers.start))
     app.add_handler(CommandHandler("cancel", handlers.cancel_route))
     app.add_handler(CommandHandler("help", handlers.help_command))
@@ -84,6 +91,8 @@ def build_application(config: Config) -> Application:
     app.add_handler(CallbackQueryHandler(handlers.open_conversation, pattern=r"^open:"))
     app.add_handler(CallbackQueryHandler(handlers.copy_reply, pattern=r"^copy:"))
     app.add_handler(CallbackQueryHandler(handlers.full_reply, pattern=r"^full:"))
+    # OHB2-BOT-REPLY-TXT-FILE-BUTTON: تنزيل الرد الكامل كملف .txt (إجراء منفصل عن copy/full).
+    app.add_handler(CallbackQueryHandler(handlers.send_reply_txt, pattern=r"^txt:"))
     app.add_handler(CallbackQueryHandler(handlers.show_status, pattern=r"^status:"))
     app.add_handler(CallbackQueryHandler(handlers.reply_prompt, pattern=r"^reply:"))
     app.add_handler(CallbackQueryHandler(handlers.start_new_chat, pattern=r"^newchat$"))
@@ -140,6 +149,17 @@ def build_application(config: Config) -> Application:
         # 1.1) OHB2-STABILIZATION-F02: تسوية/تعافي الإكمال المحلي (صفوف قديمة sent/done من
         #      غير intent + إعادة تأهيل العناصر منتهية الإجارة). بدون أي POST خارجي.
         await completion_recover(application)
+        # 1.1b) OHB2-DUPLICATE-TELEGRAM-PROMPT-DISPATCH: تقليم سجل التحديثات المعالَجة
+        #      (إضافي/غير حرج — نافذة احتفاظ ضخمة). مايمنعش الإقلاع لو فشل.
+        try:
+            removed = db.prune_processed_updates(handlers.PROCESSED_UPDATES_KEEP)
+            if removed:
+                log.info(
+                    "تقليم سجل التحديثات المعالَجة: اتشال %s صف (باقي %s)",
+                    removed, db.count_processed_updates(),
+                )
+        except Exception as exc:  # noqa: BLE001 — التقليم غير حرج
+            log.warning("تقليم سجل التحديثات المعالَجة اتخطّى (%s)", type(exc).__name__)
         # 1.2) OHB2-MINIAPP: تسوية الحذف البعيد المعلّق (شات اتحذف من OpenHands واتقطع
         #      قبل ما نثبّت، أو العكس). best-effort: ما تمنعش الإقلاع، وما بتخمّنش (تسيب
         #      المجهول معلّق). بتشتغل قبل الـ workers عشان مايحصلش إحياء لشات متشاهد.

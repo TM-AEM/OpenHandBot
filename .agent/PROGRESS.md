@@ -691,3 +691,444 @@ unknown (غامض) · failed (فشل مؤكد) · discarded (اتلغى قبل �
 - at-most-once: مفيش أي مسار بيحوّل غموض ⇒ إعادة POST؛ الإلغاء لسه CAS على الحالة + task_id.
 - الـ F4-backend بيتصرّف بس على `failed`/`discarded` (مفيش شات بعيد) — `done` بيتعامل
   idempotent زي الأول.
+
+---
+
+## OHB2-PHASE2A-FREE-HOSTING-QUALIFICATION — 2026-11-08 (research + docs only)
+
+**Status:** PARTIAL/BLOCKED by Phase 1 (review=HIGH). Final classification: `NO_QUALIFIED_FREE_NO_CARD_HOST`.
+- Phase 1 gate: HEAD `5b10850`; independent review `b4588fc1…` VERDICT **HIGH** (delete→500 `_wake`,
+  OverflowError/AttributeError→500, LOW doc nits). Phase 1 not closed ⇒ hosting selection stopped per task §2.
+- Baseline at start: working tree had pre-existing uncommitted fixes+tests (NOT mine, left untouched).
+- Verified: pytest 1856 passed, pyflakes 0, frontend 206 pass/0 fail, autopush NOT running, Backup out of scope.
+- Provider research dated 2026-11-08 (official pages): Katabump (free, no card, **4-day renewal→delete**, no
+  inbound port) = REJECTED; Enzonic (free = **hibernating game tier**, R2-archived ⇒ ephemeral) = REJECTED;
+  Northflank Sandbox Free (free, **no card**, always-on, single-instance volumes, generated HTTPS+LE TLS) =
+  STRONGEST but **free-tier volume entitlement UNVERIFIED**; Render (ephemeral FS, disks paid) / Railway
+  (trial→$1) / Fly (trial) / Koyeb (no free tier) / Oracle (card required) = REJECTED.
+- Deliverable: `docs/OHB2_PHASE2A_FREE_HOSTING_QUALIFICATION.md`.
+- No account/resource/deploy/DNS/Telegram/credential/production op performed. No commit/push.
+- Next: fix review findings #1–#3 + regression tests, re-run independent review, then (if owner approves)
+  an authorized Northflank canary to prove volume durability (tests T1–T8 in the doc).
+
+---
+
+## OHB2-PHASE2B-AUTHORIZED-HOSTING-DEPLOYMENT — 2026-11-08 (preparation only)
+
+**Status:** `BLOCKED_PENDING_EXPLICIT_AUTHORIZATION` (+ BLOCKED_PENDING_REQUIRED_EVIDENCE). **No deployment action taken.**
+- No explicit deployment authorization in the current task context (task text says a template/prior
+  attempts/provider access are NOT authorization). ⇒ task's own rule: prepare only, do not deploy.
+- Prerequisite gate FAILS: (2) Phase 1 not approved — review VERDICT HIGH; (3) 1×HIGH + 2×MEDIUM
+  unresolved; (6) 0 CI runs for revision `5b10850` (CI only triggers on `main`); (7) working tree has
+  7 modified + 4 untracked paths ⇒ not a reviewed deployable revision; (9) Phase 2A qualified **no**
+  host (`NO_QUALIFIED_FREE_NO_CARD_HOST`).
+- Non-destructive prep done: deployment guardrails, storage/SQLite rules, full env-var inventory
+  (names only) from `bot/config.py` + autopush, secrets handling rules, safety gates, persistence
+  test plan (T1–T8), rollback plan, handoff checklist.
+- Deliverable: `docs/OHB2_PHASE2B_DEPLOYMENT_PREPARATION_AND_BLOCKERS.md`.
+- Verified: pytest 1856 passed, pyflakes 0, frontend 206/0. No code changed by this task; no commit/push.
+- Unblocks: fix review findings → clean re-review → authorize exact revision (+CI) → authorize a
+  Northflank canary to prove free-tier volume durability → explicit deployment authorization.
+
+---
+
+## OHB2-AUD-01-08-REMEDIATION-AFTER-682DF5C-AND-INDEPENDENT-REVIEW — 2026-11-06
+
+**Status:** DONE (AUD-01..05,07,08 code+docs remediated, reviewed, committed, pushed). AUD-06 = owner decision (outside branch scope).
+- Commits: `b170bef` (fix(audit): AUD-01..08 remediation, 15 files) + `601b57b` (fix(review): README SAST scope + dead-branch test, 3 files). Pushed to `origin/agent/ohb2-phase1c-inbox-filter-archive-delete` (601b57b == remote).
+- Independent review (agent-server deepseek-v4.1-flash, detached worktree at the exact SHA): first pass PASS-WITH-NOTES on `b170bef` (HIGH: AUD-06 not addressed; MEDIUM: README bandit scope stale; LOW: `_page_offset` overflow branch untested). After fixes, re-review **PASS** on `601b57b`.
+- AUD-01: `_wake` tolerates missing/raising `wake` (services.py); a successful remote delete never 500s on a secondary wake. Mutation-proven.
+- AUD-02/03: oversized/negative ints and non-string JSON ⇒ 400 (not 500). Mutation-proven.
+- AUD-04: reject `page` outside `[0, MAX_PAGE]` at API + service (no silent clamp); db validates limit/offset/page_size before SQLite binding; `page=2**62` was reproduced as `OverflowError ⇒ 500`, now 400. 5 mutations proven + `_page_offset` overflow branch now covered.
+- AUD-05: rate-limit key = SHA-256(session token), never raw. Mutation-proven.
+- AUD-07: bandit scope `bot/ automation/ main.py` in ci.yml; proved a high finding (B602) in `automation/` makes bandit exit 1.
+- AUD-08: README.md, docs/MINI_APP.md, docs/NOTIFICATIONS.md, OPERATIONS_RUNBOOK.md, REGRESSION_GATE.md all consistent; docs-consistency test added.
+- Verification: pytest **1900 passed**; pyflakes clean; bandit exit 0 (High 0); node **206/0**; pip-audit "No known vulnerabilities found".
+- AUD-06 (UNRESOLVED by design): `ci.yml` triggers only on push/PR to `main`; 0 check-runs for b170bef/601b57b. AGENTS.md §6 forbids opening a PR without explicit user request. Repo is PUBLIC + unlimited free CI + precedent shows a `pull_request` from an `agent/*` branch runs CI. Options for the owner: (a) open a PR to `main` (runs CI), or (b) add the branch pattern to ci.yml triggers. Both need explicit approval; proposed, not executed.
+
+## OHB2-OUTBOX-TOMBSTONE-TOCTOU-RACE-AUDIT-AND-REMEDIATION — 2026-11-06
+
+**الهدف:** إغلاق ملاحظة LOW في `bot/outbox.py::_post_claimed` — هل ممكن يتبعت محتوى شات
+بعد ما ياخد شاهد حذف فعّال؟
+
+**معايير القبول (acceptance criteria):**
+1. تحليل السباقات السبعة المطلوبة (tombstone قبل الحجز/بعد الحجز/أثناء الفحص/بعد الفحص
+   قبل الإرسال/أثناء الإرسال/نتيجة غامضة/تعافي أو worker تاني) بالدليل من الكود.
+2. لو فيه سباق إفصاح حقيقي ⇒ أصغر تصحيح آمن: فرض الشاهد عند أقوى حد قبل الإرسال الحامل
+   للمحتوى، مع حماية المطالبات القديمة/المسترجَعة، وبقاء CAS/at-most-once كما هي.
+3. اختبارات حتمية: (أ) شاهد قبل الحجز، (ب) شاهد بعد الحجز وقبل الإرسال، (ج) شاهد عند حد
+   الفحص النهائي، (د) شاهد بعد بدء الإرسال (يُوثَّق القيد)، (هـ) مطالبة قديمة/مسترجَعة،
+   (و) شات سليم لسه بيتبعت، (ز) شات تاني غير متأثّر، (ح) الملكية/التفويض كما هي، (ط) مفيش
+   إعادة إرسال بعد نتيجة غامضة.
+4. الاختبارات تثبت **منع النداء البعيد** و**غياب الإفصاح** (مش الحالة النهائية بس).
+5. البوابات كاملة: pytest, node, pyflakes, bandit, pip-audit — كلها أخضر.
+6. مراجعة مستقلة على الـ diff غير المُودَع + معالجة أي HIGH/MEDIUM، وتوثيق LOW.
+7. عدم لمس الأربعة ملفات F-1 غير المُودَعة، وعدم أي كتابة git، وعدم أي نداء إنتاجي.
+
+**حالة:** IN PROGRESS.
+
+**النتيجة النهائية (OHB2-OUTBOX-TOMBSTONE-TOCTOU): DONE / PASS.**
+- سباق حقيقي مؤكَّد (نافذة `deleting/uncertain` تسيب السجل مؤهّلًا؛ الـ CAS لوحده ماكانش كافي).
+- الإصلاح: حرس شاهد (fail-closed) مرتين في `_post_claimed` — عند المدخل وفورًا قبل CAS الإرسال
+  (بلا `await` بينهما) ⇒ `discarded`. الحدّ الوحيد المتبقّي: شاهد يُكتب **بعد** بدء الـ POST (خارجي، موثَّق).
+- اختبارات: `tests/test_outbox_tombstone_toctou.py` (15 اختبار). إثبات الطفرة: 9 تفشل بلا الحرسين،
+  و2 (الحالة 3) تفشل بحرس المدخل وحده.
+- البوابات: pytest 2021 passed؛ node 206/0؛ pyflakes 0؛ bandit High 0؛ pip-audit نظيف.
+- مراجعتان مستقلّتان: الأولى PASS-WITH-NOTES + HIGH (الحالة 3) أُصلح؛ الثانية PASS (تصميم/منطق)،
+  بلا HIGH/MEDIUM جديدة، والحدّ in-flight موثَّق بصدق.
+- لا كتابة git، لا نداءات إنتاج، Autopush غير مُفعَّل، ملفات F-1 الأربعة دون تغيير.
+
+## OHB2-COMPLETE-REMAINING-DEFECTS-AND-INCOMPLETE-FEATURES-REMEDIATION — 2026-11-06
+
+**الهدف:** جولة تدقيق متبقية شاملة + إصلاح كل عيب مؤكَّد داخل النطاق.
+
+**معايير القبول:**
+1. تدقيق كامل للسطح (بوت/ويب/قاعدة/أمان/واجهة/CI/مستندات) بأدلّة.
+2. إغلاق/تصنيف النتائج المذكورة: outbox (sent بعد الإرسال، إشعار sandbox)، كشف الميتاداتا
+   المحلية، SameSite/WebView، `_API_CSP`، متجهات التوكن في الاختبارات، مستندات قديمة/مضلّلة.
+3. أصغر إصلاح صحيح لكل عيب مؤكَّد + اختبار انحدار يفشل قبل الإصلاح.
+4. بوابات كاملة خضراء (pytest/node/pyflakes/bandit/pip-audit) + مصفوفة ميزات متبقية.
+5. مراجعة مستقلة على الـ diff غير المُودَع + معالجة HIGH/MEDIUM.
+6. عدم لمس ملفات F-1/outbox السابقة، لا كتابة git، لا نداءات إنتاج، Autopush معطّل.
+
+**النتائج الأولية (Phase A):**
+- `_API_CSP` كود ميت (معرّف، غير مستخدم) + تعليق فوقه بيوصف `_STATIC_CSP` خطأً ⇒ LOW (توضيح/إزالة).
+- كشف ميتاداتا الصندوق: صف `notification_inbox` لشات محذوف بيفضل بعنوانه/نصه وبيظهر في
+  `list_inbox`/`count_inbox` (واجهة إشعارات الـ Mini App) ⇒ **MEDIUM (إفصاح محتوى)**.
+- المتابعات (`watched`) بتتشال على الحذف المؤكّد ⇒ مفيش كشف (بس بتفضل خلال نافذة deleting/uncertain).
+- SameSite=Strict: same-origin، متّسق مع قرار الاستضافة (Option A) ⇒ لا تغيير (الأدلّة تحت).
+
+**حالة:** IN PROGRESS.
+
+
+**النتائج الكاملة + الإصلاحات (Phase B/C):**
+1. **كشف ميتاداتا شات محذوف (MEDIUM → مُصلَح):** `delete_conversation` بتسيّب صفوف
+   `notification_inbox` أثر تدقيق (بعنوان + نص)، وقبل الإصلاح `list_inbox`/`count_inbox`
+   كانوا بيعرضوها في واجهة إشعارات الـ Mini App، و`list_watched` كان بيعرض عنوان شات
+   خلال نافذة deleting/uncertain. الإصلاح: `_inbox_visibility_clause` (بقت `self` مش
+   `@staticmethod`) بتضيف `NOT EXISTS (... deleted_conversations)` على النشط والأرشيف معًا،
+   و`list_watched` بنفس الاستبعاد. الصفوف نفسها ما بتتحذفش (أثر تدقيق/استرجاع محفوظ).
+   اختبارات: `tests/test_deleted_conversation_metadata_exposure.py` (9 اختبارات)؛ إثبات طفرة:
+   4+2 تفشل بلا الإصلاح، والضوابط تعدّي.
+2. **إشعارات outbox لشات محذوف (LOW → مُصلَح):** الإشعاران `_SANDBOX_NOT_READY_NOTICE`
+   و`_OUTBOX_EXHAUSTED_NOTICE` (خاليان من المحتوى) كانا ممكن يتبعتوا لو الشات أخد شاهد حذف
+   أثناء التحضير (بعد حرس المدخل). الإصلاح: `_tombstoned()` (fail-closed) قبل كل إرسال إشعار.
+   اختبارات: `tests/test_outbox_notice_tombstone.py` (3)؛ إثبات طفرة: 2 تفشل بلا الحرس.
+3. **`_API_CSP` كود ميت (LOW → مُصلَح):** كان معرّفًا وغير مستخدم (ضابط CSP ناقص لردود
+   الـ API)، والتعليق فوقه كان بيوصف `_STATIC_CSP` خطأً. الإصلاح: ربطه بـ `_SECURITY_HEADERS`
+   ⇒ كل ردود `_json`/`_attachment` بتاخد `default-src 'none'`، وتصحيح التعليق.
+   اختبار: `test_api_responses_carry_restrictive_csp` في `tests/test_miniapp_api.py`.
+4. **متجه توكن في الاختبارات (LOW → موثَّق):** `tests/test_miniapp_initdata.py` فيه توكن
+   تيليجرام يشبه الحقيقي؛ لكنه **فيكتور توثيقي عام** من core.telegram.org (مش سر إنتاج).
+   أُضيف تعليق صريح يوضّح ذلك (لا تغيير في القيمة لأن الفيكتور لازم يطابق التوثيق حرفيًا).
+5. **SameSite/WebView (لا عيب):** `SameSite=Strict` متّسق مع same-origin (الواجهة والـ API
+   على نفس الأصل)؛ الكوكي بيتولّد من داخل الصفحة المضمّنة ⇒ same-site. الوضع مقصود أمنيًا
+   وما اتغيّرش. أُضيف قسم «نطاق دعم العميل» في MINI_APP.md يوضّح أن الفتح في متصفّح عادي
+   خارج تيليجرام غير مدعوم عن قصد (مفيش initData).
+6. **مستندات:** README (قسم الأمان: لا أسرار إنتاج + استبعاد الشات المتشاهد)، MINI_APP.md
+   (كشف الشاتات المحذوفة + CSP ردود الـ API + نطاق العميل)، NOTIFICATIONS.md (§3.8) — كلها
+   مطابقة للكود بلا مبالغة.
+
+**البوابات (Phase C):** pytest **2034 passed** (exit 0؛ +13 اختبار جديد)؛ node **206/0**؛
+pyflakes **exit 0** على bot/ automation/ main.py tests/؛ bandit **High=0** (5 Low/17 Medium
+موثّقة)؛ pip-audit **No known vulnerabilities found**. ملفات F-1 الأربعة بايت-متطابقة (hash).
+
+**حالة:** البوابات خضراء؛ في انتظار المراجعة المستقلة على الـ diff غير المُودَع.
+
+## OHB2-TELEGRAM-EXISTING-CONVERSATION-REPOSITORY-CONTEXT-FIX — 2026-11-06
+
+**الهدف:** التحقق من/إصلاح بلاغ: إرسال برومت جوه شات تيليجرام موجود (مربوط بمستودع) كان
+بيعمل شات OpenHands جديد من غير مستودع بدل ما يبعت للشات الموجود.
+
+**معايير القبول (12 بند في المهمة):** إعادة استخدام الشات الموجود، حفظ المستودع/الـ sandbox،
+ممنوع الاستبدال الصامت بشات جديد، خطأ صريح لو التعيين مش قابل للحسم، استمرار الشاتات
+المستقلة (إنشاء/موجود)، دعم ربط المستودع لاحقًا، حفظ التفويض/الملكية، منع التكرار عبر
+إعادة المحاولة/التعافي، عدم إدخال مالك قاعدة/worker/معمارية بديلة.
+
+**Phase 1 — تشخيص (قراءة فقط، بأدلّة):**
+- تتبّع المسار كامل: `handle_text` → `take_awaiting` (kind=route/reply) → `_send_prompt` →
+  `db.add_or_group_outbox` → `OutboxWorker` → `outbox._post_claimed` →
+  `get_conversation(conversation_id)` ثم `client.send_message(conversation_id, text)`
+  (POST `/app-conversations/{id}/send-message`). الإنشاء مسار منفصل تمامًا
+  (`_start_new_chat`/`_create_chat` → `creation_jobs` → `client.start_conversation`
+  = POST `/app-conversations`).
+- **النتيجة: البلاغ غير قابل للتكرار على الكود الحالي.** مفيش أي fallback صامت بيعمل شات
+  جديد لو الشات مش موجود: `get_conversation` بترجّع `{}` **من غير استثناء** (لما الـ API
+  يرجّع 200 + قائمة فاضية) ⇒ المسار بيدخل فرع «sandbox غير جاهز» (`bump_outbox_attempt`)
+  ويفضل `pending` (إعادة محاولة) بلا أي POST إرسال أو إنشاء. (تصحيح دقة من المراجعة المستقلة:
+  المانع هو فرع sandbox، مش استثناء ApiError؛ النتيجة النهائية — مفيش إنشاء — صحيحة.)
+- مفيش فقدان لمعرّف الشات: التوجيه (`awaiting_conversation_id`) هو المعرّف المستخدَم حرفيًا
+  في `send_message`. المستودع بيتقرا من نفس الشات بعيدًا (`selected_repository`) ولا يحتاج
+  تحميلًا محليًا ولا بيتغيّر أثناء الإرسال. الـ `sandbox_id` بيتاخد من نفس الشات.
+- فحص كل الفروع (`origin/main`, `release/*`, `feature/*`, `agent/*`) ⇒ نفس المسار الصح.
+- دليل تجريبي (عميل OpenHands حقيقي + `httpx.MockTransport` + SQLite معزولة): فتح شات مربوط
+  بمستودع ثم إرسال برومتين ⇒ **صفر** نداء `POST /app-conversations`، ونداء واحد بالظبط
+  `POST /app-conversations/{existing}/send-message`، والمستودع/الـ sandbox كما هما.
+
+**Phase 2 — الإصلاح:** لا يوجد — لا عيب مؤكَّد في المسار الحالي ⇒ لا تغيير كود (AGENTS.md §6:
+ممنوع تغييرات غير مطلوبة؛ §7: ممنوع ادّعاء إصلاح بلا دليل). لم تُلمس أي ملفات إنتاج.
+
+**Phase 3 — اختبارات الانحدار:** أُضيف `tests/test_existing_conversation_repository_context.py`
+(13 اختبارًا) يثبّت كل السيناريوهات الاثني عشر المطلوبة. إثبات الطفرة: بحقن fallback إنشاء
+صامت مؤقتًا في `_post_claimed` يفشل الاختبار `test_missing_conversation_mapping_fails_safely_without_creation`
+(ثم أُعيد `bot/outbox.py` بايت-متطابقًا: sha256 9b203e54…1024b).
+
+**Phase 4 — البوابات:** pytest **2052 passed** (2039 أساس + 13)؛ node **206/0**؛ pyflakes
+**exit 0**؛ bandit **High=0** (5 Low/17 Medium موثّقة)؛ pip-audit **No known vulnerabilities found**.
+
+**الحالة:** DONE (لا عيب مؤكَّد؛ اختبارات انحدار مثبِّتة؛ كل البوابات خضراء). لا كتابة git،
+لا نداءات إنتاج، Autopush غير مُفعَّل، ملفات F-1 غير المُودَعة لم تُلمس.
+
+**المراجعة المستقلة (عدائية، Cloud API، محادثة `fbe4c0746a8449ce89be10367e2052cc`):**
+- الحكم: **PASS-WITH-NOTES**. أكّدت: (أ) استنتاج Phase 1 صحيح (مفيش مسار إنشاء صامت عند
+  إرسال برومت لشات موجود)؛ (ب) الاختبارات الـ13 سليمة وغير وهمية — أُعيد تشغيلها وأثبتت
+  الطفرات: الباگ المُبلَّغ عنه حرفيًا (توجيه route/reply لـ `_start_new_chat(None, text)`)
+  بيكسّر **9 اختبارات**؛ (ج) إضافة الاختبارات لوحدها بلا خطر HIGH/MEDIUM.
+- ملاحظتان «HIGH» عند المراجع = **أثر استنساخ معروف**: المراجع بيشوف الـ commits المدفوعة بس،
+  فحرّاس F-1 غير المُودَعة وملف الاختبار الجديد مش موجودين عنده (نفس ما هو موثَّق في ذاكرة
+  المشروع عن المراجعات السحابية). لا يمثّلان عيبًا في تسليم المهمة.
+- ملاحظة MEDIUM (دقة تقرير): اتصلّحت — المانع عند غياب الشات هو فرع «sandbox غير جاهز»، مش
+  استثناء ApiError. النتيجة النهائية (مفيش إنشاء) صحيحة.
+- ملاحظة خارج النطاق: المراجع رصد أن ثغرة outbox tombstone TOCTOU لسه **غير مطبَّقة في الشجرة
+  المدفوعة** — لكنها **مطبَّقة محليًا** في `bot/outbox.py` غير المُودَع (69 سطرًا)؛ ده نطاق
+  مهمة سابقة (OHB2-OUTBOX-TOMBSTONE-TOCTOU) ومسجَّل مغلقًا في الذاكرة، ومش نطاق مهمتنا دي.
+
+**الحالة النهائية:** DONE.
+
+---
+
+# PROGRESS — OHB2-DUPLICATE-TELEGRAM-PROMPT-DISPATCH-ROOT-CAUSE-AND-FIX
+
+## Goal
+رسالة تيليجرام واحدة من المستخدم لازم تعمل **قرار معالجة واحد** بس: إرسال واحد لشات موجود،
+أو إنشاء شات واحد — مش الاتنين. العَرَض المُبلَّغ عنه: برومت لشات موجود A (مربوط بمستودع S)
+بيوصل لـ A **وكمان** بيعمل شات جديد B (بدون مستودع) ونفس البرومت بيتبعت له.
+
+## Acceptance criteria
+1. تحديث واحد ما يعملش إرسال لشات موجود **و** إنشاء شات جديد في نفس الوقت.
+2. إعادة تسليم نفس التحديث (شبكة/إعادة تشغيل/تزامن) ما تعملش عملية OpenHands تانية.
+3. المعالجة المتزامنة لنفس التحديث ⇒ قرار معالجة واحد بس.
+4. توجيه الشات الموجود + سياق المستودع/الـ sandbox محفوظين.
+5. أوامر «شات جديد» الصريحة + الشاتات المستقلة لسه شغالة.
+6. رسائل متتالية شرعية (تحديثات مختلفة) ما تتشالْش غلط.
+7. استرجاع الصندوق ما يعملش إنشاء شات مكرّر؛ النتائج الغامضة ما تعملش إنشاء بديل.
+8. تفويض المستخدم/ملكية الشات لسه مفروضين.
+
+## Root cause (confirmed)
+- `Application.builder().concurrent_updates(True)`؛ وكل الـ handlers في مجموعة واحدة (0)،
+  وPTB بينفّذ **handler واحد بس لكل مجموعة** (سليم). بس **مفيش ديدَب على مستوى التحديث**:
+  `telegram.ext._updater` بيسجّل `_last_update_id` **بعد** ما يحط التحديث في الطابور
+  (مش بعد تنفيذه)، ومفيش أي تتبّع لـ `update_id` في الكود.
+- النتيجة: أي إعادة تسليم لنفس التحديث (انقطاع قبل تأكيد الـ offset ⇒ إعادة جلب بعد restart؛
+  أو التحديث في الطابور مرتين) بتوصل لـ `handle_text` تاني. ولأن `take_awaiting` بتستهلك
+  الحالة في المرة الأولى، فالمرة التانية بتشوف حالة مختلفة (مثلاً `newchat` بدل `route`)
+  ⇒ **قرار معالجة تاني** مستقل (إرسال A + إنشاء B). ده يفسّر العَرَض حرفيًا.
+- المساران نفسهما سليمان (مفيش fallback صامت)؛ المشكلة كانت في **غياب حاجز على مستوى
+  التحديث**، مش في مسار الإرسال أو الإنشاء.
+
+## Fix (smallest architecture-compatible)
+- جدول **دائم** `processed_updates(update_id INTEGER PRIMARY KEY, processed_at TEXT)`
+  (إضافي، `CREATE TABLE IF NOT EXISTS` ⇒ غير مدمّر للقواعد القديمة).
+- `Database.mark_update_processed(update_id, now) -> bool` بـ `INSERT OR IGNORE` ذرّي
+  (أول نداء يفوز؛ التزامن يعطي True واحد بس). + `prune_processed_updates(keep)` (تقليم
+  عند الإقلاع، نافذة 50k) + `count_processed_updates()`.
+- `handlers.dedupe_update` مسجّل في **group=-1** عبر `TypeHandler(Update, ...)` (أعلى
+  أولوية، أول حاجة تتشغّل). أول مرة ⇒ نكمّل؛ مكرّر ⇒ `raise ApplicationHandlerStop`
+  (يوقف كل المجموعات) **قبل أي عملية خارجية**.
+- لا worker جديد، ولا مالك قاعدة تاني، ولا ادّعاء exactly-once خارجي (كشف تكرار فقط).
+
+## Tests / mutation evidence
+- جديد: `tests/test_duplicate_update_dispatch.py` — **18 اختبار** على **`Application.process_update`**
+  (المدخل الكامل)، بقاعدة معزولة وعميل OpenHands وهمي (مفيش شبكة). يغطّي الـ12 سيناريو.
+- اختبار العَرَض الحرفي `test_exact_reported_symptom_one_update_cannot_send_and_create`:
+  تحديث واحد مرتين (route ثم newchat) ⇒ **إرسال واحد لـ A، صفر إنشاء**.
+- **إثبات الطفرة**: حذف تسجيل الحاجز (`group=-1`) ⇒ 4 اختبارات تفشل، منها اختبار العَرَض
+  الحرفي اللي بيرجّع `creates == [('برومت', None)]` (شات B بدون مستودع) + إرسال مكرّر
+  لـ A — **نفس العَرَض المُبلَّغ عنه**. ثم أُعيد `bot/app.py` بايت-متطابق (sha256 063a85a4…).
+
+## Verification (actual)
+- `python -m pytest -q` ⇒ **2070 passed** (2052 أساس + 18)، 72 تحذير، ~79s.
+- `node --test tests/frontend/*.test.js` ⇒ **206 pass / 0 fail**.
+- `python -m pyflakes bot/ automation/ main.py tests/` ⇒ **exit 0**.
+- `python -m bandit -r bot/ automation/ main.py -lll -s B613` ⇒ **High 0** (Low 5، Medium 17).
+- `python -m pip_audit -r requirements-dev.txt` ⇒ **No known vulnerabilities found**.
+- مجموعات مركّزة (handlers/app/outbox/grouping/u04/f02-f06/batch3r×2/batch-c/existing-context/
+  miniapp_operations/resurrection/outbox_commands/db) ⇒ **399 passed**.
+
+## Constraints honored
+- لا commit/push/PR/merge/rebase/reset/clean/تبديل فرع. لا staging واسع. لا تعديل Mini App.
+  Autopush غير مُفعَّل. لا نداءات إنتاج.
+- ملفات F-1 (`bot/outbox.py`, `tests/test_outbox_tombstone_toctou.py`,
+  `tests/test_existing_conversation_repository_context.py`, ومحتوى `.agent/PROGRESS.md`
+  السابق) لم تُلمس (mtime قديم). التعديلات: `bot/app.py`, `bot/db.py`, `bot/handlers.py`,
+  + ملف الاختبار الجديد + هذا القسم.
+
+## Remaining risks / limitations
+- الحاجز يمنع **إعادة تسليم نفس `update_id`**. لو تيليجرام (نظريًا) سلّم نفس الرسالة المنطقية
+  بمعرّف تحديث **مختلف**، الحاجز مايمنعهاش (لكن إعادة التسليم الفعلية بتعيد نفس `update_id`).
+- عقد at-most-once الخارجي زي ما هو: الـ CAS/`unknown` موجودين مسبقًا؛ الحاجز ما بيدّعيش
+  exactly-once عبر APIs خارجية.
+- سجل `processed_updates` بيكبر ببطء (تقليم 50k عند الإقلاع) — مقبول.
+
+---
+
+# PROGRESS — OHB2-DUPLICATE-DISPATCH-CRASH-CONSISTENCY-AND-FAILURE-REMEDIATION
+
+## Goal
+إغلاق مخاطر **فقد بيانات** و**معالجة مزدوجة** اتكشفت في تنفيذ حاجز منع تكرار التحديثات
+اللي اتعمل قبل كده (OHB2-DUPLICATE-TELEGRAM-PROMPT-DISPATCH)، مع إصلاح سلوك الفشل.
+
+## الخللان المؤكّدان في التصميم السابق (تسجيل عند الحاجز)
+1. **نافذة فقد دائم (data loss):** الحاجز (`group=-1`) كان بيسجّل `update_id` «معالَج»
+   **قبل** كتابة سجل العمل الدائم (outbox/creation). لو العملية ماتت/انقطعت في النافذة
+   بين الحاجز والكتابة، إعادة تسليم نفس التحديث كانت **بتتخطّى** ⇒ البرومت يضيع للأبد
+   (لا سجل، ولا إعادة محاولة).
+2. **فشل مقفول ناقص:** لو فحص/تسجيل الحاجز رمى (قاعدة مقفولة)، PTB كان **بيكمّل** للمجموعة
+   الجاية (اتأكّد تجريبيًا: PTB بيكمّل عند الاستثناء العادي، وبيبتلع `ApplicationHandlerStop`
+   من غير ما يسجّله) ⇒ احتمال معالجة مزدوجة + ادّعاء صامت.
+
+## الإصلاح (أصغر تغيير آمن)
+- **الحاجز بقى فحص قراءة فقط** (`Database.update_is_processed`) — **ما بيكتبش** أي حاجة.
+- **التسجيل «معالَج» بقى ذرّيًا مع كتابة السجل الدائم**: `_mark_processed_nocommit(update_id, now)`
+  بيتنادى **جوه نفس معاملة** `add_or_group_outbox` / `add_creation_job` (INSERT OR IGNORE
+  على مفتاح أساسي). النتيجة: إما الاتنين يتكتبوا معًا، أو ولا واحد ⇒ لا نافذة فقد، ولا ازدواج.
+- **إغلاق سباق التزامن:** بما إن الحاجز قراءة، نداءين متزامنين لنفس `update_id` ممكن يوصلوا
+  للكتابة. الفحص جوه `BEGIN IMMEDIATE` (قفل كتابة قبل القراءة) بيخلّي التاني يشوف «معالَج»
+  ويرجع `0`. (`add_or_group_outbox` و `add_creation_job` الاتنين.)
+- **عقد القيمة 0:** `_send_prompt`/`_start_new_chat` بيتعاملوا مع `0` (خسارة السباق) بـ
+  `return` مبكر ⇒ **مفيش تأكيد كاذب** ولا عملية مكرّرة. مسارات Mini App بتستدعي بنفس العقد
+  أصلًا (`if not outbox_id`).
+- **فشل مقفول صريح:** `dedupe_update` عند فشل الفحص: `log.exception` (تتبّع كامل — لأن PTB
+  بيبتلع الـ stop) + `raise ApplicationHandlerStop` ⇒ المجموعة 0 مابتشتغلش (مفيش تنفيذ مزدوج)،
+  والخطأ بيتسجّل (مفيش توه صامت).
+
+## النطاق والمقايضة (مقصودة، موثّقة في docstring)
+- العمليات اللي **مابتعملش** سجل دائم (رد/توجيه/أوامر/أزرار) مش مسجّلة «معالَج» ⇒ إعادة
+  تسليمها بتعيد الرد. أغلبها قراءة/idempotent، وقليل بيغيّر حالة صغيرة (مثل `notif:toggle`).
+- **المقايضة مقصودة:** إغلاق نافذة **فقد البرومت** (الأثر الأعلى) اتقدّم على منع تكرار تبديل
+  الإشعارات (إعادة تسليم كولباك نادرة + أثر بسيط قابل للرجوع). **الالتزام القائم** «تحديث
+  واحد ⇒ قرار إرسال/إنشاء واحد» محفوظ بالكامل (وهو موضوع التقرير الأصلي).
+- السبب: البديل (تسجيل عند الحاجز + تعافي عند الإقلاع) بيحوّل المقايضة من «فقد البرومت»
+  لـ «منع تنفيذ تاني لتحديث لسه ما اتنفّذش» — نفس عدم الحتمية، مش حلها. الفحص-القراءة
+  يحسم الحالة الصحيحة بلا تخمين.
+
+## الاختبارات (جديد: 5 اختبارات في `tests/test_duplicate_update_dispatch.py` ⇒ الإجمالي 23)
+1. `test_guard_is_read_only_marker_written_with_durable_record` — الحاجز مش بيسجّل؛ الكتابة
+   الدائمة هي اللي بتسجّل.
+2. `test_guard_db_error_fails_closed_stops_handlers_and_logs` — فشل القاعدة ⇒ مفيش صندوق،
+   مفيش إرسال، وخطأ مسجّل (caplog).
+3. `test_same_update_second_write_in_transaction_rejected` — كتابة تانية بنفس `update_id`
+   ⇒ `0` (سجل واحد بس).
+4. `test_two_distinct_updates_both_written` — تحديثين مختلفين ⇒ سجلين (مفيش رفض كاذب).
+5. `test_crash_between_guard_and_durable_write_does_not_lose_prompt` — عطل بعد الحاجز وقبل
+   الكتابة ⇒ إعادة التسليم **تنفّذ** (مفيش فقد).
+
+## إثبات الطفرة (mutation)
+- حذف الفحص الذرّي جوه المعاملة (الموضعين) ⇒ `test_same_update_second_write_in_transaction_rejected`
+  يفشل (`assert 1 == 0`). ثم أُعيد `bot/db.py` بايت-متطابق.
+- إرجاع الحاجز للتصميم القديم (`mark_update_processed` عند الحاجز) ⇒
+  `test_crash_between_guard_and_durable_write_does_not_lose_prompt` يفشل (البرومت بيضيع).
+  ثم أُعيد `bot/handlers.py` بايت-متطابق.
+- تحقّق تجريبي مباشر لـ PTB 22.8: استثناء عادي في handler ⇒ بيتسجّل (بيكمّل للمجموعة الجاية)؛
+  `ApplicationHandlerStop` ⇒ بيتلغطّى وبيمنع المجموعة الجاية، **بدون** أي لوج ⇒ لذا بنسجّل بنفسنا.
+
+## Verification (actual)
+- `python -m pytest -q` ⇒ **2075 passed** (2070 أساس + 5)، 72 تحذير، ~78s.
+- `python -m pyflakes bot/ tests/` ⇒ **exit 0**.
+- الملفات المعدّلة: `bot/db.py`, `bot/handlers.py`, `bot/app.py`, `README.md`,
+  `tests/test_duplicate_update_dispatch.py`, وهذا القسم. مسارات F-1 لم تُلمس.
+
+## Remaining risks / limitations
+- إعادة تسليم **كولباك يغيّر حالة صغيرة** (مثل تبديل الإشعارات) ممكن تتكرّر (موثّق أعلاه).
+- الحاجز يمنع إعادة تسليم **نفس `update_id`**؛ معرّف تحديث مختلف لنفس الرسالة المنطقية لا
+  يُمنع (نفس القيد السابق).
+- عقد at-most-once الخارجي زي ما هو (CAS/`unknown` مسبقًا) — الحاجز ما بيدّعيش exactly-once.
+
+---
+
+# PROGRESS — OHB2-ONE-SHOT-ROUTING-CRASH-CONSISTENCY
+
+## Goal
+إغلاق نافذة الفقد المؤكّدة للحالات لمرة واحدة (reply/newchat/reposearch) + معالجة
+P2 (فشل القاعدة) و P3 (تبديل الإشعارات المكرّر) — بدون أي مخزن/worker جديد.
+
+## Acceptance criteria
+1. استهلاك الحالة لمرة واحدة + كتابة العمل الدائم = معاملة SQLite واحدة (أو تعافٍ مكافئ).
+2. اختبار انحدار بيفشل لو فصلنا الاستهلاك عن الكتابة (mutation-verified).
+3. حمايات منع التكرار الحالية سليمة. 4. لا ارتداد F-1/تفويض. 5. pytest + pyflakes يعدّوا.
+6. الـ diff بيحفظ شغل المستخدم. 7. مفيش نشر/commit/push.
+
+## Root cause (مؤكّد مستقلًا)
+`handle_text` كان بينادي `take_awaiting` اللي **بيـcommit استهلاك** الحالة لمرة واحدة،
+وبعدين معاملة **تانية** بتكتب السجل الدائم. عطل بينهم = فقد دائم (الحالة اتمسحت، مفيش سجل،
+وإعادة التسليم بتلاقي مفيش حالة).
+
+## الإصلاح (أصغر تغيير آمن، بدون تغيير المعمارية)
+- `handle_text` بقى **يقرأ بدون استهلاك** (`Database.awaiting_state`)، و`route` بيتجدّد
+  (`renew_awaiting`)، والحالة المنتهية بتتمسح وتتبلّغ (زي الأصل).
+- `add_or_group_outbox`/`add_creation_job` بياخدوا `consume_awaiting=(telegram_id, kind)`:
+  الفحص + مسح الحالة + كتابة السجل الدائم + علامة «معالَج» **جوه نفس `BEGIN IMMEDIATE`**.
+  حالة متغيّرة/منتهية ⇒ رجوع 0 بدون كتابة. استثناء ⇒ rollback للكل.
+- `consume_one_shot_awaiting` لبحث المستودعات (مساره مافيهوش سجل دائم): بيعمل الحالة +
+  علامة «معالَج» ذرّيًا **بعد** إرسال القايمة (عطل قبل كده ⇒ إعادة تنفيذ، قايمة مكرّرة غير ضارة).
+- P3: `Database.toggle_notifications_once(update_id, now)` — التبديل + العلامة في معاملة
+  واحدة؛ نفس `update_id` ⇒ مفيش تبديل تاني؛ `update_id` مختلف ⇒ تبديل عادي.
+- P2 (موثّق غير مُصلَح): fail-closed زي ما هو + توضيح الحدود في docstring `dedupe_update`
+  (مفيش requeue؛ `drop_pending_updates=True` ⇒ إسقاط نادر محتمل وقت عطل قاعدة عابر).
+
+## Verification (actual)
+- `python -m pytest -q` ⇒ **2094 passed** (2075 + 19 جديد)، 72 تحذير.
+- `python -m pyflakes bot/ tests/` ⇒ **exit 0**. `bandit -lll -s B613` ⇒ **exit 0**.
+- mutation 1 (فصل الاستهلاك في handlers) ⇒ 7 اختبارات تفشل. mutation 2 (شيل حاجز P3) ⇒ 1 يفشل.
+- ملفات المهمة: `bot/db.py`, `bot/handlers.py`, `README.md`, `tests/test_one_shot_awaiting_atomicity.py`, هذا القسم.
+
+---
+
+# PROGRESS — OHB2-SW04 + OHB2-SW05 (تفويض upstream + فشل التسليم)
+
+## Goal
+إصلاحان ضيّقان: (SW-04) الحفاظ على تمييز `UPSTREAM_ERROR` من `_authorized_conversation`،
+و(SW-05) إيقاف تجاهل فشل `_edit_or_send()` الصامت. بدون لمس SW-02، ولا F-1، ولا الاستطلاع/
+الإقرار/إدارة offset، وبدون أي مكوّن معماري جديد.
+
+## Acceptance criteria
+1. فشل `/users/me` (upstream) يفضل `UPSTREAM_ERROR` (502) ولا يتحوّل لـ `UNAUTHORIZED` (403).
+2. غياب الهوية (`{}`/بلا id) لسه `UNAUTHORIZED` (فشل مغلق محفوظ). 3. كل مستدعي التفويض
+   مايحوّلش عطل الخدمة لرفض تفويض، وماينفّذش عملية من غير تفويض مؤكّد. 4. كل مستدعي
+   `_edit_or_send` المتأثّر يتعامل مع `False`؛ مفيش نجاح كاذب؛ مفيش استثناء بيطلع من فرع فشل.
+5. pytest + pyflakes + bandit يعدّوا. 6. مفيش commit/push/نشر. 7. شغل المستخدم محفوظ.
+
+## Root causes (مؤكّدة تجريبيًا)
+- SW-04: `IdentityCache.owner_id()` كان بيحوّل أي `ApiError` من `/users/me` لـ None، فـ
+  `authorize_conversation_detailed` بتحوّله `UNAUTHORIZED` ⇒ عطل 429/503/مهلة يبان رفض
+  تفويض عادي (403) بدل upstream (502) — على البوت والـ Mini App.
+- SW-05: `show_status`/`show_cost` كانوا بيتجاهلوا القيمة الراجعة؛ وفرع «too long» في
+  `_edit_or_send` كان بيرمي استثناء الإرسال البديل للخارج بدل ما يرجّع False.
+
+## الإصلاح (أصغر تغيير آمن)
+- `bot/files.py`: `IdentityCache.owner_id_detailed()` جديدة تفرّق (`UPSTREAM_ERROR` مقابل
+  `UNAUTHORIZED`)؛ `owner_id()` بقت غلاف متوافق يرجّع الهوية فقط (بلا تغيير سلوك).
+  `authorize_conversation_detailed` بتستخدم التفصيل. الاتنين لسه رفض مغلق (مفيش نجاح).
+- `bot/handlers.py`: `_edit_or_send` بترجّع False عند فشل الإرسال البديل (بلا استثناء)؛
+  `show_status`/`show_cost`/`open_conversation` (فرعا الرفض وخطأ التبادل) بيفحصوا النتيجة
+  ويسجّلوا تحذير صريح. توثيق docstring محدّث.
+- تحديث اختبارين قديمين كانوا بيثبّتوا التلبيس القديم (`test_a2_owner_cache.py`,
+  `test_files_service.py`) + ملف انحدار جديد `tests/test_sw04_sw05_authz_upstream_and_delivery.py`.
+
+## Verification (actual)
+- `python -m pytest -q` ⇒ **2231 passed** (الأساس 2183 + 48 صافي جديد)، 72 تحذير.
+- `python -m pyflakes bot/ automation/ main.py tests/` ⇒ **exit 0**.
+- `bandit -r bot/ automation/ main.py -lll -s B613` ⇒ High: 0. `node --test tests/frontend/*.test.js` ⇒ 206 pass.
+- `pip-audit -r requirements-dev.txt` ⇒ No known vulnerabilities found.
+- mutation: إرجاع تلبيس SW-04 ⇒ 3 اختبارات تفشل؛ إرجاع رمي SW-05 ⇒ 1 يفشل؛ تجاهل النتيجة ⇒
+  1 يفشل؛ تجاهل فرعي open ⇒ 2 يفشلون. كل الملفات أُعيدت بايت-متطابق بعد كل طفرة.
+
+## Remaining risks / limitations
+- `show_status`/`show_cost` ما زالا بيسجّلوا فشل التسليم بدل ما يعيدوا المحاولة (مفيش retry
+  أعمى — ممنوع منعًا لتكرار الرسايل). المستخدم ممكن ما يشوفش الرد، لكن مفيش ادعاء نجاح كاذب.
+- SW-02 (لَوْ LOW): مؤجّل — ما اتلمسش.
+
+## Assumptions / decisions
+- التمييز SW-04: «فشل upstream في `/users/me`» ⇒ `UPSTREAM_ERROR`؛ «الهوية غائبة/ناقصة» ⇒
+  `UNAUTHORIZED`. الاتنين رفض مغلق، فالقرار الأمني (ممنوع) ما اتغيّرش.
+- اخترت تحديث اختبارين قديمين بدل تركهما يفشلان (تثبيت السلوك القديم الخاطئ كان هيكسر البوابة).

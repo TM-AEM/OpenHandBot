@@ -331,6 +331,12 @@ class Notifier:
             seen.add(item.id)
             if item.conversation_id in in_flight:
                 continue
+            # F-1 (فرض شاهد الحذف): حدث معلّق لشات عليه شاهد حذف (deleted/deleting/uncertain)
+            # مايتسلّمش. الحذف المحلي بيسيب الصف معلّقًا في حالات deleting/uncertain (وسم
+            # `superseded` بيحصل بس على الحذف المؤكّد)، فمن غير الحرس ده المُبلّل يبعت محتوى
+            # شات اتحذف. فشل مغلق عند خطأ القاعدة (نعتبره متشاهد).
+            if self._is_tombstoned(item.conversation_id):
+                continue
             if self._watched_event_stuck(item):
                 # F-1: الحدث الكانوني الحالي لمحادثة متابَعة عالقة ⇒ إحنا مالكينه (نكمّل).
                 pass
@@ -365,6 +371,21 @@ class Notifier:
                 log.error(
                     "خطأ في استرجاع حدث الصندوق %s (%s)", item.id, type(exc).__name__
                 )
+
+    def _is_tombstoned(self, conversation_id: str) -> bool:
+        """F-1: هل الشات عليه شاهد حذف فعّال؟ **فشل مغلق**: أي خطأ قراءة ⇒ نعتبره متشاهد.
+
+        نفس دلالة `Watcher._is_tombstoned`: مسار الاسترجاع بيبعت للمستخدم، فالإخفاء
+        المؤقت أأمن من الإرسال الخاطئ لمحتوى شات اتحذف.
+        """
+        try:
+            return self._db.is_deleted(conversation_id)
+        except Exception as exc:  # noqa: BLE001 — قاعدة غير متاحة ⇒ فشل مغلق (تخطّي)
+            log.warning(
+                "تعذّر قراءة شاهد الحذف للشات %s (%s)؛ هيتخطّى (فشل مغلق).",
+                conversation_id, type(exc).__name__,
+            )
+            return True
 
     def _watched_event_stuck(self, item) -> bool:
         """F-1: هل الحدث المعلّق ده هو الحدث **الكانوني الحالي** لمحادثة متابَعة **عالقة**؟

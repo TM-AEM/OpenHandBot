@@ -22,6 +22,8 @@ Telegram WebView ──HTTPS──▶ ingress (TLS) ──HTTP──▶ الحا
 - مفيش عملية تانية، مفيش worker تاني، مفيش اتصال SQLite تاني.
 - الواجهة والـ API على **نفس الأصل** (same-origin) ⇒ كوكي جلسة `SameSite=Strict` بدون تعقيدات CORS.
 - كل الردود JSON، والأخطاء بشكل موحّد `{"error": code, "message": ...}`.
+- ردود الـ API/المرفقات بتاخد `Content-Security-Policy: default-src 'none'; frame-ancestors …`
+  (منع تحميل/تأطير أي محتوى من رد API)، والصفحة (`/mini/`) بتاخد CSP أوسع للـ SDK بس.
 
 ## 2. التبعيات
 
@@ -162,6 +164,31 @@ Telegram WebView ──HTTPS──▶ ingress (TLS) ──HTTP──▶ الحا
 - مفيش أسرار أو توقيعات في الكوكي نفسه (توكن عشوائي، والسيرفر هو اللي يعرف معناه).
 - مستخدم غير مسموح ⇒ `403` (ومفيش أي تفاصيل حساسة في الرسالة). أي جلسة لمستخدم اتشال من
   القايمة بتتبطّل وتترفض.
+
+### نطاق دعم العميل (Telegram Web مقابل WebView)
+
+التطبيق **مصمَّم للعمل داخل عميل تيليجرام** (Android/iOS/Desktop WebView) أو داخل iframe
+تيليجرام الرسمي (Telegram Web). ده مقصود ومفروض من `frame-ancestors` في الـ CSP (تيليجرام بس)
+ومن تدفّق مصادقة `initData` (اللي بيشتغل جوه عميل تيليجرام فقط). يعني:
+
+- **مدعوم:** تيليجرام WebView (محمول/سطح مكتب) وTelegram Web (iframe على `web.telegram.org`).
+- **غير مدعوم:** فتح رابط الـ Mini App مباشرة في متصفّح عادي (مش جوه تيليجرام) — مفيش
+  `Telegram.WebApp.initData` ⇒ المصادقة تفشل عن قصد (مفيش تجاوز).
+- الكوكي `SameSite=Strict` متّسق مع ده: الواجهة والـ API **نفس الأصل**، والطلب (بعد `initData`)
+  بيتولّد **من داخل الصفحة المضمّنة** ⇒ same-site بالنسبة للمتصفّح. القيد ده **مقصود** أمنيًا
+  (خط دفاع أول ضد CSRF) وما اتضعّفش.
+
+### كشف الشاتات المحذوفة (OHB2-RESIDUAL)
+
+الواجهة **ما بتعرضش** أي عنوان/محتوى/ميتاداتا لشات عليه شاهد حذف:
+
+- **الصندوق (الإشعارات):** `list_inbox`/`count_inbox` بيستبعدوا صفوف `notification_inbox`
+  لأي `conversation_id` عليه شاهد حذف (`deleted_conversations`) ⇒ مفيش عنوان/نص شات محذوف في
+  `/api/v1/notifications` ولا في عدّاد غير المقروء (الصفوف تفضل أثر تدقيق لكن مخفية).
+- **المتابعات:** `list_watched` بيستبعد نفس الشاتات ⇒ مفيش عنوان في `/api/v1/watches`.
+- **طلبات الشات الجديد:** `list_creation_jobs_for_owner` بيستبعد أي طلب عليه شاهد حذف ⇒
+  مفيش `repository` ولا `conversation_id` لشات محذوف في `/api/v1/operations/creation/list`.
+- **مسارات الشات المفردة:** كل `/conversations/{id}/…` بتُرفض بـ `404` لشات متشاهد (فرض F-1).
 
 ### ثبات الجلسات (OHB2-PHASE1A)
 
@@ -550,6 +577,9 @@ node --test tests/frontend/*.test.js
 - **دفاع في العمق:** نطاق المالك مفروض كمان على مستوى `bot/db.py` في دوال الكتابة
   (`discard_creation_job`/`set_creation_status_if_in` بتقبل `chat_id` وبتضيف `AND chat_id=?`)،
   مش بس في الخدمة — فأي مستدعي جديد مايقدرش يعدّل صف مستخدم تاني بالغلط.
+- **استبعاد الشاتات المحذوفة (OHB2-RESIDUAL):** القايمة بتستبعد أي طلب `conversation_id`
+  عليه شاهد حذف (`NOT EXISTS ... deleted_conversations`) ⇒ مفيش `repository` ولا معرّف شات
+  محذوف بيتسرّبوا في `/operations/creation/list` (خلال نافذة الحذف الجاري كمان).
 
 ### 3. الإلغاء (`action=cancel`)
 

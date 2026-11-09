@@ -1479,7 +1479,7 @@ class _ListFakeClient:
 
 
 def test_bot_list_recovers_after_transient_db_failure(tmp_path):
-    """البوت: فشل مؤقت في قراءة الشواهد ⇒ فشل مغلق، وبعد الرجوع ⇒ القايمة ترجع."""
+    """البوت: فشل قراءة الشواهد ⇒ رسالة فشل عامة (مش «ما فيهاش شاتات»)، وبعد الرجوع ⇒ القايمة ترجع."""
     items = [
         {"id": "c1", "title": "واحد", "execution_status": "running"},
         {"id": "c2", "title": "اتنين", "execution_status": "running"},
@@ -1503,14 +1503,61 @@ def test_bot_list_recovers_after_transient_db_failure(tmp_path):
 
     db.is_deleted = flaky  # type: ignore[assignment]
 
-    # 1) انقطاع مؤقت: الفلترة تفشل ⇒ فشل مغلق (مفيش إظهار).
+    # 1) الفشل: الفلترة تفشل ⇒ رسالة فشل **عامة**، وممنوع «ما فيهاش شاتات» الكاذبة.
     second = _t55_cb_update(CQ("list:0"))
     asyncio.run(h.list_conversations(second, ctx))
-    assert _shown_ids(second) == [], "الفشل المؤقت ⇒ مفيش شاتات معروضة"
-    assert "ما فيهاش شاتات" in second.callback_query.edits[-1]
+    assert _shown_ids(second) == [], "الفشل ⇒ مفيش قايمة شاتات"
+    assert "ما فيهاش شاتات" not in second.callback_query.edits[-1]
+    assert "تعذّر عرض الشاتات" in second.callback_query.edits[-1]
 
     # 2) التعافي: القاعدة رجعت ⇒ القايمة ترجع كاملة.
     state["failing"] = False
     third = _t55_cb_update(CQ("list:0"))
     asyncio.run(h.list_conversations(third, ctx))
     assert _shown_ids(third) == ["c1", "c2"]
+
+
+def test_bot_list_permanent_db_error_shows_generic_not_empty(tmp_path):
+    """فشل **دائم** في قراءة الشواهد ⇒ رسالة فشل عامة (مفيش رسالة «ما فيهاش شاتات»)."""
+    import sqlite3
+
+    items = [{"id": "c1", "title": "واحد", "execution_status": "running"}]
+    ctx = make_context(1, tmp_path, client=_ListFakeClient(items))
+    db = ctx.bot_data["db"]
+    # نملأ الكاش الأول (قاعدة سليمة)، وبعدين نخرّب القراءة بخطأ **دائم**.
+    first = _t55_cb_update(CQ("list:0"))
+    asyncio.run(h.list_conversations(first, ctx))
+    assert _shown_ids(first) == ["c1"]
+
+    calls = {"n": 0}
+
+    def permanent(_cid):
+        calls["n"] += 1
+        raise sqlite3.OperationalError("no such table: deleted_conversations")
+
+    db.is_deleted = permanent  # type: ignore[assignment]
+
+    second = _t55_cb_update(CQ("list:0"))
+    asyncio.run(h.list_conversations(second, ctx))
+    assert _shown_ids(second) == []
+    assert "ما فيهاش شاتات" not in second.callback_query.edits[-1]
+    assert "تعذّر عرض الشاتات" in second.callback_query.edits[-1]
+    # الفشل الدائم **مش** بيتعاد (مفيش انتظار/إعادة بلا داعي).
+    assert calls["n"] == 1
+
+
+def test_bot_without_deleted_no_partial_list_on_late_failure(tmp_path):
+    """فشل بعد نجاح بعض القراءات ⇒ **مفيش** قايمة جزئية؛ الاستثناء ينتشر."""
+    items = [{"id": "c1"}, {"id": "c2"}, {"id": "c3"}]
+    calls = {"n": 0}
+
+    class _LateFail:
+        def is_deleted_with_retry(self, cid):
+            calls["n"] += 1
+            if calls["n"] == 3:  # فشل عند العنصر التالت
+                raise RuntimeError("boom")
+            return False
+
+    with pytest.raises(RuntimeError, match="boom"):
+        h._without_deleted(_LateFail(), items)
+    assert calls["n"] == 3
