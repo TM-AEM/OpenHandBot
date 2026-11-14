@@ -1,0 +1,9 @@
+-r requirements.txt
+pytest==9.0.3
+# pytest-asyncio 1.1.0 بيثبّت pytest<9؛ لازم 1.3.0+ للتوافق مع pytest 9 (إصلاح PYSEC-2026-1845).
+pytest-asyncio==1.3.0
+pyflakes==4.0.3
+# OHB2-PHASE1E: فحص أمني للتبعيات + SAST (أدوات مجانية مثبّتة، بدون حساب/خدمة مدفوعة).
+# pip-audit: SCA على requirements (PyPI advisory DB). bandit: SAST لكود التشغيل.
+pip-audit==2.10.1
+bandit==1.9.4

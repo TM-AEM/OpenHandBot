@@ -1,0 +1,377 @@
+"""تجميع البوت: الربط، طابور الإرسال، والمراقب."""
+from __future__ import annotations
+
+import logging
+from contextlib import AsyncExitStack
+
+from telegram import BotCommand, BotCommandScopeChat, MenuButtonCommands, Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    MessageHandler,
+    TypeHandler,
+    filters,
+)
+
+from . import features, handlers
+from .config import Config
+from .db import Database
+from . import deletion
+from .notifier import Notifier
+from .openhands_client import OpenHandsClient
+from .outbox import CompletionWorker, CreationWorker, OutboxWorker, completion_recover
+from .watcher import Watcher
+
+log = logging.getLogger(__name__)
+
+
+# OHB2-P0-A2: المرفق **المدعوم** الوحيد حاليًا هو `Document` (ملف/مستند) — بيحمل اسم
+# وحجم، وهو حالة الرفع الطبيعية. باقي الوسائط (صور/صوت/فيديو/ملصقات…) بتفضل على مسار
+# الرفض القديم. الفلترين **متمايزين تمامًا** (`Document` vs باقي الوسائط **بعد استبعاد
+# Document`) عشان PTB بينفّذ كل handler مطابق في المجموعة ⇒ مفيش ازدواج معالجة حتى لو
+# الرسالة حملت مستند + وسيط تاني (زي مستند + أنيميشن).
+SUPPORTED_ATTACHMENT_FILTER = filters.Document.ALL
+UNSUPPORTED_ATTACHMENT_FILTER = (
+    filters.PHOTO
+    | filters.AUDIO
+    | filters.VIDEO
+    | filters.VOICE
+    | filters.VIDEO_NOTE
+    | filters.ANIMATION
+    | filters.Sticker.ALL
+    | filters.LIVE_PHOTO
+    | filters.PAID_MEDIA
+) & ~filters.Document.ALL
+
+
+# OHB2-03: قائمة الأوامر المعروضة في قائمة تيليجرام (وصف عربي). لازم تفضل متوافقة مع
+# تسجيل الـ CommandHandler تحت — في اختبار بيثبت عدم الانحراف.
+BOT_COMMANDS: tuple[tuple[str, str], ...] = (
+    ("start", "القائمة الرئيسية"),
+    ("app", "فتح التطبيق المصغّر"),
+    ("help", "المساعدة والأوامر"),
+    ("notifications", "ضبط الإشعارات الاستباقية"),
+    ("cancel", "إلغاء التوجيه الحالي"),
+    ("outbox", "سجلات الصندوق المعلّقة"),
+    ("outbox_status", "تفاصيل سجل صندوق"),
+    ("outbox_discard", "شطب سجل صندوق"),
+    ("outbox_mark_sent", "تأكيد إرسال سجل صندوق"),
+)
+
+
+async def _register_commands(application: Application, owner_id: int) -> None:
+    """يسجّل قائمة الأوامر للمالك، ويثبّت زر القائمة على «الأوامر» (مش Web App)."""
+    commands = [BotCommand(name, desc) for name, desc in BOT_COMMANDS]
+    scope = BotCommandScopeChat(chat_id=owner_id)
+    await application.bot.set_my_commands(commands, scope=scope)
+    # القرار: زر القائمة يفضل «أوامر» عشان أي إعداد سابق من BotFather ما يستبدلش القائمة.
+    await application.bot.set_chat_menu_button(
+        chat_id=owner_id, menu_button=MenuButtonCommands()
+    )
+
+
+def build_application(config: Config) -> Application:
+    # U04: بدون concurrent_updates أي أمر بطيء (تصدير/قايمة ملفات) بيأخّر تأكيد
+    # "وصل ✅" لأن التحديثات بتتعالج واحد ورا التاني. التزامن آمن هنا لأن حالة
+    # التوجيه بتتقرأ قراءة فقط (db.awaiting_state)، واستهلاكها المتوقّع النوع مع كتابة
+    # العمل الدائم (صندوق/طلب إنشاء) وعلامة «معالَج» بيحصلوا ذرّياً في معاملة واحدة.
+    # OHB2-STAGE2 (D0): نبني التطبيق **بدون Updater** (`updater(None)`) ⇒ PTB بيسييب
+    # `update_queue` + `_update_fetcher` (بيوزّع على نفس الـ handlers) **بس مفيش سحب تلقائي**
+    # ⇒ مفيش poller تاني؛ حلقة `bot.polling` المخصّصة هي اللي بتسحب (نفس العملية/القاعدة).
+    app = (
+        Application.builder()
+        .token(config.telegram_bot_token)
+        .updater(None)
+        .concurrent_updates(True)
+        .build()
+    )
+    client = OpenHandsClient(config.openhands_base_url, config.openhands_api_key)
+    db = Database(config.db_path)
+
+    # OHB2-MANUAL-POLLING-OUTCOME: معالج أخطاء PTB يسجّل فشل التحديث **بثبات** (غير مؤهّل
+    # للإقرار) بدل ما يُبتلع كنجاح. بدونه PTB بيسجّل الاستثناء ويرجّع عاديًّا ⇒ رجوع
+    # `process_update` يبان نجاح. ما بيعملش أي عملية خارجية وما بيعيدش رفع الاستثناء.
+    app.add_error_handler(handlers.handle_processing_error)
+
+    app.bot_data["config"] = config
+    app.bot_data["client"] = client
+    app.bot_data["db"] = db
+    # OHB2-POST-PUB-01/F06: سبب فشل الإقلاع الحاجز (أو None). بيتحدّد في _post_init؛
+    # الـ readiness بيقراه عشان يعلن الحالة الحقيقية.
+    app.bot_data["startup_failed"] = None
+
+    # OHB2-DUPLICATE-TELEGRAM-PROMPT-DISPATCH: حاجز الإدخال في **أعلى أولوية** (group=-1)
+    # لكل أنواع التحديثات (نص/كولباك/أمر). PTB بينفّذ handler واحد بس لكل مجموعة، فهو
+    # أول حاجة تتشغّل وآخر حاجة في مجموعته؛ ولو التحديث مكرّر بيرمي `ApplicationHandlerStop`
+    # فيوقف كل المجموعات ⇒ تحديث واحد = قرار معالجة واحد (إرسال أو إنشاء، مش الاتنين).
+    app.add_handler(TypeHandler(Update, handlers.dedupe_update), group=-1)
+    app.add_handler(CommandHandler("start", handlers.start))
+    app.add_handler(CommandHandler("cancel", handlers.cancel_route))
+    app.add_handler(CommandHandler("help", handlers.help_command))
+    app.add_handler(CommandHandler("app", handlers.app_command))
+    app.add_handler(CommandHandler("notifications", handlers.notifications_command))
+    app.add_handler(CommandHandler("outbox", handlers.outbox_list))
+    app.add_handler(CommandHandler("outbox_status", handlers.outbox_status))
+    app.add_handler(CommandHandler("outbox_discard", handlers.outbox_discard))
+    app.add_handler(CommandHandler("outbox_mark_sent", handlers.outbox_mark_sent))
+    app.add_handler(CallbackQueryHandler(handlers.show_menu, pattern=r"^menu$"))
+    app.add_handler(CallbackQueryHandler(handlers.app_open, pattern=r"^app:open$"))
+    app.add_handler(CallbackQueryHandler(handlers.notifications_menu, pattern=r"^notif:menu$"))
+    app.add_handler(CallbackQueryHandler(handlers.notifications_toggle, pattern=r"^notif:toggle$"))
+    app.add_handler(CallbackQueryHandler(handlers.cancel_route_button, pattern=r"^cancelroute$"))
+    app.add_handler(CallbackQueryHandler(handlers.list_conversations, pattern=r"^list:"))
+    app.add_handler(CallbackQueryHandler(handlers.open_conversation, pattern=r"^open:"))
+    app.add_handler(CallbackQueryHandler(handlers.copy_reply, pattern=r"^copy:"))
+    app.add_handler(CallbackQueryHandler(handlers.full_reply, pattern=r"^full:"))
+    # OHB2-BOT-REPLY-TXT-FILE-BUTTON: تنزيل الرد الكامل كملف .txt (إجراء منفصل عن copy/full).
+    app.add_handler(CallbackQueryHandler(handlers.send_reply_txt, pattern=r"^txt:"))
+    app.add_handler(CallbackQueryHandler(handlers.show_status, pattern=r"^status:"))
+    app.add_handler(CallbackQueryHandler(handlers.reply_prompt, pattern=r"^reply:"))
+    app.add_handler(CallbackQueryHandler(handlers.start_new_chat, pattern=r"^newchat$"))
+    app.add_handler(CallbackQueryHandler(handlers.new_chat_no_repo, pattern=r"^norepo$"))
+    # OHB2-C7: حذف محلي لشات — تأكيد صريح مطلوب (delete ⇒ prompt، deleteok ⇒ تنفيذ).
+    app.add_handler(CallbackQueryHandler(handlers.delete_conversation_prompt, pattern=r"^delete:"))
+    app.add_handler(CallbackQueryHandler(handlers.delete_conversation_confirm, pattern=r"^deleteok:"))
+    app.add_handler(CallbackQueryHandler(handlers.repos_page, pattern=r"^repos:"))
+    app.add_handler(CallbackQueryHandler(handlers.repo_search_prompt, pattern=r"^reposearch$"))
+    app.add_handler(CallbackQueryHandler(handlers.pick_repo, pattern=r"^pickrepo:"))
+    # القرار 4: الميزات المؤجّلة (الملفات/التصدير/التكلفة/إدارة المتابعات) مش بتتسجّل،
+    # فحتى أي callback قديم مستني مش هيوصل لأي handler (نقاط الدخول مخفية). الكود والبيانات
+    # لسه موجودين (مش بنحذف حاجة) — بس مش معروضين للمستخدم.
+    if not features.is_hidden("followups"):
+        app.add_handler(CallbackQueryHandler(handlers.list_watches, pattern=r"^watched:"))
+        app.add_handler(CallbackQueryHandler(handlers.watch_conversation, pattern=r"^watch:"))
+        app.add_handler(CallbackQueryHandler(handlers.unwatch_conversation, pattern=r"^unwatch:"))
+    if not features.is_hidden("cost"):
+        app.add_handler(CallbackQueryHandler(handlers.show_cost, pattern=r"^cost:"))
+    if not features.is_hidden("export"):
+        app.add_handler(CallbackQueryHandler(handlers.export_conversation, pattern=r"^export:"))
+    if not features.is_hidden("files"):
+        app.add_handler(CallbackQueryHandler(handlers.list_files, pattern=r"^files:"))
+        app.add_handler(CallbackQueryHandler(handlers.show_file, pattern=r"^file:"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.handle_text))
+    # OHB2-P0-A2: المرفق **المدعوم** (`Document`) ⇒ قبول آمن وربط بمستخدم+محادثة+دفعة.
+    # OHB2-UNSUPPORTED-FILE-SAFE-REJECTION: باقي الوسائط ⇒ رفض واضح (بلا أثر جانبي).
+    # الفلترين متمايزين (Document vs الباقي) ⇒ كل رسالة بتوصل لمعالج واحد بالظبط.
+    app.add_handler(
+        MessageHandler(
+            SUPPORTED_ATTACHMENT_FILTER, handlers.handle_attachment
+        )
+    )
+    app.add_handler(
+        MessageHandler(
+            UNSUPPORTED_ATTACHMENT_FILTER, handlers.handle_unsupported_attachment
+        )
+    )
+    # OHB2-STAGE2 (D1): الـ fallback — آخر handler في group 0 (أدنى أولوية) ⇒ بيتنادى **بس**
+    # لو مفيش أي handler مطابق (زي رسالة نوع مش مدعوم، أو callback بـ pattern مش مطابق)،
+    # وبيسجّل `explicitly_ignored` (مؤهّل للإقرار ⇒ مايحجبش الحدّ للأبد). ما بيكتبش فوق نتيجة
+    # محفوظة، وما بيحوّلش استثناء لتجاهل (شوف `handlers.handle_unmatched_update`).
+    app.add_handler(TypeHandler(Update, handlers.handle_unmatched_update))
+
+    async def _post_init(application: Application) -> None:
+        # 0) صيانة تشغيل آمنة: فحص سريع للتكامل + تحسين + checkpoint للـ WAL.
+        #    OHB2-POST-PUB-01/F06: نتيجة الفحص **مرجعية**. لو القاعدة تالفة/غير مؤكدة،
+        #    **ما بنشغّلش** أي worker/مراقب/مُبلّغ وبنعلن الحالة الحقيقية. مفيش حذف/إعادة
+        #    بناء تلقائية لقاعدة تالفة.
+        #    لو `main()` عمل الفحص بالفعل (قبل polling) بنعيد استخدام نتيجته بدل تكراره.
+        if application.bot_data.get("db_checked"):
+            db_ok = db.is_healthy()
+        else:
+            db_ok = db.run_startup_maintenance()
+            application.bot_data["db_checked"] = True
+        if not db_ok:
+            application.bot_data["startup_failed"] = "database_integrity"
+            log.error(
+                "إقلاع متوقف: فحص تكامل قاعدة البيانات فشل — مفيش workers ولا polling. "
+                "راجع القاعدة يدويًا (مفيش إصلاح/حذف تلقائي)."
+            )
+            return
+        # 0.1) OHB2-03: سجّل قائمة الأوامر في واجهة تيليجرام + ثبّت زر «الأوامر».
+        #      فشل الشبكة هنا ما يمنعش تشغيل البوت (الأوامر نفسها لسه شغالة بالكتابة).
+        try:
+            await _register_commands(application, config.owner_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("تعذّر تسجيل قائمة الأوامر (%s)", type(exc).__name__)
+        # 1) تعافي الصندوق (يحوّل 'sending'/'starting' المتروك لـ 'unknown') قبل أي معالجة.
+        await handlers.outbox_recover(application)
+        await handlers.creation_recover(application)
+        # 1.1) OHB2-STABILIZATION-F02: تسوية/تعافي الإكمال المحلي (صفوف قديمة sent/done من
+        #      غير intent + إعادة تأهيل العناصر منتهية الإجارة). بدون أي POST خارجي.
+        await completion_recover(application)
+        # 1.1b) OHB2-DUPLICATE-TELEGRAM-PROMPT-DISPATCH: تقليم سجل التحديثات المعالَجة
+        #      (إضافي/غير حرج — نافذة احتفاظ ضخمة). مايمنعش الإقلاع لو فشل.
+        #      OHB2-PLAN-01-STAGE3: التقليم بقى **واعيًا بحدّ الإقرار** — بنشيل بس الصفوف
+        #      `<= الحدّ` (مؤكَّدة عند تيليجرام، مش محتاجة ديدَب). الحدّ مونوتوني ومحفوظ ⇒
+        #      مفيش خطر إعادة تنفيذ. لو مفيش حدّ ⇒ no-op (مفيش تقليم بلا watermark مؤكَّد).
+        try:
+            boundary = db.get_acknowledgment_boundary()
+            removed = db.prune_processed_updates(
+                handlers.PROCESSED_UPDATES_KEEP, boundary
+            )
+            if removed:
+                log.info(
+                    "تقليم سجل التحديثات المعالَجة (حدّ=%s): اتشال %s صف (باقي %s)",
+                    boundary, removed, db.count_processed_updates(),
+                )
+        except Exception as exc:  # noqa: BLE001 — التقليم غير حرج
+            log.warning("تقليم سجل التحديثات المعالَجة اتخطّى (%s)", type(exc).__name__)
+        # 1.2) OHB2-MINIAPP: تسوية الحذف البعيد المعلّق (شات اتحذف من OpenHands واتقطع
+        #      قبل ما نثبّت، أو العكس). best-effort: ما تمنعش الإقلاع، وما بتخمّنش (تسيب
+        #      المجهول معلّق). بتشتغل قبل الـ workers عشان مايحصلش إحياء لشات متشاهد.
+        try:
+            await deletion.reconcile_pending_deletions(client, db)
+        except Exception as exc:  # noqa: BLE001 — التسوية ما تمنعش الإقلاع
+            log.warning("تسوية الحذف البعيد المعلّق اتخطّت (%s)", type(exc).__name__)
+        # 1.3) OHB2-P0-A4: كنس الـ staging المحلي للدفعات النهائية/المنتهية + رصد منظّم.
+        #      يُستدعى من hook الإقلاع **الموجود** (مفيش worker/مجدول/عملية/مالك قاعدة جديد).
+        #      محلي فقط (بلا نداء بعيد)؛ idempotent (إعادة الكنس آمنة عند إعادة التشغيل)؛
+        #      best-effort: ما يمنعش الإقلاع لو فشل.
+        try:
+            from datetime import datetime as _datetime, timezone as _timezone
+            from .attachments import AttachmentReaper
+            AttachmentReaper(db, config.db_path).sweep(now=_datetime.now(_timezone.utc))
+        except Exception as exc:  # noqa: BLE001 — الكنس (A4) ما يمنعش الإقلاع
+            log.warning("كنس الـ staging (A4) اتخطّى (%s)", type(exc).__name__)
+        # 2) worker واحد مالك لكل جدول — يبدأوا بعد ما التعافي يخلص (عشان مايعالجوش
+        #    سجل 'sending'/'starting' قبل ما يتحوّل 'unknown'). الحرس ده يمنع worker
+        #    تاني لو اتنادت _post_init تاني (إعادة تهيئة مكرّرة).
+        if application.bot_data.get("outbox_worker") is None:
+            outbox_worker = OutboxWorker(client, db, application.bot)
+            application.bot_data["outbox_worker"] = outbox_worker
+            outbox_worker.start()
+        if application.bot_data.get("creation_worker") is None:
+            creation_worker = CreationWorker(
+                client, db, application.bot, config.openhands_base_url
+            )
+            application.bot_data["creation_worker"] = creation_worker
+            creation_worker.start()
+        # F02: worker الإكمال المحلي القابل للتعافي. ما بيعملش أي عملية خارجية (إشعارات
+        # + تسجيل متابعة بس). يبدأ بعد التعافي عشان يكمل الآثار المعلّقة من إعادة تشغيل.
+        if application.bot_data.get("completion_worker") is None:
+            completion_worker = CompletionWorker(
+                client, db, application.bot, config.openhands_base_url
+            )
+            application.bot_data["completion_worker"] = completion_worker
+            completion_worker.start()
+        # حرس زي باقي الـ workers: إعادة تهيئة مكرّرة ما تعملش task مراقب تاني.
+        if application.bot_data.get("watcher") is None:
+            watcher = Watcher(
+                client,
+                db,
+                application.bot,
+                chat_id=config.owner_id,
+                interval=config.watcher_interval,
+                allowed_chats=config.allowed_telegram_ids,  # الشات الخاص id = id المستخدم
+            )
+            application.bot_data["watcher"] = watcher
+            watcher.start()
+        # المُبلّغ العام (NTF-03): إشعارات كل المحادثات. بيشارك نفس المراقب ملكية
+        # الإشعارات المتابَعة (بيسجّل لقطتها بس بدون تسليم) عشان مفيش ازدواج.
+        if application.bot_data.get("notifier") is None:
+            notifier = Notifier(
+                client,
+                db,
+                application.bot,
+                chat_id=config.owner_id,
+                interval=config.watcher_interval,
+                base_url=config.openhands_base_url,
+                allowed_chats=config.allowed_telegram_ids,
+            )
+            application.bot_data["notifier"] = notifier
+            notifier.start()
+        # نقطة التنسيق مع المُبلّغ: بعد ما تليجرام يأكّد إشعار مملوك للمراقب، بنسجّل الحالة
+        # المعيارية عبر المُبلّغ **قبل** ما المتابعة تتشال (فما يعيدش نفس الإشعار). بنضبطها
+        # هنا بعد إنشاء المُبلّغ (المراقب بيتعمل قبله). لو التسجيل فشل، المُبلّغ بيرميها
+        # للمراقب اللي بيمنع الإزالة ويعيد المحاولة في دورة جاية.
+        watcher = application.bot_data.get("watcher")
+        notifier = application.bot_data.get("notifier")
+        if watcher is not None and notifier is not None:
+            watcher.set_owner_delivery(
+                lambda conversation_id, status, now: notifier.record_notification_sent(
+                    conversation_id, status, now
+                )
+            )
+
+    async def _post_shutdown(application: Application) -> None:
+        outbox_worker: OutboxWorker | None = application.bot_data.get("outbox_worker")
+        if outbox_worker:
+            await outbox_worker.stop()
+        creation_worker: CreationWorker | None = application.bot_data.get("creation_worker")
+        if creation_worker:
+            await creation_worker.stop()
+        completion_worker: CompletionWorker | None = application.bot_data.get("completion_worker")
+        if completion_worker:
+            await completion_worker.stop()
+        watcher: Watcher | None = application.bot_data.get("watcher")
+        if watcher:
+            await watcher.stop()
+        notifier: Notifier | None = application.bot_data.get("notifier")
+        if notifier:
+            await notifier.stop()
+        await client.aclose()
+        # إغلاق نظيف: نرجّع بيانات WAL للقاعدة الرئيسية ونقصّر الـ WAL.
+        try:
+            db.checkpoint()
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).warning("checkpoint عند الإغلاق اتخطّى (%s)", type(exc).__name__)
+        db.close()
+
+    app.post_init = _post_init
+    app.post_shutdown = _post_shutdown
+
+    # OHB2-05: خلفية الـ Mini App. مقفولة افتراضيًا؛ لما تتفتح بنشغّل ASGI جوه نفس
+    # العملية (نفس قاعدة البيانات، مفيش worker تاني). لو السيرفر فشل يبدأ (منفذ مستخدم)
+    # بنفشل التشغيل كله بوضوح بدل ما نكمل بحالة غير متسقة.
+    _wire_mini_app(app, config, db)
+    return app
+
+
+def _wire_mini_app(application: Application, config: Config, db: Database) -> None:
+    """يربط خلفية الـ Mini App بدورة حياة البوت (OHB2-05)."""
+    if not config.mini_app_enabled:
+        return
+    if not config.mini_app_url:
+        raise RuntimeError(
+            "MINI_APP_ENABLED=1 لكن MINI_APP_URL فاضي — لازم رابط https عام للـ Mini App"
+        )
+
+    from .web import build_web_app
+    from .web.runner import web_server_lifespan
+
+    web_app = build_web_app(config, db, client=application.bot_data.get("client"), application=application)
+    application.bot_data["mini_app"] = web_app
+
+    original_post_init = application.post_init
+    original_post_shutdown = application.post_shutdown
+    exit_stack = AsyncExitStack()
+
+    async def _mini_post_init(application: Application) -> None:
+        if original_post_init is not None:
+            await original_post_init(application)
+        # حرس: إعادة تهيئة مكرّرة ما تبدأش سيرفر تاني.
+        if application.bot_data.get("mini_app_server") is not None:
+            return
+        # بنبدأ السيرفر بعد ما الـ workers/المراقب يشتغلوا. لو رفع، الخطأ بيطلع ويوقف
+        # التشغيل كله (ما بنسيبهوش يفشل بصمت).
+        stack = await exit_stack.__aenter__()
+        server, task = await stack.enter_async_context(
+            web_server_lifespan(web_app, "0.0.0.0", config.mini_app_port)
+        )
+        application.bot_data["mini_app_server"] = server
+        application.bot_data["mini_app_task"] = task
+        logging.getLogger(__name__).info(
+            "Mini App بيستمع على 0.0.0.0:%s", config.mini_app_port
+        )
+
+    async def _mini_post_shutdown(application: Application) -> None:
+        try:
+            await exit_stack.aclose()
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).warning("إغلاق الـ Mini App اتخطّى (%s)", type(exc).__name__)
+        if original_post_shutdown is not None:
+            await original_post_shutdown(application)
+
+    application.post_init = _mini_post_init
+    application.post_shutdown = _mini_post_shutdown

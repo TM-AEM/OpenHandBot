@@ -1,0 +1,189 @@
+:root {
+  --bg: #0f172a;
+  --panel: #1e293b;
+  --panel-2: #273449;
+  --text: #e2e8f0;
+  --muted: #94a3b8;
+  --accent: #38bdf8;
+  --danger: #f87171;
+  --ok: #34d399;
+  --radius: 14px;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f1f5f9;
+    --panel: #ffffff;
+    --panel-2: #e2e8f0;
+    --text: #0f172a;
+    --muted: #64748b;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", Tahoma, sans-serif;
+  font-size: 16px;
+  line-height: 1.6;
+  -webkit-text-size-adjust: 100%;
+}
+
+.app {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 12px 14px calc(24px + env(safe-area-inset-bottom));
+  min-height: 100vh;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 2px 16px;
+}
+
+.brand { font-weight: 700; font-size: 1.15rem; }
+
+.badge {
+  font-size: .72rem;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--panel-2);
+  color: var(--muted);
+}
+
+.state { text-align: center; padding: 48px 12px; }
+.state-title { font-size: 1.05rem; margin: 8px 0 4px; }
+.state-msg { color: var(--muted); margin: 0 0 18px; }
+.icon { font-size: 2rem; }
+
+.spinner {
+  width: 34px; height: 34px; margin: 0 auto 12px;
+  border: 3px solid var(--panel-2);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin .9s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 2.5s; } }
+
+.content { display: grid; gap: 12px; }
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--panel-2);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+}
+
+.card.row { display: flex; align-items: center; justify-content: space-between; }
+.card-label { color: var(--muted); font-size: .85rem; margin: 0 0 4px; }
+.card-value { font-size: 1.1rem; font-weight: 600; margin: 0; }
+
+.pill {
+  font-size: .8rem;
+  padding: 3px 12px;
+  border-radius: 999px;
+  background: var(--panel-2);
+  color: var(--muted);
+}
+.pill.on { background: rgba(52, 211, 153, .18); color: var(--ok); }
+.pill.off { background: rgba(248, 113, 113, .18); color: var(--danger); }
+
+.hint { color: var(--muted); font-size: .82rem; text-align: center; margin: 6px 4px 0; }
+/* OHB2-C7: نص تأكيد الحذف المحلي — بيسمّي الشات المطلوب حذفه (كلاس مستقل مش .hint). */
+.delete-confirm-note { color: var(--danger); font-size: .85rem; text-align: center; margin: 6px 4px; }
+
+.btn {
+  appearance: none;
+  border: 0;
+  border-radius: 10px;
+  background: var(--accent);
+  color: #06202e;
+  font-weight: 700;
+  font-size: 1rem;
+  padding: 11px 22px;
+  cursor: pointer;
+  min-height: 44px;
+}
+.btn:active { transform: scale(.98); }
+.btn[disabled] { opacity: .6; cursor: default; }
+
+/* OHB2-06: عناصر الواجهة الوظيفية */
+.topbar .user { font-size: 13px; opacity: .8; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tabs { display: flex; gap: 6px; overflow-x: auto; padding: 4px 0 8px; }
+.tab { flex: 1 0 auto; padding: 8px 12px; border: 1px solid #334155; background: transparent; color: inherit; border-radius: 999px; font-size: 13px; }
+.tab.active { background: #1d4ed8; border-color: #1d4ed8; color: #fff; }
+.toolbar { display: flex; justify-content: flex-end; margin-bottom: 8px; }
+.filter-bar { display: flex; gap: 6px; margin-bottom: 8px; overflow-x: auto; padding: 2px 0; }
+.chip { flex: 0 0 auto; padding: 6px 12px; border: 1px solid #334155; background: transparent; color: inherit; border-radius: 999px; font-size: 13px; }
+.chip.active { background: #1d4ed8; border-color: #1d4ed8; color: #fff; }
+.list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 12px; border: 1px solid #334155; border-radius: 12px; cursor: pointer; }
+.row-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 auto; }
+.row-pills { display: flex; gap: 4px; align-items: center; flex: 0 0 auto; }
+.row-actions { display: flex; gap: 4px; align-items: center; flex: 0 0 auto; }
+.row.archived { opacity: .7; }
+.row-title { font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row-sub { font-size: 12px; opacity: .65; }
+
+/* OHB2-08-05: صف إشعار غير مقروء + شارة العدد في التبويب. */
+.row.unread { border-inline-start: 3px solid #1d4ed8; }
+#inbox-badge {
+  background: #b91c1c;
+  color: #fff;
+  margin-inline-start: 4px;
+  vertical-align: middle;
+}
+.loading-row, .empty-row { padding: 14px; text-align: center; opacity: .7; font-size: 14px; list-style: none; }
+.pill { font-size: 12px; padding: 3px 8px; border-radius: 999px; background: #334155; color: #e2e8f0; white-space: nowrap; }
+.pill[data-status="running"] { background: #1d4ed8; }
+.pill[data-status="finished"] { background: #15803d; }
+.pill[data-status="error"], .pill[data-status="sandbox_error"] { background: #b91c1c; }
+.pill[data-status="waiting_for_confirmation"] { background: #b45309; }
+/* OHB2-08-05 (Batch 3R): شارة حالة تسليم الإشعار (pending/failed). */
+.pill.delivery { background: #7c3aed; }
+.card { display: flex; flex-direction: column; gap: 4px; padding: 14px; border: 1px solid #334155; border-radius: 12px; margin-bottom: 10px; }
+.card.row { flex-direction: row; align-items: center; justify-content: space-between; }
+.bubble { border-radius: 12px; padding: 10px 12px; margin-bottom: 10px; }
+.bubble.user { background: #1e293b; }
+.bubble.agent { background: #0b3b2e; }
+.bubble-label { font-size: 11px; opacity: .7; display: block; margin-bottom: 4px; }
+.bubble-text { margin: 0; font-size: 14px; white-space: pre-wrap; word-break: break-word; }
+.field { display: flex; gap: 8px; margin-bottom: 10px; }
+.input, .textarea { width: 100%; padding: 10px; border-radius: 10px; border: 1px solid #334155; background: transparent; color: inherit; font: inherit; }
+.textarea { margin-bottom: 10px; }
+.newchat-form { margin-top: 12px; }
+.btn.small { padding: 6px 12px; font-size: 13px; }
+.btn.ghost { background: transparent; border: 1px solid #334155; color: inherit; }
+.btn.on { background: #15803d; }
+/* OHB2-C7: زر خطر (حذف) + صف أزرار الحذف (تأكيد/إلغاء) — RTL آمن. */
+.btn.danger { background: #b91c1c; color: #fff; }
+.toolbar { gap: 8px; }
+.link { color: #60a5fa; font-size: 13px; }
+.more { display: flex; justify-content: center; margin-top: 10px; }
+.toast { position: fixed; inset-inline: 0; bottom: 18px; margin: 0 auto; width: fit-content; max-width: 90%; padding: 10px 16px; border-radius: 999px; background: #0f172a; color: #f8fafc; font-size: 14px; box-shadow: 0 6px 20px rgba(0,0,0,.35); }
+.op-box { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; }
+.op-status { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+.op-label { opacity: .75; }
+.op-pill { font-size: 12px; padding: 3px 10px; border-radius: 999px; background: #334155; color: #e2e8f0; white-space: nowrap; }
+.op-pill[data-op="pending"] { background: #475569; }
+.op-pill[data-op="accepted"] { background: #15803d; }
+.op-pill[data-op="failed"] { background: #b91c1c; }
+.op-pill[data-op="ambiguous"] { background: #b45309; }
+.op-pill[data-op="unknown"] { background: #475569; }
+.op-note { margin: 0; font-size: 13px; opacity: .85; }
+.op-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+/* OHB2-09-02: قسم ملفات الشات (قايمة + معاينة نصية محدودة). */
+.files-section { margin-top: 16px; border-top: 1px solid #1e293b; padding-top: 12px; }
+.files-section .toolbar { display: flex; justify-content: space-between; align-items: center; }
+.file-preview { margin-top: 10px; }
+.file-text { margin: 0; padding: 10px; border-radius: 10px; background: #0b1220; color: #e2e8f0; font-size: 13px; direction: ltr; text-align: left; white-space: pre-wrap; word-break: break-word; max-height: 340px; overflow: auto; }
+/* OHB2-09-04: قسم التكلفة/الاستهلاك. */
+.cost-section { margin-top: 16px; border-top: 1px solid #1e293b; padding-top: 12px; }
+.cost-text { margin: 6px 0 0; padding: 10px; border-radius: 10px; background: #0b1220; color: #e2e8f0; font-size: 13px; white-space: pre-wrap; }

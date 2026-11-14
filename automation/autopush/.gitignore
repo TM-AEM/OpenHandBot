@@ -1,0 +1,4 @@
+autopush.log
+*.log
+*.pid
+.state/

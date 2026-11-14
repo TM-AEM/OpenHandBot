@@ -1,0 +1,1595 @@
+import asyncio
+import sqlite3
+from types import SimpleNamespace
+
+import pytest
+
+import bot.handlers as h
+from bot import outbox
+from bot.db import Database
+from bot.errors import ApiError
+from bot.file_cache import FileCache
+
+
+class FakeMessage:
+    def __init__(self):
+        self.replies = []
+
+    async def reply_text(self, text, **kw):
+        self.replies.append(text)
+
+
+class FakeQuery:
+    def __init__(self):
+        self.edits = []
+        self.edits_markup = []
+        self.message = SimpleNamespace(chat_id=99)
+
+    async def answer(self):
+        pass
+
+    async def edit_message_text(self, text, **kw):
+        self.edits.append(text)
+        self.edits_markup.append(kw.get("reply_markup"))
+
+
+def make_update(user_id, text="hi"):
+    msg = FakeMessage()
+    msg.text = text
+    return SimpleNamespace(
+        effective_user=SimpleNamespace(id=user_id),
+        effective_chat=SimpleNamespace(id=99, type="private"),
+        message=msg,
+        callback_query=None,
+    )
+
+
+class FakeConfig:
+    def __init__(self, allowed_id):
+        self.allowed_telegram_ids = frozenset({allowed_id})
+        self.owner_id = allowed_id
+        self.openhands_base_url = "https://app.all-hands.dev"
+        # OHB2-MINIAPP: زر web_app بيتعرض بس لما الميزة مفعّلة والرابط مهيّأ.
+        self.mini_app_enabled = False
+        self.mini_app_url = ""
+
+    def is_allowed(self, user_id):
+        return user_id in self.allowed_telegram_ids
+
+
+def make_context(allowed_id, tmp_path, client=None):
+    ctx = SimpleNamespace()
+    ctx.bot_data = {
+        "config": FakeConfig(allowed_id),
+        "db": Database(str(tmp_path / "t.sqlite3")),
+        "client": client,
+    }
+    ctx.bot = SimpleNamespace(sent=[], send_message=None)
+    return ctx
+
+
+def test_handle_text_ignores_non_owner(tmp_path):
+    ctx = make_context(1, tmp_path)
+    update = make_update(999)
+    asyncio.run(h.handle_text(update, ctx))
+    assert update.message.replies == []
+
+
+def test_handle_text_owner_without_state_gets_hint(tmp_path):
+    ctx = make_context(1, tmp_path)
+    update = make_update(1)
+    asyncio.run(h.handle_text(update, ctx))
+    assert len(update.message.replies) == 1
+    assert "/start" in update.message.replies[0]
+
+
+def test_reply_acks_instantly_then_background(tmp_path, monkeypatch):
+    ctx = make_context(1, tmp_path)
+    ctx.bot_data["db"].set_awaiting(1, "conv-1", "reply")
+    update = make_update(1, text="برومت")
+
+    scheduled = []
+
+    def fake_create_task(coro):
+        scheduled.append(coro)
+        coro.close()
+        return None
+
+    monkeypatch.setattr(asyncio, "create_task", fake_create_task)
+    asyncio.run(h.handle_text(update, ctx))
+
+    assert update.message.replies == ["وصل ✅"]
+    # مفيش task جديد لكل برومت: الـ worker الواحد هو اللي بياخد السجل.
+    assert scheduled == []
+    assert ctx.bot_data["db"].count_outbox("pending") == 1
+    # الحالة اتشالت بعد الإرسال
+    assert ctx.bot_data["db"].get_awaiting(1) == (None, None)
+
+
+def test_start_ignores_non_owner(tmp_path):
+    ctx = make_context(1, tmp_path)
+    update = make_update(999)
+    asyncio.run(h.start(update, ctx))
+    assert update.message.replies == []
+
+
+def test_start_owner_gets_menu(tmp_path):
+    ctx = make_context(1, tmp_path)
+    update = make_update(1)
+    asyncio.run(h.start(update, ctx))
+    assert len(update.message.replies) == 1
+
+
+class FakeClient:
+    def __init__(self, items):
+        self._items = items
+
+    async def search_conversations(self, limit=20, page_id=None):
+        return {"items": self._items[:limit], "next_page_id": None}
+
+
+def _list_update(user_id, page):
+    msg = FakeMessage()
+    q = FakeQuery()
+    q.data = f"list:{page}"
+    return SimpleNamespace(
+        effective_user=SimpleNamespace(id=user_id),
+        effective_chat=SimpleNamespace(id=99, type="private"),
+        message=msg,
+        callback_query=q,
+    )
+
+
+def test_list_conversations_paginates_locally(tmp_path):
+    items = [{"id": f"c{i}", "title": f"شات {i}", "execution_status": "running"} for i in range(15)]
+    ctx = make_context(1, tmp_path, client=FakeClient(items))
+
+    update = _list_update(1, 0)
+    asyncio.run(h.list_conversations(update, ctx))
+    first = update.callback_query.edits[-1]
+    assert "صفحة 1" in first
+
+    update = _list_update(1, 1)
+    asyncio.run(h.list_conversations(update, ctx))
+    second = update.callback_query.edits[-1]
+    assert "صفحة 2" in second
+
+
+def test_list_conversations_ignores_non_owner(tmp_path):
+    ctx = make_context(1, tmp_path, client=FakeClient([]))
+    update = _list_update(999, 0)
+    asyncio.run(h.list_conversations(update, ctx))
+    assert update.callback_query.edits == []
+
+
+class DetailClient:
+    # OHB2-09-A2-01/02: تفويض الشات بقى بيتحقّق من الملكية ⇒ العميل الوهمي بيعرّف هوية
+    # `/users/me` وبيضمن `created_by_user_id` مطابق (تقدر تتخطّى القيمة صراحةً في `conv`).
+    OWNER_UUID = "owner-uuid-123"
+
+    def __init__(self, conv, files=None, content="", blob=b"zip"):
+        self._conv = conv
+        self._files = files or []
+        self._content = content
+        self._blob = blob
+
+    async def get_conversations(self, ids):
+        if not self._conv:
+            return []
+        conv = {
+            **self._conv,
+            "created_by_user_id": self._conv.get("created_by_user_id", self.OWNER_UUID),
+        }
+        return [conv]
+
+    async def get_current_user(self):
+        return {"id": self.OWNER_UUID}
+
+    async def list_files(self, conversation_id, path=""):
+        return self._files
+
+    async def read_file(self, conversation_id, file_path):
+        return self._content
+
+    async def read_file_text_bounded(self, conversation_id, file_path, max_response_bytes=None):
+        # OHB2-09-06: مسار البوت بقى بيقرا محدود عبر FileService ⇒ الفيك لازم يدعم العقد ده.
+        return self._content
+
+    async def export_conversation(self, conversation_id):
+        return self._blob
+
+
+class FakeBotWithDocs:
+    def __init__(self):
+        self.sent = []
+        self.documents = []
+
+    async def send_message(self, chat_id=None, text=None, **kw):
+        self.sent.append(text)
+
+    async def send_document(self, chat_id=None, document=None, **kw):
+        self.documents.append(document)
+
+
+def _cb_update(user_id, data):
+    q = FakeQuery()
+    q.data = data
+    return SimpleNamespace(
+        effective_user=SimpleNamespace(id=user_id),
+        effective_chat=SimpleNamespace(id=99, type="private"),
+        message=SimpleNamespace(),
+        callback_query=q,
+    )
+
+
+def _ctx_with(tmp_path, client):
+    ctx = make_context(1, tmp_path, client=client)
+    ctx.bot = FakeBotWithDocs()
+    return ctx
+
+
+class DeliverClient:
+    """عميل كفاية لمسار _deliver_outbox: شات + إرسال رسالة."""
+
+    def __init__(self, conv, send_error=None):
+        self._conv = conv
+        self._send_error = send_error
+        self.sent_prompts = []
+
+    async def get_conversations(self, ids):
+        return [self._conv] if self._conv else []
+
+    async def resume_sandbox(self, sandbox_id):
+        pass
+
+    async def send_message(self, conversation_id, text):
+        if self._send_error:
+            raise self._send_error
+        self.sent_prompts.append((conversation_id, text))
+
+
+def _seed_outbox(db, conversation_id="c1", chat_id=99, text="برومت"):
+    return db.add_outbox(conversation_id, chat_id, text, "2026-01-01T00:00:00+00:00")
+
+
+def test_deliver_outbox_baselines_actual_state_not_assumed_running(tmp_path):
+    # U01 / TASK 04A-3: لو الشات كان منتهي قبل الإرسال، لازم نخزّن الحالة الفعلية
+    # (finished) مش "running" مفترضة — عشان المراقب مايدّيش انتقال وهمي ويسلّم تقرير قديم.
+    client = DeliverClient(
+        {"id": "c1", "title": "شات", "execution_status": "finished", "sandbox_status": "RUNNING"}
+    )
+    ctx = _ctx_with(tmp_path, client)
+    db = ctx.bot_data["db"]
+    oid = _seed_outbox(db)
+    asyncio.run(h._deliver_outbox(client, db, ctx.bot, oid))
+
+    watched = db.list_watched()
+    assert len(watched) == 1
+    assert watched[0].conversation_id == "c1"
+    assert watched[0].last_state == "finished"
+    assert watched[0].last_state != "running"
+    assert client.sent_prompts == [("c1", "برومت")]
+    assert db.get_outbox(oid).status == "sent"
+
+
+def test_deliver_outbox_baselines_running_state(tmp_path):
+    client = DeliverClient(
+        {"id": "c1", "title": "شات", "execution_status": "running", "sandbox_status": "RUNNING"}
+    )
+    ctx = _ctx_with(tmp_path, client)
+    db = ctx.bot_data["db"]
+    oid = _seed_outbox(db)
+    asyncio.run(h._deliver_outbox(client, db, ctx.bot, oid))
+
+    assert db.list_watched()[0].last_state == "running"
+
+
+def test_deliver_outbox_handles_missing_state_as_unknown(tmp_path):
+    # حالة malformed/مفقودة → برضه مش "running" (fail closed).
+    client = DeliverClient({"id": "c1", "title": "شات", "sandbox_status": "RUNNING"})
+    ctx = _ctx_with(tmp_path, client)
+    db = ctx.bot_data["db"]
+    oid = _seed_outbox(db)
+    asyncio.run(h._deliver_outbox(client, db, ctx.bot, oid))
+
+    assert db.list_watched()[0].last_state == ""
+
+
+def test_show_status_reports_state(tmp_path):
+    client = DetailClient({"id": "c1", "title": "شات", "execution_status": "running", "sandbox_status": "RUNNING"})
+    ctx = _ctx_with(tmp_path, client)
+    update = _cb_update(1, "status:c1")
+    asyncio.run(h.show_status(update, ctx))
+    assert "شغال" in update.callback_query.edits[-1]
+    assert "RUNNING" in update.callback_query.edits[-1]
+
+
+def test_show_cost_reports_metrics(tmp_path):
+    client = DetailClient({"id": "c1", "metrics": {"model_name": "m", "accumulated_cost": 2.5}})
+    ctx = _ctx_with(tmp_path, client)
+    update = _cb_update(1, "cost:c1")
+    asyncio.run(h.show_cost(update, ctx))
+    assert "$2.5" not in update.callback_query.edits[-1]  # OHB2-09-A2-03: مفيش عملة مفبركة
+    assert "2.5000" in update.callback_query.edits[-1]
+
+
+def test_list_files_caches_and_paginates(tmp_path):
+    files = [f"f{i}.py" for i in range(12)]
+    ctx = _ctx_with(tmp_path, DetailClient({"id": "c1"}, files=files))
+    update = _cb_update(1, "files:c1:0")
+    asyncio.run(h.list_files(update, ctx))
+    cached = ctx.bot_data["file_cache"].get("c1")
+    assert cached is not None and cached[0] == files
+    assert "صفحة 1" in update.callback_query.edits[-1]
+
+
+def test_show_file_sends_document(tmp_path):
+    ctx = _ctx_with(tmp_path, DetailClient({"id": "c1"}, files=["a/b/main.py"], content="hello"))
+    cache = FileCache(); gen = cache.put("c1", ["a/b/main.py"]); ctx.bot_data["file_cache"] = cache
+    update = _cb_update(1, f"file:c1:{gen}:0")
+    asyncio.run(h.show_file(update, ctx))
+    assert len(ctx.bot.documents) == 1
+
+
+def test_export_sends_zip(tmp_path):
+    ctx = _ctx_with(tmp_path, DetailClient({"id": "c1"}))
+    update = _cb_update(1, "export:c1")
+    asyncio.run(h.export_conversation(update, ctx))
+    assert len(ctx.bot.documents) == 1
+
+
+def test_list_watches_empty(tmp_path):
+    ctx = _ctx_with(tmp_path, DetailClient(None))
+    update = _cb_update(1, "watched:0")
+    asyncio.run(h.list_watches(update, ctx))
+    assert "مفيش" in update.callback_query.edits[-1]
+
+
+def test_list_watches_shows_items(tmp_path):
+    ctx = _ctx_with(tmp_path, DetailClient(None))
+    ctx.bot_data["db"].add_watched("c1", "شات", chat_id=99)
+    update = _cb_update(1, "watched:0")
+    asyncio.run(h.list_watches(update, ctx))
+    assert "متابعاتي" in update.callback_query.edits[-1]
+
+
+def test_watch_conversation_adds_to_db(tmp_path):
+    ctx = _ctx_with(tmp_path, DetailClient({"id": "c1", "title": "شات", "execution_status": "running"}))
+    update = _cb_update(1, "watch:c1")
+    asyncio.run(h.watch_conversation(update, ctx))
+    assert ctx.bot_data["db"].is_watched("c1")
+    assert ctx.bot_data["db"].list_watched()[0].chat_id == 99
+
+
+def test_unwatch_conversation_removes(tmp_path):
+    ctx = _ctx_with(tmp_path, DetailClient(None))
+    ctx.bot_data["db"].add_watched("c1")
+    update = _cb_update(1, "unwatch:c1")
+    asyncio.run(h.unwatch_conversation(update, ctx))
+    assert not ctx.bot_data["db"].is_watched("c1")
+
+
+# ------------------------------------------------------- outbox delivery (U03)
+class OutboxBot:
+    """بوت تيليجرام fake مع رسائل مرصودة وفشل اختياري."""
+
+    def __init__(self, fail_contains=None):
+        self.sent = []
+        self._fail_contains = fail_contains
+
+    async def send_message(self, chat_id=None, text=None, **kw):
+        if self._fail_contains and self._fail_contains in (text or ""):
+            from telegram.error import TelegramError
+
+            raise TelegramError("boom")
+        self.sent.append(text)
+
+
+def _deliver(conv, db, bot, oid, send_error=None):
+    client = DeliverClient(conv, send_error=send_error)
+    asyncio.run(h._deliver_outbox(client, db, bot, oid))
+    return client
+
+
+def test_outbox_persisted_before_post_attempt(tmp_path):
+    # لازم يكون فيه سجل outbox قبل ما الـ POST يبدأ: نتحقق من جوه الـ client نفسه.
+    db = Database(str(tmp_path / "t.sqlite3"))
+    seen = {}
+
+    class ProbeClient:
+        async def get_conversations(self, ids):
+            return [{"id": "c1", "title": "شات", "sandbox_status": "RUNNING"}]
+
+        async def send_message(self, conversation_id, text):
+            seen["rows_at_post"] = db.count_outbox()
+
+    oid = db.add_outbox("c1", 99, "برومت", outbox.now_iso())
+    asyncio.run(h._deliver_outbox(ProbeClient(), db, OutboxBot(), oid))
+    assert seen["rows_at_post"] == 1  # السجل موجود قبل الـ POST
+    assert db.get_outbox(oid).status == "sent"
+
+
+def test_outbox_confirmed_success_is_sent(tmp_path):
+    db = Database(str(tmp_path / "t.sqlite3"))
+    oid = db.add_outbox("c1", 99, "برومت", outbox.now_iso())
+    bot = OutboxBot()
+    client = _deliver(
+        {"id": "c1", "title": "شات", "execution_status": "running", "sandbox_status": "RUNNING"},
+        db, bot, oid,
+    )
+    assert db.get_outbox(oid).status == "sent"
+    assert client.sent_prompts == [("c1", "برومت")]
+    assert any("اتبعت" in s for s in bot.sent)
+
+
+def test_outbox_definite_rejection_is_failed_and_not_retried(tmp_path):
+    db = Database(str(tmp_path / "t.sqlite3"))
+    oid = db.add_outbox("c1", 99, "برومت", outbox.now_iso())
+    bot = OutboxBot()
+    _deliver(
+        {"id": "c1", "title": "شات", "sandbox_status": "RUNNING"}, db, bot, oid,
+        send_error=ApiError("طلب غير صحيح", 422),
+    )
+    item = db.get_outbox(oid)
+    assert item.status == "failed"
+    assert item.error == "HTTP 422"
+    assert not db.is_watched("c1")
+    assert db.list_outbox_by_status("pending") == []  # مايتعادش تلقائياً
+
+
+def test_outbox_timeout_after_post_is_unknown_and_not_retried(tmp_path):
+    db = Database(str(tmp_path / "t.sqlite3"))
+    oid = db.add_outbox("c1", 99, "برومت", outbox.now_iso())
+    _deliver(
+        {"id": "c1", "title": "شات", "sandbox_status": "RUNNING"}, db, OutboxBot(), oid,
+        send_error=ApiError("تعذّر الاتصال", None),
+    )
+    assert db.get_outbox(oid).status == "unknown"
+    assert not db.is_watched("c1")
+
+
+def test_outbox_connection_failure_ambiguous_is_not_blindly_retried(tmp_path):
+    db = Database(str(tmp_path / "t.sqlite3"))
+    oid = db.add_outbox("c1", 99, "برومت", outbox.now_iso())
+    _deliver(
+        {"id": "c1", "title": "شات", "sandbox_status": "RUNNING"}, db, OutboxBot(), oid,
+        send_error=ApiError("تعذّر الاتصال بـ OpenHands", None),
+    )
+    assert db.get_outbox(oid).status == "unknown"
+    # 'unknown' ⇒ recovery مش هيعيده.
+    app = SimpleNamespace(bot_data={"db": db, "client": None}, bot=OutboxBot())
+    asyncio.run(h.outbox_recover(app))
+    assert db.get_outbox(oid).status == "unknown"
+
+
+def test_outbox_failure_before_post_is_safe_to_retry(tmp_path):
+    # فشل قراءة الشات قبل الـ POST ⇒ البرومت ماتبعتش ⇒ 'pending' (آمن يتعاود).
+    db = Database(str(tmp_path / "t.sqlite3"))
+    oid = db.add_outbox("c1", 99, "برومت", outbox.now_iso())
+
+    class BoomClient:
+        async def get_conversations(self, ids):
+            raise ApiError("تعذّر الاتصال", None)
+
+    asyncio.run(h._deliver_outbox(BoomClient(), db, OutboxBot(), oid))
+    assert db.get_outbox(oid).status == "pending"
+
+
+def test_outbox_cancellation_during_post_is_unknown(tmp_path):
+    db = Database(str(tmp_path / "t.sqlite3"))
+    oid = db.add_outbox("c1", 99, "برومت", outbox.now_iso())
+
+    class CancelClient:
+        async def get_conversations(self, ids):
+            return [{"id": "c1", "title": "شات", "sandbox_status": "RUNNING"}]
+
+        async def send_message(self, conversation_id, text):
+            raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(h._deliver_outbox(CancelClient(), db, OutboxBot(), oid))
+    assert db.get_outbox(oid).status == "unknown"
+
+
+def test_outbox_sandbox_not_ready_stays_pending(tmp_path):
+    db = Database(str(tmp_path / "t.sqlite3"))
+    oid = db.add_outbox("c1", 99, "برومت", outbox.now_iso())
+    _deliver({"id": "c1", "title": "شات", "sandbox_status": "PAUSED"}, db, OutboxBot(), oid)
+    assert db.get_outbox(oid).status == "pending"
+    assert not db.is_watched("c1")
+
+
+def test_outbox_notification_failure_does_not_change_status(tmp_path):
+    db = Database(str(tmp_path / "t.sqlite3"))
+    oid = db.add_outbox("c1", 99, "برومت", outbox.now_iso())
+    bot = OutboxBot(fail_contains="اتبعت")
+    _deliver(
+        {"id": "c1", "title": "شات", "execution_status": "running", "sandbox_status": "RUNNING"},
+        db, bot, oid,
+    )
+    assert db.get_outbox(oid).status == "sent"  # فشل الإشعار مايغيّرش الحالة
+
+
+# ------------------------------------------------------- recovery (startup)
+def _recover_app(db, client=None, bot=None):
+    return SimpleNamespace(bot_data={"db": db, "client": client}, bot=bot or OutboxBot())
+
+
+def test_recovery_leaves_pending_for_worker(tmp_path):
+    # 'pending' مالمستش خالص ⇒ آمن: التعافي مايعملش حاجة بيه، والـ worker بياخده بعدين.
+    db = Database(str(tmp_path / "t.sqlite3"))
+    oid = db.add_outbox("c1", 99, "برومت", outbox.now_iso())
+    client = DeliverClient({"id": "c1", "title": "شات", "sandbox_status": "RUNNING"})
+    asyncio.run(h.outbox_recover(_recover_app(db, client)))
+    assert db.get_outbox(oid).status == "pending"
+    assert client.sent_prompts == []  # التعافي نفسه مابعتش حاجة
+
+
+def test_recovery_marks_sending_as_unknown_and_notifies(tmp_path):
+    db = Database(str(tmp_path / "t.sqlite3"))
+    oid = db.add_outbox("c1", 99, "برومت", outbox.now_iso())
+    db.set_outbox_status(oid, "sending", outbox.now_iso())  # قطع أثناء الإرسال
+    bot = OutboxBot()
+    asyncio.run(h.outbox_recover(_recover_app(db, bot=bot)))
+    assert db.get_outbox(oid).status == "unknown"
+    assert any("مش متأكدين" in s for s in bot.sent)
+
+
+def test_recovery_never_resends_sent_unknown_failed(tmp_path):
+    db = Database(str(tmp_path / "t.sqlite3"))
+    ids = {}
+    for st in ("sent", "unknown", "failed"):
+        oid = db.add_outbox("c1", 99, f"برومت {st}", outbox.now_iso())
+        db.set_outbox_status(oid, st, outbox.now_iso())
+        ids[st] = oid
+
+    class ExplodeClient:
+        async def get_conversations(self, ids):
+            raise AssertionError("ماينفعش نلمس 'sent'/'unknown'/'failed'")
+
+        async def send_message(self, conversation_id, text):
+            raise AssertionError("ماينفعش نرسل 'sent'/'unknown'/'failed'")
+
+    asyncio.run(h.outbox_recover(_recover_app(db, ExplodeClient())))
+    for st, oid in ids.items():
+        assert db.get_outbox(oid).status == st
+
+
+def test_recovery_is_idempotent_no_duplicate_rows(tmp_path):
+    db = Database(str(tmp_path / "t.sqlite3"))
+    oid = db.add_outbox("c1", 99, "برومت", outbox.now_iso())
+    db.set_outbox_status(oid, "sending", outbox.now_iso())
+    app = _recover_app(db, client=None)
+    asyncio.run(h.outbox_recover(app))
+    asyncio.run(h.outbox_recover(app))  # إعادة تشغيل تانية
+    assert db.get_outbox(oid).status == "unknown"
+    assert db.count_outbox() == 1  # مفيش سجل مكرّر
+
+
+def test_recovery_sending_without_client_still_marks_unknown(tmp_path):
+    # عنصر 'sending' اتحوّل 'unknown' من غير أي محاولة إرسال (حتى لو الـ client None).
+    db = Database(str(tmp_path / "t.sqlite3"))
+    oid = db.add_outbox("c1", 99, "برومت", outbox.now_iso())
+    db.set_outbox_status(oid, "sending", outbox.now_iso())
+    asyncio.run(h.outbox_recover(_recover_app(db, client=None)))
+    assert db.get_outbox(oid).status == "unknown"
+
+
+
+# ------------------------------------------- outbox + awaiting / authorization
+def test_send_prompt_persists_outbox_then_wakes_worker(tmp_path, monkeypatch):
+    ctx = make_context(1, tmp_path)
+    db = ctx.bot_data["db"]
+    db.set_awaiting(1, "conv-1", "reply")
+    update = make_update(1, text="برومت")
+
+    scheduled = []
+
+    def fake_create_task(coro):
+        scheduled.append(coro)
+        coro.close()
+        return None
+
+    monkeypatch.setattr(asyncio, "create_task", fake_create_task)
+
+    class Worker:
+        def __init__(self):
+            self.woken = 0
+
+        def wake(self):
+            self.woken += 1
+
+    worker = Worker()
+    ctx.bot_data["outbox_worker"] = worker
+    asyncio.run(h.handle_text(update, ctx))
+
+    assert update.message.replies == ["وصل ✅"]
+    assert scheduled == []  # مفيش task لكل برومت — الـ worker الواحد هو المسؤول
+    assert worker.woken == 1  # اتوقّظ بدل ما نعمل task جديد
+    assert db.count_outbox("pending") == 1  # اتسجّل قبل ما التسليم يبدأ
+    item = db.list_outbox_by_status("pending")[0]
+    assert item.conversation_id == "conv-1"
+    assert item.text == "برومت"
+    assert db.get_awaiting(1) == (None, None)  # awaiting اتشالت (السلوك الأصلي)
+
+
+def test_non_owner_text_does_not_create_outbox_row(tmp_path):
+    ctx = make_context(1, tmp_path)
+    db = ctx.bot_data["db"]
+    db.set_awaiting(999, "conv-1", "reply")
+    update = make_update(999, text="برومت")
+    asyncio.run(h.handle_text(update, ctx))
+    assert db.count_outbox() == 0
+    assert update.message.replies == []
+
+
+
+# ------------------------------------------------------ new-chat creation (04A-6)
+class CreationClient:
+    """عميل fake لمسار الشات الجديد."""
+
+    def __init__(self, task_id="task-1", conv="conv-1", start_error=None):
+        self._task_id = task_id
+        self._conv = conv
+        self._start_error = start_error
+        self.start_calls = 0
+
+    async def start_conversation(self, text, repo, branch=None):
+        self.start_calls += 1
+        if self._start_error is not None:
+            raise self._start_error
+        return self._task_id
+
+    async def wait_for_start(self, task_id, timeout=180.0, interval=3.0):
+        return self._conv
+
+
+class _SendBot:
+    def __init__(self):
+        self.sent = []
+
+    async def send_message(self, chat_id=None, text=None, **kw):
+        self.sent.append(text)
+
+
+def test_new_chat_persists_job_then_wakes_creation_worker(tmp_path, monkeypatch):
+    ctx = make_context(1, tmp_path)
+    ctx.bot_data["db"].set_awaiting(1, "o/r", "newchat")
+    update = make_update(1, text="ابدأ شات")
+
+    scheduled = []
+
+    def fake_create_task(coro):
+        scheduled.append(coro)
+        coro.close()
+        return None
+
+    monkeypatch.setattr(asyncio, "create_task", fake_create_task)
+
+    class Worker:
+        def __init__(self):
+            self.woken = 0
+
+        def wake(self):
+            self.woken += 1
+
+    worker = Worker()
+    ctx.bot_data["creation_worker"] = worker
+    asyncio.run(h.handle_text(update, ctx))
+
+    assert update.message.replies == ["وصل ✅ جاري بدء شات جديد."]
+    assert scheduled == []  # مفيش task لكل طلب — worker الإنشاء هو المسؤول
+    assert worker.woken == 1
+    jobs = ctx.bot_data["db"].list_creation_jobs_by_status("pending")
+    assert len(jobs) == 1  # اتسجّل قبل ما POST البدء يبدأ
+    assert jobs[0].repo == "o/r"
+    assert jobs[0].text == "ابدأ شات"
+    assert ctx.bot_data["db"].get_awaiting(1) == (None, None)
+
+
+def test_non_owner_new_chat_creates_no_job(tmp_path):
+    ctx = make_context(1, tmp_path)
+    ctx.bot_data["db"].set_awaiting(999, "o/r", "newchat")
+    update = make_update(999, text="ابدأ شات")
+    asyncio.run(h.handle_text(update, ctx))
+    assert ctx.bot_data["db"].count_creation_jobs() == 0
+    assert update.message.replies == []
+
+
+def test_create_chat_direct_persists_and_finishes(tmp_path):
+    client = CreationClient(conv="conv-42")
+    ctx = make_context(1, tmp_path, client=client)
+    ctx.bot = _SendBot()
+    asyncio.run(h._create_chat(ctx, 99, "o/r", "برومت"))
+    db = ctx.bot_data["db"]
+    jobs = db.list_creation_jobs_by_status("done")
+    assert len(jobs) == 1
+    assert jobs[0].conversation_id == "conv-42"
+    assert db.is_watched("conv-42")
+
+
+def test_create_chat_direct_ambiguous_is_unknown(tmp_path):
+    client = CreationClient(start_error=ApiError("timeout", None))
+    ctx = make_context(1, tmp_path, client=client)
+    ctx.bot = _SendBot()
+    asyncio.run(h._create_chat(ctx, 99, "o/r", "برومت"))
+    db = ctx.bot_data["db"]
+    assert db.count_creation_jobs("unknown") == 1
+    assert client.start_calls == 1
+
+
+# =====================================================================
+# TASK 55 (المرحلة B/C): عرض التبادل + النسخ + كاش القايمة
+# =====================================================================
+class ExchangeClient:
+    """عميل موحّد للاختبارات: شات + تبادل + قايمة مع عدّادات نداءات."""
+
+    OWNER_UUID = "owner-uuid-123"
+
+    def __init__(self, conv, user_text="برومتي", reply="ردي", *, open_error=None,
+                 exchange_error=None, list_items=None):
+        self._conv = conv
+        self._user_text = user_text
+        self._reply = reply
+        self._open_error = open_error
+        self._exchange_error = exchange_error
+        self._list_items = list_items if list_items is not None else []
+        self.list_calls = 0
+        self.exchange_calls = 0
+
+    async def get_conversations(self, ids):
+        if self._open_error:
+            raise self._open_error
+        if not self._conv:
+            return []
+        conv = {**self._conv, "created_by_user_id": self._conv.get("created_by_user_id", self.OWNER_UUID)}
+        return [conv]
+
+    async def get_current_user(self):
+        return {"id": self.OWNER_UUID}
+
+    async def get_last_exchange(self, cid):
+        self.exchange_calls += 1
+        if self._exchange_error:
+            raise self._exchange_error
+        return (self._user_text, self._reply)
+
+    async def search_conversations(self, limit=100, page_id=None):
+        self.list_calls += 1
+        return {"items": self._list_items[:limit], "next_page_id": None}
+
+
+class RecBot:
+    def __init__(self):
+        self.messages = []
+        self.documents = []
+
+    async def send_message(self, chat_id=None, text=None, **kw):
+        self.messages.append((text, kw.get("parse_mode")))
+
+    async def send_document(self, chat_id=None, document=None, **kw):
+        self.documents.append(document)
+
+
+class CQ:
+    def __init__(self, data):
+        self.data = data
+        self.edits = []
+        self.markups = []
+        self.message = SimpleNamespace(chat_id=99)
+        self.answered = 0
+
+    async def answer(self):
+        self.answered += 1
+
+    async def edit_message_text(self, text, **kw):
+        self.edits.append(text)
+        self.markups.append(kw.get("reply_markup"))
+
+
+def _t55_cb_update(q, user_id=1):
+    return SimpleNamespace(
+        effective_user=SimpleNamespace(id=user_id),
+        effective_chat=SimpleNamespace(id=99, type="private"),
+        callback_query=q,
+        message=None,
+    )
+
+
+def _markup_callbacks(markup):
+    return [b.callback_data for row in markup.inline_keyboard for b in row]
+
+
+CONV55 = {"id": "A", "title": "شات A", "execution_status": "finished", "selected_repository": "o/r"}
+
+
+def test_open_shows_last_prompt_and_agent_reply(tmp_path):
+    ctx = make_context(1, tmp_path, client=ExchangeClient(CONV55, "برومتي", "ردي"))
+    ctx.bot = RecBot()
+    q = CQ("open:A")
+    asyncio.run(h.open_conversation(_t55_cb_update(q), ctx))
+    assert q.edits and "آخر برومت منك:" in q.edits[0] and "برومتي" in q.edits[0]
+    assert "رد الـ agent:" in q.edits[0] and "ردي" in q.edits[0]
+    assert "10 دقايق" in q.edits[0]
+    assert ctx.bot_data["db"].get_awaiting(1) == ("A", "route")
+
+
+def test_open_long_reply_offers_full_button(tmp_path):
+    ctx = make_context(1, tmp_path, client=ExchangeClient(CONV55, "ب", "ر" * 5000))
+    ctx.bot = RecBot()
+    q = CQ("open:A")
+    asyncio.run(h.open_conversation(_t55_cb_update(q), ctx))
+    cbs = _markup_callbacks(q.markups[-1])
+    assert "copy:A" in cbs and "full:A" in cbs
+
+
+def test_open_short_reply_has_no_full_button(tmp_path):
+    ctx = make_context(1, tmp_path, client=ExchangeClient(CONV55, "ب", "رد قصير"))
+    ctx.bot = RecBot()
+    q = CQ("open:A")
+    asyncio.run(h.open_conversation(_t55_cb_update(q), ctx))
+    cbs = _markup_callbacks(q.markups[-1])
+    assert "copy:A" in cbs and "full:A" not in cbs
+
+
+def test_open_no_reply_has_no_copy_button(tmp_path):
+    ctx = make_context(1, tmp_path, client=ExchangeClient(CONV55, "ب", None))
+    ctx.bot = RecBot()
+    q = CQ("open:A")
+    asyncio.run(h.open_conversation(_t55_cb_update(q), ctx))
+    assert "لسه مفيش رد." in q.edits[0]
+    assert "عرض للنسخ اليدوي" not in q.edits[0]
+    assert "copy:A" not in _markup_callbacks(q.markups[-1])
+
+
+def test_open_with_reply_explains_manual_copy_and_links_mini_app(tmp_path):
+    ctx = make_context(1, tmp_path, client=ExchangeClient(CONV55, "ب", "رد مفيد"))
+    ctx.bot_data["config"].mini_app_enabled = True
+    ctx.bot_data["config"].mini_app_url = "https://app.example.com/mini"
+    ctx.bot = RecBot()
+    q = CQ("open:A")
+    asyncio.run(h.open_conversation(_t55_cb_update(q), ctx))
+    assert "عرض للنسخ اليدوي" in q.edits[0]
+    assert "code block" in q.edits[0]
+    assert "Mini App" in q.edits[0]
+    web_btns = [b for row in q.markups[-1].inline_keyboard for b in row if b.web_app is not None]
+    assert len(web_btns) == 1
+    assert web_btns[0].web_app["url"] == "https://app.example.com/mini"
+
+
+def test_open_missing_chat_message(tmp_path):
+    ctx = make_context(1, tmp_path, client=ExchangeClient(None))
+    ctx.bot = RecBot()
+    q = CQ("open:missing")
+    asyncio.run(h.open_conversation(_t55_cb_update(q), ctx))
+    assert q.edits == ["الشات مش موجود."]
+
+
+def test_open_missing_priority_over_exchange_error(tmp_path):
+    # الشات مش موجود + طلب الأحداث فشل ⇒ الرسالة القديمة "مش موجود" (أولوية ثابتة).
+    client = ExchangeClient(None, exchange_error=ApiError("server", 500))
+    ctx = make_context(1, tmp_path, client=client)
+    ctx.bot = RecBot()
+    q = CQ("open:missing")
+    asyncio.run(h.open_conversation(_t55_cb_update(q), ctx))
+    assert q.edits == ["الشات مش موجود."]
+
+
+def test_open_exchange_error_shows_error_and_no_route(tmp_path):
+    """OHB2-SW-07: فشل upstream (5xx) في آخر تبادل: الرسالة تتعرض **و**الاستثناء ينتشر.
+
+    قبل الإصلاح كان بيرجع عاديًّا (ابتلاع فشل تشغيلي). دلوقتي: نفس الرسالة للمستخدم،
+    لكن الفشل ينتشر (مفيش إتمام كاذب)، ومفيش توجيه جديد.
+    """
+    client = ExchangeClient(CONV55, exchange_error=ApiError("server", 500))
+    ctx = make_context(1, tmp_path, client=client)
+    ctx.bot = RecBot()
+    q = CQ("open:A")
+    with pytest.raises(h.OperationalApiFailure):
+        asyncio.run(h.open_conversation(_t55_cb_update(q), ctx))
+    assert q.edits and "server" in q.edits[0]
+    assert ctx.bot_data["db"].get_awaiting(1) == (None, None)
+
+
+def test_copy_reply_sends_pre_escaped(tmp_path):
+    ctx = make_context(1, tmp_path, client=ExchangeClient(CONV55, "ب", "رد <b> & </b>"))
+    ctx.bot = RecBot()
+    q = CQ("copy:A")
+    asyncio.run(h.copy_reply(_t55_cb_update(q), ctx))
+    assert ctx.bot.messages
+    text = ctx.bot.messages[0][0]
+    assert text.startswith("<pre>") and text.endswith("</pre>")
+    assert "<b>" not in text and "&lt;b&gt;" in text and "&amp;" in text
+
+
+def test_copy_reply_non_owner_ignored(tmp_path):
+    ctx = make_context(1, tmp_path, client=ExchangeClient(CONV55))
+    ctx.bot = RecBot()
+    q = CQ("copy:A")
+    asyncio.run(h.copy_reply(_t55_cb_update(q, user_id=999), ctx))
+    assert ctx.bot.messages == []
+    assert q.answered == 1
+
+
+def test_copy_reply_no_reply_message(tmp_path):
+    ctx = make_context(1, tmp_path, client=ExchangeClient(CONV55, "ب", None))
+    ctx.bot = RecBot()
+    q = CQ("copy:A")
+    asyncio.run(h.copy_reply(_t55_cb_update(q), ctx))
+    assert [m[0] for m in ctx.bot.messages] == ["لسه مفيش رد للشات ده."]
+
+
+def test_copy_reply_api_error_sends_new_message_only(tmp_path):
+    """OHB2-SW-07: فشل upstream (5xx) في آخر تبادل: رسالة الخطأ **و**انتشار الاستثناء.
+
+    قبل الإصلاح كان بيرجع عاديًّا. دلوقتي الشاشة لسه ما اتغيّرتش (رسالة جديدة) لكن
+    الفشل التشغيلي ينتشر بدل ما يتحوّل لإتمام ناجح.
+    """
+    client = ExchangeClient(CONV55, exchange_error=ApiError("server", 500))
+    ctx = make_context(1, tmp_path, client=client)
+    ctx.bot = RecBot()
+    q = CQ("copy:A")
+    with pytest.raises(h.OperationalApiFailure):
+        asyncio.run(h.copy_reply(_t55_cb_update(q), ctx))
+    assert ctx.bot.messages and "server" in ctx.bot.messages[0][0]
+    assert q.edits == []  # الشاشة ما اتغيّرتش
+
+
+def test_copy_reply_very_long_sends_document(tmp_path):
+    from bot.sender import COPY_PART_LIMIT
+
+    ctx = make_context(1, tmp_path, client=ExchangeClient(CONV55, "ب", "ب" * (COPY_PART_LIMIT * 4)))
+    ctx.bot = RecBot()
+    q = CQ("copy:A")
+    asyncio.run(h.copy_reply(_t55_cb_update(q), ctx))
+    assert ctx.bot.documents and ctx.bot.messages == []
+
+
+def test_full_reply_sends_long_reply(tmp_path):
+    ctx = make_context(1, tmp_path, client=ExchangeClient(CONV55, "ب", "ب" * 5000))
+    ctx.bot = RecBot()
+    q = CQ("full:A")
+    asyncio.run(h.full_reply(_t55_cb_update(q), ctx))
+    assert len(ctx.bot.messages) == 2  # send_long يقسّم لقطعتين
+    assert ctx.bot.documents == []
+
+
+# -------------------------------------------------- كاش القايمة (المرحلة C)
+def _list_items(n):
+    return [{"id": f"c{i}", "title": f"شات {i}", "execution_status": "running"} for i in range(n)]
+
+
+def test_list_cache_avoids_second_api_call(tmp_path):
+    client = ExchangeClient(None, list_items=_list_items(15))
+    ctx = make_context(1, tmp_path, client=client)
+    asyncio.run(h.list_conversations(_t55_cb_update(CQ("list:0")), ctx))
+    asyncio.run(h.list_conversations(_t55_cb_update(CQ("list:1")), ctx))
+    assert client.list_calls == 1  # الضغطة التانية من الكاش
+
+
+def test_list_cache_expires(tmp_path, monkeypatch):
+    client = ExchangeClient(None, list_items=_list_items(3))
+    ctx = make_context(1, tmp_path, client=client)
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(h.time, "monotonic", lambda: clock["t"])
+    asyncio.run(h.list_conversations(_t55_cb_update(CQ("list:0")), ctx))
+    clock["t"] += h.LIST_TTL + 1
+    asyncio.run(h.list_conversations(_t55_cb_update(CQ("list:0")), ctx))
+    assert client.list_calls == 2
+
+
+def test_list_empty_not_cached(tmp_path):
+    client = ExchangeClient(None, list_items=[])
+    ctx = make_context(1, tmp_path, client=client)
+    asyncio.run(h.list_conversations(_t55_cb_update(CQ("list:0")), ctx))
+    asyncio.run(h.list_conversations(_t55_cb_update(CQ("list:0")), ctx))
+    assert client.list_calls == 2
+    assert "list_cache" not in ctx.bot_data
+
+
+def test_send_prompt_invalidates_list_cache(tmp_path):
+    ctx = make_context(1, tmp_path)
+    ctx.bot_data["list_cache"] = (h.time.monotonic(), [{"id": "x"}])
+    ctx.bot_data["db"].set_awaiting(1, "conv-1", "reply")
+    asyncio.run(h.handle_text(make_update(1, "برومت"), ctx))
+    assert "list_cache" not in ctx.bot_data
+
+
+def test_create_chat_invalidates_list_cache(tmp_path):
+    ctx = make_context(1, tmp_path, client=CreationClient(conv="conv-9"))
+    ctx.bot = _SendBot()
+    ctx.bot_data["list_cache"] = (h.time.monotonic(), [{"id": "x"}])
+    asyncio.run(h._create_chat(ctx, 99, "o/r", "برومت"))
+    assert "list_cache" not in ctx.bot_data
+
+
+def test_open_ignores_exchange_cache(tmp_path):
+    client = ExchangeClient(CONV55, "ب", "ردي")
+    ctx = make_context(1, tmp_path, client=client)
+    ctx.bot = RecBot()
+    ctx.bot_data["exchange_cache"] = {"A": (h.time.monotonic(), "قديم", "قديم")}
+    asyncio.run(h.open_conversation(_t55_cb_update(CQ("open:A")), ctx))
+    assert client.exchange_calls == 1  # تحديث = قراءة طازة دايماً
+
+
+def test_copy_after_open_uses_cache(tmp_path):
+    client = ExchangeClient(CONV55, "ب", "ردي")
+    ctx = make_context(1, tmp_path, client=client)
+    ctx.bot = RecBot()
+    asyncio.run(h.open_conversation(_t55_cb_update(CQ("open:A")), ctx))
+    assert client.exchange_calls == 1
+    asyncio.run(h.copy_reply(_t55_cb_update(CQ("copy:A")), ctx))
+    assert client.exchange_calls == 1  # من الكاش، مفيش طلب تاني
+
+
+def test_copy_after_ttl_refetches(tmp_path, monkeypatch):
+    client = ExchangeClient(CONV55, "ب", "ردي")
+    ctx = make_context(1, tmp_path, client=client)
+    ctx.bot = RecBot()
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(h.time, "monotonic", lambda: clock["t"])
+    asyncio.run(h.open_conversation(_t55_cb_update(CQ("open:A")), ctx))
+    clock["t"] += h.EXCHANGE_TTL + 1
+    asyncio.run(h.copy_reply(_t55_cb_update(CQ("copy:A")), ctx))
+    assert client.exchange_calls == 2
+
+
+def test_exchange_cache_evicts_oldest(tmp_path):
+    ctx = make_context(1, tmp_path, client=ExchangeClient(CONV55))
+    for i in range(h.EXCHANGE_CACHE_MAX + 5):
+        h._store_exchange(ctx, f"c{i}", "ب", "ر")
+    cache = ctx.bot_data["exchange_cache"]
+    assert len(cache) == h.EXCHANGE_CACHE_MAX
+    assert "c0" not in cache  # الأقدم اتشال
+    assert f"c{h.EXCHANGE_CACHE_MAX + 4}" in cache
+
+
+
+# ================================= NTF-17.2: R-2 (user-facing unwatch error) ================
+class _RemoveFailsDb(Database):
+    """remove_watched يرمي خطأ SQLite (فحص مسار الفشل)."""
+
+    def remove_watched(self, conversation_id):
+        raise sqlite3.OperationalError("disk I/O error")
+
+
+class _RemoveFailsWatcher:
+    """مراقب fake: unwatch يرمي خطأ SQLite."""
+
+    def unwatch(self, conversation_id):
+        raise sqlite3.OperationalError("disk I/O error")
+
+
+def test_unwatch_db_failure_shows_error_and_keeps_retry(tmp_path):
+    ctx = _ctx_with(tmp_path, DetailClient(None))
+    ctx.bot_data["db"].add_watched("c1")
+    ctx.bot_data["db"] = _RemoveFailsDb(str(tmp_path / "t2.sqlite3"))
+    ctx.bot_data["db"].add_watched("c1")
+    update = _cb_update(1, "unwatch:c1")
+    # OHB2-SW-06: الفشل الدائم (disk I/O) **ينتشر** بدل ما يتحوّل لنجاح صامت.
+    with pytest.raises(sqlite3.Error):
+        asyncio.run(h.unwatch_conversation(update, ctx))
+    edits = update.callback_query.edits
+    assert len(edits) == 1
+    assert "تعذّر" in edits[0]  # رسالة خطأ واضحة
+    assert "اتشال" not in edits[0]  # مايدّعيش النجاح
+    markup = update.callback_query.edits_markup[0]
+    cbs = [b.callback_data for row in markup.inline_keyboard for b in row]
+    assert "unwatch:c1" in cbs  # زر المحاولة متاح
+
+
+def test_unwatch_success_still_reports_removal(tmp_path):
+    ctx = _ctx_with(tmp_path, DetailClient(None))
+    ctx.bot_data["db"].add_watched("c1")
+    update = _cb_update(1, "unwatch:c1")
+    asyncio.run(h.unwatch_conversation(update, ctx))
+    assert update.callback_query.edits == ["تمام، اتشال من المتابعة."]
+    assert not ctx.bot_data["db"].is_watched("c1")
+
+
+def test_unwatch_via_watcher_failure_shows_error(tmp_path):
+    ctx = _ctx_with(tmp_path, DetailClient(None))
+    ctx.bot_data["db"].add_watched("c1")
+    ctx.bot_data["watcher"] = _RemoveFailsWatcher()
+    update = _cb_update(1, "unwatch:c1")
+    # OHB2-SW-06: فشل المراقب (فشل دائم) ينتشر كذلك.
+    with pytest.raises(sqlite3.Error):
+        asyncio.run(h.unwatch_conversation(update, ctx))
+    assert "تعذّر" in update.callback_query.edits[0]
+    assert ctx.bot_data["db"].is_watched("c1")  # لسه متابَع
+
+
+def test_unwatch_non_owner_ignored(tmp_path):
+    ctx = _ctx_with(tmp_path, DetailClient(None))
+    ctx.bot_data["db"].add_watched("c1")
+    update = _cb_update(999, "unwatch:c1")  # مش المالك
+    asyncio.run(h.unwatch_conversation(update, ctx))
+    assert update.callback_query.edits == []
+    assert ctx.bot_data["db"].is_watched("c1")
+
+
+# =====================================================================
+# OHB2-03: أوامر /help و /app وزر فتح التطبيق
+# =====================================================================
+def _web_app_urls(markup):
+    if markup is None:
+        return []
+    urls = []
+    for row in markup.inline_keyboard:
+        for b in row:
+            if b.web_app:
+                urls.append(b.web_app["url"] if isinstance(b.web_app, dict) else b.web_app.url)
+    return urls
+
+
+def test_help_owner_gets_commands_list(tmp_path):
+    ctx = make_context(1, tmp_path)
+    update = make_update(1)
+    asyncio.run(h.help_command(update, ctx))
+    assert len(update.message.replies) == 1
+    assert "/app" in update.message.replies[0] and "/help" in update.message.replies[0]
+
+
+def test_help_ignores_non_owner(tmp_path):
+    ctx = make_context(1, tmp_path)
+    update = make_update(999)
+    asyncio.run(h.help_command(update, ctx))
+    assert update.message.replies == []
+
+
+def test_app_command_without_url_is_graceful(tmp_path):
+    ctx = make_context(1, tmp_path)  # FakeConfig.mini_app_url فاضي
+    update = make_update(1)
+    asyncio.run(h.app_command(update, ctx))
+    assert len(update.message.replies) == 1
+    assert "مش متاح" in update.message.replies[0]
+
+
+def test_app_command_with_url_sends_web_app_button(tmp_path):
+    ctx = make_context(1, tmp_path)
+    ctx.bot_data["config"].mini_app_enabled = True
+    ctx.bot_data["config"].mini_app_url = "https://app.example.com/mini"
+    update = make_update(1)
+    asyncio.run(h.app_command(update, ctx))
+    assert len(update.message.replies) == 1
+
+
+def test_app_open_callback_without_url_shows_unavailable(tmp_path):
+    ctx = make_context(1, tmp_path)
+    update = _cb_update(1, "app:open")
+    asyncio.run(h.app_open(update, ctx))
+    assert update.callback_query.edits  # رسالة "مش متاح"
+    assert "مش متاح" in update.callback_query.edits[0]
+
+
+def test_app_open_callback_with_url_edits_to_web_app_button(tmp_path):
+    ctx = make_context(1, tmp_path)
+    ctx.bot_data["config"].mini_app_enabled = True
+    ctx.bot_data["config"].mini_app_url = "https://app.example.com/mini"
+    update = _cb_update(1, "app:open")
+    asyncio.run(h.app_open(update, ctx))
+    markup = update.callback_query.edits_markup[0]
+    assert _web_app_urls(markup) == ["https://app.example.com/mini"]
+
+
+def test_start_menu_includes_web_app_button_when_configured(tmp_path):
+    ctx = make_context(1, tmp_path)
+    ctx.bot_data["config"].mini_app_enabled = True
+    ctx.bot_data["config"].mini_app_url = "https://app.example.com/mini"
+    update = make_update(1)
+    asyncio.run(h.start(update, ctx))
+    assert len(update.message.replies) == 1
+
+
+# =====================================================================
+# OHB2-F1: الشاتات المحذوفة محليًا لازم تختفي من قايمة شاتات البوت
+# (البحث بعيد مش عارف بالحذف المحلي ⇒ بنفلتر بشاهد الحذف قبل الترقيم)
+# =====================================================================
+F1_OWNER_UUID = "owner-uuid-123"
+
+
+class F1ListClient:
+    """عميل للقايمة + التفويض: نتائج بحث بعيدة متحكَّم فيها + عدّادات نداءات."""
+
+    def __init__(self, list_items=None, conv=None, created_by=F1_OWNER_UUID):
+        self._list_items = list(list_items or [])
+        self._conv = conv
+        self._created_by = created_by
+        self.list_calls = 0
+        self.deleted_remote_calls = 0
+
+    async def search_conversations(self, limit=100, page_id=None):
+        self.list_calls += 1
+        return {"items": self._list_items[:limit], "next_page_id": None}
+
+    async def get_conversations(self, ids):
+        if self._conv is None:
+            return []
+        return [{**self._conv, "created_by_user_id": self._created_by}]
+
+    async def get_current_user(self):
+        return {"id": F1_OWNER_UUID}
+
+    async def delete_conversation(self, conversation_id):
+        # OHB2-MINIAPP: العميل بيرجّع True بس لما OpenHands يأكّد النجاح.
+        self.deleted_remote_calls += 1
+        return True
+
+
+def _f1_items(n, prefix="c"):
+    return [
+        {"id": f"{prefix}{i}", "title": f"شات {i}", "execution_status": "running"}
+        for i in range(n)
+    ]
+
+
+def _list_callbacks(update):
+    return _markup_callbacks(update.callback_query.markups[-1])
+
+
+def _shown_ids(update):
+    """معرّفات الشاتات الظاهرة كأزرار فتح (open:<id>) فقط."""
+    return [d.split(":", 1)[1] for d in _list_callbacks(update) if d.startswith("open:")]
+
+
+def test_list_excludes_locally_deleted_and_keeps_valid(tmp_path):
+    """نتيجة بحث بعيدة فيها شاتات محذوفة محليًا ⇒ تختفي، والسليمة تفضل (ترتيب محفوظ)."""
+    client = F1ListClient(list_items=[
+        {"id": "keep1", "title": "سليم 1", "execution_status": "running"},
+        {"id": "gone1", "title": "محذوف 1", "execution_status": "running"},
+        {"id": "keep2", "title": "سليم 2", "execution_status": "running"},
+        {"id": "gone2", "title": "محذوف 2", "execution_status": "running"},
+    ])
+    ctx = make_context(1, tmp_path, client=client)
+    db = ctx.bot_data["db"]
+    db.delete_conversation("gone1", outbox.now_iso())
+    db.delete_conversation("gone2", outbox.now_iso())
+
+    update = _t55_cb_update(CQ("list:0"))
+    asyncio.run(h.list_conversations(update, ctx))
+
+    assert _shown_ids(update) == ["keep1", "keep2"]  # المحذوف مشيل والترتيب زي ما هو
+
+
+def test_list_all_deleted_shows_empty_message(tmp_path):
+    """كل النتائج محذوفة محليًا ⇒ رسالة 'ما فيهاش شاتات' (مفيش أزرار شاتات)."""
+    client = F1ListClient(list_items=[
+        {"id": "gone", "title": "محذوف", "execution_status": "running"},
+    ])
+    ctx = make_context(1, tmp_path, client=client)
+    ctx.bot_data["db"].delete_conversation("gone", outbox.now_iso())
+
+    update = _t55_cb_update(CQ("list:0"))
+    asyncio.run(h.list_conversations(update, ctx))
+
+    assert update.callback_query.edits == ["ما فيهاش شاتات."]
+
+
+def test_list_pagination_and_ordering_correct_after_filtering(tmp_path):
+    """الترقيم/الترتيب يفضلوا صح بعد إزالة المحذوف (القايمة بتتقسّم على الناتج المفلتر)."""
+    client = F1ListClient(list_items=_f1_items(22))
+    ctx = make_context(1, tmp_path, client=client)
+    db = ctx.bot_data["db"]
+    db.delete_conversation("c0", outbox.now_iso())
+    db.delete_conversation("c1", outbox.now_iso())
+
+    p0 = _t55_cb_update(CQ("list:0"))
+    asyncio.run(h.list_conversations(p0, ctx))
+    assert _shown_ids(p0) == [f"c{i}" for i in range(2, 12)]  # 10 عناصر مفلترة
+    assert "صفحة 1" in p0.callback_query.edits[-1]
+    assert "list:1" in _list_callbacks(p0)  # فيه المزيد
+
+    p1 = _t55_cb_update(CQ("list:1"))
+    asyncio.run(h.list_conversations(p1, ctx))
+    assert _shown_ids(p1) == [f"c{i}" for i in range(12, 22)]  # الـ 10 الباقيين
+    assert "list:2" not in _list_callbacks(p1)  # مفيش المزيد
+    assert client.list_calls == 1  # الصفحة التانية من الكاش (وبعدين اتّفلترت برضه)
+
+
+def test_list_keeps_valid_when_unrelated_tombstone_exists(tmp_path):
+    """شاهد حذف لشات مش موجود في القايمة مايشيلش شاتات سليمة (مفيش إزالة بالغلط)."""
+    client = F1ListClient(list_items=_f1_items(3))
+    ctx = make_context(1, tmp_path, client=client)
+    ctx.bot_data["db"].delete_conversation("other-conv", outbox.now_iso())
+
+    update = _t55_cb_update(CQ("list:0"))
+    asyncio.run(h.list_conversations(update, ctx))
+
+    assert _shown_ids(update) == ["c0", "c1", "c2"]
+
+
+def test_confirm_delete_invalidates_list_cache(tmp_path):
+    """الحذف المؤكَّد الناجح يبطّل كاش القايمة (زي البرومت/بدء الشات) ويحذف من OpenHands."""
+    client = F1ListClient(conv={"id": "c1", "title": "شات"})
+    ctx = make_context(1, tmp_path, client=client)
+    ctx.bot_data["db"].add_watched("c1", "شات", chat_id=99)
+    ctx.bot_data["list_cache"] = (
+        h.time.monotonic(),
+        [{"id": "c1", "title": "شات", "execution_status": "running"}],
+    )
+
+    update = _t55_cb_update(CQ("deleteok:c1"))
+    asyncio.run(h.delete_conversation_confirm(update, ctx))
+
+    assert "list_cache" not in ctx.bot_data  # اتبطّل
+    assert ctx.bot_data["db"].is_deleted("c1") is True  # اتحذف محليًا
+    assert client.deleted_remote_calls == 1  # اتحذف من OpenHands نفسه
+    assert ctx.bot_data["db"].remote_deletion_state("c1") == ctx.bot_data["db"].REMOTE_CONFIRMED
+
+
+def test_stale_cache_cannot_display_deleted_conversation(tmp_path):
+    """كاش دافي (اتبنى قبل الحذف) ما يقدرش يعرض الشات المحذوف."""
+    client = F1ListClient(list_items=_f1_items(2))
+    ctx = make_context(1, tmp_path, client=client)
+    ctx.bot_data["list_cache"] = (
+        h.time.monotonic(),
+        [
+            {"id": "c0", "title": "شات 0", "execution_status": "running"},
+            {"id": "c1", "title": "شات 1", "execution_status": "running"},
+        ],
+    )
+    ctx.bot_data["db"].delete_conversation("c0", outbox.now_iso())
+
+    update = _t55_cb_update(CQ("list:0"))
+    asyncio.run(h.list_conversations(update, ctx))
+
+    assert "c0" not in _shown_ids(update)  # المحذوف مشيل
+    assert "c1" in _shown_ids(update)  # السليم فاضل
+    assert client.list_calls == 0  # جت من الكاش (بس اتّفلترت)
+
+
+def test_fresh_remote_search_cannot_resurrect_deleted(tmp_path):
+    """بحث بعيد جديد فيه الشات المحذوف ⇒ لسه مايظهرش (مفيش إحياء)."""
+    client = F1ListClient(list_items=[
+        {"id": "c1", "title": "شات", "execution_status": "running"},
+    ])
+    ctx = make_context(1, tmp_path, client=client)
+    ctx.bot_data["db"].delete_conversation("c1", outbox.now_iso())
+
+    update = _t55_cb_update(CQ("list:0"))
+    asyncio.run(h.list_conversations(update, ctx))
+
+    assert client.list_calls == 1  # بحث جديد فعلاً (مش كاش)
+    assert _shown_ids(update) == []
+    assert update.callback_query.edits[-1] == "ما فيهاش شاتات."
+
+
+def test_delete_prompt_does_not_delete_or_invalidate(tmp_path):
+    """ضغطة الحذف الأولى (تأكيد) ما بتحذفش ولا بتبطّل الكاش — محتاجة تأكيد صريح."""
+    client = F1ListClient(conv={"id": "c1", "title": "شات"})
+    ctx = make_context(1, tmp_path, client=client)
+    ctx.bot_data["db"].add_watched("c1", "شات", chat_id=99)
+    ctx.bot_data["list_cache"] = (h.time.monotonic(), [{"id": "c1"}])
+
+    update = _t55_cb_update(CQ("delete:c1"))
+    asyncio.run(h.delete_conversation_prompt(update, ctx))
+
+    assert "list_cache" in ctx.bot_data  # ما اتبطّلش
+    assert ctx.bot_data["db"].is_deleted("c1") is False  # ما اتحذفش
+
+
+def test_confirm_delete_non_owner_does_not_invalidate_or_delete(tmp_path):
+    """تفويض فاشل (غير مالك) ⇒ مفيش حذف ومفيش تبّطيل كاش."""
+    client = F1ListClient(conv={"id": "c1", "title": "شات"}, created_by="someone-else")
+    ctx = make_context(1, tmp_path, client=client)
+    ctx.bot_data["db"].add_watched("c1", "شات", chat_id=99)
+    ctx.bot_data["list_cache"] = (h.time.monotonic(), [{"id": "c1"}])
+
+    update = _t55_cb_update(CQ("deleteok:c1"))
+    asyncio.run(h.delete_conversation_confirm(update, ctx))
+
+    assert "list_cache" in ctx.bot_data  # ما اتبطّلش
+    assert ctx.bot_data["db"].is_deleted("c1") is False  # ما اتحذفش
+    assert client.deleted_remote_calls == 0
+
+
+def test_confirm_delete_disallowed_user_no_change(tmp_path):
+    """مستخدم غير مسموح ⇒ رجوع مبكر: مفيش حذف ومفيش تبّطيل كاش."""
+    client = F1ListClient(conv={"id": "c1", "title": "شات"})
+    ctx = make_context(1, tmp_path, client=client)
+    ctx.bot_data["db"].add_watched("c1", "شات", chat_id=99)
+    ctx.bot_data["list_cache"] = (h.time.monotonic(), [{"id": "c1"}])
+
+    update = _t55_cb_update(CQ("deleteok:c1"), user_id=999)
+    asyncio.run(h.delete_conversation_confirm(update, ctx))
+
+    assert "list_cache" in ctx.bot_data
+    assert ctx.bot_data["db"].is_deleted("c1") is False
+
+
+def test_confirm_delete_db_error_does_not_invalidate(tmp_path, monkeypatch):
+    """خطأ قاعدة بيانات أثناء الحذف ⇒ رسالة خطأ، ومفيش تبّطيل كاش."""
+    client = F1ListClient(conv={"id": "c1", "title": "شات"})
+    ctx = make_context(1, tmp_path, client=client)
+    ctx.bot_data["db"].add_watched("c1", "شات", chat_id=99)
+    ctx.bot_data["list_cache"] = (h.time.monotonic(), [{"id": "c1"}])
+
+    def boom(*_a, **_k):
+        raise sqlite3.Error("boom")
+
+    monkeypatch.setattr(ctx.bot_data["db"], "delete_conversation", boom)
+    update = _t55_cb_update(CQ("deleteok:c1"))
+    asyncio.run(h.delete_conversation_confirm(update, ctx))
+
+    assert "list_cache" in ctx.bot_data  # فشل ⇒ ما اتبطّلش
+    assert update.callback_query.edits  # رسالة خطأ عربية
+
+
+def test_delete_then_list_cannot_show_deleted_end_to_end(tmp_path):
+    """سيناريو كامل: عرض القايمة (كاش) ⇒ حذف مؤكَّد ⇒ عرض تاني ⇒ المحذوف مش ظاهر.
+
+    بيثبت إن الكاش مايقدرش يعرض الشات المحذوف بعد الحذف (سواء الكاش اتبطّل أو الفلترة
+    شالت الصف)، وإن بحث بعيد جديد لسه مايرجّعوش.
+    """
+    client = F1ListClient(
+        list_items=[
+            {"id": "keep", "title": "سليم", "execution_status": "running"},
+            {"id": "gone", "title": "محذوف", "execution_status": "running"},
+        ],
+        conv={"id": "gone", "title": "محذوف"},
+    )
+    ctx = make_context(1, tmp_path, client=client)
+
+    # 1) عرض أول ⇒ الشاتين ظاهرين + الكاش اتعبّى.
+    first = _t55_cb_update(CQ("list:0"))
+    asyncio.run(h.list_conversations(first, ctx))
+    assert _shown_ids(first) == ["keep", "gone"]
+    assert "list_cache" in ctx.bot_data
+
+    # 2) حذف مؤكَّد ⇒ الكاش اتبطّل.
+    asyncio.run(h.delete_conversation_confirm(_t55_cb_update(CQ("deleteok:gone")), ctx))
+    assert "list_cache" not in ctx.bot_data
+    assert ctx.bot_data["db"].is_deleted("gone") is True
+
+    # 3) عرض تاني (بحث جديد) ⇒ المحذوف مش ظاهر، السليم ظاهر.
+    second = _t55_cb_update(CQ("list:0"))
+    asyncio.run(h.list_conversations(second, ctx))
+    assert _shown_ids(second) == ["keep"]
+
+
+# ========================================= OHB2-AUDIT-FIX-05: bot list pagination
+class PagedClient:
+    """عميل وهمي بيدعم البحث بصفحات عبر next_page_id (لاختبار لمّ كل الصفحات)."""
+
+    def __init__(self, pages):
+        self._pages = pages
+        self.calls = []
+
+    async def search_conversations(self, limit=100, page_id=None):
+        self.calls.append(page_id)
+        return self._pages[page_id]
+
+
+def test_list_conversations_collects_all_pages(tmp_path):
+    """البوت لازم يجمع **كل** الصفحات (مش أول صفحة بس) — 15 شات على صفحتين."""
+    pages = {
+        None: {
+            "items": [
+                {"id": f"c{i}", "title": f"شات {i}", "execution_status": "running"}
+                for i in range(10)
+            ],
+            "next_page_id": "p2",
+        },
+        "p2": {
+            "items": [
+                {"id": f"c{i}", "title": f"شات {i}", "execution_status": "running"}
+                for i in range(10, 15)
+            ],
+            "next_page_id": None,
+        },
+    }
+    client = PagedClient(pages)
+    ctx = make_context(1, tmp_path, client=client)
+    asyncio.run(h.list_conversations(_list_update(1, 0), ctx))
+    # الصفحة الثانية من الـ 15 (c10..c14) لازم تكون موجودة (يعني اتلمّت كل الصفحات).
+    upd = _list_update(1, 1)
+    asyncio.run(h.list_conversations(upd, ctx))  # نفس السياق ⇒ من الكاش
+    assert "صفحة 2" in upd.callback_query.edits[-1]
+    assert client.calls == [None, "p2"]  # اتلمّت كل الصفحات مرة واحدة
+
+
+def test_list_conversations_flags_truncation(tmp_path):
+    """لو القايمة أطول من الحد، نعلن إننا بنعرض جزء (مش إخفاء صامت)."""
+    class AlwaysMore:
+        async def search_conversations(self, limit=100, page_id=None):
+            return {"items": [{"id": f"c{page_id}", "title": "x",
+                               "execution_status": "running"}], "next_page_id": "more"}
+
+    ctx = make_context(1, tmp_path, client=AlwaysMore())
+    upd = _list_update(1, 0)
+    asyncio.run(h.list_conversations(upd, ctx))
+    assert "القايمة طويلة" in upd.callback_query.edits[-1]
+
+
+# ===================== OHB2-PHASE5-FIX-04: bot fail-closed then recovery (P3-02)
+class _ListFakeClient:
+    def __init__(self, items):
+        self._items = items
+
+    async def search_conversations(self, limit=100, page_id=None):
+        return {"items": list(self._items), "next_page_id": None}
+
+
+def test_bot_list_recovers_after_transient_db_failure(tmp_path):
+    """البوت: فشل قراءة الشواهد ⇒ رسالة فشل عامة (مش «ما فيهاش شاتات»)، وبعد الرجوع ⇒ القايمة ترجع."""
+    items = [
+        {"id": "c1", "title": "واحد", "execution_status": "running"},
+        {"id": "c2", "title": "اتنين", "execution_status": "running"},
+    ]
+    ctx = make_context(1, tmp_path, client=_ListFakeClient(items))
+    db = ctx.bot_data["db"]
+    # الكاش بيتملّى من أول نداء (والقاعدة الحقيقية شغالة).
+    first = _t55_cb_update(CQ("list:0"))
+    asyncio.run(h.list_conversations(first, ctx))
+    assert _shown_ids(first) == ["c1", "c2"]
+    assert "list_cache" in ctx.bot_data
+
+    # فلتر قابل للتحكّم: بيفشل مؤقتًا ثم يتعافى (على نفس كائن القاعدة).
+    real = db.is_deleted
+    state = {"failing": True}
+
+    def flaky(cid):
+        if state["failing"]:
+            raise RuntimeError("database unavailable")
+        return real(cid)
+
+    db.is_deleted = flaky  # type: ignore[assignment]
+
+    # 1) الفشل: الفلترة تفشل ⇒ رسالة فشل **عامة**، وممنوع «ما فيهاش شاتات» الكاذبة.
+    second = _t55_cb_update(CQ("list:0"))
+    asyncio.run(h.list_conversations(second, ctx))
+    assert _shown_ids(second) == [], "الفشل ⇒ مفيش قايمة شاتات"
+    assert "ما فيهاش شاتات" not in second.callback_query.edits[-1]
+    assert "تعذّر عرض الشاتات" in second.callback_query.edits[-1]
+
+    # 2) التعافي: القاعدة رجعت ⇒ القايمة ترجع كاملة.
+    state["failing"] = False
+    third = _t55_cb_update(CQ("list:0"))
+    asyncio.run(h.list_conversations(third, ctx))
+    assert _shown_ids(third) == ["c1", "c2"]
+
+
+def test_bot_list_permanent_db_error_shows_generic_not_empty(tmp_path):
+    """فشل **دائم** في قراءة الشواهد ⇒ رسالة فشل عامة (مفيش رسالة «ما فيهاش شاتات»)."""
+    import sqlite3
+
+    items = [{"id": "c1", "title": "واحد", "execution_status": "running"}]
+    ctx = make_context(1, tmp_path, client=_ListFakeClient(items))
+    db = ctx.bot_data["db"]
+    # نملأ الكاش الأول (قاعدة سليمة)، وبعدين نخرّب القراءة بخطأ **دائم**.
+    first = _t55_cb_update(CQ("list:0"))
+    asyncio.run(h.list_conversations(first, ctx))
+    assert _shown_ids(first) == ["c1"]
+
+    calls = {"n": 0}
+
+    def permanent(_cid):
+        calls["n"] += 1
+        raise sqlite3.OperationalError("no such table: deleted_conversations")
+
+    db.is_deleted = permanent  # type: ignore[assignment]
+
+    second = _t55_cb_update(CQ("list:0"))
+    asyncio.run(h.list_conversations(second, ctx))
+    assert _shown_ids(second) == []
+    assert "ما فيهاش شاتات" not in second.callback_query.edits[-1]
+    assert "تعذّر عرض الشاتات" in second.callback_query.edits[-1]
+    # الفشل الدائم **مش** بيتعاد (مفيش انتظار/إعادة بلا داعي).
+    assert calls["n"] == 1
+
+
+def test_bot_without_deleted_no_partial_list_on_late_failure(tmp_path):
+    """فشل بعد نجاح بعض القراءات ⇒ **مفيش** قايمة جزئية؛ الاستثناء ينتشر."""
+    items = [{"id": "c1"}, {"id": "c2"}, {"id": "c3"}]
+    calls = {"n": 0}
+
+    class _LateFail:
+        def is_deleted_with_retry(self, cid):
+            calls["n"] += 1
+            if calls["n"] == 3:  # فشل عند العنصر التالت
+                raise RuntimeError("boom")
+            return False
+
+    with pytest.raises(RuntimeError, match="boom"):
+        h._without_deleted(_LateFail(), items)
+    assert calls["n"] == 3

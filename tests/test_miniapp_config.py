@@ -1,0 +1,136 @@
+"""اختبارات إعدادات الـ Mini App الجديدة (OHB2-05)."""
+from __future__ import annotations
+
+import pytest
+
+from bot.config import ConfigError, load_config
+
+BASE_ENV = {
+    "TELEGRAM_BOT_TOKEN": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+    "OPENHANDS_API_KEY": "secret-key-123456",
+    "ALLOWED_TELEGRAM_ID": "555",
+}
+
+
+def env(**over):
+    return {**BASE_ENV, **over}
+
+
+def test_mini_app_defaults_are_off_and_safe():
+    cfg = load_config(env())
+    assert cfg.mini_app_enabled is False
+    assert cfg.mini_app_port == 12000
+    assert cfg.mini_app_initdata_max_age == 300
+    assert cfg.mini_app_session_ttl == 3600
+    assert cfg.mini_app_cookie_secure is True
+
+
+def test_mini_app_enabled_parsed():
+    # OHB2-N10-22: التفعيل بقى يتطلّب رابط عام صالح (الرابط إعداد مطلوب للميزة).
+    url = "https://example.test/mini/"
+    assert load_config(env(MINI_APP_ENABLED="1", MINI_APP_URL=url)).mini_app_enabled is True
+    assert load_config(env(MINI_APP_ENABLED="true", MINI_APP_URL=url)).mini_app_enabled is True
+    assert load_config(env(MINI_APP_ENABLED="no")).mini_app_enabled is False
+    # OHB2-POST-PUB-01/F05: قيمة منطقية غير معروفة تُرفض صراحةً (قبل كده كانت بتتجاهل بصمت).
+    with pytest.raises(ConfigError):
+        load_config(env(MINI_APP_ENABLED="garbage"))
+
+
+def test_mini_app_port_validation():
+    assert load_config(env(MINI_APP_PORT="12001")).mini_app_port == 12001
+    with pytest.raises(ConfigError):
+        load_config(env(MINI_APP_PORT="0"))
+    with pytest.raises(ConfigError):
+        load_config(env(MINI_APP_PORT="70000"))
+    with pytest.raises(ConfigError):
+        load_config(env(MINI_APP_PORT="abc"))
+
+
+def test_mini_app_positive_int_validation():
+    assert load_config(env(MINI_APP_INITDATA_MAX_AGE="600")).mini_app_initdata_max_age == 600
+    with pytest.raises(ConfigError):
+        load_config(env(MINI_APP_INITDATA_MAX_AGE="-5"))
+    with pytest.raises(ConfigError):
+        load_config(env(MINI_APP_SESSION_TTL="0"))
+
+
+def test_mini_app_cookie_secure_can_be_disabled_for_dev():
+    assert load_config(env(MINI_APP_COOKIE_SECURE="0")).mini_app_cookie_secure is False
+
+
+# ---------------------------------------------------------------- OHB2-06
+def test_rate_limit_defaults():
+    cfg = load_config(env())
+    assert cfg.mini_app_auth_rate_per_minute == 10
+    assert cfg.mini_app_auth_rate_per_hour == 30
+    assert cfg.mini_app_api_rate_per_minute == 60
+    assert cfg.mini_app_rate_max_keys == 4096
+
+
+def test_rate_limit_overrides_and_validation():
+    cfg = load_config(
+        env(
+            MINI_APP_AUTH_RATE_PER_MINUTE="5",
+            MINI_APP_AUTH_RATE_PER_HOUR="20",
+            MINI_APP_API_RATE_PER_MINUTE="40",
+            MINI_APP_RATE_MAX_KEYS="128",
+        )
+    )
+    assert cfg.mini_app_auth_rate_per_minute == 5
+    assert cfg.mini_app_auth_rate_per_hour == 20
+    assert cfg.mini_app_api_rate_per_minute == 40
+    assert cfg.mini_app_rate_max_keys == 128
+    with pytest.raises(ConfigError):
+        load_config(env(MINI_APP_AUTH_RATE_PER_MINUTE="0"))
+    with pytest.raises(ConfigError):
+        load_config(env(MINI_APP_API_RATE_PER_MINUTE="-1"))
+
+
+def test_allowed_origins_derived_from_mini_app_url():
+    cfg = load_config(env(MINI_APP_URL="https://work-1.example.test/mini/"))
+    assert cfg.mini_app_allowed_origins == frozenset({"https://work-1.example.test"})
+
+
+def test_allowed_origins_explicit_override():
+    cfg = load_config(
+        env(
+            MINI_APP_URL="https://work-1.example.test/mini/",
+            MINI_APP_ALLOWED_ORIGINS="https://work-1.example.test, http://localhost:12000",
+        )
+    )
+    assert cfg.mini_app_allowed_origins == frozenset(
+        {"https://work-1.example.test", "http://localhost:12000"}
+    )
+
+
+def test_allowed_origins_rejects_invalid():
+    with pytest.raises(ConfigError):
+        load_config(env(MINI_APP_ALLOWED_ORIGINS="not-an-origin"))
+
+
+def test_allowed_origins_empty_when_no_url():
+    assert load_config(env()).mini_app_allowed_origins == frozenset()
+
+
+# OHB2-N10-22: الرابط العام إعداد مطلوب لما الميزة مفعّلة — نفشل عند التحقق من الإعداد
+# (ConfigError) بدل الفشل المتأخر عند بناء التطبيق (RuntimeError).
+
+
+def test_mini_app_enabled_requires_url_at_config():
+    with pytest.raises(ConfigError):
+        load_config(env(MINI_APP_ENABLED="1", MINI_APP_URL=""))
+
+
+def test_mini_app_disabled_ignores_empty_url():
+    # مقفولة + رابط فاضي ⇒ عادي (مفيش كسر للتشغيل العادي).
+    cfg = load_config(env(MINI_APP_ENABLED="0", MINI_APP_URL=""))
+    assert cfg.mini_app_enabled is False
+
+
+def test_mini_app_enabled_with_url_is_ok():
+    cfg = load_config(
+        env(MINI_APP_ENABLED="1", MINI_APP_URL="https://example.test/mini/")
+    )
+    assert cfg.mini_app_enabled is True
+    assert cfg.mini_app_url == "https://example.test/mini/"
+

@@ -1,0 +1,100 @@
+# ملاحظات OpenHands Cloud API — نتائج المرحلة 0
+
+اتأكدت عمليًا في 2026-10-11 من `https://app.all-hands.dev/api/v1`.
+
+## المصادقة
+- الثلاثة headers شغالة: `Authorization: Bearer`، `X-Access-Token`، `X-Session-API-Key`.
+- البوت يستخدم `Authorization: Bearer` (الأوضح في دليل Cloud API).
+
+## قايمة الشاتات
+`GET /app-conversations/search?limit=N`
+- ترجّع `{"items": [...], "next_page_id": ...}` (object مش array).
+- الترتيب الافتراضي تقريبًا `updated_at` تنازلي. الخطة تقول الترتيب مش موثق، فالبوت بيرتّب client-side بـ `updated_at` كضمان.
+- `execution_status` بيرجع `null` لبعض الشاتات القديمة (PAUSED) — لازم التعامل مع None.
+- `next_page_id` ممكن يكون `null`.
+- الحقول المهمة لكل عنصر: `id`، `title`، `selected_repository`، `selected_branch`، `sandbox_id`، `sandbox_status`، `execution_status`، `updated_at`، `conversation_ui_url`.
+
+## حالة شات أو أكتر
+`GET /app-conversations?ids=ID1&ids=ID2` — معرّفات متكررة في نفس الباراميتر.
+- ترجّع **array**، وعناصرها ممكن تكون `null` (اتأكدنا).
+- الفاصلة `,` بين المعرّفات ترجّع 400 (`Invalid UUID format`).
+
+## آخر رد
+`GET /conversation/{id}/events/search?sort_order=TIMESTAMP_DESC&limit=50`
+- ترجّع `{"items": [...]}`. الحد الأقصى لـ `limit` = **100** (200 ترجّع 422).
+- `kind__eq` يقبل القيم دي بس: `ServerErrorEvent, ACPToolCallEvent, Condensation, CondensationRequest, CondensationSummaryEvent, ConversationErrorEvent, ConversationStateUpdateEvent, HookExecutionEvent, LLMCompletionLogEvent, ActionEvent, MessageEvent, AgentErrorEvent, ObservationEvent, UserRejectObservation, SystemPromptEvent, StreamingDeltaEvent, TokenEvent, InterruptEvent, PauseEvent`.
+- **`FinishAction` مش قيمة صحيحة لـ `kind__eq`** (422) — لأنه نوع `ActionEvent`. لازم تجيب `ActionEvent` وتفلتر بنفسك على `action.kind == "FinishAction"`.
+- رد الـ agent العادي: `MessageEvent` بحيث `source == "agent"` والنص في **`llm_message.content[].text`** (مش في `event.message`).
+- في مراقبة دي كانت آخر `MessageEvent` من الـ agent، مفيش `FinishAction` ظهر.
+
+## إرسال برومت
+`POST /app-conversations/{id}/send-message`
+جسم: `{"role":"user","content":[{"type":"text","text":...}],"run":true}`
+- على sandbox **PAUSED** → **409** و`detail` بيقول:
+  `Sandbox is PAUSED. Use POST /api/v1/sandboxes/{sandbox_id}/resume to resume it first.`
+- `sandbox_id` موجود كحقل على عنصر الشات.
+
+## شات جديد
+`POST /app-conversations` جسم: `{"initial_message":{"content":[{"type":"text","text":...}]}, "selected_repository":...}`
+- بيرجّع start task فيه `id`.
+- `GET /app-conversations/start-tasks?ids=TASK_ID` → **array عناصرها ممكن `null`**. استنى `status == "READY"` وخد `app_conversation_id`. (المسار ده ماتمرنش live على شات جديد في المرحلة 0، اتأكد شكله فقط.)
+- `selected_repository` اختياري حسب الخطة؛ البوت بيدعم بدونه.
+
+## حذف شات (OHB2-MINIAPP)
+`DELETE /app-conversations/{id}` — حذف **بعيد** فعلي لشات على OpenHands (مش إخفاء محلي).
+- المصادقة: `Authorization: Bearer <OPENHANDS_API_KEY>` (زي باقي النداءات). موثّق كـ `APIKeyHeader`
+  (`X-Access-Token`) في OpenAPI، والواجهة الرسمية بتبعت `Bearer`.
+- النجاح: `200` بجسم `{"success": true}`. `404` **مبهم**: المصدر الرسمي بيرجّعه في حالتين —
+  الشات مش موجود فعلًا (`'Conversation not found'`) أو الخدمة فشلت داخليًا (`'Failed to delete
+  conversation'`)؛ فممنوع نعتبره نجاحًا تلقائيًا ⇒ بيمر بتسوية التحقق من الوجود (قراءات متتالية).
+  `400` = معرّف غير صالح. `401/403` = فشل مصادقة/تفويض. `429`/`5xx` = نتيجة **مجهولة** (نعيد
+  المحاولة/نسوّي). التنفيذ: `bot/openhands_client.py::delete_conversation` +
+  التنسيق المشترك في `bot/deletion.py`.
+- التحقق من الوجود: `GET /app-conversations?ids=<id>` ⇒ قايمة فاضية = غايب. القراءة من نفس
+  جلسة الكتابة (مفيش replica/كاش ⇒ قراءة قوية)، وبنطلب **قراءتين متتاليتين** فاضيتين قبل
+  تأكيد الغياب (bounded) عشان غياب عارض واحد مايتحسبش دليل حذف — يُستخدم لتسوية النتيجة
+  المبهمة/المجهولة بعد الانقطاع/إعادة التشغيل.
+
+## المستودعات
+`GET /git/repositories/search?provider=github&limit=100`
+- ترجّع `{"items":[...]}`، كل عنصر فيه `full_name`، `main_branch`، `is_public`.
+- 16 مستودع لـ `TM-AEM`.
+
+## ملفات الشات والتصدير (اتأكد live)
+- `GET /app-conversations/{id}/files?path=` → **مصفوفة نصية** بالمسارات النسبية (لاحظت 534 ملف
+  في شات Recovo، فيه `.gradle/` و`build/` كمان).
+- `GET /app-conversations/{id}/file?file_path=<path>` → **نص خام JSON** (string). الباراميتر
+  اسمه `file_path` **مش** `path` — لو بعتت `path` بترجّع `""` بـ 200 من غير أي خطأ.
+- `GET /app-conversations/{id}/download` → **zip** (`application/zip`، 6.4MB) لكنه
+  **تصدير الشات** (event_*.json + meta.json)، **مش** ملفات الـ workspace.
+- `metrics` على عنصر الشات فيه `accumulated_cost` و`accumulated_token_usage.{prompt,completion}_tokens`
+  و`model_name`. `pr_number` ممكن يكون **`[1]` (list)** أو scalar؛ رابط الـ PR يتكوّن من
+  `selected_repository` + الرقم.
+
+## ترقيم الصفحات (اتأكد live)
+- الترتيب الخام لـ `app-conversations/search` **مش** بالـ `created_at` ولا الـ `updated_at`.
+- فالترقيم لازم يكون client-side: نجيب لحد 100 عنصر (أقصى `limit`) مرة واحدة، نرتّبهم إحنا، وبعدين نقسّمهم.
+- ترتيب كل صفحة لوحدها مع الـ cursor من الـ API بيكسر التسلسل (تكرار/فقد عناصر).
+
+## مرجع
+- https://docs.openhands.dev/openhands/usage/cloud/cloud-api.md
+- مواصفات OpenAPI: `GET https://app.all-hands.dev/openapi.json` (v1.68.1 وقت الفحص).
+
+## OHB2-01 — عقد شكل الردود (تحقق schema)
+كل دوال `OpenHandsClient` العامة بتمرّ على `_as_items(data)`: بتقبل **مصفوفة مباشرة**
+أو **dict فيه `items` مصفوفة**، وأي شكل تاني (str/int/None/dict بدون items) ⇒
+`ApiError("رد غير متوقع من OpenHands")` بدل نتيجة فاضية مضلّلة. العناصر غير-dict
+بتتسقط بأمان (مفيش انهيار على `it.get`).
+
+| الدالة | الشكل المقبول | ملاحظات |
+|---|---|---|
+| `search_conversations` | list أو `{items:[...], next_page_id}` | يرتّب client-side، يسقط null |
+| `get_conversations` | list أو `{items:[...]}` | **مصفوفة فيها null مسموحة** (توثيق مؤكّد) |
+| `search_events` | list أو `{items:[...]}` | يسقط العناصر غير-dict |
+| `list_files` | list نصي أو `{items:[...]}` | يحتفظ بالسلاسل فقط |
+| `get_start_task` | list أو `{items:[...]}` | أول عنصر dict غير فاضي |
+| `search_repositories` | list أو `{items:[...]}` | عناصر dict |
+| أي جسم مش JSON | — | `ApiError` آمن (بدون JSONDecodeError خام) |
+
+كمان: `OPENHANDS_BASE_URL` لمضيف خارجي **لازم** `https://`؛ HTTP العادي مسموح فقط
+لـ loopback (`localhost`/`127.0.0.1`/`::1`) للتطوير المحلي.

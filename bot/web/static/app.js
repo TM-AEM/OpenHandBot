@@ -1,0 +1,1403 @@
+/* Mini App (OHB2-06) — JS عادي بحجم صغير، مفيش إطار عمل. */
+(function () {
+  "use strict";
+
+  var API = "/api/v1";
+  var tg = (window.Telegram && window.Telegram.WebApp) || null;
+  var REQUEST_TIMEOUT = 12000;
+  var state = { chatsPage: 0, currentChat: null, selectedRepo: null, inboxPage: 0, inboxLoading: false, inboxIds: {}, inboxHasMore: false, inboxVisible: false, inboxLastRefreshAt: 0, inboxFilter: "all", detailSeq: 0, chatsSeq: 0, reposSeq: 0, watchesSeq: 0, jobsPage: 0, jobsLoading: false, jobsHasMore: false };
+  // OHB2-08-07: مؤقّت التحديث الدوري (مرئي فقط) + آخر وقت تحديث (للتهدئة).
+  var inboxPollTimer = null;
+
+  function $(id) { return document.getElementById(id); }
+  function el(tag, cls, text) {
+    var n = document.createElement(tag);
+    if (cls) { n.className = cls; }
+    if (text !== undefined && text !== null) { n.textContent = text; }
+    return n;
+  }
+
+  function show(name) {
+    ["state-loading", "state-error", "state-ready"].forEach(function (id) {
+      var n = $(id);
+      if (n) { n.hidden = (id !== name); }
+    });
+    var app = $("app");
+    if (app) { app.setAttribute("aria-busy", name === "state-loading" ? "true" : "false"); }
+  }
+
+  function showView(name) {
+    // C4 (BATCH-C): لما نخرج من شاشة التفاصيل، نبطّل الشات الحالي. ده بيخلي حرس
+    // الردود القديمة (`currentChat`) فعالًا لوحده: رد تفاصيل جاي بعد ما المستخدم ساب
+    // الشاشة (تنقّل/رجوع) مايدهسش الشاشة الجديدة، مش بس لو فتح شات تاني.
+    if (name !== "view-detail") { state.currentChat = null; }
+    ["view-chats", "view-detail", "view-watches", "view-inbox", "view-jobs", "view-new", "view-settings"].forEach(function (id) {
+      var n = $(id);
+      if (n) { n.hidden = (id !== name); }
+    });
+    var tabs = document.querySelectorAll(".tab");
+    for (var i = 0; i < tabs.length; i++) {
+      var active = tabs[i].getAttribute("data-view") === name.replace("view-", "");
+      tabs[i].classList.toggle("active", active);
+      tabs[i].setAttribute("aria-selected", active ? "true" : "false");
+    }
+  }
+
+  function setError(message) {
+    var n = $("error-msg");
+    if (n) { n.textContent = message || "حصل خطأ غير متوقع."; }
+    show("state-error");
+  }
+
+  var toastTimer = null;
+  function toast(message) {
+    var n = $("toast");
+    if (!n) { return; }
+    n.textContent = message;
+    n.hidden = false;
+    if (toastTimer) { clearTimeout(toastTimer); }
+    toastTimer = setTimeout(function () { n.hidden = true; }, 2600);
+  }
+
+  function friendlyMessage(status, data) {
+    if (data && data.message) { return data.message; }
+    if (status === 401) { return "محتاج تسجيل دخول."; }
+    if (status === 403) { return "الحساب ده مش مسموح له."; }
+    if (status === 429) { return "طلبات كتير، استنى شوية وجرّب تاني."; }
+    if (status >= 500) { return "الخدمة مش متاحة دلوقتي، جرّب تاني."; }
+    return "حصل خطأ غير متوقع، جرّب تاني.";
+  }
+
+  function fetchJson(path, options) {
+    var opts = options || {};
+    var controller = new AbortController();
+    var timer = setTimeout(function () { controller.abort(); }, REQUEST_TIMEOUT);
+    var init = {
+      method: opts.method || "GET",
+      headers: { "Accept": "application/json" },
+      credentials: "same-origin",
+      signal: controller.signal,
+      cache: "no-store"
+    };
+    if (opts.body !== undefined) {
+      init.headers["Content-Type"] = "application/json";
+      init.body = JSON.stringify(opts.body);
+    }
+    return fetch(path, init).then(function (res) {
+      clearTimeout(timer);
+      return res.json().catch(function () { return {}; }).then(function (data) {
+        return { status: res.status, ok: res.ok, data: data };
+      });
+    }).catch(function (err) {
+      clearTimeout(timer);
+      throw err;
+    });
+  }
+
+  function get(path) { return fetchJson(API + path); }
+  function post(path, body) { return fetchJson(API + path, { method: "POST", body: body }); }
+  function del(path) { return fetchJson(API + path, { method: "DELETE" }); }
+
+  function withRetry(fn) {
+    return fn().catch(function () {
+      return new Promise(function (r) { setTimeout(r, 700); }).then(fn);
+    });
+  }
+
+  // منطق دورة حياة معرّف العملية (OHB2-07-FIX) — مشترك ومُختبر في ops.js.
+  var OPS = window.RecovoOps;
+  if (!OPS) { throw new Error("RecovoOps مش محمّل (ops.js)"); }
+  var INBOX = window.RecovoInbox;
+  if (!INBOX) { throw new Error("RecovoInbox مش محمّل (inbox.js)"); }
+  // OHB2-PHASE1D: منطق عرض/إدارة طلبات الشات الجديد — مشترك ومُختبر في jobs.js.
+  var JOBS = window.RecovoJobs;
+  if (!JOBS) { throw new Error("RecovoJobs مش محمّل (jobs.js)"); }
+  var FILES = window.RecovoFiles;
+  if (!FILES) { throw new Error("RecovoFiles مش محمّل (files.js)"); }
+  var COST = window.RecovoCost;
+  if (!COST) { throw new Error("RecovoCost مش محمّل (cost.js)"); }
+  var COPY = window.RecovoCopy;
+  if (!COPY) { throw new Error("RecovoCopy مش محمّل (copy.js)"); }
+  var EXPORT = window.RecovoExport;
+  if (!EXPORT) { throw new Error("RecovoExport مش محمّل (export.js)"); }
+  // OHB2-PHASE1B: مرجع آمن لـ navigator (مش موجود في بيئة الاختبار المصغّرة).
+  var NAV = (typeof navigator !== "undefined") ? navigator : null;
+  // OHB2-09-02: منع طلبات الملفات المكرّرة المتزامنة (نفس الشات/الملف).
+  var filesDeduper = FILES.createDeduper();
+  function opKey(parts) { return OPS.identityKey(parts); }
+
+  // حالات العملية اللي السيرفر بيرجّعها: pending/accepted/failed/ambiguous/unknown/discarded.
+  var OP_TEXT = {
+    pending: "قيد التنفيذ…",
+    accepted: "وصل ✅",
+    failed: "فشل",
+    ambiguous: "مش متأكدين",
+    unknown: "مش معروف",
+    discarded: "اتلغت"
+  };
+
+  function opPill(op) {
+    var state = (op && op.state) || "unknown";
+    var pill = el("span", "op-pill", OP_TEXT[state] || state);
+    pill.setAttribute("data-op", state);
+    return pill;
+  }
+
+  // يستعلم عن حالة العملية (GET آمن، idempotent) باستخدام معرّف العملية.
+  function queryOperation(kind, ref, conversationId) {
+    var q = "?client_ref=" + encodeURIComponent(ref);
+    if (kind === "prompt") { q += "&conversation_id=" + encodeURIComponent(conversationId); }
+    var path = kind === "prompt" ? "/operations/outbox" : "/operations/creation";
+    return get(path + q).then(function (res) {
+      if (res.status === 404) { return { ok: true, data: { state: "unknown" } }; }
+      return res;
+    });
+  }
+
+  // يعرض حالة العملية جوه صندوق، ويستعلم بتراجع محدود (مفيش إعادة إرسال تلقائية).
+  // `resend` دالة بتعيد إرسال نفس العملية بنفس المعرّف (idempotent) عند الطلب الصريح.
+  function trackOperation(box, kind, ref, conversationId, onAccepted, resend, manager) {
+    var status = el("div", "op-status");
+    status.appendChild(el("span", "op-label", "حالة العملية: "));
+    status.appendChild(opPill({ state: "pending" }));
+    box.appendChild(status);
+    var attempts = 0;
+    var maxAttempts = 6;
+    function showUnknown() {
+      // OHB2-N10-05: نحدّث الحالة المعروضة لـ "مش معروف" قبل الإجراءات، عشان ما
+      // تفضلش شايلة "قيد التنفيذ…" الابتدائية (تضاد بصري).
+      status.innerHTML = "";
+      status.appendChild(el("span", "op-label", "حالة العملية: "));
+      status.appendChild(opPill({ state: "unknown" }));
+      if (manager) { manager.resolve(ref, "unknown"); }
+      showOpActions(box, kind, ref, conversationId, "unknown", onAccepted, resend, manager, null);
+    }
+    function poll() {
+      queryOperation(kind, ref, conversationId).then(function (res) {
+        if (!res.ok) {
+          // OHB2-N10-05: رد غير ناجح (429/5xx/انقطاع) مش حالة نهائية — منسيبش
+          // الصندوق عالق على "قيد التنفيذ" للأبد. نعرض إجراءات صريحة (استعلام/إعادة
+          // محاولة) من غير أي إعادة إرسال تلقائية.
+          showUnknown();
+          return;
+        }
+        var op = res.data || {};
+        var state = op.state || "unknown";
+        // نسجّل الحالة اللي رصدناها: نهائية ⇒ العملية خلصت، فإرسال جديد بنفس
+        // المفتاح ياخد معرّف جديد. غامضة ⇒ تفضل نشطة (المعرّف يتحفظ).
+        if (manager) { manager.resolve(ref, state); }
+        status.innerHTML = "";
+        status.appendChild(el("span", "op-label", "حالة العملية: "));
+        status.appendChild(opPill(op));
+        if (state === "accepted") {
+          if (onAccepted) { onAccepted(op); }
+          return;
+        }
+        attempts += 1;
+        if (state !== "pending" || attempts >= maxAttempts) {
+          // فشل/غامض/مش معروف — أو لسه pending بعد ما استنفدنا المحاولات: نعرض
+          // إجراءات صريحة (استعلام + إعادة محاولة بنفس المعرّف). مفيش إعادة تلقائية.
+          showOpActions(box, kind, ref, conversationId, state, onAccepted, resend, manager, op);
+          return;
+        }
+        setTimeout(poll, 1500 + attempts * 500);
+      }).catch(function () {
+        // OHB2-N10-05: فشل الاستعلام نفسه (شبكة/انقطاع) — نعرض إجراءات صريحة بدل
+        // ما نسيب الواجهة عالقة على "قيد التنفيذ".
+        showUnknown();
+      });
+    }
+    setTimeout(poll, 800);
+  }
+
+  var OP_NOTE = {
+    ambiguous: "النتيجة غامضة (ممكن يكون وصل). استعلم عن الحالة الأول قبل أي إعادة إرسال.",
+    failed: "العملية فشلت بشكل مؤكد.",
+    pending: "لسه قيد التنفيذ. استعلم تاني بعد شوية.",
+    unknown: "حالة العملية مش معروفة. استعلم عنها.",
+    discarded: "اتلغت قبل ما تتبعت. مفيش أي إرسال حصل."
+  };
+
+  // عند نتيجة غامضة/فاشلة/لسه معلّقة: نعرض إجراءات صريحة — استعلام (قراءة) وإعادة
+  // محاولة بنفس معرّف العملية (idempotent، مفيش تكرار). مفيش أي إعادة تلقائية.
+  function showOpActions(box, kind, ref, conversationId, state, onAccepted, resend, manager, op) {
+    if (box.querySelector(".op-actions")) { return; }
+    var note = el("p", "op-note", OP_NOTE[state] || OP_NOTE.unknown);
+    var actions = el("div", "op-actions");
+    var checkBtn = el("button", "btn ghost small", "استعلام عن الحالة");
+    checkBtn.addEventListener("click", function () {
+      checkBtn.disabled = true;
+      queryOperation(kind, ref, conversationId).then(function (res) {
+        checkBtn.disabled = false;
+        var op2 = (res && res.data) || {};
+        var s = op2.state || "unknown";
+        if (manager) { manager.resolve(ref, s); }
+        box.querySelectorAll(".op-status").forEach(function (n) { n.remove(); });
+        var line = el("div", "op-status");
+        line.appendChild(el("span", "op-label", "حالة العملية: "));
+        line.appendChild(opPill(op2));
+        box.appendChild(line);
+        box.querySelectorAll(".op-actions, .op-note").forEach(function (n) { n.remove(); });
+        if (s === "accepted") { if (onAccepted) { onAccepted(op2); } }
+        else { showOpActions(box, kind, ref, conversationId, s, onAccepted, resend, manager, op2); }
+      }).catch(function () { checkBtn.disabled = false; toast("مش قادر أوصل للسيرفر."); });
+    });
+    actions.appendChild(checkBtn);
+    var retryBtn = el("button", "btn small", "إعادة المحاولة");
+    retryBtn.addEventListener("click", function () {
+      retryBtn.disabled = true;
+      resend(ref).then(function (res) {
+        retryBtn.disabled = false;
+        if (res.ok) {
+          box.querySelectorAll(".op-status, .op-actions, .op-note").forEach(function (n) { n.remove(); });
+          trackOperation(box, kind, ref, conversationId, onAccepted, resend, manager);
+          toast("اتعادت المحاولة بنفس العملية ✅");
+        } else {
+          toast(friendlyMessage(res.status, res.data));
+        }
+      }).catch(function () { retryBtn.disabled = false; toast("مش قادر أوصل للسيرفر."); });
+    });
+    actions.appendChild(retryBtn);
+
+    // OHB2-09-05: تسوية يدوية للبرومتات المعلّقة (نفس أوامر البوت). بتظهر بس لما
+    // يبقى عندنا id، وبتعمل تحديث للحالة بعد النجاح. 409 (حالة نهائية/غير مناسبة)
+    // بيترجم لرسالة عربية من غير ما نغيّر حاجة محليًا.
+    if (kind === "prompt" && op && op.id !== undefined && op.id !== null && state !== "accepted") {
+      var markSent = el("button", "btn ghost small", "تأكيد الإرسال");
+      markSent.addEventListener("click", function () {
+        markSent.disabled = true;
+        reconcileOperation(op.id, "mark_sent").then(function (res) {
+          markSent.disabled = false;
+          if (!res.ok) { toast(friendlyMessage(res.status, res.data)); return; }
+          toast("اتعلّم كمُرسل ✅");
+          if (manager && res.data) { manager.resolve(ref, res.data.state || "accepted"); }
+          box.querySelectorAll(".op-status, .op-actions, .op-note").forEach(function (n) { n.remove(); });
+          var line = el("div", "op-status");
+          line.appendChild(el("span", "op-label", "حالة العملية: "));
+          line.appendChild(opPill(res.data));
+          box.appendChild(line);
+        }).catch(function () { markSent.disabled = false; toast("مش قادر أوصل للسيرفر."); });
+      });
+      actions.appendChild(markSent);
+
+      var discard = el("button", "btn ghost small", "شطب العملية");
+      discard.addEventListener("click", function () {
+        discard.disabled = true;
+        reconcileOperation(op.id, "discard").then(function (res) {
+          discard.disabled = false;
+          if (!res.ok) { toast(friendlyMessage(res.status, res.data)); return; }
+          var data = res.data || {};
+          // OHB2-N10-28C: لو الإلغاء مش مؤكد (الـ POST ممكن يكون بدأ)، ما نغيّرش الحالة
+          // لـ "اتلغت" — نبلّغ إن الإلغاء غير مؤكد ونسيب الحالة زي ما هي.
+          if (data.cancellation === "not_confirmed") {
+            toast("الإلغاء غير مؤكد — الإرسال ممكن يكون بدأ. استعلم عن الحالة.");
+            return;
+          }
+          toast("اتلغت قبل الإرسال ✅");
+          if (manager) { manager.resolve(ref, data.state || "discarded"); }
+          box.querySelectorAll(".op-status, .op-actions, .op-note").forEach(function (n) { n.remove(); });
+          var line = el("div", "op-status");
+          line.appendChild(el("span", "op-label", "حالة العملية: "));
+          line.appendChild(opPill(data));
+          box.appendChild(line);
+        }).catch(function () { discard.disabled = false; toast("مش قادر أوصل للسيرفر."); });
+      });
+      actions.appendChild(discard);
+    }
+
+    box.appendChild(note);
+    box.appendChild(actions);
+  }
+
+  // OHB2-09-05: تسوية عملية برومت معلّقة (discard/mark_sent) عبر مسار مصادَق (POST).
+  function reconcileOperation(id, action) {
+    return post("/operations/outbox/reconcile", { id: id, action: action });
+  }
+
+  // -------------------------------------------------------------- auth
+  function authenticate() {
+    var raw = (tg && tg.initData) ? tg.initData : "";
+    if (!raw) {
+      return Promise.resolve({ status: 401, ok: false, data: { message: "افتح التطبيق من جوه تيليجرام." } });
+    }
+    return post("/auth", { initData: raw });
+  }
+
+  function renderBootstrap(data) {
+    var user = (data && data.user) || {};
+    var nameEl = $("user-name");
+    if (nameEl && user.display_name) {
+      nameEl.textContent = user.display_name;
+      nameEl.hidden = false;
+    }
+    var settings = (data && data.settings) || {};
+    renderNotif(settings.notifications_enabled !== false);
+    // القرار 4: نطابق إخفاء ميزات البوت (المتابعات) في الواجهة كمان.
+    var feats = (data && data.features) || {};
+    var watchesTab = document.querySelector('.tab[data-view="watches"]');
+    if (watchesTab && feats.watches === false) { watchesTab.hidden = true; }
+    // OHB2-08-05: شارة غير المقروء في تبويب الإشعارات.
+    var inbox = (data && data.inbox) || {};
+    renderInboxBadge(inbox.unread_count);
+  }
+
+  function renderNotif(enabled) {
+    var btn = $("notif-toggle");
+    if (!btn) { return; }
+    btn.textContent = enabled ? "مفعّلة ✅" : "متوقفة ⛔";
+    btn.setAttribute("data-enabled", enabled ? "1" : "0");
+    btn.classList.toggle("on", enabled);
+  }
+
+  // --------------------------------------------------------------- inbox
+  function renderInboxBadge(count) {
+    var badge = $("inbox-badge");
+    if (!badge) { return; }
+    var text = INBOX.badgeText(count);
+    if (text) {
+      badge.textContent = text;
+      badge.hidden = false;
+    } else {
+      badge.hidden = true;
+    }
+  }
+
+  function kindLabel(kind) {
+    return INBOX.kindLabel(kind);
+  }
+
+  // OHB2-08-07: `silent` للتحديثات الخلفية (الرجوع للصفحة / poll) عشان ما نعرضش صف
+  // "بيتم التحميل…" وميضيء الشاشة من غير داعي. `page` بيتزامن مع اللي السيرفر رجّعه
+  // (السيرفر بيرجع للأولى لو تجاوزنا الحد) — OHB2-08-08.
+  function loadInbox(page, silent) {
+    var list = $("inbox-list");
+    if (!list) { return; }
+    // OHB2-08-06: حارس الطلب الجاري — الضغط المتكرّر على "المزيد"/"تحديث" مايعملش
+    // طلبات متداخلة (page=1 و page=2 في نفس اللحظة). الحارس أول حاجة عشان ما نلمسش
+    // حالة التحميل الجاري. بيتصفّر في then/catch تحت.
+    if (state.inboxLoading) { return; }
+    state.inboxLoading = true;
+    // OHB2-PHASE1C: نلتقط الفلتر اللي الطلب ده بتاعه. لو المستخدم غيّر الفلتر أثناء
+    // الطلب، الرد ده بقى قديم ⇒ نتجاهله ونعيد التحميل بالفلتر الحالي (منع سباق
+    // بين تغيير الفلتر والترقيم والتحديثات).
+    var reqFilter = state.inboxFilter;
+    var unreadOnly = reqFilter === "unread";
+    var archived = reqFilter === "archived";
+    var query = INBOX.filterQuery(page || 0, unreadOnly, archived);
+    if (page === 0) { state.inboxIds = {}; if (!silent) { list.innerHTML = ""; list.appendChild(el("li", "loading-row", "بيتم التحميل…")); } }
+    get("/notifications?" + query).then(function (res) {
+      state.inboxLoading = false;
+      if (reqFilter !== state.inboxFilter) { loadInbox(0); return; }
+      var data = res.data || {};
+      if (!res.ok) {
+        // فشل تحديث خلفي ⇒ نتجاهله ونحافظ على المعروض (مفيش وميض/مسح).
+        if (silent) { return; }
+        if (page === 0) { list.innerHTML = ""; }
+        list.appendChild(el("li", "empty-row", friendlyMessage(res.status, res.data)));
+        return;
+      }
+      // OHB2-08-08: نزامن رقم الصفحة مع رد السيرفر (لو رجع للأولى بسبب تجاوز الحد)
+      // عشان "المزيد" يكمّل من المكان الصح بدل ما يطلب صفحة مش موجودة.
+      // R5-01: `state.inboxPage` = آخر صفحة **نجحت**، وهو المصدر الوحيد للحقيقة
+      // (بيتكتب هنا بس). كده فشل أي طلب (HTTP/شبكة) مايقدّمش الصفحة، و"المزيد" يعيد
+      // نفس الصفحة الفاشلة بدل ما يتخطاها.
+      if (typeof data.page === "number" && data.page >= 0) { state.inboxPage = data.page; }
+      state.inboxHasMore = !!data.has_more;
+      renderInboxBadge(data.unread_count);
+      var items = data.items || [];
+      if (page === 0) { list.innerHTML = ""; }
+      if (page === 0 && !items.length) { list.appendChild(el("li", "empty-row", INBOX.emptyText(unreadOnly, archived))); }
+      items.forEach(function (it) {
+        // OHB2-08-06: منع تكرار نفس الإشعار — الترقيم بـ offset ممكن يتداخل لما
+        // إشعارات جديدة تتصدّر القايمة، فنفس المعرّف يظهر في صفحتين.
+        var idKey = String(it.id);
+        if (state.inboxIds[idKey]) { return; }
+        state.inboxIds[idKey] = true;
+        list.appendChild(renderInboxRow(it));
+      });
+      var more = $("inbox-more");
+      if (more) { more.hidden = !data.has_more; }
+    }).catch(function () {
+      state.inboxLoading = false;
+      // OHB2-PHASE1C: نفس حارس السباق في مسار الفشل (رفض الشبكة) — لو الفلتر اتغيّر
+      // أثناء الطلب، مانعرضش خطأ للفلتر القديم؛ نعيد التحميل بالفلتر الحالي.
+      if (reqFilter !== state.inboxFilter) { loadInbox(0); return; }
+      if (page === 0 && !silent) { list.innerHTML = ""; list.appendChild(el("li", "empty-row", "مش قادر أوصل للسيرفر.")); }
+    });
+  }
+
+  // OHB2-PHASE1C: صف إشعار واحد + أزرار الأرشفة/الاسترجاع/الحذف. الحذف النهائي بيتطلب
+  // تأكيد صريح (خطوتين) في الواجهة، والسيرفر بيفرض الأهلية تاني بشكل مستقل.
+  function renderInboxRow(it) {
+    var unread = INBOX.isUnread(it);
+    var archived = INBOX.isArchived(it);
+    var li = el("li", "row" + (unread ? " unread" : "") + (archived ? " archived" : ""));
+    var main = el("div", "row-main");
+    main.appendChild(el("span", "row-title", it.title || it.conversation_id || ""));
+    main.appendChild(el("span", "row-sub", kindLabel(it.kind)));
+    li.appendChild(main);
+    var pills = el("div", "row-pills");
+    // OHB2-08-05 (Batch 3R): شارة حالة التسليم (مفيش شارة لو اتسلّم).
+    var delivery = INBOX.deliveryLabel(it.delivery_status);
+    if (delivery) { pills.appendChild(el("span", "pill delivery", delivery)); }
+    pills.appendChild(el("span", "pill", unread ? "جديد" : "مقروء"));
+    li.appendChild(pills);
+    var actions = el("div", "row-actions");
+    // أرشفة/استرجاع (قابل للعكس دائمًا).
+    var archiveBtn = el("button", "btn ghost small", archived ? "استرجاع" : "أرشفة");
+    archiveBtn.addEventListener("click", function (e) {
+      if (e && e.stopPropagation) { e.stopPropagation(); }
+      setInboxArchived(it, !archived, archiveBtn);
+    });
+    actions.appendChild(archiveBtn);
+    // حذف نهائي — بس لو السيرفر قال إنه مؤهّل، ومع تأكيد صريح.
+    if (INBOX.canDelete(it)) {
+      var delBtn = el("button", "btn danger small", "🗑 حذف");
+      var confirmBtn = el("button", "btn danger small", "أكّد الحذف");
+      confirmBtn.hidden = true;
+      var cancelBtn = el("button", "btn ghost small", "إلغاء");
+      cancelBtn.hidden = true;
+      var deleting = false;
+      delBtn.addEventListener("click", function (e) {
+        if (e && e.stopPropagation) { e.stopPropagation(); }
+        delBtn.hidden = true; confirmBtn.hidden = false; cancelBtn.hidden = false;
+      });
+      cancelBtn.addEventListener("click", function (e) {
+        if (e && e.stopPropagation) { e.stopPropagation(); }
+        delBtn.hidden = false; confirmBtn.hidden = true; cancelBtn.hidden = true;
+      });
+      confirmBtn.addEventListener("click", function (e) {
+        if (e && e.stopPropagation) { e.stopPropagation(); }
+        if (deleting) { return; }
+        deleting = true;
+        confirmBtn.disabled = true; cancelBtn.disabled = true;
+        del("/notifications/" + encodeURIComponent(it.id)).then(function (res) {
+          if (res.ok) {
+            renderInboxBadge(res.data && res.data.unread_count);
+            toast("اتحذف الإشعار نهائيًا ✅");
+            loadInbox(0);
+          } else {
+            deleting = false; confirmBtn.disabled = false; cancelBtn.disabled = false;
+            toast(friendlyMessage(res.status, res.data));
+          }
+        }).catch(function () {
+          // انقطاع الشبكة: النتيجة غامضة ⇒ نسمح بإعادة المحاولة (مفيش نجاح كاذب).
+          deleting = false; confirmBtn.disabled = false; cancelBtn.disabled = false;
+          toast("مش قادر أوصل للسيرفر — جرّب تاني.");
+        });
+      });
+      actions.appendChild(delBtn);
+      actions.appendChild(confirmBtn);
+      actions.appendChild(cancelBtn);
+    }
+    li.appendChild(actions);
+    li.addEventListener("click", function () {
+      if (unread) {
+        post("/notifications/" + encodeURIComponent(it.id) + "/read", {}).then(function (r2) {
+          if (r2.ok) { renderInboxBadge(r2.data && r2.data.unread_count); }
+        }).catch(function () { /* نتجاهل: العرض لسه شغال */ });
+      }
+      if (it.conversation_id) { openDetail(it.conversation_id); }
+    });
+    return li;
+  }
+
+  // OHB2-PHASE1C: أرشفة/استرجاع إشعار (قابل للعكس). ما بنحدّثش العرض كذبًا: بنعيد التحميل
+  // من السيرفر بعد النجاح بس، وأي فشل يعرض رسالة من غير ما يغيّر الحالة المعروضة.
+  function setInboxArchived(it, wantArchived, btn) {
+    var path = "/notifications/" + encodeURIComponent(it.id) + (wantArchived ? "/archive" : "/unarchive");
+    if (btn) { btn.disabled = true; }
+    post(path, {}).then(function (res) {
+      if (btn) { btn.disabled = false; }
+      if (res.ok) {
+        renderInboxBadge(res.data && res.data.unread_count);
+        toast(wantArchived ? "اتأرشف ✅" : "اتسترجع ✅");
+        loadInbox(0);
+      } else {
+        toast(friendlyMessage(res.status, res.data));
+      }
+    }).catch(function () {
+      if (btn) { btn.disabled = false; }
+      toast("مش قادر أوصل للسيرفر.");
+    });
+  }
+
+  // OHB2-PHASE1C: تبديل فلتر الصندوق (الكل / غير المقروء / المؤرشف). بيصفّر الترقيم
+  // عشان ما نتخطّاش سجلات عند تغيير الفلتر، وبيعيد التحميل من أول صفحة.
+  function setInboxFilter(filter) {
+    state.inboxFilter = filter;
+    ["inbox-filter-all", "inbox-filter-unread", "inbox-filter-archived"].forEach(function (id) {
+      var btn = $(id);
+      if (!btn) { return; }
+      var on = btn.getAttribute("data-filter") === filter;
+      btn.className = on ? "chip active" : "chip";
+    });
+    state.inboxPage = 0;
+    state.inboxIds = {};
+    state.inboxHasMore = false;
+    state.inboxLastRefreshAt = Date.now();
+    loadInbox(0);
+  }
+
+  // OHB2-PHASE1D: قايمة طلبات الشات الجديد (قراءة فقط، مقيّدة بالمالك على السيرفر).
+  // `page===0` بتصفّر القايمة؛ الفشل الصامت (silent) بيحافظ على المعروض.
+  function loadJobs(page, silent) {
+    var list = $("jobs-list");
+    if (!list) { return; }
+    if (state.jobsLoading) { return; }
+    state.jobsLoading = true;
+    var p = page || 0;
+    if (p === 0 && !silent) {
+      list.innerHTML = "";
+      list.appendChild(el("li", "loading-row", "بيتم التحميل…"));
+    }
+    get("/operations/creation/list?page=" + encodeURIComponent(p)).then(function (res) {
+      state.jobsLoading = false;
+      var data = res.data || {};
+      if (!res.ok) {
+        if (silent) { return; }
+        if (p === 0) { list.innerHTML = ""; }
+        list.appendChild(el("li", "empty-row", friendlyMessage(res.status, res.data)));
+        return;
+      }
+      if (typeof data.page === "number" && data.page >= 0) { state.jobsPage = data.page; }
+      state.jobsHasMore = !!data.has_more;
+      var items = data.items || [];
+      if (p === 0) { list.innerHTML = ""; }
+      if (p === 0 && !items.length) {
+        list.appendChild(el("li", "empty-row", "مفيش طلبات بدء شات لسه."));
+      }
+      items.forEach(function (it) { list.appendChild(renderJobRow(it)); });
+      var more = $("jobs-more");
+      if (more) { more.hidden = !data.has_more; }
+    }).catch(function () {
+      state.jobsLoading = false;
+      if (p === 0 && !silent) {
+        list.innerHTML = "";
+        list.appendChild(el("li", "empty-row", "مش قادر أوصل للسيرفر."));
+      }
+    });
+  }
+
+  // OHB2-PHASE1D: صف طلب شات جديد. الأزرار بتظهر **بس** حسب أعلام السيرفر
+  // (`cancellable`/`resolvable`) — مفيش قرار من الواجهة، والسيرفر بيفرض الأهلية تاني.
+  function renderJobRow(it) {
+    var li = el("li", "row");
+    var main = el("div", "row-main");
+    var title = el("div", "row-title", "طلب بدء #" + it.id + (it.repository ? (" — " + it.repository) : ""));
+    main.appendChild(title);
+    var meta = el("div", "row-meta");
+    meta.appendChild(el("span", "op-pill", JOBS.stateLabel(it.state)));
+    var postLabel = JOBS.postStateLabel(it.post_state);
+    if (postLabel) { meta.appendChild(el("span", "pill", "الإرسال: " + postLabel)); }
+    if (it.terminal) { meta.appendChild(el("span", "pill", "نهائي")); }
+    main.appendChild(meta);
+    main.appendChild(el("p", "op-note", JOBS.note(it)));
+    li.appendChild(main);
+
+    var actions = el("div", "row-actions");
+    // إلغاء آمن — بس قبل الإرسال المؤكد، ومع تأكيد صريح (خطوتين).
+    if (JOBS.canCancel(it)) {
+      var cancelBtn = el("button", "btn danger small", "إلغاء الطلب");
+      var confirmBtn = el("button", "btn danger small", "أكّد الإلغاء");
+      confirmBtn.hidden = true;
+      var backBtn = el("button", "btn ghost small", "رجوع");
+      backBtn.hidden = true;
+      var busy = false;
+      cancelBtn.addEventListener("click", function () {
+        cancelBtn.hidden = true; confirmBtn.hidden = false; backBtn.hidden = false;
+      });
+      backBtn.addEventListener("click", function () {
+        cancelBtn.hidden = false; confirmBtn.hidden = true; backBtn.hidden = true;
+      });
+      confirmBtn.addEventListener("click", function () {
+        if (busy) { return; }
+        busy = true;
+        confirmBtn.disabled = true; backBtn.disabled = true;
+        reconcileJob(it.id, "cancel").then(function (res) {
+          if (res.ok) {
+            var data = res.data || {};
+            if (data.cancellation === "not_confirmed") {
+              toast("الإلغاء غير مؤكد — الإرسال ممكن يكون بدأ. استعلم عن الحالة.");
+            } else {
+              toast("اتلغى قبل الإرسال ✅");
+            }
+            loadJobs(0);
+          } else {
+            busy = false; confirmBtn.disabled = false; backBtn.disabled = false;
+            toast(friendlyMessage(res.status, res.data));
+          }
+        }).catch(function () {
+          busy = false; confirmBtn.disabled = false; backBtn.disabled = false;
+          toast("مش قادر أوصل للسيرفر — جرّب تاني.");
+        });
+      });
+      actions.appendChild(cancelBtn);
+      actions.appendChild(confirmBtn);
+      actions.appendChild(backBtn);
+    }
+    // تأكيد البدء (حسم الغموض) — بس لو السيرفر قال إن الطلب غامض، ومع تأكيد صريح.
+    if (JOBS.canResolve(it)) {
+      var markBtn = el("button", "btn small", "أكّد إنه بدأ");
+      var markConfirm = el("button", "btn small", "تأكيد نهائي");
+      markConfirm.hidden = true;
+      var markBack = el("button", "btn ghost small", "رجوع");
+      markBack.hidden = true;
+      var markBusy = false;
+      markBtn.addEventListener("click", function () {
+        markBtn.hidden = true; markConfirm.hidden = false; markBack.hidden = false;
+      });
+      markBack.addEventListener("click", function () {
+        markBtn.hidden = false; markConfirm.hidden = true; markBack.hidden = true;
+      });
+      markConfirm.addEventListener("click", function () {
+        if (markBusy) { return; }
+        markBusy = true;
+        markConfirm.disabled = true; markBack.disabled = true;
+        reconcileJob(it.id, "mark_sent").then(function (res) {
+          if (res.ok) { toast("اتأكد إنه بدأ ✅"); loadJobs(0); }
+          else {
+            markBusy = false; markConfirm.disabled = false; markBack.disabled = false;
+            toast(friendlyMessage(res.status, res.data));
+          }
+        }).catch(function () {
+          markBusy = false; markConfirm.disabled = false; markBack.disabled = false;
+          toast("مش قادر أوصل للسيرفر — جرّب تاني.");
+        });
+      });
+      actions.appendChild(markBtn);
+      actions.appendChild(markConfirm);
+      actions.appendChild(markBack);
+    }
+    // فتح المحادثة المرتبطة — بس لو السيرفر رجّع معرّف محادثة (بدليل).
+    if (JOBS.hasConversation(it)) {
+      var openBtn = el("button", "btn ghost small", "افتح الشات");
+      openBtn.addEventListener("click", function () { openDetail(it.conversation_id); });
+      actions.appendChild(openBtn);
+    }
+    li.appendChild(actions);
+    return li;
+  }
+
+  // OHB2-PHASE1D: تسوية طلب شات (cancel/mark_sent) عبر مسار مصادَق (POST).
+  function reconcileJob(id, action) {
+    return post("/operations/creation/reconcile", { id: id, action: action });
+  }
+
+  var DELETION_STATE_LABEL = {
+    deleting: "جاري الحذف (معلّق)",
+    uncertain: "غير محسوم"
+  };
+
+  function loadDeletions(silent) {
+    var list = $("deletions-list");
+    if (!list) { return; }
+    if (!silent) {
+      list.innerHTML = "";
+      list.appendChild(el("li", "loading-row", "بيتم التحميل…"));
+    }
+    get("/operations/deletions/list").then(function (res) {
+      if (!res.ok) {
+        if (silent) { return; }
+        list.innerHTML = "";
+        list.appendChild(el("li", "empty-row", friendlyMessage(res.status, res.data)));
+        return;
+      }
+      var items = (res.data && res.data.items) || [];
+      list.innerHTML = "";
+      if (!items.length) {
+        list.appendChild(el("li", "empty-row", "مفيش عمليات حذف معلّقة."));
+        return;
+      }
+      items.forEach(function (it) { list.appendChild(renderDeletionRow(it)); });
+    }).catch(function () {
+      if (!silent) {
+        list.innerHTML = "";
+        list.appendChild(el("li", "empty-row", "مش قادر أوصل للسيرفر."));
+      }
+    });
+  }
+
+  function renderDeletionRow(it) {
+    var li = el("li", "row");
+    var main = el("div", "row-main");
+    main.appendChild(el("div", "row-title", "حذف شات: " + (it.conversation_id || "")));
+    var meta = el("div", "row-meta");
+    meta.appendChild(el("span", "op-pill", DELETION_STATE_LABEL[it.state] || it.state || "معلّق"));
+    if (it.updated_at) { meta.appendChild(el("span", "pill", it.updated_at)); }
+    main.appendChild(meta);
+    li.appendChild(main);
+
+    var actions = el("div", "row-actions");
+    var checkBtn = el("button", "btn small", "تحقق الآن");
+    var confirmBtn = el("button", "btn small", "أكّد التحقق");
+    confirmBtn.hidden = true;
+    var backBtn = el("button", "btn ghost small", "رجوع");
+    backBtn.hidden = true;
+    var busy = false;
+    checkBtn.addEventListener("click", function () {
+      checkBtn.hidden = true; confirmBtn.hidden = false; backBtn.hidden = false;
+    });
+    backBtn.addEventListener("click", function () {
+      checkBtn.hidden = false; confirmBtn.hidden = true; backBtn.hidden = true;
+    });
+    confirmBtn.addEventListener("click", function () {
+      if (busy) { return; }
+      busy = true;
+      confirmBtn.disabled = true; backBtn.disabled = true;
+      post("/operations/deletions/reconcile", { conversation_id: it.conversation_id }).then(function (res) {
+        if (res.ok) {
+          toast((res.data && res.data.message) || "اتحذف الشات نهائيًا من OpenHands ✅");
+          loadDeletions(false);
+        } else {
+          busy = false; confirmBtn.disabled = false; backBtn.disabled = false;
+          toast(friendlyMessage(res.status, res.data));
+          loadDeletions(false);
+        }
+      }).catch(function () {
+        busy = false; confirmBtn.disabled = false; backBtn.disabled = false;
+        toast("مش قادر أوصل للسيرفر — جرّب تاني.");
+      });
+    });
+    actions.appendChild(checkBtn);
+    actions.appendChild(confirmBtn);
+    actions.appendChild(backBtn);
+    li.appendChild(actions);
+    return li;
+  }
+
+  // OHB2-08-07: تحديث صندوق الإشعارات لو الصفحة مرئية وتبويب الإشعارات مفتوح فعلاً،
+  // مع تهدئة (ما نكرّرش التحديث في نفس اللحظة). بيتنادى من poll / رجوع الصفحة.
+  function refreshInboxIfVisible() {
+    if (!state.inboxVisible) { return; }
+    var view = $("view-inbox");
+    if (!view || view.hidden) { return; }
+    if (INBOX.shouldThrottleRefresh(state.inboxLastRefreshAt, Date.now())) { return; }
+    state.inboxLastRefreshAt = Date.now();
+    loadInbox(state.inboxPage, true);
+  }
+
+  // OHB2-08-07: نبدأ/نوقف poll حسب رؤية الصفحة. مخفية ⇒ نوقف (مفيش طلبات خلفية).
+  function setInboxPolling(visible) {
+    if (inboxPollTimer) { clearInterval(inboxPollTimer); inboxPollTimer = null; }
+    if (visible) {
+      var ms = INBOX.refreshInterval(true);
+      inboxPollTimer = setInterval(refreshInboxIfVisible, ms);
+    }
+  }
+
+  // OHB2-08-07: لما الصفحة ترجع مرئية نحدّث فورًا (لو التبويب مفتوح) + نرجّع الـ poll.
+  function onVisibilityChange() {
+    var visible = !document.hidden;
+    state.inboxVisible = visible;
+    setInboxPolling(visible);
+    if (visible) { refreshInboxIfVisible(); }
+  }
+
+  function markAllRead() {
+    var btn = $("inbox-read-all");
+    if (btn) { btn.disabled = true; }
+    post("/notifications/read-all", {}).then(function (res) {
+      if (btn) { btn.disabled = false; }
+      if (res.ok) {
+        renderInboxBadge(res.data && res.data.unread_count);
+        // R5-01: نفس الثابت — خط الأساس بيتضبط من مسار النجاح بس (loadInbox(0)).
+        loadInbox(0);
+      } else {
+        toast(friendlyMessage(res.status, res.data));
+      }
+    }).catch(function () { if (btn) { btn.disabled = false; } toast("مش قادر أوصل للسيرفر."); });
+  }
+
+  // -------------------------------------------------------------- chats
+  function statusPill(item) {
+    var pill = el("span", "pill", item.state_label || item.status || "");
+    pill.setAttribute("data-status", item.status || "");
+    return pill;
+  }
+
+  function loadChats(refresh) {
+    var list = $("chats-list");
+    // OHB2-MINIAPP-STALE-FIX: حرس الردود القديمة بنفس نمط `detailSeq`. كل طلب جديد
+    // بيلغي الطلبات الأقدم؛ الرد (نجاح/فشل/رفض شبكة) مايلمسش الـ DOM غير لو لسه
+    // تابع للجيل الحالي. كده رد قديم مايستعيدش شات اتحذف ولا يدهس قايمة/صفحة أحدث.
+    var seq = ++state.chatsSeq;
+    function current() { return state.chatsSeq === seq; }
+    list.innerHTML = "";
+    list.appendChild(el("li", "loading-row", "بيتم التحميل…"));
+    var q = "?page=" + state.chatsPage + (refresh ? "&refresh=1" : "");
+    return get("/conversations" + q).then(function (res) {
+      if (!current()) { return; }
+      if (!res.ok) { list.innerHTML = ""; list.appendChild(el("li", "empty-row", friendlyMessage(res.status, res.data))); return; }
+      var data = res.data || {};
+      list.innerHTML = "";
+      var items = data.items || [];
+      if (!items.length) { list.appendChild(el("li", "empty-row", "مفيش شاتات.")); }
+      items.forEach(function (item) {
+        var li = el("li", "row");
+        var main = el("div", "row-main");
+        main.appendChild(el("span", "row-title", item.title || "بدون عنوان"));
+        main.appendChild(el("span", "row-sub", item.repository || "بدون مستودع"));
+        li.appendChild(main);
+        li.appendChild(statusPill(item));
+        li.addEventListener("click", function () { openDetail(item.id); });
+        list.appendChild(li);
+      });
+      var more = $("chats-more");
+      if (more) { more.hidden = !data.has_more; }
+    }).catch(function () {
+      // OHB2-MINIAPP-STALE-FIX: رفض الشبكة كان بيسيب صف «بيتم التحميل…» للأبد وبيرمي
+      // unhandled rejection. دلوقتي بنستبدله برسالة قابلة للاسترجاع — لكن برضه بحرس
+      // الجيل، عشان فشل قديم مايدهسش نجاح أحدث.
+      if (!current()) { return; }
+      list.innerHTML = "";
+      list.appendChild(el("li", "empty-row", "مش قادر أوصل للسيرفر."));
+    });
+  }
+
+  function openDetail(id) {
+    var box = $("view-detail");
+    box.innerHTML = "";
+    box.appendChild(el("div", "loading-row", "بيتم التحميل…"));
+    showView("view-detail");
+    state.currentChat = id;
+    // OHB2-09-07 (B-07-07): حرس ضد الردود القديمة. لو المستخدم فتح شات تاني قبل ما
+    // يرجع رد الأول، بنتجاهل الرد القديم عشان مايدهسش عرض الشات الأحدث (مفيش تسريب
+    // حالة بين الشاتات). بنقارن الرقم التسلسلي قبل أي تحديث للـ DOM.
+    var seq = ++state.detailSeq;
+    function current() { return state.detailSeq === seq && state.currentChat === id; }
+    get("/conversations/" + encodeURIComponent(id)).then(function (res) {
+      if (!current()) { return; }
+      if (!res.ok) { box.innerHTML = ""; box.appendChild(el("p", "empty-row", friendlyMessage(res.status, res.data))); return; }
+      var d = res.data || {};
+      box.innerHTML = "";
+      var back = el("button", "btn ghost small", "→ رجوع");
+      back.addEventListener("click", function () { showView("view-chats"); });
+      box.appendChild(back);
+
+      var card = el("div", "card");
+      card.appendChild(el("p", "card-value", d.title || "بدون عنوان"));
+      card.appendChild(el("p", "card-label", (d.repository || "بدون مستودع") + " · " + (d.state_label || d.status || "")));
+      if (d.pr_url) {
+        var a = el("a", "link", "افتح الـ PR");
+        a.href = d.pr_url; a.target = "_blank"; a.rel = "noopener noreferrer";
+        card.appendChild(a);
+      }
+      box.appendChild(card);
+
+      if (d.last_prompt) {
+        var pb = el("div", "bubble user");
+        pb.appendChild(el("span", "bubble-label", "آخر برومت"));
+        pb.appendChild(el("p", "bubble-text", d.last_prompt));
+        box.appendChild(pb);
+      }
+      var rb = el("div", "bubble agent");
+      rb.appendChild(el("span", "bubble-label", "آخر رد"));
+      rb.appendChild(el("p", "bubble-text", d.last_reply || "لسه مفيش رد."));
+      box.appendChild(rb);
+      // OHB2-PHASE1B: زر نسخ **الرد الكامل** (مش المعاينة المقصوصة). بيجيب النص
+      // الكامل من الـ endpoint المصادَق وقت الضغط، وبيبلّغ بنجاح/فشل النسخ بصدق.
+      var copyRow = el("div", "toolbar");
+      var copyBtn = el("button", "btn ghost small", "📋 نسخ الرد الكامل");
+      if (!d.last_reply) { copyBtn.disabled = true; }
+      copyBtn.addEventListener("click", function () {
+        if (copyBtn.disabled) { return; }
+        copyBtn.disabled = true;
+        get("/conversations/" + encodeURIComponent(id) + "/reply").then(function (res) {
+          if (!res.ok) {
+            copyBtn.disabled = false;
+            toast(friendlyMessage(res.status, res.data));
+            return;
+          }
+          var full = (res.data && res.data.reply) || "";
+          COPY.copyText(full, { navigator: NAV, document: document }).then(function (result) {
+            copyBtn.disabled = false;
+            toast(COPY.feedback(result));
+          });
+        }).catch(function () { copyBtn.disabled = false; toast("مش قادر أوصل للسيرفر."); });
+      });
+      copyRow.appendChild(copyBtn);
+      box.appendChild(copyRow);
+
+      var prompt = el("textarea", "textarea");
+      prompt.rows = 3;
+      prompt.placeholder = "اكتب برومت للشات ده…";
+      box.appendChild(prompt);
+      var send = el("button", "btn", "إرسال البرومت");
+      var opBox = el("div", "op-box");
+      box.appendChild(send);
+      box.appendChild(opBox);
+      // مدير معرّف العملية: نفس المفتاح (نص البرومت) + عملية نشطة ⇒ نفس المعرّف
+      // (إعادة محاولة/ضغط مزدوج مايكرّرش). عملية نهائية ⇒ معرّف جديد لنفس النص.
+      var promptOps = OPS.createRefManager();
+      function promptKey(text) { return opKey([id, text]); }
+      function resend(ref) {
+        return post(
+          "/conversations/" + encodeURIComponent(id) + "/prompt",
+          { text: promptOps.payload(), client_ref: ref }
+        );
+      }
+      send.addEventListener("click", function () {
+        var text = prompt.value.trim();
+        if (!text) { toast("اكتب نص الأول."); return; }
+        if (send.disabled) { return; }
+        // عملية نشطة بنفس النص ⇒ نفس المعرّف؛ غير كده ⇒ معرّف جديد.
+        var ref = promptOps.acquire(promptKey(text), text);
+        send.disabled = true;
+        opBox.innerHTML = "";
+        resend(ref).then(function (res) {
+          send.disabled = false;
+          if (res.ok) {
+            prompt.value = "";
+            trackOperation(opBox, "prompt", ref, id, null, resend, promptOps);
+          } else {
+            // فشل مؤكّد (مثلاً 400) ⇒ العملية خلصت، فإعادة الإرسال بنفس النص
+            // تعمل عملية جديدة بدل ما تتلغى.
+            promptOps.resolve(ref, "failed");
+            toast(friendlyMessage(res.status, res.data));
+          }
+        }).catch(function () {
+          // انقطاع الشبكة: النتيجة غامضة. ما نعيدش الإرسال تلقائياً — نستعلم عن
+          // الحالة بمعرّف العملية (نفس النص ما اتبعتش مرتين).
+          send.disabled = false;
+          trackOperation(opBox, "prompt", ref, id, null, resend, promptOps);
+        });
+      });
+
+      // OHB2-PHASE1B: زر تصدير الشات (zip) — تنزيل مباشر عبر رابط مصادَق. بنقرأ اسم
+      // الملف الآمن من هيدر `Content-Disposition`، ولو فشل الطلب بنعرض رسالة واضحة
+      // (مفيش تنزيل وهمي). التنزيل بيحصل على مسار المصادقة/الكوكي نفسه (same-origin).
+      var exportBtn = el("button", "btn ghost small", "⬇️ تصدير الشات");
+      exportBtn.addEventListener("click", function () {
+        if (exportBtn.disabled) { return; }
+        exportBtn.disabled = true;
+        var url = API + "/conversations/" + encodeURIComponent(id) + "/export";
+        fetch(url, { method: "GET", credentials: "same-origin", cache: "no-store" })
+          .then(function (res) {
+            if (!res.ok) {
+              return res.json().catch(function () { return {}; }).then(function (data) {
+                exportBtn.disabled = false;
+                var code = data && data.error;
+                toast(EXPORT.errorLabel(code, friendlyMessage(res.status, data)));
+              });
+            }
+            var name = EXPORT.filenameFromDisposition(res.headers.get("content-disposition"));
+            return res.blob().then(function (blob) {
+              var objUrl = URL.createObjectURL(blob);
+              var a = el("a", "link", "");
+              a.href = objUrl;
+              a.download = name;
+              document.body.appendChild(a);
+              a.click();
+              if (a.remove) { a.remove(); }
+              setTimeout(function () { URL.revokeObjectURL(objUrl); }, 0);
+              exportBtn.disabled = false;
+              toast("تم تنزيل التصدير ✅");
+            });
+          })
+          .catch(function () { exportBtn.disabled = false; toast("مش قادر أوصل للسيرفر."); });
+      });
+      box.appendChild(exportBtn);
+
+      var watchBtn = el("button", "btn ghost small", d.watched ? "إلغاء المتابعة" : "متابعة");
+      watchBtn.addEventListener("click", function () {
+        watchBtn.disabled = true;
+        var req = d.watched
+          ? del("/conversations/" + encodeURIComponent(id) + "/watch")
+          : post("/conversations/" + encodeURIComponent(id) + "/watch", {});
+        req.then(function (res) {
+          watchBtn.disabled = false;
+          if (res.ok) { d.watched = !d.watched; watchBtn.textContent = d.watched ? "إلغاء المتابعة" : "متابعة"; toast("تم ✅"); }
+          else { toast(friendlyMessage(res.status, res.data)); }
+        }).catch(function () { watchBtn.disabled = false; toast("مش قادر أوصل للسيرفر."); });
+      });
+      box.appendChild(watchBtn);
+
+      // OHB2-MINIAPP: حذف الشات **من OpenHands نفسه** (بتأكيد صريح). الـ backend بيعمل
+      // نداء الحذف البعيد الأول، وبيرجّع 200 بس لما OpenHands يأكّد. أي فشل/نتيجة غامضة
+      // بترجع رسالة واضحة وبتفضل على الشاشة (retryable) — مفيش نجاح كاذب.
+      var delNote = el(
+        "p", "delete-confirm-note",
+        "متأكد إنك عايز تحذف «" + (d.title || "بدون عنوان") + "» نهائيًا من OpenHands؟"
+      );
+      delNote.hidden = true;
+      box.appendChild(delNote);
+      var delRow = el("div", "toolbar");
+      var delBtn = el("button", "btn danger small", "🗑 حذف الشات");
+      var confirmBtn = el("button", "btn danger small", "🗑 أكّد الحذف");
+      var cancelBtn = el("button", "btn ghost small", "إلغاء");
+      confirmBtn.hidden = true;
+      cancelBtn.hidden = true;
+      var deleting = false;
+      delBtn.addEventListener("click", function () {
+        delBtn.hidden = true;
+        confirmBtn.hidden = false;
+        cancelBtn.hidden = false;
+        delNote.hidden = false;
+      });
+      cancelBtn.addEventListener("click", function () {
+        confirmBtn.hidden = true;
+        cancelBtn.hidden = true;
+        delNote.hidden = true;
+        delBtn.hidden = false;
+      });
+      confirmBtn.addEventListener("click", function () {
+        if (deleting) { return; }  // منع الحذف المكرّر من الضغط المزدوج
+        deleting = true;
+        confirmBtn.disabled = true;
+        cancelBtn.disabled = true;
+        del("/conversations/" + encodeURIComponent(id)).then(function (res) {
+          if (res.ok) {
+            toast("اتحذف من OpenHands نهائيًا ✅");
+            showView("view-chats");
+            loadChats(true);
+          } else {
+            deleting = false;
+            confirmBtn.disabled = false;
+            cancelBtn.disabled = false;
+            toast(friendlyMessage(res.status, res.data));
+          }
+        }).catch(function () {
+          // انقطاع الشبكة: النتيجة غامضة ⇒ نسمح بإعادة المحاولة (idempotent).
+          deleting = false;
+          confirmBtn.disabled = false;
+          cancelBtn.disabled = false;
+          toast("مش قادر أوصل للسيرفر — جرّب تاني.");
+        });
+      });
+      delRow.appendChild(delBtn);
+      delRow.appendChild(confirmBtn);
+      delRow.appendChild(cancelBtn);
+      box.appendChild(delRow);
+
+      // OHB2-09-02: قسم الملفات (قايمة + معاينة). كل حاجة عبر الـ Files API المصادَق،
+      // والواجهة ما بتفترضش إن ملف قابل للقراءة لمجرد ظهوره في القايمة.
+      box.appendChild(renderFilesSection(id));
+
+      // OHB2-09-04: قسم التكلفة/الاستهلاك (نداء منفصل، ومابيفشّلش التفاصيل لو فشل).
+      box.appendChild(renderCostSection(id));
+    }).catch(function () {
+      if (!current()) { return; }
+      box.innerHTML = "";
+      box.appendChild(el("p", "empty-row", "مش قادر أوصل للسيرفر."));
+    });
+  }
+
+  // ------------------------------------------------------------ files (OHB2-09-02)
+  function filesErrorText(res) {
+    var data = (res && res.data) || {};
+    return FILES.errorLabel(data.error, friendlyMessage(res && res.status, data));
+  }
+
+  function renderFilesSection(id) {
+    var wrap = el("div", "files-section");
+    var head = el("div", "toolbar");
+    head.appendChild(el("span", "card-label", "ملفات الشات"));
+    var refresh = el("button", "btn ghost small", "تحديث");
+    head.appendChild(refresh);
+    wrap.appendChild(head);
+
+    var list = el("ul", "list");
+    var previewBox = el("div", "file-preview");
+    // OHB2-MINIAPP-STALE-FIX: جيل المعاينة الحالي (بيتزوّد في كل طلب معاينة، وفي `load`
+    // كمان عشان تحديث قايمة الملفات يلغي أي معاينة معلّقة قبل ما ترسم).
+    var previewSeq = 0;
+    wrap.appendChild(list);
+    wrap.appendChild(previewBox);
+
+    function showLoading(container, text) {
+      container.innerHTML = "";
+      container.appendChild(el("li", "loading-row", text || "بيتم التحميل…"));
+    }
+
+    function loadPreview(path) {
+      // OHB2-MINIAPP-STALE-FIX: حرس خاص بالمعاينة. كل طلب معاينة جديد (مسار مختلف أو
+      // نفس المسار مرة تانية) بياخد رقم جيل؛ الرد مايكتبش في `previewBox` غير لو لسه
+      // الجيل الحالي. ده منفصل عن `filesDeduper` (اللي بيمنع تكرار نفس المفتاح الجاري
+      // بس، ومش بيحمي من رد قديم لمسار تاني).
+      var seq = ++previewSeq;
+      function current() { return previewSeq === seq; }
+      previewBox.innerHTML = "";
+      previewBox.appendChild(el("p", "loading-row", "بيتم تحميل الملف…"));
+      // نفس المفتاح (شات/مسار) أثناء التحميل ⇒ نفس الطلب (مفيش تكرار).
+      filesDeduper.run("preview:" + id + ":" + path, function () {
+        return get(
+          "/conversations/" + encodeURIComponent(id) + "/file?path=" + encodeURIComponent(path)
+        );
+      }).then(function (res) {
+        if (!current()) { return; }
+        previewBox.innerHTML = "";
+        if (!res.ok) { previewBox.appendChild(el("p", "empty-row", filesErrorText(res))); return; }
+        var pre = el("pre", "file-text", FILES.previewText(res.data));
+        previewBox.appendChild(pre);
+        if (FILES.isTruncated(res.data)) {
+          previewBox.appendChild(el("p", "hint", "المعاينة مقصوصة (الملف أكبر)."));
+        }
+      }).catch(function () {
+        if (!current()) { return; }
+        previewBox.innerHTML = "";
+        previewBox.appendChild(el("p", "empty-row", "مش قادر أوصل للسيرفر."));
+      });
+    }
+
+    function load() {
+      showLoading(list);
+      // OHB2-MINIAPP-STALE-FIX: تحديث قايمة الملفات يلغي أي معاينة معلّقة (ما ترسمش فوق الحالة الجديدة).
+      previewSeq += 1;
+      previewBox.innerHTML = "";
+      filesDeduper.run("files:" + id, function () {
+        return get("/conversations/" + encodeURIComponent(id) + "/files");
+      }).then(function (res) {
+        list.innerHTML = "";
+        if (!res.ok) { list.appendChild(el("li", "empty-row", filesErrorText(res))); return; }
+        var files = (res.data && res.data.files) || [];
+        if (!files.length) { list.appendChild(el("li", "empty-row", "مفيش ملفات.")); return; }
+        files.forEach(function (path) {
+          var li = el("li", "row");
+          li.appendChild(el("span", "row-title", path));
+          li.addEventListener("click", function () { loadPreview(path); });
+          list.appendChild(li);
+        });
+      }).catch(function () {
+        list.innerHTML = "";
+        list.appendChild(el("li", "empty-row", "مش قادر أوصل للسيرفر."));
+      });
+    }
+
+    refresh.addEventListener("click", load);
+    load();
+    return wrap;
+  }
+
+  // ------------------------------------------------------------ cost (OHB2-09-04)
+  function renderCostSection(id) {
+    var wrap = el("div", "cost-section");
+    wrap.appendChild(el("span", "card-label", "التكلفة والاستهلاك"));
+    var body = el("div", "cost-body");
+    body.appendChild(el("p", "loading-row", "بيتم التحميل…"));
+    wrap.appendChild(body);
+    get("/conversations/" + encodeURIComponent(id) + "/cost").then(function (res) {
+      body.innerHTML = "";
+      if (!res.ok) {
+        body.appendChild(el("p", "empty-row", filesErrorText(res)));
+        return;
+      }
+      body.appendChild(el("pre", "cost-text", COST.formatCost(res.data)));
+    }).catch(function () {
+      body.innerHTML = "";
+      body.appendChild(el("p", "empty-row", "مش قادر أوصل للسيرفر."));
+    });
+    return wrap;
+  }
+
+  // ------------------------------------------------------------ watches
+  function loadWatches() {
+    var list = $("watches-list");
+    // OHB2-MINIAPP-STALE-FIX: حرس الجيل — طلب أحدث يلغي ردود المتابعات الأقدم.
+    var seq = ++state.watchesSeq;
+    function current() { return state.watchesSeq === seq; }
+    list.innerHTML = "";
+    list.appendChild(el("li", "loading-row", "بيتم التحميل…"));
+    get("/watches").then(function (res) {
+      if (!current()) { return; }
+      list.innerHTML = "";
+      if (!res.ok) { list.appendChild(el("li", "empty-row", friendlyMessage(res.status, res.data))); return; }
+      var items = (res.data && res.data.items) || [];
+      if (!items.length) { list.appendChild(el("li", "empty-row", "مفيش متابعات.")); }
+      items.forEach(function (w) {
+        var li = el("li", "row");
+        var main = el("div", "row-main");
+        main.appendChild(el("span", "row-title", w.title || w.id));
+        main.appendChild(el("span", "row-sub", w.last_state || ""));
+        li.appendChild(main);
+        li.addEventListener("click", function () { openDetail(w.id); });
+        list.appendChild(li);
+      });
+    }).catch(function () {
+      if (!current()) { return; }
+      list.innerHTML = "";
+      list.appendChild(el("li", "empty-row", "مش قادر أوصل للسيرفر."));
+    });
+  }
+
+  // ----------------------------------------------------------- new chat
+  function loadRepos(query) {
+    var list = $("repo-list");
+    // OHB2-MINIAPP-STALE-FIX: حرس الجيل — بحث أحدث يلغي ردود البحث الأقدم (نجاح/فشل/رفض).
+    var seq = ++state.reposSeq;
+    function current() { return state.reposSeq === seq; }
+    list.innerHTML = "";
+    list.appendChild(el("li", "loading-row", "بيتم التحميل…"));
+    get("/repositories?q=" + encodeURIComponent(query || "")).then(function (res) {
+      if (!current()) { return; }
+      list.innerHTML = "";
+      if (!res.ok) { list.appendChild(el("li", "empty-row", friendlyMessage(res.status, res.data))); return; }
+      var items = (res.data && res.data.items) || [];
+      if (!items.length) { list.appendChild(el("li", "empty-row", "مفيش مستودعات.")); }
+      items.forEach(function (r) {
+        var li = el("li", "row");
+        li.appendChild(el("span", "row-title", r.full_name + (r.private ? " 🔒" : "")));
+        li.addEventListener("click", function () { pickRepo(r.full_name); });
+        list.appendChild(li);
+      });
+    }).catch(function () {
+      if (!current()) { return; }
+      list.innerHTML = "";
+      list.appendChild(el("li", "empty-row", "مش قادر أوصل للسيرفر."));
+    });
+  }
+
+  function pickRepo(fullName) {
+    state.selectedRepo = fullName;
+    var label = $("newchat-repo");
+    if (label) { label.textContent = "المستودع: " + fullName; }
+    var form = $("newchat-form");
+    if (form) { form.hidden = false; }
+  }
+
+  // شات بدون مستودع: نفس تدفّق الإنشاء بس من غير مستودع مختار.
+  function pickNoRepo() {
+    state.selectedRepo = null;
+    var label = $("newchat-repo");
+    if (label) { label.textContent = "بدون مستودع"; }
+    var form = $("newchat-form");
+    if (form) { form.hidden = false; }
+  }
+
+  // إنشاء شات جديد: نسجّل في طابور الإنشاء المتين، وبعدها نتابع حالة العملية
+  // (pending/accepted/failed/ambiguous). عند النجاح ننتقل لصفحة تفاصيل الشات.
+  // المفتاح بيشمل المستودع + النص: نفس البرومت في مستودع مختلف = عملية جديدة،
+  // وشات بدون مستودع مفتاحه مختلف (مستودع فاضي) فمابيتجمّعش مع شات مستودع.
+  var createOps = OPS.createRefManager();
+  function createKey(repo, text) { return opKey([repo || "", text]); }
+  function resendCreate(ref) {
+    return post("/chats", {
+      repository: state.selectedRepo || "",
+      text: createOps.payload(),
+      client_ref: ref
+    });
+  }
+  function createChat() {
+    var text = ($("newchat-text").value || "").trim();
+    if (!text) { toast("اكتب البرومت الأول."); return; }
+    var btn = $("newchat-send");
+    if (btn.disabled) { return; }
+    // عملية نشطة بنفس (مستودع + نص) ⇒ نفس المعرّف؛ غير كده ⇒ معرّف جديد.
+    var ref = createOps.acquire(createKey(state.selectedRepo, text), text);
+    var opBox = $("newchat-op");
+    opBox.innerHTML = "";
+    btn.disabled = true;
+    function accepted(op) {
+      if (op && op.conversation_id) {
+        toast("اتبدأ الشات ✅");
+        $("newchat-text").value = "";
+        openDetail(op.conversation_id);
+      } else {
+        toast("اتبدأ الشات ✅ — حدّث القايمة.");
+        showView("view-chats");
+        loadChats(true);
+      }
+    }
+    resendCreate(ref).then(function (res) {
+      btn.disabled = false;
+      if (res.ok) {
+        trackOperation(opBox, "creation", ref, null, accepted, resendCreate, createOps);
+      } else {
+        createOps.resolve(ref, "failed");
+        toast(friendlyMessage(res.status, res.data));
+      }
+    }).catch(function () {
+      // انقطاع الشبكة: النتيجة غامضة ⇒ ما نعيدش الإنشاء تلقائياً، نتابع بالمعرّف.
+      btn.disabled = false;
+      trackOperation(opBox, "creation", ref, null, accepted, resendCreate, createOps);
+    });
+  }
+
+  // ------------------------------------------------------------ settings
+  function toggleNotif() {
+    var btn = $("notif-toggle");
+    var enabled = btn.getAttribute("data-enabled") === "1";
+    btn.disabled = true;
+    post("/app/notifications", { enabled: !enabled }).then(function (res) {
+      btn.disabled = false;
+      if (res.ok) { renderNotif(res.data.notifications_enabled); toast("تم التحديث ✅"); }
+      else { toast(friendlyMessage(res.status, res.data)); }
+    }).catch(function () { btn.disabled = false; toast("مش قادر أوصل للسيرفر."); });
+  }
+
+  // ---------------------------------------------------------------- boot
+  function bind() {
+    var tabs = document.querySelectorAll(".tab");
+    for (var i = 0; i < tabs.length; i++) {
+      (function (tab) {
+        tab.addEventListener("click", function () {
+          var view = tab.getAttribute("data-view");
+          showView("view-" + view);
+          if (view === "chats") { state.chatsPage = 0; loadChats(false); }
+          if (view === "watches") { loadWatches(); }
+          if (view === "inbox") { state.inboxLastRefreshAt = Date.now(); loadInbox(0); }
+          if (view === "jobs") { state.jobsPage = 0; loadJobs(0, false); loadDeletions(false); }
+          if (view === "new") { loadRepos(""); }
+        });
+      })(tabs[i]);
+    }
+    $("chats-refresh").addEventListener("click", function () { state.chatsPage = 0; loadChats(true); });
+    $("chats-next").addEventListener("click", function () { state.chatsPage += 1; loadChats(false); });
+    $("watches-refresh").addEventListener("click", loadWatches);
+    $("inbox-refresh").addEventListener("click", function () { state.inboxLastRefreshAt = Date.now(); loadInbox(0); });
+    ["inbox-filter-all", "inbox-filter-unread", "inbox-filter-archived"].forEach(function (id) {
+      var btn = $(id);
+      if (btn) { btn.addEventListener("click", function () { setInboxFilter(btn.getAttribute("data-filter")); }); }
+    });
+    $("inbox-next").addEventListener("click", function () {
+      if (state.inboxLoading) { return; }
+      if (!state.inboxHasMore) { return; }  // OHB2-08-08: مفيش المزيد ⇒ ما نطلبش صفحة مش موجودة.
+      // R5-01: نطلب الصفحة الجاية من غير ما نقدّم `state.inboxPage` — بيتقدّم بس لما
+      // الطلب ينجح (في مسار النجاح جوه loadInbox). لو فشل، الضغط التاني يعيد نفس الصفحة.
+      loadInbox(INBOX.nextPage(state.inboxPage, true));
+    });
+    $("inbox-read-all").addEventListener("click", markAllRead);
+    // OHB2-PHASE1D: تحديث/المزيد لطلبات البدء + عمليات الحذف المعلّقة.
+    $("jobs-refresh").addEventListener("click", function () { state.jobsPage = 0; loadJobs(0, false); loadDeletions(false); });
+    $("jobs-next").addEventListener("click", function () {
+      if (state.jobsLoading) { return; }
+      if (!state.jobsHasMore) { return; }
+      loadJobs(state.jobsPage + 1, false);
+    });
+    $("repo-search-btn").addEventListener("click", function () { loadRepos($("repo-search").value); });
+    $("repo-search").addEventListener("keydown", function (e) { if (e.key === "Enter") { loadRepos($("repo-search").value); } });
+    $("newchat-send").addEventListener("click", createChat);
+    $("newchat-norepo").addEventListener("click", pickNoRepo);
+    $("notif-toggle").addEventListener("click", toggleNotif);
+    $("retry-btn").addEventListener("click", start);
+    // OHB2-08-07: نربط رؤية الصفحة (تبويب المتصفح/الخلفية) + نبدأ الحالة الابتدائية.
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    state.inboxVisible = !document.hidden;
+    setInboxPolling(state.inboxVisible);
+  }
+
+  function start() {
+    show("state-loading");
+    if (tg) { try { tg.ready(); tg.expand(); } catch (e) { /* تجاهل */ } }
+    withRetry(authenticate).then(function (auth) {
+      if (!auth.ok) { setError(friendlyMessage(auth.status, auth.data)); return null; }
+      return withRetry(function () { return get("/app/bootstrap"); });
+    }).then(function (boot) {
+      if (!boot) { return; }
+      if (!boot.ok) { setError(friendlyMessage(boot.status, boot.data)); return; }
+      renderBootstrap(boot.data);
+      show("state-ready");
+      showView("view-chats");
+      loadChats(false);
+    }).catch(function () {
+      setError("مش قادر أوصل للسيرفر. اتأكد من الاتصال وجرّب تاني.");
+    });
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", function () { bind(); start(); });
+  } else {
+    bind();
+    start();
+  }
+})();
