@@ -36,6 +36,11 @@ class Config:
     # OHB2-POST-PUB-01/F07: شبكات البروكسيات الموثوقة (IPs/CIDRs). فاضية افتراضيًا ⇒
     # ما بنصدّقش أي هيدر تحويل، وبنستخدم IP الاتصال الفعلي (fail closed).
     mini_app_trusted_proxies: tuple[str, ...] = ()
+    # OHB2-LIFE-03: مفتاح إيقاف **مستقلّ** لاستقبال المستندات المحلي (Document intake).
+    # True افتراضيًا (سلوك المنتج الحالي محفوظ). False ⇒ تعطيل استقبال المستندات فقط:
+    # مفيش get_file/تنزيل/صف/ملف/نداء OpenHands/سجل outbox، مع رسالة صادقة. ما بيعطّلش
+    # النصوص/الأزرار/Mini App ولا مسار رفض الوسائط غير المدعومة (اللي يفضل شغّالًا).
+    attachment_document_intake_enabled: bool = True
 
     @property
     def secrets(self) -> tuple[str, str]:
@@ -306,6 +311,11 @@ def load_config(env: dict | None = None) -> Config:
     # ما نتجاهله بصمت، وإلا نفتح باب تزوير IP).
     mini_app_trusted_proxies = _parse_trusted_proxies(env)
 
+    # OHB2-LIFE-03: مفتاح إيقاف استقبال المستندات المحلي (افتراضيًا مفعّل ⇒ سلوك محفوظ).
+    attachment_document_intake_enabled = _parse_bool(
+        env, "ATTACHMENT_DOCUMENT_INTAKE_ENABLED", True
+    )
+
     return Config(
         telegram_bot_token=token,
         openhands_api_key=api_key,
@@ -327,4 +337,5 @@ def load_config(env: dict | None = None) -> Config:
         mini_app_api_rate_per_minute=mini_app_api_rate_per_minute,
         mini_app_rate_max_keys=mini_app_rate_max_keys,
         mini_app_trusted_proxies=mini_app_trusted_proxies,
+        attachment_document_intake_enabled=attachment_document_intake_enabled,
     )

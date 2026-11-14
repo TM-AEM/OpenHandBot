@@ -52,8 +52,9 @@ worker/process/مالك قاعدة تاني.
 افتراضيًّا**: قرار المالك (Option A) = إبقاء فرض حصص D-12 **معطّلًا افتراضيًّا** لحد ما
 يوافق المالك صراحةً، مع الحفاظ على الآلية جاهزة للتفعيل. الآلية **مش** بتتفعّل بأي مسار
 ضمني/env/config: التفعيل يتطلّب تمرير حدّ صريح (`max_items_per_batch`/`max_total_bytes`/
-`max_bytes_per_batch`) من كود معتمَد صراحةً. **تنشيط الحصص الكلّية/لكل-دفعة مستقبلًا
-يتطلّب استراتيجية كنس/تعافٍ معتمَدة منفصلة** (مفيش نقطة كنس عند الإدخال — R-3).
+`max_bytes_per_batch`) من كود معتمَد صراحةً. أي تفعيل مستقبلي يتطلّب موافقة مالك صريحة +
+استراتيجية كنس/تعافٍ معتمَدة. الكنس **الانتهاكي** (LIFE-01) بيمشي من **tick عامل موجود**
+(`Watcher`) — مفيش نقطة كنس عند الإدخال (R-3)، ومفيش عامل/مجدول/عملية جديدة.
 
 **جدول الحدود (FIX-R05) — المرجع الوحيد لِما هو فعّال:**
 
@@ -74,6 +75,7 @@ import os
 import secrets
 import stat as _stat
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -109,6 +111,10 @@ STAGING_FILE_MODE = 0o600
 _TOKEN_HEX_BYTES = 16  # ⇒ 32 محرف hex
 _HEAD_BYTES = 4096
 _MAX_DISPLAY_NAME = 200
+
+# OHB2-LIFE-01: أقل فترة (ثواني) بين كنسين انتهاكيين متتاليين على tick عامل **موجود**.
+# ثابت (مفيش مفتاح إعداد جديد) ⇒ الكنسة الكاملة ما بتشتغلش على كل تحديث/tick.
+OPPORTUNISTIC_SWEEP_MIN_INTERVAL_SECONDS = 60.0
 
 # امتدادات تنفيذية/سكربتية مرفوضة (سياسة §5.7: "any, except executable/script types").
 _DENIED_EXTENSIONS = frozenset(
@@ -1360,3 +1366,76 @@ class AttachmentReaper:
             report.get("files_deleted", 0), report.get("orphans_left", 0),
             report.get("unsafe_left", 0), report.get("untracked_left", 0),
         )
+
+
+class OpportunisticSweeper:
+    """OHB2-LIFE-01: غلاف **رقيق** حوالين `AttachmentReaper` لتشغيل كنسة محدودة من tick
+    عامل **موجود** (`Watcher`) بدل الإقلاع بس — بلا عامل/مجدول/عملية/مالك قاعدة جديد.
+
+    الخصائص (كلها مفروضة هنا، مش مفترضة):
+    - **محدودة زمنيًّا:** كنسة واحدة على الأكثر كل `min_interval` ثانية ⇒ مفيش كنسة كاملة
+      على كل tick/تحديث.
+    - **حرس إعادة دخول:** الكنسة **متزامنة**؛ `_running` بيمنع أي تداخل حتى لو استُدعيت
+      من سياقين (نظريًّا) ⇒ مفيش كنسين متوازيين على نفس الاتصال/الجذر.
+    - **مفيش ابتلاع فشل:** فشل الكنسة بيتسجّل (بأنواع الأخطاء فقط، بلا محتوى/مسارات) وبيُرصد
+      كـ «فشل» صريح، **مش** نجاح كاذب. الحالة الزمنية **ما بتتحدّثش** عند الفشل ⇒ إعادة
+      المحاولة مسموحة على الـ tick المؤهّل التالي (مفيش كبت دائم بعد فشل/كنسة جزئية).
+    - **idempotent:** بيعيد استخدام `AttachmentReaper.sweep` نفسه (مفيش منطق كنس مكرّر).
+    - **حرس الأخطاء يفضل شغّال:** كنسة A4 محصورة/بلا تخمين/بلا متابعة symlink (تفاصيل في
+      `AttachmentReaper`). الجذر الآمن بيتأكّد جوه `_remove_file`/`_validated_root`.
+    - **ما بيمسّش `T0`/المهلة:** الكنسة بتقرأ `t0` بس (بلا تعديل).
+
+    ملاحظة صدق: ده **كنس انتهاكي**، مش كنس دوري مضمون — أثناء خمول تام (مفيش ticks) ممكن
+    البايتات تفضل لحد الـ tick التالي/إعادة التشغيل. الحذف الدوري الصارم يتطلّب قرار
+    معمارية منفصل (مجدول/عامل)، وده **مش** مُصرَّح به هنا.
+    """
+
+    def __init__(
+        self,
+        reaper: AttachmentReaper,
+        *,
+        min_interval: float = OPPORTUNISTIC_SWEEP_MIN_INTERVAL_SECONDS,
+        clock=None,
+    ) -> None:
+        if min_interval is None or float(min_interval) < 0:
+            raise ValueError("min_interval لازم يكون رقم غير سالب")
+        self._reaper = reaper
+        self._min_interval = float(min_interval)
+        self._clock = clock or time.monotonic
+        self._last_run_at: float | None = None
+        self._running = False
+
+    @property
+    def reaper(self) -> AttachmentReaper:
+        return self._reaper
+
+    def maybe_sweep(self, *, now: datetime | None = None) -> SweepReport | None:
+        """يشغّل كنسة **واحدة** لو الفترة عدّت ومفيش كنسة شغّالة.
+
+        ترجّع `SweepReport` لما الكنسة اشتغلت فعلًا، و`None` لما اتخطّت (خنق زمني أو
+        إعادة دخول) — الفرق ده مقصود للرصد والاختبارات. **لا بترمي** لأخطاء الكنسة
+        المتوقّعة: بتُسجَّل وتُرجَّع `None` (فشل صريح، مش نجاح)، والزمن **ما بيتقدّمش**
+        ⇒ إعادة محاولة على الـ tick التالي.
+        """
+        if self._running:
+            return None  # كنسة شغّالة بالفعل ⇒ مفيش تداخل
+        mono = self._clock()
+        if (
+            self._last_run_at is not None
+            and (mono - self._last_run_at) < self._min_interval
+        ):
+            return None  # لسه بدري (خنق) ⇒ مفيش كنسة كاملة على كل tick
+        self._running = True
+        try:
+            sweep_now = now if now is not None else datetime.now(timezone.utc)
+            report = self._reaper.sweep(now=sweep_now)
+        except Exception as exc:  # noqa: BLE001 — فشل الكنسة ⇒ يُسجَّل، مفيش نجاح كاذب
+            log.warning(
+                "كنس LIFE-01 الانتهاكي فشل (%s) ⇒ هيتعاود على الـ tick التالي",
+                type(exc).__name__,
+            )
+            return None  # الزمن **ما بيتقدّمش** ⇒ إعادة محاولة مسموحة
+        finally:
+            self._running = False
+        self._last_run_at = mono  # نجاح (حتى لو جزئي) ⇒ نطبّق الخنق لحد الـ tick الجاي
+        return report

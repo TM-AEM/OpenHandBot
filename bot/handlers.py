@@ -1612,6 +1612,11 @@ ATTACHMENT_QUOTA_TEXT = (
 ATTACHMENT_AUTH_FAILED_TEXT = (
     "مش قادر أتحقّق من صلاحية الشات دلوقتي. جرّب تاني."
 )
+# OHB2-LIFE-03: مفتاح إيقاف استقبال المستندات المحلي (ATTACHMENT_DOCUMENT_INTAKE_ENABLED=0).
+# رسالة صادقة: استقبال الملفات متوقف، وباقي المسارات (نص/أزرار/Mini App) شغّالة.
+ATTACHMENT_INTAKE_DISABLED_TEXT = (
+    "استقبال الملفات متوقف مؤقتًا. ابعت رسالتك كنص عادي."
+)
 ATTACHMENT_ERROR_TEXT = (
     "تعذّر استلام الملف دلوقتي. جرّب تاني."
 )
@@ -1823,6 +1828,17 @@ async def handle_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not await _guard(update, context):
         return
     message = update.message
+    # OHB2-LIFE-03: مفتاح إيقاف استقبال المستندات المحلي. لو معطّل ⇒ رفض صادق **قبل** أي
+    # get_file/تنزيل/صف/ملف/نداء OpenHands/سجل outbox. ما بيعطّلش مسارات النص/الأزرار.
+    cfg = context.bot_data.get("config")
+    if cfg is not None and not getattr(cfg, "attachment_document_intake_enabled", True):
+        try:
+            await message.reply_text(ATTACHMENT_INTAKE_DISABLED_TEXT)
+        except Exception as exc:  # noqa: BLE001 — فشل الرد ⇒ فشل مُسجّل (مش نجاح صامت)
+            record_update_failure(update, context, exc)
+            raise
+        mark_explicitly_ignored(update, context)
+        return
     telegram_id = update.effective_user.id
     db = context.bot_data["db"]
     update_id = _update_id(update)

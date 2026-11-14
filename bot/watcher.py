@@ -67,6 +67,7 @@ class Watcher:
         clock=None,
         allowed_chats=None,
         on_owner_delivery=None,
+        opportunistic_sweeper=None,
     ) -> None:
         if not isinstance(interval, int) or isinstance(interval, bool) or interval <= 0:
             raise ValueError("فترة المراقب لازم تكون رقم صحيح موجب")
@@ -94,6 +95,9 @@ class Watcher:
         self._default_chat_id = chat_id
         self._interval = interval
         self._task: asyncio.Task | None = None
+        # OHB2-LIFE-01: كنس انتهاكي اختياري من الـ tick **الموجود** (مفيش عامل/مجدول جديد).
+        # None ⇒ السلوك السابق بالظبط (كنس الإقلاع فقط). الحرس/الخنق/الفشل داخل الغلاف.
+        self._opportunistic_sweeper = opportunistic_sweeper
         # OHB2-08-02R: مواعيد إعادة المحاولة بعد RetryAfter بقت **دائمة لكل محادثة** في
         # `db.notifier_retry_not_before` (UTC ISO)، مش مؤقّت in-memory. كده الموعد بيفضل
         # بعد إعادة التشغيل، و429 لمحادثة ما بيوقفش باقي المتابعات.
@@ -171,6 +175,12 @@ class Watcher:
             await asyncio.sleep(self._interval)
 
     async def tick(self) -> None:
+        # OHB2-LIFE-01: كنس انتهاكي **محدود/مخنوق** من الـ tick الموجود (لو مربوط). محلي
+        # فقط، بلا نداء بعيد، ولا بيعطّل الـ tick: أي فشل جوه الغلاف بيتسجّل ويرجع None.
+        # الحرس (خنق زمني + إعادة دخول) جوه `OpportunisticSweeper` ⇒ مفيش كنسة كاملة على
+        # كل tick، ومفيش كنسين متوازيين. كنس الإقلاع (A4) يفضل مسار التعافي.
+        if self._opportunistic_sweeper is not None:
+            self._opportunistic_sweeper.maybe_sweep()
         # OHB2-08-05 (Batch 3R): نعيد محاولة أحداث الصندوق المعلّقة **قبل** المعالجة
         # العادية. الأحداث اللي محادثاتها متابَعة بتتخطّى هنا (بتتعامل في مسار المتابعة
         # النشط)، فبنستهدف اللي اتشالت متابعتها (استنفاد/إلغاء) أو معلّقة عبر إعادة تشغيل.

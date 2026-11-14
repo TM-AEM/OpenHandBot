@@ -2883,3 +2883,63 @@ P0، مفيش تغيير سلوك، مفيش كود/اختبارات/مخطط.**
 - **PARTIAL / ينتظر مراجعة عدائية مستقلة.** التنفيذ + الاختبارات + البوابة مكتملة محليًّا.
   **لا** commit/push/PR/merge/نشر/تفعيل Autopush (تعليمة المهمة صريحة).
 - **الخطوة التالية:** مراجعة عدائية مستقلة (جلسة منفصلة) على الشجرة الحالية قبل أي دفع.
+
+---
+
+## OHB2-REPAIR-PLAN-02-ATTACHMENT-LIFECYCLE (2026-11-14)
+
+**النطاق:** تنفيذ أربع مهام على مسار الإدخال/التخزين المحلي للمرفقات بلا تغيير المعمارية
+أو سياسة المرفقات (A0–A4): `LIFE-01` كنس انتهاكي محدود، `LIFE-02` تعافي عند حدود row-first،
+`LIFE-03` مفتاح إيقاف استقبال المستندات، `LIFE-04` تكامل دورة الحياة من طرف لطرف.
+**الفرع:** `agent/ohb2-repair-plan-02-attachment-lifecycle` (من `main` = `f6c0f24`).
+**بلا** commit/push/PR/merge/نشر/تفعيل Autopush (تعليمة المهمة صريحة).
+
+### معايير القبول (متحقَّقة)
+1. LIFE-01: كنسة محدودة/مخنوقة من **tick عامل موجود** (`Watcher`) — مفيش عامل/مجدول/عملية/
+   مالك قاعدة جديد؛ مفيش نقطة كنس عند الإدخال (R-3 قائم).
+2. LIFE-02: عند كل حدّ متين (صف pending ⇒ كتابة ⇒ تحقّق ⇒ stored ⇒ نتيجة) الحالة آمنة قابلة
+   للتعافي؛ عمره ما ينتج نجاح كاذب؛ دليل الهوية ينجو؛ idempotent.
+3. LIFE-03: مفتاح مستقلّ `ATTACHMENT_DOCUMENT_INTAKE_ENABLED` (افتراضيًا مفعّل = سلوك محفوظ)؛
+   عند الإيقاف ⇒ رفض صادق **قبل** أي `get_file`/تنزيل/صف/ملف/نداء OpenHands/outbox، والرد
+   `explicitly_ignored`؛ ما بيعطّلش النص/الأزرار/Mini App ولا رفض الوسائط غير المدعومة.
+4. LIFE-04: مسار تكامل حقيقي يربط الاستقبال ⇒ التخزين ⇒ الانتهاء ⇒ الكنس ⇒ التعافي.
+
+### ما اتعمل (الملفات)
+- `bot/attachments.py`: `OpportunisticSweeper` (غلاف رقيق: خنق زمني + حرس إعادة دخول،
+  **متزامن** بلا `asyncio`، فشل يُسجَّل ولا يُبلَّغ كنجاح، الزمن ما يتقدّمش عند الفشل ⇒ إعادة
+  محاولة) + ثابت `OPPORTUNISTIC_SWEEP_MIN_INTERVAL_SECONDS=60.0` + تحديث التوثيق.
+- `bot/watcher.py`: معامل اختياري `opportunistic_sweeper`؛ نداء `maybe_sweep()` في بداية
+  `tick` **الموجود** (None ⇒ السلوك السابق بالظبط).
+- `bot/app.py`: نفس الـ `AttachmentReaper` بيتلفّ في `OpportunisticSweeper` ويُمرَّر للمراقب
+  (مفيش عامل/مالك قاعدة جديد).
+- `bot/config.py`: `attachment_document_intake_enabled: bool = True` + قراءة
+  `ATTACHMENT_DOCUMENT_INTAKE_ENABLED` عبر `_parse_bool` (قيمة غلط ⇒ `ConfigError`).
+- `bot/handlers.py`: `ATTACHMENT_INTAKE_DISABLED_TEXT` + بوابة إيقاف مبكّرة في `handle_attachment`.
+- `.env.example`: توثيق `ATTACHMENT_DOCUMENT_INTAKE_ENABLED`.
+- الاختبارات الجديدة: `tests/test_repair_plan_02_life01_opportunistic_cleanup.py` (16)،
+  `..._life02_crash_recovery.py` (21)، `..._life03_intake_kill_switch.py` (23)،
+  `..._life04_lifecycle_e2e.py` (9) = **69 اختبارًا**.
+
+### التحقّق (أوامر ونتائج فعلية)
+- `python -m pytest -q` ⇒ **1 failed, 3025 passed** (154s). الفشل **قائم سابقًا**:
+  `test_deploy_manifest.py::test_documented_manifest_is_import_sufficient` (بيئة: subprocess
+  معزول يخفي `telegram`) — **مش انحدار**. الخط الأساس: `1 failed, 2956 passed` (+69 = 3025).
+- `python -m pyflakes bot/ automation/ main.py tests/` ⇒ exit **0**.
+- `python -m bandit -r bot/ automation/ main.py -lll -s B613` ⇒ High **0** (Medium 17، Low 5 — كما الأساس).
+- `python -m pip_audit -r requirements-dev.txt` ⇒ **No known vulnerabilities found**.
+- `node --test tests/frontend/*.test.js` ⇒ **223 pass / 0 fail**.
+- حراسة A4 (44) + R-3 guard + كل اختبارات المرفقات ⇒ خضراء.
+
+### Assumptions / decisions
+- **LIFE-01:** نقطة الكنس المعتمَدة = **tick عامل موجود** (`Watcher`) — منصوص عليها في A4
+  staged plan (سطر 718–720: «hook موجود **and/or** tick عامل موجود»). ما لمستُ `accept()` ولا
+  أضفتُ `opportunistic_cleanup` (R-3 قائم). الثابت الزمني (60ث) ثابت بلا مفتاح إعداد جديد.
+- **LIFE-02:** لا تغيير كود — الفحص أثبت أن ترتيب row-first، وسم DB-أولًا، ورفض الكتابة
+  المقيّد، وتحقّق magic، وحفظ الهوية، و`ON DELETE RESTRICT` كلها صحيحة قائمة. أضفتُ تغطية فقط.
+- **LIFE-03:** افتراضي مفعّل (أصغر تغيير، قابل للعكس، بلا تغيير سلوك إنتاجي).
+- **LIFE-04:** لا تغيير كود — تكامل فقط.
+
+### الحالة
+- **PARTIAL / ينتظر مراجعة عدائية مستقلة.** التنفيذ + الاختبارات + البوابة مكتملة محليًّا.
+  **لا** commit/push/PR/merge/نشر/تفعيل Autopush.
+- **الخطوة التالية:** مراجعة عدائية مستقلة (جلسة منفصلة) على الشجرة الحالية قبل أي دفع.

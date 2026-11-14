@@ -228,10 +228,15 @@ def build_application(config: Config) -> Application:
         #      يُستدعى من hook الإقلاع **الموجود** (مفيش worker/مجدول/عملية/مالك قاعدة جديد).
         #      محلي فقط (بلا نداء بعيد)؛ idempotent (إعادة الكنس آمنة عند إعادة التشغيل)؛
         #      best-effort: ما يمنعش الإقلاع لو فشل.
+        #      OHB2-LIFE-01: نفس الـ reaper بيتلفّ في `OpportunisticSweeper` ويُمرَّر لـ tick
+        #      المراقب **الموجود** ⇒ كنس انتهاكي محدود/مخنوق بين الإقلاعات (مفيش عامل جديد).
+        opportunistic_sweeper = None
         try:
             from datetime import datetime as _datetime, timezone as _timezone
-            from .attachments import AttachmentReaper
-            AttachmentReaper(db, config.db_path).sweep(now=_datetime.now(_timezone.utc))
+            from .attachments import AttachmentReaper, OpportunisticSweeper
+            reaper = AttachmentReaper(db, config.db_path)
+            reaper.sweep(now=_datetime.now(_timezone.utc))
+            opportunistic_sweeper = OpportunisticSweeper(reaper)
         except Exception as exc:  # noqa: BLE001 — الكنس (A4) ما يمنعش الإقلاع
             log.warning("كنس الـ staging (A4) اتخطّى (%s)", type(exc).__name__)
         # 2) worker واحد مالك لكل جدول — يبدأوا بعد ما التعافي يخلص (عشان مايعالجوش
@@ -264,6 +269,7 @@ def build_application(config: Config) -> Application:
                 chat_id=config.owner_id,
                 interval=config.watcher_interval,
                 allowed_chats=config.allowed_telegram_ids,  # الشات الخاص id = id المستخدم
+                opportunistic_sweeper=opportunistic_sweeper,  # OHB2-LIFE-01 (محدود/مخنوق)
             )
             application.bot_data["watcher"] = watcher
             watcher.start()
