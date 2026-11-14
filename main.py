@@ -5,12 +5,14 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 
 from bot.app import build_application
 from bot.bootstrap import BootstrapError, prepare_runtime, setup_logging
 from bot.config import ConfigError
+from bot.polling import run_bot
 
 
 def _setup_logging(level: str, secrets: tuple[str, ...] = ()) -> None:
@@ -59,12 +61,12 @@ def main() -> int:
         return 1
     if db is not None:
         app.bot_data["db_checked"] = True
-    # القرار (OHB2-02): `drop_pending_updates=True` **مقصود**. بعد أي restart/انقطاع،
-    # التحديثات القديمة المتراكمة بتترمي بدل ما تتنفّذ كلها مرة واحدة. النتيجة التشغيلية:
-    # أوامر/رسائل اتبعتت وقت البوت واقف مش هتتعالج. ده مقبول للاستخدام الفردي (المالك
-    # بيتعامل مع البوت لايف)، وبيحمي من "طوفان" أوامر قديمة + تكرار أوامر بعد إعادة التشغيل.
-    # تغيير السياسة دي عايز اختبارات لمعالجة التحديثات القديمة ومنع تكرار الأوامر (مؤجّل).
-    app.run_polling(drop_pending_updates=True)
+    # OHB2-STAGE2 (D0/D2): بنشغّل حلقة الاستطلاع المخصّصة بدل `run_polling`.
+    # `Application` مبني بـ `updater(None)` ⇒ مفيش Updater ⇒ مفيش poller تاني؛ الحلقة الوحيدة
+    # في `bot.polling` هي اللي بتسحب. الحلقة بتعمل `deleteWebhook(drop_pending_updates=False)`
+    # وبتستأنف من الحدّ الدائم (`B+1`) أو `offset=None` لو مفيش حدّ ⇒ **المعلّق محفوظ دائمًا**
+    # (بديل قرار OHB2-02 القديم `drop_pending_updates=True`، المعتمد صراحةً في Stage 2).
+    asyncio.run(run_bot(app))
     return 0
 
 

@@ -21,12 +21,13 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from ..config import Config
+from ..db import MAX_PAGE, MAX_SQLITE_INT
 from ..errors import ApiError, error_text
 from .clientip import parse_trusted_proxies, resolve_client_ip
 from .initdata import DEFAULT_MAX_AGE, InitDataError, TelegramUser, validate_init_data
 from .ratelimit import api_limiter, auth_limiter
-from .services import MiniAppService, ValidationError
-from .sessions import SessionStore
+from .services import MiniAppService, ValidationError, EXPORT_CONTENT_TYPE
+from .sessions import SessionStore, hash_token
 
 log = logging.getLogger(__name__)
 
@@ -35,6 +36,11 @@ INDEX_FILE = STATIC_DIR / "index.html"
 COOKIE_NAME = "ohb_session"
 MAX_BODY_BYTES = 16 * 1024
 API_PREFIX = "/api/v1"
+# OHB2-PHASE1B: المحارف المسموح بيها في اسم ملف التنزيل (ASCII آمن) — نمنع أي CR/LF
+# أو اقتباس أو محرف تحكّم من إنه يوصل لهيدر `Content-Disposition`.
+_HEADER_SAFE_NAME = frozenset(
+    ch for ch in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
+)
 
 _MIME_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -47,21 +53,26 @@ _MIME_TYPES = {
     ".webmanifest": "application/manifest+json",
 }
 
+# OHB2-RESIDUAL: ردود الـ API/المرفقات (JSON/zip) لازم تكون غير قابلة للتأطير أصلًا
+# (`default-src 'none'` + `frame-ancestors` لتيليجرام بس). القيمة دي كانت **معرّفة وغير
+# مستخدمة** (كود ميت = ضابط أمني ناقص)؛ بقت جزء من الهيدرز الأمنية المشتركة عشان كل ردود
+# `_json`/`_attachment` تاخدها فعلاً.
+_API_CSP = (
+    "default-src 'none'; frame-ancestors https://web.telegram.org https://*.telegram.org; "
+    "base-uri 'none'; form-action 'none'"
+)
 # مسارات الـ API مسموح تشارك عبر نفس الأصل بس (same-origin)، وممنوع تتكاش.
 _SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
     "X-Frame-Options": "SAMEORIGIN",
+    "Content-Security-Policy": _API_CSP,
     "Cache-Control": "no-store",
     "Pragma": "no-cache",
     "Cross-Origin-Opener-Policy": "same-origin",
     "Cross-Origin-Resource-Policy": "same-origin",
 }
 # نفس الأصل + تحميل Telegram WebApp من cdn + ستايل/سكربت داخليين. مفيش مصادر خارجية تانية.
-_API_CSP = (
-    "default-src 'none'; frame-ancestors https://web.telegram.org https://*.telegram.org; "
-    "base-uri 'none'; form-action 'none'"
-)
 _STATIC_CSP = (
     "default-src 'self'; script-src 'self' https://telegram.org; "
     "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
@@ -81,10 +92,27 @@ def _error(status: int, code: str, message: str, headers: dict | None = None) ->
     return _json({"error": code, "message": message}, status=status, headers=headers)
 
 
+def _attachment(data: bytes, filename: str) -> Response:
+    """رد تنزيل ملف (zip) بهيدرز آمنة واسم ملف آمن (OHB2-PHASE1B).
+
+    `Content-Disposition: attachment` مع `filename` آمن (بيتولّد من معرّف صالح ومنقّى
+    ⇒ مفيش CR/LF/اقتباس ⇒ مفيش response-header injection). `Content-Length` صريح
+    بيوصف الحجم الفعلي بعد الحد الصلب. الهيدرز الأمنية العامة (`nosniff`/`no-store`/
+    `CORP`) بتتضاف هنا كمان عشان الرد الخام ماشي على نفس مسار `_json` الأمني.
+    """
+    safe = "".join(ch for ch in filename if ch in _HEADER_SAFE_NAME) or "conversation.zip"
+    headers = dict(_SECURITY_HEADERS)
+    headers["Content-Type"] = EXPORT_CONTENT_TYPE
+    headers["Content-Disposition"] = f'attachment; filename="{safe}"'
+    headers["Content-Length"] = str(len(data))
+    return Response(data, media_type=EXPORT_CONTENT_TYPE, headers=headers)
+
+
 class MiniApp:
     """يملك حالة الـ web (مخزن الجلسات + الإعدادات) ويبني تطبيق Starlette.
 
-    `db` هو **نفس** كائن قاعدة بيانات البوت (مفيش اتصال تاني) — بنقرأ منه قراءة فقط.
+    `db` هو **نفس** كائن قاعدة بيانات البوت (مفيش اتصال تاني) — بنقرأ منه قراءة فقط،
+    وبنكتب فيه جلسات الـ Mini App بس (OHB2-PHASE1A).
     """
 
     def __init__(self, config: Config, db=None, client=None, application=None) -> None:
@@ -92,7 +120,9 @@ class MiniApp:
         self._db = db
         self._application = application
         self._service = MiniAppService(config, db, client, application)
-        self.sessions = SessionStore(config.mini_app_session_ttl)
+        # OHB2-PHASE1A: الجلسات **دائمة** في نفس قاعدة SQLite (نفس كائن `db` المملوك
+        # للعملية الواحدة). مفيش اتصال تاني ولا مخزن خارجي.
+        self.sessions = SessionStore(config.mini_app_session_ttl, db)
         self.max_age = config.mini_app_initdata_max_age or DEFAULT_MAX_AGE
         self.owner_id = config.owner_id
         self.allowed_origins = set(config.mini_app_allowed_origins)
@@ -282,6 +312,21 @@ class MiniApp:
                 self.notification_read,
                 methods=["POST"],
             ),
+            Route(
+                f"{API_PREFIX}/notifications/{{item_id}}/archive",
+                self.notification_archive,
+                methods=["POST"],
+            ),
+            Route(
+                f"{API_PREFIX}/notifications/{{item_id}}/unarchive",
+                self.notification_unarchive,
+                methods=["POST"],
+            ),
+            Route(
+                f"{API_PREFIX}/notifications/{{item_id}}",
+                self.notification_delete,
+                methods=["DELETE"],
+            ),
             Route(f"{API_PREFIX}/conversations", self.conversations, methods=["GET"]),
             Route(
                 f"{API_PREFIX}/conversations/{{conversation_id}}",
@@ -296,6 +341,16 @@ class MiniApp:
             Route(
                 f"{API_PREFIX}/conversations/{{conversation_id}}/cost",
                 self.conversation_cost,
+                methods=["GET"],
+            ),
+            Route(
+                f"{API_PREFIX}/conversations/{{conversation_id}}/reply",
+                self.conversation_reply,
+                methods=["GET"],
+            ),
+            Route(
+                f"{API_PREFIX}/conversations/{{conversation_id}}/export",
+                self.conversation_export,
                 methods=["GET"],
             ),
             Route(
@@ -326,8 +381,28 @@ class MiniApp:
             Route(f"{API_PREFIX}/operations/outbox", self.outbox_operation, methods=["GET"]),
             Route(f"{API_PREFIX}/operations/creation", self.creation_operation, methods=["GET"]),
             Route(
+                f"{API_PREFIX}/operations/creation/list",
+                self.creation_operation_list,
+                methods=["GET"],
+            ),
+            Route(
                 f"{API_PREFIX}/operations/outbox/reconcile",
                 self.outbox_reconcile,
+                methods=["POST"],
+            ),
+            Route(
+                f"{API_PREFIX}/operations/creation/reconcile",
+                self.creation_reconcile,
+                methods=["POST"],
+            ),
+            Route(
+                f"{API_PREFIX}/operations/deletions/list",
+                self.deletion_operation_list,
+                methods=["GET"],
+            ),
+            Route(
+                f"{API_PREFIX}/operations/deletions/reconcile",
+                self.deletion_reconcile,
                 methods=["POST"],
             ),
             Route(
@@ -360,7 +435,9 @@ class MiniApp:
         ترتيب الفحص: حد المعدّل (قبل أي شغل) ⇒ الجلسة ⇒ Origin (لو طلب بيغيّر الحالة).
         """
         session = self._session_from_cookie(request)
-        key = session.token if session is not None else f"ip:{self._client_ip(request)}"
+        # OHB2-PHASE1E-F4: مفتاح الحد لازم ما يكونش التوكن الخام نفسه (التوثيق بيقول
+        # «معرّفات مستعارة مش توكنات»). بنستخدم hash التوكن (نفس دالة تخزين الجلسة).
+        key = hash_token(session.token) if session is not None else f"ip:{self._client_ip(request)}"
         limited = self._rate_limited(self.api_limiter, key)
         if limited is not None:
             return None, limited
@@ -457,7 +534,11 @@ class MiniApp:
         session, err = await self._guarded(request, state_changing=True)
         if err is not None:
             return err
-        self.sessions.revoke(session.token)
+        if not self.sessions.revoke(session.token):
+            # فشل حذف الجلسة من القاعدة ⇒ ما ندّعيش نجاح تسجيل خروج، وما نمسحش الكوكي
+            # (نخليه عشان العميل يقدر يعيد محاولة الإلغاء). الجلسة ممكن تفضل سارية
+            # لحد الـ TTL. نرجّع 503 Service Unavailable صراحةً (بلا تفاصيل داخلية).
+            return _error(503, "logout_failed", "تعذّر تسجيل الخروج — جرّب تاني.")
         response = _json({"ok": True})
         response.delete_cookie(COOKIE_NAME, path="/")
         return response
@@ -497,9 +578,14 @@ class MiniApp:
             page = int(request.query_params.get("page", "0") or 0)
         except ValueError:
             return _error(400, "bad_request", "رقم الصفحة غير صالح.")
+        if page < 0 or page > MAX_PAGE:
+            return _error(400, "bad_request", "رقم الصفحة غير صالح.")
         unread_only = request.query_params.get("unread") in ("1", "true")
+        archived = request.query_params.get("archived") in ("1", "true")
         try:
-            data = self._service.list_notifications(page=page, unread_only=unread_only)
+            data = self._service.list_notifications(
+                page=page, unread_only=unread_only, archived=archived
+            )
         except ApiError as exc:
             return self._api_error(exc)
         return _json(data)
@@ -510,6 +596,42 @@ class MiniApp:
             return err
         try:
             data = self._service.mark_notification_read(request.path_params.get("item_id", ""))
+        except ValidationError as exc:
+            return _error(400, "bad_request", str(exc))
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json(data)
+
+    async def notification_archive(self, request):
+        session, err = await self._guarded(request, state_changing=True)
+        if err is not None:
+            return err
+        try:
+            data = self._service.archive_notification(request.path_params.get("item_id", ""))
+        except ValidationError as exc:
+            return _error(400, "bad_request", str(exc))
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json(data)
+
+    async def notification_unarchive(self, request):
+        session, err = await self._guarded(request, state_changing=True)
+        if err is not None:
+            return err
+        try:
+            data = self._service.unarchive_notification(request.path_params.get("item_id", ""))
+        except ValidationError as exc:
+            return _error(400, "bad_request", str(exc))
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json(data)
+
+    async def notification_delete(self, request):
+        session, err = await self._guarded(request, state_changing=True)
+        if err is not None:
+            return err
+        try:
+            data = self._service.delete_notification(request.path_params.get("item_id", ""))
         except ValidationError as exc:
             return _error(400, "bad_request", str(exc))
         except ApiError as exc:
@@ -535,11 +657,19 @@ class MiniApp:
             page = int(request.query_params.get("page", "0") or 0)
         except ValueError:
             return _error(400, "bad_request", "رقم الصفحة غير صالح.")
+        if page < 0 or page > MAX_PAGE:
+            return _error(400, "bad_request", "رقم الصفحة غير صالح.")
         refresh = request.query_params.get("refresh") == "1"
         try:
             data = await self._service.list_conversations(page=page, refresh=refresh)
         except ApiError as exc:
             return self._api_error(exc)
+        except Exception:  # noqa: BLE001 — OHB2-SW03: فشل قراءة الشواهد ⇒ 500 عام
+            # فشل قاعدة عند فلترة الشواهد (بعد الإعادة المحدودة) مايتحوّلش لرد 200 فاضي
+            # مضلّل. بنرجّع نفس عقد الخطأ العام المعتاد (`server_error`) من غير أي تفاصيل
+            # داخلية (استثناء/SQL/مسارات) في الرد.
+            log.exception("فشل فلترة الشواهد في قايمة الشاتات (Mini App)")
+            return _error(500, "server_error", "الخدمة مش متاحة دلوقتي.")
         return _json(data)
 
     async def conversation_detail(self, request):
@@ -580,6 +710,45 @@ class MiniApp:
         except ApiError as exc:
             return self._api_error(exc)
         return _json(data)
+
+    async def conversation_reply(self, request):
+        """OHB2-PHASE1B: الرد الكامل للـ assistant (مصادَقة، read-only).
+
+        مصدر زر «نسخ الرد الكامل»: النص الكامل بلا قصّ بصري (المعاينة في التفاصيل
+        محدودة بـ 4000 محرف، لكن النسخ محتاج الرد كامل). التفويض والملكية server-side.
+        """
+        session, err = await self._guarded(request, state_changing=False)
+        if err is not None:
+            return err
+        try:
+            data = await self._service.get_full_reply(
+                request.path_params.get("conversation_id", "")
+            )
+        except ValidationError as exc:
+            return _error(400, "bad_request", str(exc))
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json(data)
+
+    async def conversation_export(self, request):
+        """OHB2-PHASE1B: تصدير الشات (zip) للمستخدم المصرّح له — مصادَقة، read-only.
+
+        بترجّع الملف الخام بنوع `application/zip` واسم تنزيل آمن. التفويض والملكية
+        server-side؛ مفيش ثقة في أي معرّف مستخدم من العميل. فشل التنزيل/عدّى الحد
+        ⇒ خطأ منظّم (مفيش ملف)، فمفيش تصدير «ناجح» كاذب.
+        """
+        session, err = await self._guarded(request, state_changing=False)
+        if err is not None:
+            return err
+        try:
+            data, filename = await self._service.export_conversation(
+                request.path_params.get("conversation_id", "")
+            )
+        except ValidationError as exc:
+            return _error(400, "bad_request", str(exc))
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _attachment(data, filename)
 
     async def conversation_files(self, request):
         """OHB2-09-02: قايمة ملفات شات مصرّح به (read-only، مصادَقة)."""
@@ -655,6 +824,8 @@ class MiniApp:
                 outbox_id = int(raw_id)
             except ValueError:
                 raise ValidationError("رقم العملية غير صالح") from None
+            if outbox_id < 0 or outbox_id > MAX_SQLITE_INT:
+                raise ValidationError("رقم العملية غير صالح")
             return self._service.outbox_operation(outbox_id)
         if ref:
             conversation_id = request.query_params.get("conversation_id") or ""
@@ -677,6 +848,24 @@ class MiniApp:
             return self._api_error(exc)
         return _json(data)
 
+    async def creation_operation_list(self, request):
+        """OHB2-PHASE1D: قايمة طلبات الشات الجديد المملوكة للمالك (قراءة فقط) + الترقيم."""
+        session, err = await self._guarded(request, state_changing=False)
+        if err is not None:
+            return err
+        raw_page = (request.query_params.get("page") or "0").strip()
+        try:
+            page = int(raw_page)
+        except ValueError:
+            return _error(400, "bad_request", "رقم الصفحة غير صالح")
+        if page < 0 or page > MAX_PAGE:
+            return _error(400, "bad_request", "رقم الصفحة غير صالح")
+        try:
+            data = self._service.list_creation_jobs(page)
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json(data)
+
     async def outbox_reconcile(self, request):
         """OHB2-09-05: تسوية يدوية لعملية برومت (discard/mark_sent) — parity مع البوت."""
         session, err = await self._guarded(request, state_changing=True)
@@ -693,8 +882,79 @@ class MiniApp:
             outbox_id = int(raw_id)
         except (TypeError, ValueError):
             return _error(400, "bad_request", "رقم العملية غير صالح")
+        if outbox_id < 0 or outbox_id > MAX_SQLITE_INT:
+            return _error(400, "bad_request", "رقم العملية غير صالح")
+        # OHB2-PHASE1E-F2: الإجراء لازم يكون نص — قيمة JSON غير نصية (5/[1]/{}) كانت
+        # بتضرب AttributeError (500) جوّه `.strip()`؛ دلوقتي بنرفضها بـ 400 (نفس نمط F3).
+        raw_action = body.get("action")
+        if not isinstance(raw_action, str):
+            return _error(400, "bad_request", "إجراء غير معروف")
         try:
-            data = self._service.reconcile_outbox(outbox_id, (body.get("action") or "").strip())
+            data = self._service.reconcile_outbox(outbox_id, raw_action.strip())
+        except ValidationError as exc:
+            return _error(400, "bad_request", str(exc))
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json(data)
+
+    async def creation_reconcile(self, request):
+        """OHB2-PHASE1D: تسوية يدوية لطلب شات جديد (cancel/mark_sent) — parity مع البوت."""
+        session, err = await self._guarded(request, state_changing=True)
+        if err is not None:
+            return err
+        try:
+            body = await self._read_body(request)
+        except _BodyTooLarge:
+            return _error(413, "payload_too_large", "الطلب كبير أوي.")
+        except _BadJson:
+            return _error(400, "bad_request", "صيغة الطلب غير صحيحة.")
+        raw_id = body.get("id")
+        try:
+            job_id = int(raw_id)
+        except (TypeError, ValueError):
+            return _error(400, "bad_request", "رقم العملية غير صالح")
+        if job_id < 0 or job_id > MAX_SQLITE_INT:
+            return _error(400, "bad_request", "رقم العملية غير صالح")
+        # OHB2-PHASE1D-F3: الإجراء لازم يكون نص — قيمة JSON غير نصية (5/[1]/{}) كانت
+        # بتضرب AttributeError (500) جوّه `.strip()`؛ دلوقتي بنرفضها بـ 400.
+        raw_action = body.get("action")
+        if not isinstance(raw_action, str):
+            return _error(400, "bad_request", "إجراء غير معروف")
+        try:
+            data = self._service.reconcile_creation(job_id, raw_action.strip())
+        except ValidationError as exc:
+            return _error(400, "bad_request", str(exc))
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json(data)
+
+    async def deletion_operation_list(self, request):
+        """قايمة عمليات الحذف البعيد المعلّقة ('deleting'/'uncertain') للعرض والتسوية اليدوية."""
+        session, err = await self._guarded(request, state_changing=False)
+        if err is not None:
+            return err
+        try:
+            data = self._service.list_pending_deletions()
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json(data)
+
+    async def deletion_reconcile(self, request):
+        """تسوية يدوية لحذف بعيد معلّق عبر التحقق من الوجود (GET) بدون إعادة إرسال DELETE."""
+        session, err = await self._guarded(request, state_changing=True)
+        if err is not None:
+            return err
+        try:
+            body = await self._read_body(request)
+        except _BodyTooLarge:
+            return _error(413, "payload_too_large", "الطلب كبير أوي.")
+        except _BadJson:
+            return _error(400, "bad_request", "صيغة الطلب غير صحيحة.")
+        raw_cid = body.get("conversation_id")
+        if not isinstance(raw_cid, str):
+            return _error(400, "bad_request", "معرّف الشات غير صالح.")
+        try:
+            data = await self._service.reconcile_deletion(raw_cid)
         except ValidationError as exc:
             return _error(400, "bad_request", str(exc))
         except ApiError as exc:
@@ -709,6 +969,8 @@ class MiniApp:
                 job_id = int(raw_id)
             except ValueError:
                 raise ValidationError("رقم العملية غير صالح") from None
+            if job_id < 0 or job_id > MAX_SQLITE_INT:
+                raise ValidationError("رقم العملية غير صالح")
             return self._service.creation_operation(job_id)
         if ref:
             found = self._service.find_creation_operation(ref)
@@ -742,7 +1004,7 @@ class MiniApp:
         return _json(data)
 
     async def conversation_delete(self, request):
-        """حذف محلي لشات (OHB2-C7). تفويض ملكية + تغيير حالة (CSRF/origin) قبل أي حذف."""
+        """حذف الشات **من OpenHands نفسه** ثم تثبيته محليًا (OHB2-MINIAPP). تفويض ملكية + تغيير حالة (CSRF/origin) قبل أي حذف."""
         session, err = await self._guarded(request, state_changing=True)
         if err is not None:
             return err
@@ -784,7 +1046,9 @@ class MiniApp:
         try:
             page = int(request.query_params.get("page", "0") or 0)
         except ValueError:
-            page = 0
+            return _error(400, "bad_request", "رقم الصفحة غير صالح.")
+        if page < 0 or page > MAX_PAGE:
+            return _error(400, "bad_request", "رقم الصفحة غير صالح.")
         try:
             data = self._service.list_watches(page=page)
         except ApiError as exc:
@@ -798,7 +1062,9 @@ class MiniApp:
         try:
             page = int(request.query_params.get("page", "0") or 0)
         except ValueError:
-            page = 0
+            return _error(400, "bad_request", "رقم الصفحة غير صالح.")
+        if page < 0 or page > MAX_PAGE:
+            return _error(400, "bad_request", "رقم الصفحة غير صالح.")
         try:
             data = await self._service.list_repositories(
                 query=request.query_params.get("q", ""), page=page

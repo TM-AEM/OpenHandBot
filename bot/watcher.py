@@ -178,6 +178,13 @@ class Watcher:
         watched = self._db.list_watched()
         if not watched:
             return
+        # F-1 (فرض شاهد الحذف): نشيل الشاتات المتشاهدة (deleted/deleting/uncertain) **قبل**
+        # أي نداء بعيد — الحذف المحلي بيسيب صف المتابعة موجود في حالات deleting/uncertain،
+        # فمن غير الفلتر ده المراقب يفضل يكلّم OpenHands (`get_conversations`) ويبعت محتوى
+        # شات اتحذف. نتخطّى (مش نمسح الصف) عشان إعادة المحاولة/الإحياء الصريح يفضلوا شغالين.
+        watched = [w for w in watched if not self._is_tombstoned(w.conversation_id)]
+        if not watched:
+            return
         ids = [w.conversation_id for w in watched]
         try:
             convs = {c["id"]: c for c in await self._client.get_conversations(ids)}
@@ -232,6 +239,22 @@ class Watcher:
         INBOX_KIND_STALE_REPORT,
     )
 
+    def _is_tombstoned(self, conversation_id: str) -> bool:
+        """F-1: هل الشات عليه شاهد حذف فعّال؟ **فشل مغلق**: أي خطأ قراءة ⇒ نعتبره متشاهد.
+
+        نفس سلوك بقية الحرّاس (`notifier._process`، `outbox._complete_outbox`): الشات
+        المتشاهد مايتكلّمش معاه. الفرق إننا هنا بنفشل **مغلق** لو قراءة الشاهد فشلت —
+        المراقب مسار كتابة (بيبعت للمستخدم) فالإخفاء المؤقت أأمن من الإرسال الخاطئ.
+        """
+        try:
+            return self._db.is_deleted(conversation_id)
+        except Exception as exc:  # noqa: BLE001 — قاعدة غير متاحة ⇒ فشل مغلق (تخطّي)
+            log.warning(
+                "تعذّر قراءة شاهد الحذف للشات %s (%s)؛ هيتخطّى (فشل مغلق).",
+                conversation_id, type(exc).__name__,
+            )
+            return True
+
     async def _recover_pending_events(self) -> None:
         """يعيد محاولة أحداث الصندوق المعلّقة اللي المراقب مالكها (أنواع المتابعة)."""
         now = self._now_iso()
@@ -265,6 +288,12 @@ class Watcher:
         cutoff = (self._clock() - INBOX_CLAIM_LEASE).isoformat()
         if not self._db.claim_pending_inbox(item.id, claim, now, cutoff=cutoff):
             return  # عامل تاني حجزه/سلّمه لحظة كده ⇒ ما نرسلش
+        # F-1: حدث معلّق لشات عليه شاهد حذف (اتعلّم superseded على الحذف المؤكّد، لكن ممكن
+        # يكون لسه pending لو الحذف لسه deleting/uncertain) ⇒ ما نبعتهوش. الحجز فوق لسه
+        # بيتشال عشان ما نسيبه معلّق. مفيش أي نداء بعيد هنا أصلاً.
+        if self._is_tombstoned(item.conversation_id):
+            self._db.clear_inbox_claim(item.id, claim)
+            return
         dest = item.chat_id if item.chat_id is not None else self._default_chat_id
         if self._allowed_chats is not None and dest not in self._allowed_chats:
             dest = self._default_chat_id

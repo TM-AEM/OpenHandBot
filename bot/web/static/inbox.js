@@ -74,11 +74,60 @@
     return (n - l) < gap;
   }
 
+  // OHB2-PHASE1C: هل العنصر مؤرشف؟ (حقل `archived` من السيرفر، أو `archived_at` للتوافق).
+  function isArchived(item) {
+    if (!item) { return false; }
+    if (item.archived === true) { return true; }
+    return !!(item.archived_at);
+  }
+
+  // OHB2-PHASE1C: الأنواع **الآمنة للحذف النهائي** (نفس allowlist السيرفر). `proactive`
+  // مستثنى (إشعار حالة حيّة مرتبط بدليل تسوية). أي نوع غير معروف ⇒ محمي.
+  var DELETABLE_KINDS = { terminal: true, timeout: true, missing: true, stale_report: true };
+
+  // فحص ملكية صريح (مش وراثة prototype) عشان قيم زي `constructor`/`__proto__` ما
+  // تتفهمش غلط كأنواع آمنة (fail-closed في إشارة الواجهة).
+  function isDeletableKind(kind) {
+    return typeof kind === "string" && Object.prototype.hasOwnProperty.call(DELETABLE_KINDS, kind);
+  }
+
+  // OHB2-PHASE1C: هل السيرفر/الواجهة يعتبروا العنصر قابلًا للحذف النهائي؟ إشارة للواجهة
+  // بس (القرار النهائي على السيرفر). لو السيرفر ما بعتش `deletable`، نستنتج **بتحفّظ**:
+  // نوع آمن + مُسلَّم + مقروء — نفس شرط السيرفر (fail-closed لأي نوع غير معروف).
+  function canDelete(item) {
+    if (!item) { return false; }
+    if (typeof item.deletable === "boolean") { return item.deletable; }
+    if (!isDeletableKind(item.kind)) { return false; }
+    return !isUnread(item) && (item.delivery_status === undefined || item.delivery_status === "delivered");
+  }
+
+  // OHB2-PHASE1C: نص استعلام القايمة حسب الفلتر (كل/غير المقروء) والأرشيف. بيُستخدم في
+  // **نفس** نداء الـ API الموجود (`unread=1`) — مفيش فلترة مكرّرة في الواجهة.
+  function filterQuery(page, unreadOnly, archived) {
+    var p = Number(page);
+    if (!isFinite(p) || p < 0) { p = 0; }
+    var parts = ["page=" + Math.floor(p)];
+    if (unreadOnly) { parts.push("unread=1"); }
+    if (archived) { parts.push("archived=1"); }
+    return parts.join("&");
+  }
+
+  // OHB2-PHASE1C: نص الحالة الفاضية حسب الفلتر/العرض.
+  function emptyText(unreadOnly, archived) {
+    if (archived) { return "مفيش إشعارات مؤرشفة."; }
+    if (unreadOnly) { return "مفيش إشعارات غير مقروءة."; }
+    return "مفيش إشعارات.";
+  }
+
   return {
     KINDS: KINDS,
     badgeText: badgeText,
     kindLabel: kindLabel,
     isUnread: isUnread,
+    isArchived: isArchived,
+    canDelete: canDelete,
+    filterQuery: filterQuery,
+    emptyText: emptyText,
     deliveryLabel: deliveryLabel,
     nextPage: nextPage,
     refreshInterval: refreshInterval,

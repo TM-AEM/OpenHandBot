@@ -189,6 +189,10 @@ def test_official_telegram_test_vector():
     import hmac
     from urllib.parse import urlencode
 
+    # OHB2-RESIDUAL: ده **فيكتور توثيقي عام** من core.telegram.org/bots/webapps
+    # (مثال Vladislav Kibenko) — **مش سر إنتاج** ولا توكن بوت حقيقي شغّال. القيمة
+    # والتوقيع المتوقّع منقولان حرفيًا من التوثيق الرسمي، فمينفعش يتغيّروا من غير ما
+    # الفيكتور يبقى غلط. السطر ده موجود عشان محدش يخلطه بتوكن إنتاج (مفيش سر في الريبو).
     bot_token = "5768337691:AAH5YkoiEuPk8-FZa32hStHTqXiLPtAEhx8"
     user = (
         '{"id":279058397,"first_name":"Vladislav","last_name":"Kibenko",'

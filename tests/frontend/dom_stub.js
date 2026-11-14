@@ -87,6 +87,9 @@ class El {
   }
   // زرّ: click() بيطلق الحدث (والأزرار المعطّلة ما بتطلقهاش زي المتصفح).
   click() { if (this.disabled) { return undefined; } return this.dispatch("click", { type: "click" }); }
+  // OHB2-PHASE1B: محاكاة textarea للنسخ الاحتياطي.
+  select() { this.selected = true; return this; }
+  setSelectionRange(start, end) { this.selectionStart = start; this.selectionEnd = end; return this; }
   querySelector() { return null; }
   querySelectorAll() { return []; }
   // نستعمل textContent المباشر (مفيش عرض فعلي).
@@ -104,9 +107,17 @@ class Document {
     this._byClass = new Map();
     this.readyState = "complete";
     this._listeners = {};
+    // OHB2-PHASE1B: body + execCommand لمحاكاة مسار النسخ الاحتياطي (fallback).
+    this.body = new El("body");
+    this.execCommandResult = true;
+    this.execCommandCalls = [];
     // OHB2-08-07: رؤية الصفحة (افتراضي: مرئية زي المتصفح في المقدمة).
     this.hidden = false;
     this.visibilityState = "visible";
+  }
+  execCommand(cmd) {
+    this.execCommandCalls.push(cmd);
+    return this.execCommandResult;
   }
   createElement(tag) { return new El(tag); }
   getElementById(id) { return this._ids.get(id) || null; }
@@ -154,10 +165,12 @@ class Document {
 const IDS = [
   "app", "user-name",
   "state-loading", "state-error", "error-msg", "retry-btn", "state-ready",
-  "view-chats", "view-detail", "view-watches", "view-inbox", "view-new", "view-settings",
+  "view-chats", "view-detail", "view-watches", "view-inbox", "view-jobs", "view-new", "view-settings",
   "chats-list", "chats-more", "chats-next", "chats-refresh",
   "watches-list", "watches-refresh",
   "inbox-list", "inbox-more", "inbox-next", "inbox-refresh", "inbox-read-all", "inbox-badge",
+  "inbox-filter-all", "inbox-filter-unread", "inbox-filter-archived",
+  "jobs-list", "jobs-more", "jobs-next", "jobs-refresh", "deletions-list",
   "repo-search", "repo-search-btn", "repo-list",
   "newchat-form", "newchat-repo", "newchat-text", "newchat-send", "newchat-op", "newchat-norepo",
   "notif-toggle", "toast",
@@ -167,12 +180,20 @@ const TABS = [
   { view: "watches", label: "المتابعات" },
   { view: "inbox", label: "الإشعارات" },
   { view: "new", label: "شات جديد" },
+  { view: "jobs", label: "طلبات البدء" },
   { view: "settings", label: "الإعدادات" },
 ];
 
 function buildDocument() {
   const doc = new Document();
   IDS.forEach((id) => doc.register(new El("div"), id));
+  // OHB2-PHASE1C: خصائص فلاتر الصندوق زي index.html (data-filter).
+  const FILTERS = { "inbox-filter-all": "all", "inbox-filter-unread": "unread", "inbox-filter-archived": "archived" };
+  Object.keys(FILTERS).forEach((id) => {
+    const el = doc.getElementById(id);
+    el.setAttribute("data-filter", FILTERS[id]);
+    el.className = "chip";
+  });
   TABS.forEach((t) => {
     const b = new El("button");
     b.setAttribute("data-view", t.view);
@@ -186,7 +207,7 @@ function buildDocument() {
   doc.getElementById("state-ready").hidden = true;
   doc.getElementById("inbox-badge").hidden = true;
   doc.getElementById("toast").hidden = true;
-  ["view-chats", "view-detail", "view-watches", "view-inbox", "view-new", "view-settings"]
+  ["view-chats", "view-detail", "view-watches", "view-inbox", "view-jobs", "view-new", "view-settings"]
     .forEach((id) => { doc.getElementById(id).hidden = true; });
   return doc;
 }
@@ -249,6 +270,14 @@ function toResponse(result) {
   return {
     status: result.status === undefined ? 200 : result.status,
     ok: result.ok !== undefined ? result.ok : (result.status === undefined || result.status < 400),
+    headers: {
+      get: (name) => {
+        const h = (result.headers || {});
+        const key = Object.keys(h).find((k) => k.toLowerCase() === String(name).toLowerCase());
+        return key === undefined ? null : h[key];
+      },
+    },
+    blob: () => Promise.resolve(result.blob === undefined ? { size: 0 } : result.blob),
     json: () => Promise.resolve(result.data === undefined ? {} : result.data),
   };
 }
@@ -281,7 +310,16 @@ function loadApp(opts) {
     Array,
     isFinite,
     encodeURIComponent,
+    // OHB2-PHASE1B: تنزيل الملف (Blob/objectURL) لمحاكاة زر التصدير.
+    URL: {
+      _urls: {},
+      createObjectURL: function (blob) { const u = "blob:mock/" + (Object.keys(this._urls).length + 1); this._urls[u] = blob; return u; },
+      revokeObjectURL: function (u) { delete this._urls[u]; },
+    },
+    Blob: function (parts, opts) { this.parts = parts; this.type = (opts && opts.type) || ""; this.size = 0; },
   };
+  // navigator: مرجع حقيقي للنسخ (Clipboard API أو لا شيء).
+  sandbox.navigator = opts.navigator || null;
   sandbox.window = sandbox;
   sandbox.self = sandbox;
   sandbox.globalThis = sandbox;
@@ -290,7 +328,7 @@ function loadApp(opts) {
 
   const root = path.resolve(__dirname, "../../bot/web/static");
   const ctx = vm.createContext(sandbox);
-  for (const file of ["ops.js", "inbox.js", "files.js", "cost.js", "app.js"]) {
+  for (const file of ["jobs.js", "ops.js", "inbox.js", "files.js", "cost.js", "copy.js", "export.js", "app.js"]) {
     const code = fs.readFileSync(path.join(root, file), "utf8");
     vm.runInContext(code, ctx, { filename: file });
   }

@@ -1,51 +1,53 @@
-"""TASK 04B-07: سياسة تحديثات تيليجرام المتراكمة عند البدء (القرار 3).
+"""OHB2-STAGE2: سياسة تحديثات تيليجرام المتراكمة عند البدء (D2).
 
-عند تشغيل البوت بنـ long polling، أي تحديثات واردة اتراكمت وقت التوقف لازم تتتجاهل
-(drop_pending_updates=True) عشان البوت مايعالجش أوامر قديمة عند الرجوع. ده منفصل تمامًا
-عن تعافي الصندوق الصادر (outbox) — اللي لازم يحافظ على السجلات الدائمة ومايحذفهاش.
+**تغيير مقصود (Stage 2، موافقة صريحة):** بدل `run_polling(drop_pending_updates=True)` (اللي
+كان **يرمي** المعلّق)، بقت حلقة الاستطلاع المخصّصة تستخدم `deleteWebhook(drop_pending_updates=False)`
+وتستأنف من الحدّ الدائم (`B+1`) أو `offset=None` ⇒ **المعلّق محفوظ دائمًا** (مفيش رمي تلقائي).
+هذا منفصل تمامًا عن تعافي الصندوق الصادر (outbox) — اللي لازم يحافظ على السجلات الدائمة.
 
-بنختبر مسار الإعداد الحقيقي (main.main) من غير أي polling حقيقي أو اتصال تيليجرام.
+بنختبر مسار الإعداد الحقيقي (`main.main`) من غير أي polling حقيقي أو اتصال تيليجرام.
 """
 import bot.app as app_mod
 import main as main_mod
 
 
 class _RecordingApp:
-    """تطبيق وهمي بيسجّل باراميترات run_polling من غير أي شبكة."""
+    """تطبيق وهمي بيسجّل نقطة الإقلاع من غير أي شبكة."""
 
     def __init__(self):
         self.polling_kwargs = None
+        self.ran_custom_bot = False
 
-    def run_polling(self, **kwargs):
+    def run_polling(self, **kwargs):  # pragma: no cover — ممنوع الاستخدام في Stage 2
         self.polling_kwargs = kwargs
 
 
-def test_main_configures_drop_pending_updates(monkeypatch, tmp_path):
-    # نبني Config حقيقي من بيئة مغلقة (بدون أي أسرار حقيقية).
-    env = {
-        "TELEGRAM_BOT_TOKEN": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
-        "OPENHANDS_API_KEY": "sk-test-not-real",
-        "ALLOWED_TELEGRAM_ID": "1",
-        "DB_PATH": str(tmp_path / "t.sqlite3"),
-    }
+def _env(monkeypatch, tmp_path):
     monkeypatch.setattr("bot.config.load_dotenv", lambda *a, **k: None)
-    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", env["TELEGRAM_BOT_TOKEN"])
-    monkeypatch.setenv("OPENHANDS_API_KEY", env["OPENHANDS_API_KEY"])
-    monkeypatch.setenv("ALLOWED_TELEGRAM_ID", env["ALLOWED_TELEGRAM_ID"])
-    monkeypatch.setenv("DB_PATH", env["DB_PATH"])
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11")
+    monkeypatch.setenv("OPENHANDS_API_KEY", "sk-test-not-real")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_ID", "1")
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "t.sqlite3"))
+
+
+def test_main_uses_custom_poller_not_run_polling(monkeypatch, tmp_path):
+    """main لازم يشغّل الحلقة المخصّصة (`run_bot`)، **مش** `run_polling` (مفيش Updater)."""
+    _env(monkeypatch, tmp_path)
 
     fake_app = _RecordingApp()
-    # نعترض بناء التطبيق عند نقطة استخدام main، ونرجّع تطبيق وهمي.
-    # OHB2-N10-25: main ينادي build_application(config) — بنقبل **kwargs للأمان.
-    monkeypatch.setattr(
-        main_mod, "build_application", lambda config, **kwargs: fake_app
-    )
+    monkeypatch.setattr(main_mod, "build_application", lambda config, **kwargs: fake_app)
+
+    async def _fake_run_bot(application):
+        application.ran_custom_bot = True
+
+    monkeypatch.setattr(main_mod, "run_bot", _fake_run_bot)
 
     rc = main_mod.main()
 
     assert rc == 0
-    assert fake_app.polling_kwargs is not None
-    assert fake_app.polling_kwargs.get("drop_pending_updates") is True
+    assert fake_app.ran_custom_bot is True
+    # ممنوع مسار `run_polling` القديم (اللي كان بيرمي المعلّق).
+    assert fake_app.polling_kwargs is None
 
 
 def test_drop_pending_is_independent_of_outbox_recovery(monkeypatch, tmp_path):

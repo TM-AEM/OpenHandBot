@@ -11,17 +11,17 @@ from bot import outbox
 from tests.test_handlers import make_context, make_update
 
 
-def test_pop_awaiting_consumes_once(tmp_path):
+def test_take_awaiting_consumes_once(tmp_path):
     db = Database(str(tmp_path / "t.sqlite3"))
     db.set_awaiting(1, "conv-A", "reply")
-    assert db.pop_awaiting(1) == ("conv-A", "reply")
-    assert db.pop_awaiting(1) == (None, None)
+    assert db.take_awaiting(1)[:2] == ("conv-A", "reply")
+    assert db.take_awaiting(1)[:2] == (None, None)
     assert db.get_awaiting(1) == (None, None)
 
 
-def test_pop_awaiting_without_state(tmp_path):
+def test_take_awaiting_without_state(tmp_path):
     db = Database(str(tmp_path / "t.sqlite3"))
-    assert db.pop_awaiting(7) == (None, None)
+    assert db.take_awaiting(7)[:2] == (None, None)
 
 
 def test_concurrent_messages_consume_state_exactly_once(tmp_path):

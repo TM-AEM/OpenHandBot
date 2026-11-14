@@ -3,10 +3,56 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from enum import Enum
+
+from . import update_outcomes
 
 log = logging.getLogger(__name__)
+
+# OHB2-SW03: سياسة إعادة محاولة **مشتركة** لقراءات SQLite العابرة (busy/locked). معرّفة في
+# طبقة القاعدة عشان البوت والـ Mini App يستخدموا نفس الميزانية بالظبط (مفيش تكرار سياسة).
+# ميزانية صغيرة عمدًا: مجموع الانتظار ≈ 0.25+0.5+1 = 1.75 ثانية كحد أقصى، وبعدها بنرفع
+# الاستثناء الأصلي (مفيش فشل مقفول صامت). في وضع WAL القراءة مش بتتحاصر بالكتّاب، فالفشل
+# العابر الحقيقي ضيّق جدًا؛ الفشل الدائم (قاعدة تالفة/مقفولة) **مش** هيتعاد.
+DEDUPE_RETRY_DELAYS = (0.25, 0.5, 1.0)
+# أكواد SQLite العابرة **الأساسية**: BUSY (5) و LOCKED (6). بنطابق الكود الأساسي
+# (`sqlite_errorcode & 0xFF`) لو الكود متاح (Python 3.11+)، عشان الأكواد الممتدة اللي
+# أصلها BUSY/LOCKED (BUSY_RECOVERY 261، LOCKED_SHAREDCACHE 262، BUSY_SNAPSHOT 517،
+# BUSY_TIMEOUT 773، وأي إضافة مستقبلية) تُصنّف عابرة كذلك. لو الكود مش متاح، بنطابق
+# النص المعروف كاحتياطي (نسخ أقدم/أخطاء بدون كود).
+_TRANSIENT_SQLITE_CODES = frozenset(
+    code
+    for code in (getattr(sqlite3, "SQLITE_BUSY", None), getattr(sqlite3, "SQLITE_LOCKED", None))
+    if code is not None
+)
+# قناع الكود الأساسي في SQLite: الكود الأساسي = `result_code & 0xFF`، والأكواد الممتدة
+# بتضيف بتات أعلى (مثال: BUSY_SNAPSHOT 517 = 0x205 ⇒ 0x05 = BUSY).
+_SQLITE_PRIMARY_CODE_MASK = 0xFF
+
+
+def is_transient_sqlite_error(exc: Exception) -> bool:
+    """هل الخطأ فشل SQLite **عابر** (قفل/انشغال) يستحق إعادة محاولة محدودة؟
+
+    بنطابق **الكود الأساسي** (`sqlite_errorcode & 0xFF`) لو الكود متاح — الطريقة المتينة
+    اللي بتغطّي الأكواد الممتدة (BUSY_RECOVERY/BUSY_SNAPSHOT/BUSY_TIMEOUT/LOCKED_SHAREDCACHE…)
+    اللي أصلها BUSY أو LOCKED. لو الكود مش متاح، بنطابق نص الرسالة المعروف. أي خطأ تاني
+    (قاعدة تالفة، قرص ممتلئ، اتصال مقفول، جدول مش موجود) **دائم** ⇒ False (فشل مقفول فورًا،
+    مفيش إعادة محاولة).
+    """
+    if not isinstance(exc, sqlite3.Error):
+        return False
+    code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(code, int):
+        return (code & _SQLITE_PRIMARY_CODE_MASK) in _TRANSIENT_SQLITE_CODES
+    if code is not None:
+        return False  # كود بنوع غير متوقّع ⇒ نفس سلوك الأصل (مش عابر)، ومفيش استثناء جديد
+    msg = str(exc).lower()
+    return "locked" in msg or "busy" in msg
+
 
 # حالات صندوق الصادر (outbox) — كل انتقال مع سلوك التعافي بعد إعادة التشغيل:
 #   pending  : اتسجّل بثبات ولسه ماتحاولش الإرسال. آمن يتعاود بعد restart.
@@ -61,6 +107,78 @@ CREATION_NOTIFY_NONE = ""
 CREATION_NOTIFY_PENDING = "pending"
 CREATION_NOTIFY_SENT = "sent"
 
+# OHB2-P0-A0: حالات الدفعة/العنصر المحلية للمرفقات (نموذج بيانات A0 — المخطّط فقط).
+#   pending          : اتسجّل بثبات (صف موجود) ولسه مافيش محاولة رفع.
+#   intent_recorded  : OHB2-P0-A3/D-27 — نيّة محلية متينة (نصّ مصاحب مؤهّل اتخزّن). **مش** إرسال
+#                      بعيد؛ الإرسال البعيد لسه حالة مستقبلية (`dispatching`).
+#   dispatching      : اتسجّل نية الإرسال **البعيد** (عند الإرسال الفعلي) — مرحلة B.
+#   uncertain        : نتيجة الرفع البعيد غامضة (timeout/5xx) ⇒ مصالحة، بلا إعادة عمياء.
+#   delivered        : اتأكد التسليم (دليل قراءة/`expires_at`).
+#   expired          : فاتت المهلة (T0+15د) قبل التسليم.
+#   rejected         : رفض نهائي مؤكد.
+#   failed           : فشل نهائي مؤكد.
+# الانتقالات سلوك مراحل A2/A3/A4؛ `dispatching` لسه بلا منطق انتقال (مرحلة B).
+ATTACHMENT_BATCH_PENDING = "pending"
+ATTACHMENT_BATCH_INTENT_RECORDED = "intent_recorded"
+ATTACHMENT_BATCH_DISPATCHING = "dispatching"
+ATTACHMENT_BATCH_UNCERTAIN = "uncertain"
+ATTACHMENT_BATCH_DELIVERED = "delivered"
+ATTACHMENT_BATCH_EXPIRED = "expired"
+ATTACHMENT_BATCH_REJECTED = "rejected"
+ATTACHMENT_BATCH_FAILED = "failed"
+ATTACHMENT_BATCH_STATUSES = (
+    ATTACHMENT_BATCH_PENDING,
+    ATTACHMENT_BATCH_INTENT_RECORDED,
+    ATTACHMENT_BATCH_DISPATCHING,
+    ATTACHMENT_BATCH_UNCERTAIN,
+    ATTACHMENT_BATCH_DELIVERED,
+    ATTACHMENT_BATCH_EXPIRED,
+    ATTACHMENT_BATCH_REJECTED,
+    ATTACHMENT_BATCH_FAILED,
+)
+
+# OHB2-P0-A3/D-32 (F1-1a/F1-1b): تصنيف **صريح** لحالات الدفعة عند حدّ توجيه النصّ في A3.
+# القاعدة الحاكمة: حالات **غير محسومة** (لسه فيها نيّة/إرسال معلّق) بتحجب البرومت العادي؛
+# حالات **نهائية** ما بتحجبش برومتًا جديدًا بذاتها (لكن ما بتصرّحش بتحويل/إعادة نصّ قديم).
+#   - unresolved: النيّة/الإرسال لسه معلّق ⇒ **تحجب** (فشل مغلق). `intent_recorded` = نيّة
+#     محلية متينة (D-27)؛ `dispatching`/`uncertain` = مراحل B (لسه بلا منطق انتقال).
+#   - terminal: نتيجة نهائية ⇒ **لا تحجب** برومتًا جديدًا (بلا غموض).
+ATTACHMENT_BATCH_UNRESOLVED_STATUSES = frozenset(
+    {
+        ATTACHMENT_BATCH_INTENT_RECORDED,
+        ATTACHMENT_BATCH_DISPATCHING,
+        ATTACHMENT_BATCH_UNCERTAIN,
+    }
+)
+ATTACHMENT_BATCH_TERMINAL_STATUSES = frozenset(
+    {
+        ATTACHMENT_BATCH_DELIVERED,
+        ATTACHMENT_BATCH_EXPIRED,
+        ATTACHMENT_BATCH_REJECTED,
+        ATTACHMENT_BATCH_FAILED,
+    }
+)
+
+
+class AttachmentBatchIntegrityError(RuntimeError):
+    """OHB2-P0-A3/F2: حالة دفعة مرفقات **غير معروفة/غير صالحة** ⇒ رفض مغلق.
+
+    تُرفع عند وجود صفّ `attachment_batches` بحالة خارج `ATTACHMENT_BATCH_STATUSES`
+    (تلف بيانات، قيمة مستقبلية غير مدعومة، أو NULL). الرفع **مقصود**: بدل ما تُصنَّف
+    الحالة المجهولة `NONE` وتسقط بصمت لمسار البرومت/`outbox` (fail-open)، بينتشر
+    الاستثناء للمعالج ⇒ يُسجَّل **فشلًا تقنيًّا غير مؤهّل للإقرار** (`failed_*`)، بلا أي
+    صفّ `outbox` وبلا أي نداء بعيد. مفيش كتم للاستثناء ولا تحويله لنجاح/رفض مؤهّل.
+    """
+
+
+# OHB2-P0-A1: حالة عنصر مرفق **اتخزّن** بنجاح (بايتات كاملة + تحقّق). العنصر بيفضل
+# `pending` (نفس قيمة A0) قبل كده — بما فيها عند الفشل — عشان كنس A4 يلاقي المعلّق.
+ATTACHMENT_ITEM_STORED = "stored"
+# OHB2-P0-A4/D-35: عنصر اتكنس (بايتات الـ staging اتحذفت بعد قرار نهائي/انتهاء). علامة
+# **عنصر** (مش حالة دفعة) عشان ما نغيّرش مجموعة حالات الدفعة المعتمدة (D-32/D-34). العنصر
+# الكنسي `reaped` **مش** `stored` ⇒ الرصد يميّز بين المكنوس والمُخزَّن.
+ATTACHMENT_ITEM_REAPED = "reaped"
+
 # OHB2-STABILIZATION-F02: أنواع مراجع أعمال الإكمال المحلي المعلّقة (جدول completion_pending).
 # معرّفة هنا عشان طبقة الـ DB تقدر تبني استعلامات التسوية/الرصد من غير اعتماد دائري على outbox.
 COMPLETION_KIND_OUTBOX = "outbox"
@@ -78,6 +196,22 @@ INBOX_KIND_MISSING = "missing"         # شات متابَع اختفى من Ope
 INBOX_KIND_STALE_REPORT = "stale_report"  # مفيش تقرير جديد بعد البرومبت
 INBOX_KIND_PROACTIVE = "proactive"     # إشعار استباقي عام (المُبلّغ)
 
+# OHB2-PHASE1C: مجموعة الحذف النهائي **الآمنة** (allowlist صريحة). دول بس أنواع **تقارير
+# حالة/نتيجة** مش مرتبطة بعملية قابلة للتنفيذ: مفيش outbox/creation job مرتبط بيهم،
+# فحذفهم بعد التسليم + القراءة ما بيفقدش دليلًا تشغيليًا.
+#   - `proactive` **مستثنى** لأنه إشعار حالة حيّة لمحادثة (مرتبط بعلامة تسوية `notifier_pending`
+#     ومفتاح حدث؛ حذفه يهدّد دليل الاسترجاع).
+#   - أي نوع **غير معروف** (مش هنا) محمي تلقائيًا — سياسة fail-closed: أي نوع جديد/غريب
+#     مايتحذفش نهائيًا لحد ما يتقيّم ويتضاف صراحةً.
+INBOX_DELETABLE_KINDS = frozenset(
+    {
+        INBOX_KIND_TERMINAL,
+        INBOX_KIND_TIMEOUT,
+        INBOX_KIND_MISSING,
+        INBOX_KIND_STALE_REPORT,
+    }
+)
+
 # أقصى طول لنص الإشعار المحفوظ. ردود الـ agent ممكن تكون ضخمة؛ بنقصّها عشان القاعدة ما
 # تتضخّمش. الرسالة الكاملة بتفضل في تيليجرام؛ الصندوق ملخّص قابل للعرض.
 INBOX_MAX_MESSAGE_CHARS = 1000
@@ -88,6 +222,14 @@ INBOX_MAX_PER_CONVERSATION = 50
 INBOX_MAX_TOTAL = 500
 # أقصى عدد عناصر في صفحة قايمة الصندوق (يتفرض في طبقة الـ API).
 INBOX_PAGE_SIZE = 10
+# أقصى عدد صحيح يقبله SQLite (INTEGER = 64-bit). أي رقم أكبر منه بيرمي OverflowError
+# وقت الـ binding. بنستخدمه كسقف مشترك للتحقق من الحدود (AUD-04/AUD-02).
+MAX_SQLITE_INT = 2**63 - 1
+# AUD-04: أقصى رقم صفحة مسموح لأي قايمة مُرقّمة (offset = page × page_size). بنحدّد رقم
+# الصفحة نفسه عشان يفضل offset = page × size داخل نطاق 64-bit حتى لو page_size كبير،
+# ومايتحوّلش لـ OverflowError جوّه SQLite. مليون صفحة × 10 = 10M صف أقصى — أوسع بكتير
+# من أي بيانات واقعية (سقوف الصندوق/المحادثات أصغر)، فمفيش تقييد عملي للاستخدام الطبيعي.
+MAX_PAGE = 1_000_000
 
 # OHB2-08-05 (Batch 3R): حالة تسليم الحدث (مستقلة تمامًا عن حالة القراءة `read_at`).
 #   pending   : الحدث اتسجّل بثبات (durable) ولسه ماتسلّمش لتليجرام. **مايتقلّمش أبدًا.**
@@ -97,6 +239,13 @@ INBOX_PAGE_SIZE = 10
 INBOX_DELIVERY_PENDING = "pending"
 INBOX_DELIVERY_DELIVERED = "delivered"
 INBOX_DELIVERY_FAILED = "failed"
+# OHB2-PHASE1C: نتيجة محاولة الحذف النهائي لصف صندوق (مُفرَض على السيرفر، مش على الواجهة).
+#   deleted   : الصف كان مؤهّلًا واتحذف فعلًا.
+#   protected : الصف موجود لكنه محمي (مش مؤهّل للحذف النهائي) ⇒ مفيش أي تغيير.
+#   missing   : الصف مش موجود أصلًا.
+INBOX_DELETE_DELETED = "deleted"
+INBOX_DELETE_PROTECTED = "protected"
+INBOX_DELETE_MISSING = "missing"
 # أقصى طول لتصنيف خطأ التسليم المحفوظ (نوع الاستثناء بس — مفيش نص حسّاس/أسرار).
 INBOX_MAX_ERROR_CHARS = 120
 # أقصى عدد محاولات تسليم للحدث الواحد قبل ما نصنّفه فاشل (ميزانية مستقلة لكل حدث).
@@ -111,6 +260,12 @@ INBOX_CLAIM_LEASE = timedelta(minutes=5)
 AWAITING_TTL = timedelta(minutes=10)
 
 
+# OHB2-P0-A0: مهلة الدفعة الثابتة (15 دقيقة) من **أول** ملف في الدفعة المعلّقة. ثابت P0
+# (I4) **منفصل** عن `AWAITING_TTL` (10 دقايق)؛ إعادة استخدام `AWAITING_TTL` كانت هتكسر
+# المهلة. `T0` بيتخزّن مرة واحدة عند أول ملف وعمره ما بيتمدّد (I6).
+ATTACHMENT_BATCH_TTL = timedelta(minutes=15)
+
+
 # نافذة تجميع الرسايل المتتالية (القرار 2): أي رسالة جاية خلال 1.5 ثانية من آخر تحديث
 # لبرومت لسه 'pending' لنفس الوجهة بتتجمّع معاه في سجل واحد (مش إرسال منفصل).
 GROUP_WINDOW = timedelta(seconds=1.5)
@@ -121,9 +276,45 @@ def _parse_iso(value: str | None) -> datetime | None:
         return None
     try:
         parsed = datetime.fromisoformat(value)
-    except ValueError:
+    except (ValueError, TypeError):
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _attachment_batch_deadline(t0: str | None) -> datetime | None:
+    """الموعد النهائي للدفعة = `T0 + ATTACHMENT_BATCH_TTL` (None لو `t0` غير صالح).
+
+    نفس دلالة `attachments.batch_deadline` (مرجع واحد للمهلة `ATTACHMENT_BATCH_TTL`)؛ نسخة
+    محلية صغيرة عشان طبقة القاعدة (A3) ما تعتمدش على وحدة المرفقات العليا (تفادي دورية الاستيراد).
+    """
+    if not t0:
+        return None
+    try:
+        start = datetime.fromisoformat(t0)
+    except (ValueError, TypeError):
+        return None
+    if not start.tzinfo:
+        start = start.replace(tzinfo=timezone.utc)
+    return start + ATTACHMENT_BATCH_TTL
+
+
+def normalize_message_identity(
+    telegram_id: object, chat_id: object, message_id: object
+) -> tuple[int, int, int] | None:
+    """OHB2-P0-A3/D-33/D-34: تحقّق تطبيقي للهوية القانونية للرسالة.
+
+    الهوية = `(telegram_id, chat_id, message_id)`، وكلها يجب أن تكون **أعدادًا صحيحة موجبة**.
+    SQLite ديناميكي (تصريح النوع = affinity فقط) ⇒ التحقّق هنا **إلزامي**؛ نرفض: غياب/`None`/
+    `bool`/غير `int`/`0`/سالب. `True`/`False` (subclass من `int`) مرفوضان صراحةً. ترجّع
+    `None` عند أي قيمة غير صالحة ⇒ المستدعي يفشل مغلقًا (لا يخترع هوية). `update_id` **ليس**
+    جزءًا من الهوية (هوية تسليم منفصلة).
+    """
+    out: list[int] = []
+    for value in (telegram_id, chat_id, message_id):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            return None
+        out.append(value)
+    return (out[0], out[1], out[2])
 
 
 @dataclass
@@ -282,14 +473,82 @@ class InboxItem:
     claim_token: str | None = None
     # وقت أخذ الحجز (ISO). بيسمح بحجز له مدة صلاحية: حجز قديم (من عملية وقعت) بيتحرّر تلقائيًا.
     claim_at: str | None = None
+    # OHB2-PHASE1C: محور **الأرشفة** (منفصل تمامًا عن القراءة والتسليم). NULL = نشط
+    # (ظاهر في الصندوق العادي). وقت ISO = مؤرشف (مخفي من العادي، بيظهر في عرض الأرشيف).
+    # الأرشفة **قابلة للعكس** (`archived_at` بس، مفيش أي مساس بالتسليم/العملية/القراءة).
+    archived_at: str | None = None
 
     @property
     def unread(self) -> bool:
         return self.read_at is None
 
     @property
+    def archived(self) -> bool:
+        return self.archived_at is not None
+
+    @property
     def delivery_pending(self) -> bool:
         return self.delivery_status == INBOX_DELIVERY_PENDING
+
+
+@dataclass
+class AttachmentBatch:
+    """OHB2-P0-A0: صف دفعة مرفقات محلية واحدة (المخطّط فقط — بلا منطق دورة حياة).
+
+    الدفعة **client-side** بالكامل (I4/I6/§8.4): `T0` هو ختم UTC المطلق لأول ملف،
+    وبيتخزّن **مرة واحدة** وعمره ما بيتمدّد. الحالة مربوطة بالمستخدم والمحادثة الصريحة.
+    """
+
+    batch_id: str
+    telegram_id: int
+    conversation_id: str
+    t0: str
+    status: str = ATTACHMENT_BATCH_PENDING
+    created_at: str | None = None
+    updated_at: str | None = None
+    # OHB2-P0-A3/D-27: النصّ المصاحب المؤهّل المخزَّن محليًّا (None قبل تسجيل النيّة).
+    intent_text: str | None = None
+
+
+class AttachmentRoutingState(str, Enum):
+    """نتيجة تصنيف حالة المرفقات عند حدّ توجيه النصّ (A3 — D-32)."""
+
+    NONE = "none"                        # مفيش أي دفعة ذات صلة ⇒ البرومت العادي كما هو
+    LIVE = "live"                        # دفعة `pending` حيّة **وحيدة** ⇒ مسار النصّ المصاحب
+    MULTI_LIVE = "multi_live"            # أكثر من دفعة `pending` حيّة ⇒ غموض (فشل مغلق)
+    EXPIRED_PENDING = "expired_pending"  # دفعة `pending` **منتهية** (بلا حيّة) ⇒ لا إحياء
+    UNRESOLVED = "unresolved"            # دفعة غير محسومة (نيّة/إرسال معلّق) ⇒ تحجب
+    TERMINAL = "terminal"                # دفعة نهائية فقط ⇒ **لا تحجب** برومتًا جديدًا
+    # OHB2-P0-A3/D-34: تمييز الحالة النهائية بحسب دليل هوية الرسالة الواردة.
+    TERMINAL_ASSOCIATED = "terminal_associated"   # النصّ **مُثبَت** ارتباطه بدفعة نهائية ⇒ حجب
+    TERMINAL_UNPROVEN = "terminal_unproven"       # دفعة نهائية + **لا** دليل هوية ⇒ فشل مغلق (D-34)
+
+
+@dataclass(frozen=True)
+class AttachmentRouting:
+    """نتيجة `classify_attachment_routing` (A3 — D-32): الحالة + الدفعات ذات الصلة."""
+
+    state: AttachmentRoutingState
+    live_batches: tuple[AttachmentBatch, ...] = ()
+    unresolved_batches: tuple[AttachmentBatch, ...] = ()
+
+
+@dataclass
+class AttachmentItem:
+    """OHB2-P0-A0: صف عنصر واحد داخل دفعة مرفقات (المخطّط فقط).
+
+    `staging_token` مرجع **غير شفّاف** لبايتات الـ staging المحلية (اسم الملف الفعلي
+    بيحدّده A1)؛ ما بنخزّنش اسم ملف المستخدم ولا أي محتوى.
+    """
+
+    item_id: str
+    batch_id: str
+    staging_token: str | None = None
+    display_name: str | None = None
+    size_bytes: int | None = None
+    status: str = ATTACHMENT_BATCH_PENDING
+    created_at: str | None = None
+    updated_at: str | None = None
 
 
 class Database:
@@ -300,6 +559,15 @@ class Database:
         # ما ترميش "database is locked".
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
+        # OHB2-P0-A3/D-35: فرض المفاتيح الأجنبية على **الاتصال الإنتاجي**. SQLite افتراضيًّا
+        # OFF، والـpragma **لكل اتصال** (مش عالمي). تُنفَّذ هنا **قبل أي معاملة** (شرط SQLite:
+        # لا يمكن تغييرها داخل معاملة نشطة) — بعد `connect` مباشرة. فشل التفعيل ⇒ استثناء
+        # (fail-closed) بدل المتابعة بلا حماية FK على ربط الهوية↔الدفعة.
+        self._conn.execute("PRAGMA foreign_keys=ON")
+        if self._conn.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+            raise RuntimeError(
+                "PRAGMA foreign_keys=ON لم يُفعَّل على اتصال الإنتاج (fail-closed)"
+            )
         # NTF-20: hook اختياري ينسّق التلميح in-memory للتسليم المعلّق قبل بدء دورة متابعة
         # جديدة. المراقب بيسجّله (زي set_owner_delivery) عشان كل مستدعي `add_watched`
         # (handlers/outbox/creation) يستفيد من غير ما يعرف المراقب.
@@ -441,7 +709,8 @@ class Database:
                 transition_status TEXT,
                 transition_seq  INTEGER,
                 claim_token     TEXT,
-                claim_at        TEXT
+                claim_at        TEXT,
+                archived_at     TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_inbox_unread ON notification_inbox(read_at);
             CREATE INDEX IF NOT EXISTS idx_inbox_conversation
@@ -453,8 +722,103 @@ class Database:
             -- القديمة بتاخده تلقائيًا (إضافي وغير مدمّر — مفيش فقد بيانات).
             CREATE TABLE IF NOT EXISTS deleted_conversations (
                 conversation_id TEXT PRIMARY KEY,
-                deleted_at      TEXT
+                deleted_at      TEXT,
+                remote_state    TEXT,
+                remote_updated_at TEXT,
+                witness_origin  TEXT,
+                witness_attempt_id TEXT,
+                witness_preexisting INTEGER NOT NULL DEFAULT 0
             );
+            -- OHB2-PHASE1A: جلسات الـ Mini App **دائمة** (بدل in-memory). العمود
+            -- `token_hash` هو SHA-256 للتوكن الخام؛ **التوكن الخام ما بيتخزّنش أبدًا**.
+            -- `expires_at` ختم زمني من السيرفر (unix float) بيحكم الانتهاء حتى لو العميل
+            -- فضل يبعت الكوكي. الحذف من نفس الجدول = إلغاء (revoke) دائم ينجو من restart.
+            -- `CREATE TABLE IF NOT EXISTS` ⇒ إضافي وغير مدمّر للقواعد القديمة.
+            CREATE TABLE IF NOT EXISTS web_sessions (
+                token_hash  TEXT PRIMARY KEY,
+                user_id     INTEGER NOT NULL,
+                created_at  REAL NOT NULL,
+                expires_at  REAL NOT NULL,
+                profile     TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_web_sessions_expires ON web_sessions(expires_at);
+            -- OHB2-DUPLICATE-TELEGRAM-PROMPT-DISPATCH: سجل **دائم** لمعرّفات تحديثات تيليجرام
+            -- اللي اتعالجت، عشان ضمان «تحديث واحد ⇒ قرار معالجة واحد». `update_id` مفتاح
+            -- أساسي (فريد على مستوى تيليجرام)، فإعادة تسليم نفس التحديث (شبكة/إعادة تشغيل/
+            -- تزامن) بتتصدّ قبل أي عملية خارجية (إرسال أو إنشاء). ده **كشف تكرار** مش ضمان
+            -- exactly-once خارجي (نفس عقد المشروع الموثّق). `processed_at` وصفى للتشغيل
+            -- والتنظيف. `CREATE TABLE IF NOT EXISTS` ⇒ إضافي وغير مدمّر للقواعد القديمة.
+            CREATE TABLE IF NOT EXISTS processed_updates (
+                update_id    INTEGER PRIMARY KEY,
+                processed_at TEXT NOT NULL,
+                -- OHB2-MANUAL-POLLING-OUTCOME: فئة النتيجة الدائمة. NULL للصفوف القديمة
+                -- (= غير مؤهّلة للإقرار، fail-closed) لحد ما تُكتب مع العملية الدائمة.
+                outcome      TEXT
+            );
+            -- OHB2-MANUAL-POLLING-OUTCOME: سجل الفشل الدائم للتحديثات اللي **مالهاش** عمل
+            -- دائم (تحديث مرفوض/غير مدعوم، أو handler فشل/ابتلع استثناء). وجود صف هنا = فيه
+            -- قرار مُوثَّق (fail-closed: مايتقبلش كنجاح). منفصل عن `processed_updates` عشان
+            -- ما نغيّرش دلالات الديدَب القائمة. `CREATE TABLE IF NOT EXISTS` ⇒ إضافي.
+            CREATE TABLE IF NOT EXISTS update_failures (
+                update_id   INTEGER PRIMARY KEY,
+                outcome     TEXT NOT NULL,
+                reason      TEXT,
+                failed_at   TEXT NOT NULL
+            );
+            -- OHB2-P0-A0 (المخطّط فقط): حالة الدفعة/العنصر المحلية للمرفقات في قاعدة
+            -- SQLite القائمة (نفس المالك — I2/I3/I5، بلا قاعدة ثانية/عمّال/مجدول).
+            -- الدفعة **client-side** (I4/I6/§8.4): `t0` ختم UTC مطلق لأول ملف،
+            -- **ثابت وعمره ما بيتمدّد**؛ ما بنخزّنش `expires_at` مشتق ولا أي شيء يتحدّث
+            -- مع كل ملف. الحالة مربوطة بالمستخدم (`telegram_id`) والمحادثة الصريحة
+            -- (`conversation_id`) ⇒ العزل بين المستخدمين/المحادثات قابل للفرض بفحص ملكية
+            -- الصف. حالة الدفعة من مجموعة `ATTACHMENT_BATCH_STATUSES`. إضافي وغير مدمّر.
+            CREATE TABLE IF NOT EXISTS attachment_batches (
+                batch_id        TEXT PRIMARY KEY,
+                telegram_id     INTEGER NOT NULL,
+                conversation_id TEXT NOT NULL,
+                t0              TEXT NOT NULL,
+                status          TEXT NOT NULL DEFAULT 'pending',
+                created_at      TEXT,
+                updated_at      TEXT,
+                intent_text     TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_attachment_batches_owner
+                ON attachment_batches(telegram_id, conversation_id);
+            -- عنصر واحد لكل ملف مرفق في الدفعة. `batch_id` مرجع للدفعة الأب (I5:
+            -- صفوف دفعة+عنصر متينة). `staging_token` مرجع غير شفّاف لبايتات الـ staging
+            -- (اسم الملف الفعلي/دورة الكتابة = A1)؛ ما بنخزّنش محتوى ولا اسم ملف المستخدم.
+            CREATE TABLE IF NOT EXISTS attachment_items (
+                item_id       TEXT PRIMARY KEY,
+                batch_id      TEXT NOT NULL,
+                staging_token TEXT,
+                display_name  TEXT,
+                size_bytes    INTEGER,
+                status        TEXT NOT NULL DEFAULT 'pending',
+                created_at    TEXT,
+                updated_at    TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_attachment_items_batch
+                ON attachment_items(batch_id);
+            -- OHB2-P0-A3/D-33/D-35: دليل هوية رسالة↔دفعة **متين ومستقلّ** عن
+            -- `processed_updates` (التقليم مايلمسوش). الهوية القانونية =
+            -- (telegram_id, chat_id, message_id)؛ `update_id` هوية تسليم منفصلة وليست بديلًا
+            -- عن `message_id`. الـPK يمنع إعادة ربط رسالة واحدة بدفعة أخرى صامتًا (تعارض ⇒
+            -- IntegrityError ⇒ فشل مغلق). الـFK `ON DELETE RESTRICT` (بلا cascade) يمنع حذف
+            -- دليل الهوية مع الدفعة — يُفرض فعليًّا عبر `PRAGMA foreign_keys=ON` في `__init__`.
+            -- بلا مدّة احتفاظ/بلا عامل تنظيف (D-35 بند 6).
+            CREATE TABLE IF NOT EXISTS attachment_message_identity (
+                telegram_id     INTEGER NOT NULL,
+                chat_id         INTEGER NOT NULL,
+                message_id      INTEGER NOT NULL,
+                batch_id        TEXT    NOT NULL,
+                conversation_id TEXT    NOT NULL,
+                created_at      TEXT    NOT NULL,
+                PRIMARY KEY (telegram_id, chat_id, message_id),
+                FOREIGN KEY (batch_id) REFERENCES attachment_batches(batch_id)
+                    ON DELETE RESTRICT
+            );
+            CREATE INDEX IF NOT EXISTS idx_attachment_message_identity_batch
+                ON attachment_message_identity(batch_id);
             """
         )
         self._migrate()
@@ -499,6 +863,11 @@ class Database:
         outbox_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(outbox)")}
         if outbox_cols and "attempts" not in outbox_cols:
             self._conn.execute("ALTER TABLE outbox ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+        # OHB2-MANUAL-POLLING-OUTCOME: عمود النتيجة على جدول الديدَب (nullable ⇒ الصفوف
+        # القديمة بتاخد NULL = غير مؤهّلة، fail-closed؛ غير مدمّر).
+        pu_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(processed_updates)")}
+        if pu_cols and "outcome" not in pu_cols:
+            self._conn.execute("ALTER TABLE processed_updates ADD COLUMN outcome TEXT")
         # OHB2-07: معرّف العملية اللي العميل يولّده (idempotency). عمود إضافي nullable،
         # والصفوف القديمة بتاخد NULL (مفيش فقد بيانات، والسلوك القديم زي ما هو).
         if outbox_cols and "client_ref" not in outbox_cols:
@@ -638,6 +1007,12 @@ class Database:
             self._conn.execute(
                 "ALTER TABLE notification_inbox ADD COLUMN claim_at TEXT"
             )
+        # OHB2-PHASE1C: عمود الأرشفة (محور منفصل وقابل للعكس). إضافي nullable ⇒ الصفوف
+        # القديمة بتاخد NULL = نشطة (مفيش فقد بيانات، ومفيش تغيير في سلوك القراءة/التسليم).
+        if inbox_cols and "archived_at" not in inbox_cols:
+            self._conn.execute(
+                "ALTER TABLE notification_inbox ADD COLUMN archived_at TEXT"
+            )
         if inbox_cols:
             self._conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_inbox_event_key "
@@ -667,6 +1042,761 @@ class Database:
             # تنظيف: `idx_inbox_created(id)` كان زائد (الـ PK فهرس بالفعل) وبيضاعف الكتابة
             # عند كل إدراج/تقليم. بنشيله لو موجود (فهرس بس — مفيش أي مساس بالبيانات).
             self._conn.execute("DROP INDEX IF EXISTS idx_inbox_created")
+
+        # OHB2-MINIAPP: حالة الحذف البعيد على الشاهد (deleting ⇒ uncertain/confirmed).
+        # أعمدة إضافية على قاعدة موجودة (غير مدمّر: الصفوف القديمة تاخد NULL).
+        tomb_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(deleted_conversations)")}
+        if tomb_cols and "remote_state" not in tomb_cols:
+            self._conn.execute("ALTER TABLE deleted_conversations ADD COLUMN remote_state TEXT")
+        if tomb_cols and "remote_updated_at" not in tomb_cols:
+            self._conn.execute("ALTER TABLE deleted_conversations ADD COLUMN remote_updated_at TEXT")
+        # OHB2-PR6: هُوية الشاهد **متينة** (بدل مقارنة الطوابع الزمنية — TS-1).
+        #   witness_origin     : NULL = شاهد قديم (حذف محلي سابق)، 'attempt' = محاولة حذف بعيد.
+        #   witness_attempt_id : رمز المحاولة المالكة (للـ compare-and-swap).
+        #   witness_preexisting: 1 = الصف كان موجودًا **قبل** أول محاولة بعيد (شاهد قديم)،
+        #                        0 = الصف أنشأته المحاولة نفسها. عمود **تراكمي** (monotonic):
+        #                        ما بيتصفّرش أبدًا، فلو محاولة **جديدة** ورثت شاهدًا قديمًا
+        #                        بتبان شاهدًا قديمًا دايمًا (منع إعادة التصنيف غلط — TS-1).
+        if tomb_cols and "witness_origin" not in tomb_cols:
+            self._conn.execute("ALTER TABLE deleted_conversations ADD COLUMN witness_origin TEXT")
+        if tomb_cols and "witness_attempt_id" not in tomb_cols:
+            self._conn.execute(
+                "ALTER TABLE deleted_conversations ADD COLUMN witness_attempt_id TEXT"
+            )
+        if tomb_cols and "witness_preexisting" not in tomb_cols:
+            self._conn.execute(
+                "ALTER TABLE deleted_conversations ADD COLUMN "
+                "witness_preexisting INTEGER NOT NULL DEFAULT 0"
+            )
+            # ترحيل غير مدمّر ولا يعتمد على الوقت: أي شاهد قديم موجود **الآن** (قبل أن
+            # يعرف الكود العمود الجديد) هو بالتعريف «سابق لأي محاولة» ⇒ نوسمه 1. هذا
+            # idempotent (العمود يتضاف مرة واحدة فقط؛ لو أُضيف من قبل لا نلمس البيانات)
+            # وآمن عند الانقطاع (ALTER + UPDATE داخل نفس معاملة `_migrate` الذرّية).
+            self._conn.execute(
+                "UPDATE deleted_conversations SET witness_preexisting=1 WHERE witness_origin IS NULL"
+            )
+        # OHB2-P0-A0: جدولا المرفقات (`attachment_batches`/`attachment_items`) جديدان
+        # بالكامل ⇒ بيتعملوا في `_init_schema` بـ `CREATE TABLE IF NOT EXISTS` (نفس مسار
+        # الإضافة غير المدمّر لكل الجداول الجديدة). القواعد القديمة بتاخد الجدولين تلقائيًا
+        # عند أول `Database()` من غير أي مساس بالبيانات الموجودة.
+        # OHB2-P0-A3/D-27: عمود `intent_text` يتضاف **إضافيًّا وغير مدمّر** لقواعد أُنشئت
+        # قبل A3 (الصفوف القديمة بتاخد NULL = بلا نصّ مصاحب — fail-closed).
+        batch_cols = {
+            r["name"] for r in self._conn.execute("PRAGMA table_info(attachment_batches)")
+        }
+        if batch_cols and "intent_text" not in batch_cols:
+            self._conn.execute(
+                "ALTER TABLE attachment_batches ADD COLUMN intent_text TEXT"
+            )
+
+    # ------------------------------------------------- attachment batches (OHB2-P0-A0)
+    def create_attachment_batch(
+        self,
+        batch_id: str,
+        telegram_id: int,
+        conversation_id: str,
+        t0: str,
+        status: str = ATTACHMENT_BATCH_PENDING,
+        now: str | None = None,
+    ) -> None:
+        """OHB2-P0-A0: يسجّل صف دفعة مرفقات جديد (المخطّط فقط — بلا دورة حياة).
+
+        `t0` ختم UTC المطلق لأول ملف ويُمرَّر **مرة واحدة**؛ الدالة ما بتحدّثهوش
+        (منع تمديد المهلة — I6). `conversation_id` بيُمرَّر من المستدعي بعد التحقق منه
+        بـ `files.is_valid_conversation_id` (نطاق A2/A3)؛ المخطّط نفسه ما بيفحصش.
+        """
+        stamp = now or datetime.now(timezone.utc).isoformat()
+        self._conn.execute(
+            "INSERT INTO attachment_batches"
+            "(batch_id, telegram_id, conversation_id, t0, status, created_at, updated_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?)",
+            (batch_id, int(telegram_id), conversation_id, t0, status, stamp, stamp),
+        )
+        self._conn.commit()
+
+    def get_attachment_batch(
+        self, batch_id: str, *, telegram_id: int | None = None
+    ) -> AttachmentBatch | None:
+        """يجيب دفعة بالمعرّف، مع فرض **ملكية** الصف لو `telegram_id` اتحدّد.
+
+        نطاق المالك (عزل بين المستخدمين — §5 بند 8): تمرير `telegram_id` بيخلي دفعة
+        مستخدم تاني **مش مرئية**، وهو الأساس اللي A2/A3 يفرضوا بيه العزل.
+        """
+        if telegram_id is None:
+            row = self._conn.execute(
+                "SELECT * FROM attachment_batches WHERE batch_id=?", (batch_id,)
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT * FROM attachment_batches WHERE batch_id=? AND telegram_id=?",
+                (batch_id, int(telegram_id)),
+            ).fetchone()
+        return self._row_to_attachment_batch(row) if row else None
+
+    def add_attachment_item(
+        self,
+        item_id: str,
+        batch_id: str,
+        staging_token: str | None = None,
+        display_name: str | None = None,
+        size_bytes: int | None = None,
+        status: str = ATTACHMENT_BATCH_PENDING,
+        now: str | None = None,
+    ) -> None:
+        """OHB2-P0-A0: يسجّل صف عنصر واحد جوه دفعة (المخطّط فقط).
+
+        الترتيب اللي بيستخدمه A1 **row-first**: العنصر يتسجّل قبل أي كتابة bytes؛
+        `staging_token` مرجع غير شفّاف لبايتات الـ staging (مش اسم ملف المستخدم).
+        """
+        stamp = now or datetime.now(timezone.utc).isoformat()
+        self._insert_attachment_item_nocommit(
+            item_id, batch_id, staging_token, display_name, size_bytes, status, stamp
+        )
+        self._conn.commit()
+
+    def _insert_attachment_item_nocommit(
+        self,
+        item_id: str,
+        batch_id: str,
+        staging_token: str | None,
+        display_name: str | None,
+        size_bytes: int | None,
+        status: str,
+        stamp: str,
+    ) -> None:
+        """إدراج صف عنصر **جوه معاملة المستدعي** (بدون commit). مصدر واحد للإدراج."""
+        self._conn.execute(
+            "INSERT INTO attachment_items"
+            "(item_id, batch_id, staging_token, display_name, size_bytes, status, "
+            "created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                item_id,
+                batch_id,
+                staging_token,
+                display_name,
+                None if size_bytes is None else int(size_bytes),
+                status,
+                stamp,
+                stamp,
+            ),
+        )
+
+    def list_attachment_items(self, batch_id: str) -> list[AttachmentItem]:
+        """عناصر دفعة واحدة بترتيب إدراج مستقر (المخطّط فقط)."""
+        rows = self._conn.execute(
+            "SELECT * FROM attachment_items WHERE batch_id=? ORDER BY created_at, item_id",
+            (batch_id,),
+        ).fetchall()
+        return [self._row_to_attachment_item(r) for r in rows]
+
+    def set_attachment_item_status(
+        self, item_id: str, status: str, *, size_bytes: int | None = None,
+        staging_token: str | None = None,
+    ) -> bool:
+        """OHB2-P0-A1/A2: يحدّث حالة عنصر (`pending` ⇒ `stored`) اختياريًا مع الحجم/التوكن.
+
+        يرجّع True لو صف واحد اتحدّث، وFalse لو العنصر مش موجود (المستدعي **ما يعلنش
+        نجاح** على False — fail closed). مش بيمسّ `t0` (مفيش تمديد للمهلة). الاستعلامات
+        ثابتة (بلا بناء نص) ⇒ مفيش مخاطر حقن.
+        """
+        stamp = datetime.now(timezone.utc).isoformat()
+        if size_bytes is not None and staging_token is not None:
+            cur = self._conn.execute(
+                "UPDATE attachment_items SET status=?, size_bytes=?, staging_token=?, "
+                "updated_at=? WHERE item_id=?",
+                (status, int(size_bytes), staging_token, stamp, item_id),
+            )
+        elif size_bytes is not None:
+            cur = self._conn.execute(
+                "UPDATE attachment_items SET status=?, size_bytes=?, updated_at=? "
+                "WHERE item_id=?",
+                (status, int(size_bytes), stamp, item_id),
+            )
+        elif staging_token is not None:
+            cur = self._conn.execute(
+                "UPDATE attachment_items SET status=?, staging_token=?, updated_at=? "
+                "WHERE item_id=?",
+                (status, staging_token, stamp, item_id),
+            )
+        else:
+            cur = self._conn.execute(
+                "UPDATE attachment_items SET status=?, updated_at=? WHERE item_id=?",
+                (status, stamp, item_id),
+            )
+        self._conn.commit()
+        return cur.rowcount == 1
+
+    # ---------------------------------------------- OHB2-P0-A2: دورة حياة الدفعة
+    def latest_pending_attachment_batch(
+        self, telegram_id: int, conversation_id: str
+    ) -> AttachmentBatch | None:
+        """أحدث دفعة `pending` لمستخدم+محادثة (أو None).
+
+        A2: بتربط الملف الجديد بالدفعة القائمة **المؤهّلة** (نفس المستخدم والمحادثة،
+        لسه `pending`). ترتيب `rowid` = أحدث دفعة اتسجّلت. الدفعات المنتهية/غير الـ
+        `pending` ما بترجعش (المستدعي بيقرّر الإنهاء/الدفعة الجديدة).
+        """
+        row = self._conn.execute(
+            "SELECT * FROM attachment_batches WHERE telegram_id=? AND conversation_id=? "
+            "AND status=? ORDER BY rowid DESC LIMIT 1",
+            (int(telegram_id), conversation_id, ATTACHMENT_BATCH_PENDING),
+        ).fetchone()
+        return self._row_to_attachment_batch(row) if row else None
+
+    def mark_attachment_batch_status(self, batch_id: str, status: str, *, now: str) -> bool:
+        """يحدّث حالة دفعة (مثلاً `pending` ⇒ `expired`). True لو صف واحد اتحدّث.
+
+        **ما بيلمسش `t0`** (مفيش تمديد/تصفير للمهلة أبدًا — I6).
+        """
+        cur = self._conn.execute(
+            "UPDATE attachment_batches SET status=?, updated_at=? WHERE batch_id=?",
+            (status, now, batch_id),
+        )
+        self._conn.commit()
+        return cur.rowcount == 1
+
+    # ---------------------------------------------- OHB2-P0-A3: النية المحلية المتينة (D-27/D-29/D-30)
+    def list_live_pending_attachment_batches(
+        self, telegram_id: int, *, now_iso: str
+    ) -> list[AttachmentBatch]:
+        """كل الدفعات **الحيّة المعلّقة** للمستخدم عبر **كل** المحادثات (D-29).
+
+        «حيّة» = `status=pending` و`T0 + 15د > now` (نفس `ATTACHMENT_BATCH_TTL`، بلا تمديد).
+        الغرض: كشف **الغموض على مستوى المستخدم** (أكثر من دفعة حيّة ⇒ فشل مغلق)، وكشف دفعة
+        حيّة **لمحادثة أخرى**. قراءة فقط؛ ما بتحوّلش ولا بتنهي أي دفعة (الإنهاء سلوك منفصل).
+        `t0` غير صالح ⇒ الدفعة **مش حيّة** (fail-closed، نفس `batch_deadline`).
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM attachment_batches WHERE telegram_id=? AND status=? "
+            "ORDER BY rowid DESC",
+            (int(telegram_id), ATTACHMENT_BATCH_PENDING),
+        ).fetchall()
+        live: list[AttachmentBatch] = []
+        for row in rows:
+            batch = self._row_to_attachment_batch(row)
+            deadline = _attachment_batch_deadline(batch.t0)
+            if deadline is None or _parse_iso(now_iso) is None:
+                continue  # ختم غير صالح ⇒ مش حيّة (fail-closed)
+            if _parse_iso(now_iso) < deadline:
+                live.append(batch)
+        return live
+
+    def has_expired_pending_attachment_batch(
+        self, telegram_id: int, *, now_iso: str
+    ) -> bool:
+        """هل فيه دفعة `pending` **مش حيّة** (`T0 + 15د <= now`، أو `T0` غير صالح) للمستخدم؟
+
+        يُستخدم لكشف نصّ قد يخصّ دفعة منتهية (D-29 بند 5: لا تحويل تلقائي إلى برومت عادي).
+        **fail-closed:** دفعة معلّقة بـ`t0` غير صالح **مش حيّة** (نفس `list_live_...`) ⇒ بتُحسب
+        «مش حيّة» هنا كمان، عشان النصّ مايتسرّبش لمسار البرومت العادي بسبب ختم تالف.
+        قراءة فقط؛ ما بتحوّلش حالة أي دفعة (الوسم `expired` سلوك A4/مسارات أخرى).
+        """
+        rows = self._conn.execute(
+            "SELECT t0 FROM attachment_batches WHERE telegram_id=? AND status=?",
+            (int(telegram_id), ATTACHMENT_BATCH_PENDING),
+        ).fetchall()
+        if not rows:
+            return False  # مفيش دفعة معلّقة أصلًا ⇒ مفيش رفض (المسار العادي كما هو)
+        now_dt = _parse_iso(now_iso)
+        if now_dt is None:
+            # فيه دفعة معلّقة بس «الآن» غير صالح ⇒ ما نقدرش نثبت الحيوية ⇒ فشل مغلق.
+            return True
+        for row in rows:
+            deadline = _attachment_batch_deadline(row["t0"])
+            if deadline is None or now_dt >= deadline:
+                return True
+        return False
+
+    def list_unresolved_attachment_batches(self, telegram_id: int) -> list[AttachmentBatch]:
+        """كل الدفعات **غير المحسومة** للمستخدم عبر **كل** المحادثات (D-32/F1-1a).
+
+        «غير محسومة» = حالة ضمن `ATTACHMENT_BATCH_UNRESOLVED_STATUSES`
+        (`intent_recorded`/`dispatching`/`uncertain`): لسه فيها نيّة/إرسال معلّق ⇒ **تحجب**
+        البرومت العادي (فشل مغلق)، حتى لو الدفعة تخصّ محادثة أخرى لنفس المستخدم.
+        نطاق **المالك** إلزامي (`telegram_id`) ⇒ عزل بين المستخدمين. قراءة فقط.
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM attachment_batches WHERE telegram_id=? AND status IN "
+            "('intent_recorded','dispatching','uncertain') ORDER BY rowid DESC",
+            (int(telegram_id),),
+        ).fetchall()
+        return [self._row_to_attachment_batch(row) for row in rows]
+
+    def has_terminal_attachment_batch(self, telegram_id: int) -> bool:
+        """هل فيه أي دفعة **نهائية** (`delivered`/`expired`/`rejected`/`failed`) للمستخدم؟
+        (D-32/F1-1a.)
+
+        غرضها: تمييز «حالة نهائية» عن «مفيش أي دفعة» لأغراض التصنيف/التدقيق فقط — الدفعة
+        النهائية **ما بتحجبش** برومتًا جديدًا بذاتها (D-32 بند 2)، والنتيجة السلوكية نفسها
+        (`NONE`). نطاق **المالك** إلزامي (`telegram_id`) ⇒ عزل بين المستخدمين. قراءة فقط.
+        """
+        row = self._conn.execute(
+            "SELECT 1 FROM attachment_batches WHERE telegram_id=? "
+            "AND status IN ('delivered','expired','rejected','failed') LIMIT 1",
+            (int(telegram_id),),
+        ).fetchone()
+        return row is not None
+
+    def has_unknown_attachment_batch_status(self, telegram_id: int) -> bool:
+        """هل فيه صفّ دفعة للمستخدم بحالة **خارج** `ATTACHMENT_BATCH_STATUSES` (أو NULL)؟
+
+        F2 (fail-closed): الحالة المجهولة/التالفة **ممنوع** تُصنَّف `NONE` (اللي كان بيسمح
+        بالسقوط الصامت لمسار البرومت/`outbox`). المقارنة في **بايثون** ضد
+        `ATTACHMENT_BATCH_STATUSES` نفسها (مصدر واحد، بلا SQL مُركَّب) ⇒ مفيش انحراف، و`None`
+        (لو حصل) بيُرفض ضمنًا لأنه مش عضو في المجموعة. عدد الدفعات لكل مستخدم صغير. نطاق
+        **المالك** إلزامي. قراءة فقط.
+        """
+        rows = self._conn.execute(
+            "SELECT DISTINCT status FROM attachment_batches WHERE telegram_id=?",
+            (int(telegram_id),),
+        ).fetchall()
+        return any(row["status"] not in ATTACHMENT_BATCH_STATUSES for row in rows)
+
+    # ---------------------------------------------- OHB2-P0-A4: كنس/انتهاء (قراءة + CAS)
+    def list_expired_pending_attachment_batches(self, *, now_iso: str) -> list[AttachmentBatch]:
+        """كل الدفعات `pending` اللي **فاتت مهلتها** (`T0 + 15د <= now`) عبر **كل** المستخدمين.
+
+        مدخل كنس A4 (قراءة فقط). المهلة تُحسب من `t0` الأصلي **الثابت** (مفيش تمديد/تصفير —
+        I4/I6). **fail-closed:** `t0` غير صالح أو «الآن» غير صالح ⇒ تُعتبر **منتهية** (نفس
+        دلالة `list_live_pending_attachment_batches`/`has_expired_pending_attachment_batch`)
+        عشان ما تفضلش دفعة بلا مهلة قابلة للحساب معلّقة للأبد.
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM attachment_batches WHERE status=? ORDER BY rowid",
+            (ATTACHMENT_BATCH_PENDING,),
+        ).fetchall()
+        now_dt = _parse_iso(now_iso)
+        expired: list[AttachmentBatch] = []
+        for row in rows:
+            batch = self._row_to_attachment_batch(row)
+            deadline = _attachment_batch_deadline(batch.t0)
+            if deadline is None or now_dt is None or now_dt >= deadline:
+                expired.append(batch)
+        return expired
+
+    def list_attachment_batches_by_status(self, status: str) -> list[AttachmentBatch]:
+        """كل الدفعات بحالة معيّنة عبر كل المستخدمين (قراءة فقط) — مدخل كنس A4 للنهائيات."""
+        rows = self._conn.execute(
+            "SELECT * FROM attachment_batches WHERE status=? ORDER BY rowid",
+            (status,),
+        ).fetchall()
+        return [self._row_to_attachment_batch(r) for r in rows]
+
+    def list_all_attachment_batches(self) -> list[AttachmentBatch]:
+        """كل الدفعات (قراءة فقط) — لكشف الدلاء اليتيمة/العناصر بلا دفعة في A4."""
+        rows = self._conn.execute(
+            "SELECT * FROM attachment_batches ORDER BY rowid"
+        ).fetchall()
+        return [self._row_to_attachment_batch(r) for r in rows]
+
+    def list_attachment_items_by_status(self, status: str) -> list[AttachmentItem]:
+        """كل العناصر بحالة معيّنة (قراءة فقط) — لكشف/رصد كنس A4."""
+        rows = self._conn.execute(
+            "SELECT * FROM attachment_items WHERE status=? ORDER BY created_at, item_id",
+            (status,),
+        ).fetchall()
+        return [self._row_to_attachment_item(r) for r in rows]
+
+    def list_all_attachment_items(self) -> list[AttachmentItem]:
+        """كل العناصر (قراءة فقط) — لبناء مجموعة التوكنات المرتبطة في A4 (تمييز اليتيم)."""
+        rows = self._conn.execute(
+            "SELECT * FROM attachment_items ORDER BY created_at, item_id"
+        ).fetchall()
+        return [self._row_to_attachment_item(r) for r in rows]
+
+    def mark_attachment_item_reaped(self, item_id: str) -> bool:
+        """OHB2-P0-A4/D-35: CAS العنصر من `pending`/`stored` ⇒ `reaped` (معاملة واحدة).
+
+        يُنادى **فقط بعد** قرار نهائي/انتهاء مؤكَّد للدفعة (تسلسل DB-أولًا قبل حذف البايتات).
+        True لو صف واحد اتحدّث. ما بيمسّش `attachment_message_identity` (دليل الهوية مستقل —
+        D-35). عنصر مش موجود أو مش في الحالة المؤهّلة ⇒ False (المستدعي مايعلنش نجاح).
+        """
+        stamp = datetime.now(timezone.utc).isoformat()
+        cur = self._conn.execute(
+            "UPDATE attachment_items SET status=?, updated_at=? "
+            "WHERE item_id=? AND status IN (?, ?)",
+            (
+                ATTACHMENT_ITEM_REAPED,
+                stamp,
+                item_id,
+                ATTACHMENT_BATCH_PENDING,
+                ATTACHMENT_ITEM_STORED,
+            ),
+        )
+        self._conn.commit()
+        return cur.rowcount == 1
+
+    def count_attachment_batches(self) -> int:
+        row = self._conn.execute("SELECT COUNT(*) AS n FROM attachment_batches").fetchone()
+        return int(row["n"]) if row else 0
+
+    def count_attachment_items(self) -> int:
+        row = self._conn.execute("SELECT COUNT(*) AS n FROM attachment_items").fetchone()
+        return int(row["n"]) if row else 0
+
+    def classify_attachment_routing(
+        self,
+        telegram_id: int,
+        *,
+        now_iso: str,
+        chat_id: int | None = None,
+        message_id: int | None = None,
+    ) -> AttachmentRouting:
+        """تصنيف **صريح** لحالة المرفقات عند حدّ توجيه النصّ (A3 — D-32/F1-1a/F1-1b).
+
+        **مصدر قرار واحد** يمنع الشروط المتفرّقة المتضاربة بين القاعدة والمعالج والاختبارات.
+        نطاق كل الاستعلامات **بالمالك** (`telegram_id`) ⇒ عزل بين المستخدمين. الترتيب:
+
+        1. **حالات غير محسومة** (`intent_recorded`/`dispatching`/`uncertain`) ⇒ `UNRESOLVED`
+           (تحجب؛ حتى لو لمحادثة أخرى).
+        2. **أكثر من دفعة `pending` حيّة** ⇒ `MULTI_LIVE` (غموض ⇒ فشل مغلق).
+        3. **دفعة `pending` حيّة واحدة** ⇒ `LIVE` (مسار النصّ المصاحب؛ يبقى ربط route/الملكية
+           والتحقّق النهائي للمعالج).
+        4. **لا حيّة** لكن فيه دفعة `pending` **منتهية** ⇒ `EXPIRED_PENDING` (لا إحياء/لا تحويل).
+        5. **لا حيّة ولا منتهية** لكن فيه دفعة **نهائية** ⇒ `TERMINAL` (لا تحجب برومتًا جديدًا).
+        6. غير ذلك ⇒ `NONE` (مسار البرومت العادي كما هو).
+
+        **F2 (fail-closed):** لو وُجد أي صفّ بحالة **خارج** `ATTACHMENT_BATCH_STATUSES`
+        (أو NULL) ⇒ يرفع `AttachmentBatchIntegrityError` **قبل** أي تصنيف آخر. الحالة المجهولة
+        ما بتتحوّلش أبدًا لـ`NONE` (منع السقوط الصامت لمسار البرومت/`outbox`).
+
+        **fail-closed:** استعلام فرعي يفشل (قاعدة معطوبة) ⇒ يرفع الاستثناء للمستدعي (اللي
+        بيسجّل فشلًا غير مؤهّل ويوقف). «الآن» غير صالح ⇒ الدفعة مش حيّة (نفس `list_live_...`).
+
+        **D-34 (تعريف `NONE` الصريح — P-1):** `NONE` يُعاد **فقط** بعد تصنيف **ناجح ومكتمل
+        ومقيَّد بالمالك** يُثبت أنّه **لا توجد أي حالة دفعة ذات صلة** تربط الرسالة الواردة بدفعة
+        قائمة. `NONE` **لا يُعاد أبدًا** عند: وجود دفعة نهائية في نطاق المالك (`TERMINAL_*`)؛
+        دفعة نهائية بلا دليل هوية؛ دفعة نهائية تاريخية غير مُثبَتة؛ دفعات متعدّدة تجعل الإسناد
+        غامضًا (`MULTI_LIVE`)؛ فشل الاستعلام/نتائج ناقصة/سجلات تالفة (يرفع استثناء). **فقط**
+        نتيجة `NONE` مُتحقَّق منها قد تدخل تصنيف البرومت العادي، ورَهينة بكل فحوص المالك/route/
+        المحادثة المستقلة. الدفعات النهائية **تحجب** الآن (`TERMINAL_ASSOCIATED`/
+        `TERMINAL_UNPROVEN`) بدل السقوط لمسار البرومت (D-34؛ ألغى سلوك D-32 بند 2 القديم
+        «TERMINAL وNONE متطابقتان»).
+        """
+        # F2: فحص سلامة الحالات **أولًا** (fail-closed) — حالة مجهولة ⇒ رفض مغلق صريح.
+        if self.has_unknown_attachment_batch_status(telegram_id):
+            raise AttachmentBatchIntegrityError(
+                "attachment batch with unknown/unsupported status for owner"
+            )
+        unresolved = self.list_unresolved_attachment_batches(telegram_id)
+        if unresolved:
+            return AttachmentRouting(
+                AttachmentRoutingState.UNRESOLVED,
+                unresolved_batches=tuple(unresolved),
+            )
+        live = self.list_live_pending_attachment_batches(telegram_id, now_iso=now_iso)
+        if len(live) > 1:
+            return AttachmentRouting(
+                AttachmentRoutingState.MULTI_LIVE, live_batches=tuple(live)
+            )
+        if len(live) == 1:
+            return AttachmentRouting(
+                AttachmentRoutingState.LIVE, live_batches=(live[0],)
+            )
+        if self.has_expired_pending_attachment_batch(telegram_id, now_iso=now_iso):
+            return AttachmentRouting(AttachmentRoutingState.EXPIRED_PENDING)
+        if self.has_terminal_attachment_batch(telegram_id):
+            # OHB2-P0-A3/D-34: دفعة نهائية في نطاق المالك ⇒ **فشل مغلق**. غياب دليل الهوية
+            # **ليس** دليلًا على رسالة جديدة ⇒ `TERMINAL_UNPROVEN`. وجود دليل هوية ⇒ النصّ
+            # **مُثبَت** الارتباط بدفعة نهائية ⇒ `TERMINAL_ASSOCIATED`. الحالتان **تحجبان**
+            # (لا برومت عادي/لا `_send_prompt`/لا `outbox`)؛ الفرق دلالي (تتبّع/تدقيق).
+            identity = (
+                normalize_message_identity(telegram_id, chat_id, message_id)
+                if chat_id is not None and message_id is not None
+                else None
+            )
+            if identity is not None and self.message_identity_batch_id(*identity) is not None:
+                return AttachmentRouting(AttachmentRoutingState.TERMINAL_ASSOCIATED)
+            return AttachmentRouting(AttachmentRoutingState.TERMINAL_UNPROVEN)
+        return AttachmentRouting(AttachmentRoutingState.NONE)
+
+    def record_attachment_intent(
+        self,
+        batch_id: str,
+        *,
+        telegram_id: int,
+        conversation_id: str,
+        intent_text: str,
+        now: str,
+        update_id: int | None,
+        chat_id: int | None = None,
+        message_id: int | None = None,
+    ) -> str | None:
+        """OHB2-P0-A3/D-27: يكتب النصّ + الانتقال إلى `intent_recorded` + نتيجة التحديث ذرّيًّا.
+
+        **معاملة واحدة** (`BEGIN IMMEDIATE`): إما الاتنين يتحفظوا أو ولا واحد. **بتعيد التحقّق
+        جوّه المعاملة** من الملكية (`telegram_id`) والمحادثة بالضبط (`conversation_id`) والحالة
+        (`pending`) والمهلة (`T0 + 15د > now`) — **مش** بتعتمد على قراءة سابقة (منع سباق
+        الانتهاء/تغيير الملكية/الحالة). الشرط `status=pending` في الـ`UPDATE` هو حاجز الـCAS
+        ضدّ **تسجيلين متزامنين** لنفس الدفعة: الثاني `rowcount=0` ⇒ `None`.
+
+        ترجّع `batch_id` عند النجاح، أو `None` لما الدفعة **مش مؤهّلة** (مش موجودة/مش ملك
+        المستخدم/محادثة مختلفة/مش `pending`/منتهية/سباق حالة). النصّ يُخزَّن **كما هو**
+        (التطبيع/التحقّق مسؤولية المستدعي — `bot.attachment_text`).
+
+        **مفيش إرسال بعيد ولا صفّ `outbox`** — نيّة محلية فقط (D-27). **مفيش ادّعاء
+        exactly-once**؛ التحديث المكرّر (`update_id` مسجّل) بيتسجّل `duplicate_completed`
+        ويترجّع `None` بلا أي كتابة (نفس نمط A2).
+        """
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if update_id is not None and self.update_is_processed(update_id):
+                self._mark_processed_nocommit(
+                    update_id, now, update_outcomes.DUPLICATE_COMPLETED
+                )
+                conn.commit()
+                return None
+            row = conn.execute(
+                "SELECT * FROM attachment_batches WHERE batch_id=?", (batch_id,)
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return None
+            batch = self._row_to_attachment_batch(row)
+            now_dt = _parse_iso(now)
+            deadline = _attachment_batch_deadline(batch.t0)
+            eligible = (
+                batch.telegram_id == int(telegram_id)
+                and batch.conversation_id == conversation_id
+                and batch.status == ATTACHMENT_BATCH_PENDING
+                and now_dt is not None
+                and deadline is not None
+                and now_dt < deadline
+            )
+            if not eligible:
+                conn.rollback()
+                return None
+            cur = conn.execute(
+                "UPDATE attachment_batches SET status=?, intent_text=?, updated_at=? "
+                "WHERE batch_id=? AND status=?",
+                (ATTACHMENT_BATCH_INTENT_RECORDED, intent_text, now, batch_id,
+                 ATTACHMENT_BATCH_PENDING),
+            )
+            if cur.rowcount != 1:
+                conn.rollback()
+                return None
+            # OHB2-P0-A3/D-33/D-35: دليل الهوية يُكتب **داخل نفس المعاملة** (ذرّي مع النيّة).
+            # الهوية غير صالحة (غياب/سوء شكل) ⇒ **فشل مغلق**: نتراجع بلا نيّة (المعالج يسجّل
+            # فشلًا غير مؤهّل) — لا نكتب نيّة بلا دليل هوية. قيد الـPK يمنع إعادة الربط؛ تعارض
+            # ⇒ `IntegrityError` ⇒ rollback (fail-closed).
+            identity = (
+                normalize_message_identity(telegram_id, chat_id, message_id)
+                if chat_id is not None and message_id is not None
+                else None
+            )
+            if identity is None:
+                conn.rollback()
+                return None
+            conn.execute(
+                "INSERT INTO attachment_message_identity "
+                "(telegram_id, chat_id, message_id, batch_id, conversation_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (identity[0], identity[1], identity[2], batch_id, conversation_id, now),
+            )
+            self._mark_processed_nocommit(
+                update_id, now, update_outcomes.DURABLE_INTENT_RECORDED
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return batch_id
+
+    def message_identity_batch_id(
+        self, telegram_id: int, chat_id: int, message_id: int
+    ) -> str | None:
+        """OHB2-P0-A3/D-33: دفعة مرتبطة بهوية رسالة، أو `None` لو مفيش دليل هوية.
+
+        قراءة فقط. **`None` تعني «لا دليل» لا «رسالة جديدة»** (D-34 بند 6): المعالج يعاملها
+        كـ`TERMINAL_UNPROVEN` (فشل مغلق) عند وجود دفعة نهائية، لا كبرومت عادي.
+        """
+        row = self._conn.execute(
+            "SELECT batch_id FROM attachment_message_identity "
+            "WHERE telegram_id=? AND chat_id=? AND message_id=?",
+            (int(telegram_id), int(chat_id), int(message_id)),
+        ).fetchone()
+        return row["batch_id"] if row is not None else None
+
+    def count_message_identities(self) -> int:
+        """عدد صفوف دليل هوية الرسالة (للاختبارات/المراقبة)."""
+        return int(
+            self._conn.execute(
+                "SELECT COUNT(*) FROM attachment_message_identity"
+            ).fetchone()[0]
+        )
+
+    def record_rejected_ineligible(
+        self, *, now: str, update_id: int | None, reason: str | None = None
+    ) -> bool:
+        """OHB2-P0-A3/D-30: نتيجة رفض نهائية متينة `rejected_ineligible` (مؤهّلة للإقرار).
+
+        قرار **دائم** مسجَّل في `processed_updates.outcome` (معاملة واحدة) ⇒ حدّ الإقرار يقدر
+        يتقدّم (مفيش إعادة معالجة لاحقة). **مفيش** كتابة دفعة/`outbox`/إرسال. ترجّع True لو
+        اتحفظت، أو False لو مفيش `update_id` صالح (fail-closed: مفيش نتيجة ⇒ غير مؤهّل).
+
+        **حدّ مهم:** ده للحالات **النهائية المؤهّلة** (نصّ غير مؤهّل/غموض/دفعة منتهية). الأعطال
+        **التقنية** (فشل قاعدة/تفويض/نتيجة غامضة) **ما بتمرّش** من هنا — بتتسجّل `failed_*`/
+        `partial_or_unknown` (غير مؤهّلة) عبر `record_update_failure` (D-30/D-09-R2 fail-closed).
+        """
+        if update_id is None:
+            return False
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.mark_update_outcome(
+                update_id, now, update_outcomes.REJECTED_INELIGIBLE,
+                reason=reason, commit=False,
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return True
+
+    def get_attachment_item(
+        self, item_id: str, *, batch_id: str | None = None
+    ) -> AttachmentItem | None:
+        """عنصر بالمعرّف، مع فرض **انتماء الدفعة** لو `batch_id` اتحدّد.
+
+        A1-REV-F3/عزل: تمرير `batch_id` بيمنع تحديث/قراءة عنصر دفعة تانية.
+        """
+        if batch_id is None:
+            row = self._conn.execute(
+                "SELECT * FROM attachment_items WHERE item_id=?", (item_id,)
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT * FROM attachment_items WHERE item_id=? AND batch_id=?",
+                (item_id, batch_id),
+            ).fetchone()
+        return self._row_to_attachment_item(row) if row else None
+
+    def accept_attachment_item(
+        self,
+        batch: AttachmentBatch,
+        *,
+        item_id: str,
+        display_name: str | None,
+        now: str,
+        update_id: int | None = None,
+        staging_token: str | None = None,
+    ) -> str | None:
+        """OHB2-P0-A2: كتابة **النية الدائمة** للقبول + نتيجة التحديث **في معاملة واحدة**.
+
+        بيسجّل صف عنصر `pending` (مرجع العنصر اللي A1 هيكتب بايتاته بعدين — row-first)
+        ونتيجة التحديث `durable_intent_recorded` **ذرّيًا**: إما الاتنين يتحفظوا أو ولا
+        واحد. ده اللي بيمنع «نجاح كاذب» (قبول من غير دليل دائم) أو «حجب الحدّ للأبد»
+        (دليل بلا نتيجة). **مفيش ادّعاء exactly-once**: `update_id` مكرّر (نفس الدفعة أو
+        دفعة جديدة) بيتسجّل بـ `duplicate_completed` (دليل دائم، بلا ازدواج).
+
+        **شرط مسبق:** المستدعي (A2) لسه متأكّد إن `batch` دفعة `pending` صالحة لنفس
+        المستخدم والمحادثة (وإلا مايناديش). الكتابة هنا **مش** بتعيد التحقّق من صلاحية
+        الدفعة (تجنّب قراءة-ثم-كتابة عبر `await`؛ العمليات تُسلسَل في العملية الواحدة).
+
+        بترجّع معرّف الدفعة الفعلي اللي العنصر اتسجّل فيه (للـ evidence)، أو **`None`**
+        لما التحديث يكون **مكرّرًا** (`update_id` مسجّل قبل كده) ⇒ مفيش عنصر جديد
+        اتكتب (F-4). المستدعي **ما يصنعش** معرّف عنصر ولا يفترض قبولًا جديدًا.
+        """
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if update_id is not None and self.update_is_processed(update_id):
+                self._mark_processed_nocommit(
+                    update_id, now, update_outcomes.DUPLICATE_COMPLETED
+                )
+                conn.commit()
+                return None
+            self._insert_attachment_item_nocommit(
+                item_id, batch.batch_id, staging_token, display_name, None,
+                ATTACHMENT_BATCH_PENDING, now,
+            )
+            self._mark_processed_nocommit(
+                update_id, now, update_outcomes.DURABLE_INTENT_RECORDED
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return batch.batch_id
+
+    def accept_attachment_item_into_new_batch(
+        self,
+        *,
+        telegram_id: int,
+        conversation_id: str,
+        batch_id: str,
+        item_id: str,
+        t0: str,
+        display_name: str | None,
+        now: str,
+        update_id: int | None = None,
+        staging_token: str | None = None,
+    ) -> str | None:
+        """OHB2-P0-A2: إنشاء دفعة جديدة + عنصرها + نتيجة التحديث **في معاملة واحدة**.
+
+        دفعة جديدة بتتولّد لما مفيش دفعة `pending` مؤهّلة (أول ملف، أو بعد انتهاء دفعة
+        سابقة). `T0 = t0` **يتحطّ مرة واحدة** عند أول ملف (عمره ما بيتمدّد — I6).
+
+        بترجّع معرّف الدفعة الجديدة، أو **`None`** لما التحديث يكون **مكرّرًا**
+        (`update_id` مسجّل قبل كده) ⇒ **مافيش** دفعة ولا عنصر جديد اتعملوا (F-4).
+        """
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if update_id is not None and self.update_is_processed(update_id):
+                self._mark_processed_nocommit(
+                    update_id, now, update_outcomes.DUPLICATE_COMPLETED
+                )
+                conn.commit()
+                return None
+            conn.execute(
+                "INSERT INTO attachment_batches"
+                "(batch_id, telegram_id, conversation_id, t0, status, created_at, updated_at) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?)",
+                (
+                    batch_id, int(telegram_id), conversation_id, t0,
+                    ATTACHMENT_BATCH_PENDING, now, now,
+                ),
+            )
+            self._insert_attachment_item_nocommit(
+                item_id, batch_id, staging_token, display_name, None,
+                ATTACHMENT_BATCH_PENDING, now,
+            )
+            self._mark_processed_nocommit(
+                update_id, now, update_outcomes.DURABLE_INTENT_RECORDED
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return batch_id
+
+    @staticmethod
+    def _row_to_attachment_batch(row: sqlite3.Row) -> AttachmentBatch:
+        return AttachmentBatch(
+            batch_id=row["batch_id"],
+            telegram_id=row["telegram_id"],
+            conversation_id=row["conversation_id"],
+            t0=row["t0"],
+            status=row["status"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            intent_text=row["intent_text"],
+        )
+
+    @staticmethod
+    def _row_to_attachment_item(row: sqlite3.Row) -> AttachmentItem:
+        return AttachmentItem(
+            item_id=row["item_id"],
+            batch_id=row["batch_id"],
+            staging_token=row["staging_token"],
+            display_name=row["display_name"],
+            size_bytes=row["size_bytes"],
+            status=row["status"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
 
     # ----------------------------------------------------------------- watched
     def add_watched(
@@ -934,6 +2064,30 @@ class Database:
         ).fetchone()
         return row is not None
 
+    def is_deleted_with_retry(self, conversation_id: str) -> bool:
+        """قراءة شاهد الحذف مع إعادة محاولة **محدودة** للفشل العابر بس (OHB2-SW03).
+
+        سياسة مشتركة (البوت + الـ Mini App): محاولة أولى + حتى 3 إعادات بمُدد
+        `DEDUPE_RETRY_DELAYS` (0.25/0.5/1.0ث) **للفشل العابر** (SQLite BUSY/LOCKED) بس.
+        الفشل الدائم يُرفع فورًا بلا إعادة، وبعد استنفاد الميزانية بنرفع **الاستثناء الأصلي**.
+        ممنوع نرجّع `False` (أو أي نتيجة تشبه النجاح) عند فشل القراءة — القراءة الناجحة بس
+        هي اللي بتحدّد «متشاهد» من «مش متشاهد» (مفيش فشل يُلبَس لبوس الفراغ).
+        """
+        attempt = 0
+        while True:
+            try:
+                return self.is_deleted(conversation_id)
+            except Exception as exc:  # noqa: BLE001 — التصنيف بيقرّر: عابر يُعاد، دائم يُرفع
+                if not is_transient_sqlite_error(exc) or attempt >= len(DEDUPE_RETRY_DELAYS):
+                    raise
+                delay = DEDUPE_RETRY_DELAYS[attempt]
+                attempt += 1
+                log.warning(
+                    "فحص شاهد الحذف (%s): فشل SQLite عابر (%s) — إعادة محاولة %d/%d بعد %.2fث",
+                    conversation_id, type(exc).__name__, attempt, len(DEDUPE_RETRY_DELAYS), delay,
+                )
+                time.sleep(delay)
+
     def _tombstone_nocommit(self, conversation_id: str, now: str) -> None:
         """يسجّل شاهد الحذف **داخل معاملة المستدعي** (idempotent: أول مرة بس تحفظ وقت الحذف)."""
         self._conn.execute(
@@ -942,6 +2096,273 @@ class Database:
             (conversation_id, now),
         )
 
+    # --------------------------------- remote deletion state (OHB2-MINIAPP)
+    # القيم: None (مفيش حذف بعيد) ⇒ 'deleting' (اتطلب حذف بعيد، النتيجة لسه مجهولة)
+    # ⇒ 'uncertain' (فشل/انقطاع — محتاج إعادة محاولة/تسوية) أو 'confirmed' (OpenHands أكّد).
+    REMOTE_DELETING = "deleting"
+    REMOTE_UNCERTAIN = "uncertain"
+    REMOTE_CONFIRMED = "confirmed"
+
+    # OHB2-PR6: هُوية الشاهد المتينة. بدل تمييز «قديم/جديد» بمقارنة الطوابع الزمنية
+    # (`deleted_at != remote_updated_at` — عرضة لدقّة الساعة/رجوعها/التطبيع — TS-1)،
+    # بنعتمد على أعمدة صريحة:
+    #   witness_origin      = 'attempt' لشاهد أنشأته محاولة بعيد، NULL لشاهد قديم.
+    #   witness_attempt_id  = رمز المحاولة المالكة (compare-and-swap بين المحاولات).
+    #   witness_preexisting = 1 لو الصف كان موجودًا قبل أول محاولة بعيد (شاهد قديم)،
+    #                         وبيبقى 1 للأبد (monotonic) ⇒ مايتغيّرش مع إعادات المحاولة.
+    # التصنيف ما بيعتمدش على الوقت إطلاقًا ⇒ TS-1 مُلغى.
+    WITNESS_ORIGIN_ATTEMPT = "attempt"
+
+    def _begin_attempt_nocommit(self, conversation_id: str, now: str, attempt_id: str) -> bool:
+        """يوسم محاولة حذف بعيد **داخل معاملة المستدعي**: شاهد + 'deleting' + هُوية المحاولة.
+
+        `witness_preexisting` بيتحدّد **مرة واحدة** عند أول محاولة على الصف، وبعدها بيتغيّرش
+        (monotonic): 1 لو الصف كان موجودًا قبل أول محاولة (شاهد قديم)، و0 لو أول محاولة هي اللي
+        أنشأته. إعادات المحاولة اللاحقة **ما بتغيّرش** القيمة (لو `witness_origin` قديم =
+        'attempt' يبقى عندنا محاولة سابقة ⇒ نحافظ) ⇒ محاولة جديدة على صف أنشأته بنفسها تفضل
+        «جديدة»، ومحاولة على شاهد قديم تفضل «قديمة». التصنيف ما بيعتمدش على الوقت إطلاقًا.
+
+        **حراسة الإنهاء (CAS):** مش بنوسم 'deleting' على شات حالته 'confirmed' — إثبات الحذف
+        نهائي وما يتلغيش بمحاولة لاحقة. بيرجّع True لو خدنا الملكية، False لو الشات مؤكّد
+        مسبقًا (المستدعي يعالجها كحذف مكتمل).
+        """
+        existed = self._conn.execute(
+            "SELECT 1 FROM deleted_conversations WHERE conversation_id=?",
+            (conversation_id,),
+        ).fetchone() is not None
+        self._tombstone_nocommit(conversation_id, now)
+        cur = self._conn.execute(
+            "UPDATE deleted_conversations SET remote_state=?, remote_updated_at=?, "
+            "witness_origin=?, witness_attempt_id=?, "
+            "witness_preexisting=CASE "
+            "  WHEN witness_origin=? THEN witness_preexisting "  # محاولة سابقة ⇒ نحافظ
+            "  WHEN ? THEN 1 ELSE witness_preexisting END "       # أول محاولة على صف موجود ⇒ قديم
+            "WHERE conversation_id=? AND (remote_state IS NULL OR remote_state != ?)",
+            (
+                self.REMOTE_DELETING, now, self.WITNESS_ORIGIN_ATTEMPT, attempt_id,
+                self.WITNESS_ORIGIN_ATTEMPT, 1 if existed else 0, conversation_id,
+                self.REMOTE_CONFIRMED,
+            ),
+        )
+        return cur.rowcount == 1
+
+    def begin_remote_deletion(self, conversation_id: str, now: str) -> str | None:
+        """يوسم الحذف الجاري (شاهد + 'deleting' + هُوية محاولة) في معاملة ذرّية **قبل** النداء.
+
+        يرجّع `attempt_id` الفريد للمحاولة دي (يُستخدم في الـ compare-and-swap بعد النداء)،
+        أو None لو الشات **مؤكّد الحذف مسبقًا** (في الحالة دي ما بناخدش ملكية — إثبات الحذف
+        نهائي). لو العملية اتقطعت بعد كده، الحالة تفضل (تنجو من restart) فأي إعادة محاولة/
+        تسوية تعرف إن فيه حذف بعيد معلّق، ومايتحياش الشات في الوقت نفسه.
+        """
+        attempt_id = uuid.uuid4().hex
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            took = self._begin_attempt_nocommit(conversation_id, now, attempt_id)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return attempt_id if took else None
+
+    def _set_remote_state_nocommit(self, conversation_id: str, state: str | None, now: str) -> None:
+        """يثبّت حالة الحذف البعيد **داخل معاملة المستدعي** (كتابة غير مشروطة)."""
+        self._conn.execute(
+            "UPDATE deleted_conversations SET remote_state=?, remote_updated_at=? "
+            "WHERE conversation_id=?",
+            (state, now, conversation_id),
+        )
+
+    def set_remote_deletion_state(self, conversation_id: str, state: str | None, now: str) -> None:
+        """يثبّت حالة الحذف البعيد ('deleting'/'uncertain'/'confirmed' أو NULL) — كتابة دائمة.
+
+        كتابة غير مشروطة: تُستخدم في مسارات **ملكية المحاولة** (التسوية) اللي بتتأكد من
+        ملكية الشاهد بـ CAS على `witness_attempt_id` قبلها. مش مسار «تصفير بيانات محاولة».
+        """
+        self._set_remote_state_nocommit(conversation_id, state, now)
+        self._conn.commit()
+
+    def revert_remote_deletion_cas(
+        self, conversation_id: str, attempt_id: str | None, state: str | None, now: str | None
+    ) -> bool:
+        """compare-and-swap: يرجّع بيانات الحذف البعيد لحالتها السابقة **بس** لو المحاولة دي
+        ما زالت مالكة الشاهد (`witness_attempt_id IS attempt_id`) **والحالة ليست 'confirmed'**.
+
+        `IS ?` (مش `= ?`) مقصود: مالك الشاهد القديم بعد الترحيل `NULL`، و`= NULL` ما بتطابقش
+        أبدًا فكانت تسيب الصفوف القديمة المعلّقة عالقة للأبد.
+
+        حرس الإنهاء: `'confirmed'` حالة **نهائية** (إثبات حذف بعيد بدليل إيجابي) ⇒ ممنوع أي
+        CAS يرجّعها/يطمسها. يرجّع True لو النجح (احنا المالك)، False لو محاولة أحدث سبقتنا أو
+        الحالة مؤكّدة (ما بنلمسش — منع lost-update). الكتابة ذرّية داخل `BEGIN IMMEDIATE`.
+        """
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = conn.execute(
+                "UPDATE deleted_conversations SET remote_state=?, remote_updated_at=? "
+                "WHERE conversation_id=? AND witness_attempt_id IS ? AND remote_state != ?",
+                (state, now, conversation_id, attempt_id, self.REMOTE_CONFIRMED),
+            )
+            ok = cur.rowcount == 1
+            conn.commit()
+            return ok
+        except Exception:
+            conn.rollback()
+            raise
+
+    def clear_witness_cas(self, conversation_id: str, attempt_id: str | None) -> bool:
+        """compare-and-swap: يشيل صف الشاهد **بس** لو المحاولة دي ما زالت مالكة الشاهد
+        (`witness_attempt_id IS attempt_id`) **والحالة ليست 'confirmed'**.
+
+        حرس الإنهاء: شاهد 'confirmed' (حذف بعيد مثبت) ما بيتحذفش أبدًا من مسار «الشات لسه
+        موجود» ⇒ مفيش إحياء لشات متحذّف. يرجّع True لو النجح (الصف اتشال)، False لو عملية
+        أحدث سبقتنا أو الحالة مؤكّدة.
+        """
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = conn.execute(
+                "DELETE FROM deleted_conversations "
+                "WHERE conversation_id=? AND witness_attempt_id IS ? AND remote_state != ?",
+                (conversation_id, attempt_id, self.REMOTE_CONFIRMED),
+            )
+            ok = cur.rowcount == 1
+            conn.commit()
+            return ok
+        except Exception:
+            conn.rollback()
+            raise
+
+    def remote_deletion_state(self, conversation_id: str) -> str | None:
+        """حالة الحذف البعيد للشات (None لو مفيش حذف بعيد اتبدأ)."""
+        row = self._conn.execute(
+            "SELECT remote_state FROM deleted_conversations WHERE conversation_id=?",
+            (conversation_id,),
+        ).fetchone()
+        return row["remote_state"] if row is not None else None
+
+    def remote_deletion_metadata(self, conversation_id: str) -> tuple[str | None, str | None]:
+        """(حالة الحذف البعيد، طابعه الزمني) في قراءة واحدة — للاسترجاع الأمين بعد الفشل.
+
+        بنقرأ الحقلين مع بعض عشان الاسترجاع يعيد الحالة **والطابع** الأصليين بالظبط (مش طابع
+        جديد). هُوية المالك (compare-and-swap) بتُقرأ من `witness_attempt_id()` منفصلة.
+        """
+        row = self._conn.execute(
+            "SELECT remote_state, remote_updated_at FROM deleted_conversations "
+            "WHERE conversation_id=?",
+            (conversation_id,),
+        ).fetchone()
+        if row is None:
+            return (None, None)
+        return (row["remote_state"], row["remote_updated_at"])
+
+    def clear_remote_deletion(self, conversation_id: str) -> None:
+        """يشيل شاهد الحذف (استرجاع محلي) — يُستخدم لما يثبت إن الشات **لسه موجود** بعيدًا.
+
+        كتابة غير مشروطة: تُستخدم في مسارات ملكية المحاولة اللي بتتحقق من الملكية أولًا.
+        """
+        self._conn.execute(
+            "DELETE FROM deleted_conversations WHERE conversation_id=?",
+            (conversation_id,),
+        )
+        self._conn.commit()
+
+    def list_pending_remote_deletions(self) -> list[str]:
+        """معرّفات الشاتات اللي حذفها البعيد لسه معلّق ('deleting'/'uncertain')."""
+        rows = self._conn.execute(
+            "SELECT conversation_id FROM deleted_conversations "
+            "WHERE remote_state IN (?, ?)",
+            (self.REMOTE_DELETING, self.REMOTE_UNCERTAIN),
+        ).fetchall()
+        return [r["conversation_id"] for r in rows]
+
+    def list_pending_remote_deletions_with_owner(self) -> list[tuple[str, str | None]]:
+        """زي `list_pending_remote_deletions` لكن مع رمز المحاولة المالكة لكل شات.
+
+        التسوية بتستخدم المالك (`witness_attempt_id`) للـ compare-and-swap، فما تطمسش
+        محاولة أحدث بدأت بعد ما قرأنا القايمة.
+        """
+        rows = self._conn.execute(
+            "SELECT conversation_id, witness_attempt_id FROM deleted_conversations "
+            "WHERE remote_state IN (?, ?)",
+            (self.REMOTE_DELETING, self.REMOTE_UNCERTAIN),
+        ).fetchall()
+        return [(r["conversation_id"], r["witness_attempt_id"]) for r in rows]
+
+    def list_pending_remote_deletions_detail(self) -> list[dict]:
+        """تفاصيل آمنة للحذف البعيد المعلّق ('deleting'/'uncertain') للعرض والتسوية في Mini App."""
+        rows = self._conn.execute(
+            "SELECT conversation_id, remote_state, remote_updated_at, deleted_at "
+            "FROM deleted_conversations "
+            "WHERE remote_state IN (?, ?) "
+            "ORDER BY COALESCE(remote_updated_at, deleted_at) DESC, conversation_id ASC",
+            (self.REMOTE_DELETING, self.REMOTE_UNCERTAIN),
+        ).fetchall()
+        return [
+            {
+                "conversation_id": r["conversation_id"],
+                "state": r["remote_state"],
+                "updated_at": r["remote_updated_at"] or r["deleted_at"] or "",
+            }
+            for r in rows
+        ]
+
+    def claim_remote_reconcile(self, conversation_id: str) -> str | None:
+        """يمتلك جولة تسوية لحذف بعيد معلّق ('deleting'/'uncertain') بدون تغيير الحالة أو الطابع.
+
+        يرجّع `attempt_id` جديد للـ CAS (لمنع تداخل محاولة أقدم/أحدث)، أو None لو الشات
+        مش معلّق أو اتأكّد حذفه مسبقًا ('confirmed'). لو الشاهد كان قديمًا بلا `witness_origin`
+        (`NULL`) بيوسمه `'attempt'` مع `witness_preexisting=1` زي `_begin_attempt_nocommit`.
+        """
+        attempt_id = uuid.uuid4().hex
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = conn.execute(
+                "UPDATE deleted_conversations SET witness_attempt_id=?, witness_origin=?, "
+                "witness_preexisting=CASE WHEN witness_origin=? THEN witness_preexisting ELSE 1 END "
+                "WHERE conversation_id=? AND remote_state IN (?, ?)",
+                (
+                    attempt_id,
+                    self.WITNESS_ORIGIN_ATTEMPT,
+                    self.WITNESS_ORIGIN_ATTEMPT,
+                    conversation_id,
+                    self.REMOTE_DELETING,
+                    self.REMOTE_UNCERTAIN,
+                ),
+            )
+            ok = cur.rowcount == 1
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return attempt_id if ok else None
+
+    def is_legacy_witness(self, conversation_id: str) -> bool:
+        """هل الشاهد **سبق** أول محاولة حذف بعيد (حذف محلي قديم)؟
+
+        التصنيف **متين وغير زمني** (OHB2-PR6 / TS-1): بيعتمد على `witness_preexisting`
+        (1 = الصف كان موجودًا قبل المحاولة) بدل مقارنة `deleted_at` بـ `remote_updated_at`.
+        الصفوف القديمة (المرحّلة) بتاخد 1؛ أي محاولة جديدة على شاهد قديم بتخليه 1 (monotonic)؛
+        ومحاولة جديدة على صف أنشأته بنفسها بتخليه 0. القيمة دائمة ⇒ تنجو من الانهيار/إعادة
+        التشغيل/إعادة المحاولة، وما بتعتمدش على دقّة الساعة ولا رجوعها ولا التطبيع.
+        """
+        row = self._conn.execute(
+            "SELECT witness_preexisting FROM deleted_conversations WHERE conversation_id=?",
+            (conversation_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        return bool(row["witness_preexisting"])
+
+    def witness_attempt_id(self, conversation_id: str) -> str | None:
+        """رمز محاولة الحذف المالكة للشاهد (None لو مفيش صف أو الشاهد قديم بلا محاولة)."""
+        row = self._conn.execute(
+            "SELECT witness_attempt_id FROM deleted_conversations WHERE conversation_id=?",
+            (conversation_id,),
+        ).fetchone()
+        return None if row is None else row["witness_attempt_id"]
+
     def _clear_tombstone_nocommit(self, conversation_id: str) -> None:
         """يشيل شاهد الحذف **داخل معاملة المستدعي** (إعادة تفاعل صريح من المستخدم)."""
         self._conn.execute(
@@ -949,7 +2370,7 @@ class Database:
             (conversation_id,),
         )
 
-    def delete_conversation(self, conversation_id: str, now: str) -> dict:
+    def delete_conversation(self, conversation_id: str, now: str, *, remote_confirmed: bool = False) -> dict:
         """حذف محلي آمن لشات في **معاملة ذرّية واحدة** (OHB2-C7).
 
         يشيل كل الأثر المحلي المرتبط بالشات من غير أي نداء خارجي (مفيش حذف بعيد):
@@ -1026,6 +2447,14 @@ class Database:
             # لسه غير محذوف عشان التسجيل الداخلي يكمّل؛ وبعد الـ commit الشاهد فعّال
             # لأي مسار لاحق (ساعتها مستحيل يتخلّل بين الكتابة والـ commit — قفل الكتابة).
             self._tombstone_nocommit(conversation_id, now)
+            # OHB2-MINIAPP: لو المستدعي أكّد نجاح الحذف البعيد، نثبّت الحالة 'confirmed'
+            # في **نفس** معاملة الحذف المحلي (ذرّي: مفيش حالة «محذوف محليًا بلا نتيجة بعيدة»).
+            if remote_confirmed:
+                conn.execute(
+                    "UPDATE deleted_conversations SET remote_state=?, remote_updated_at=? "
+                    "WHERE conversation_id=?",
+                    (self.REMOTE_CONFIRMED, now, conversation_id),
+                )
             conn.commit()
         except Exception:
             conn.rollback()
@@ -1039,10 +2468,65 @@ class Database:
             "inbox_superseded": int(inbox_superseded),
         }
 
+    # ------------------------------------------------------ Mini App sessions
+    # OHB2-PHASE1A: جلسات الـ Mini App **دائمة** في نفس قاعدة SQLite (نفس المالك
+    # الواحد للعملية). بنخزّن **هاش** التوكن بس (`token_hash` = SHA-256 hex)؛ التوكن
+    # الخام عمود ما بيتخزّنش. كل عملية صغيرة معاملة واحدة (`with self._conn`) — مفيش
+    # نداء شبكة جوه أي معاملة، و`sqlite3` بيدير commit/rollback تلقائيًا.
+
+    def add_web_session(
+        self, token_hash: str, user_id: int, created_at: float, expires_at: float, profile_json: str
+    ) -> None:
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO web_sessions (token_hash, user_id, created_at, expires_at, profile) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (token_hash, int(user_id), float(created_at), float(expires_at), profile_json),
+            )
+
+    def get_web_session(self, token_hash: str, now: float) -> tuple[int, float, float, str] | None:
+        """يرجّع (user_id, created_at, expires_at, profile_json) للجلسة **غير المنتهية**.
+
+        المنتهي ما بيرجّعش أبدًا (fail closed): بنفلتر بـ `expires_at > now` في نفس
+        الاستعلام. أي `token_hash` غير موجود/غير صالح ⇒ None."""
+        row = self._conn.execute(
+            "SELECT user_id, created_at, expires_at, profile FROM web_sessions "
+            "WHERE token_hash=? AND expires_at > ?",
+            (token_hash, float(now)),
+        ).fetchone()
+        if row is None:
+            return None
+        return int(row["user_id"]), float(row["created_at"]), float(row["expires_at"]), row["profile"]
+
+    def delete_web_session(self, token_hash: str) -> None:
+        """إلغاء/تسجيل خروج دائم (نجو من restart). غير موجود ⇒ لا شيء (idempotent)."""
+        with self._conn:
+            self._conn.execute("DELETE FROM web_sessions WHERE token_hash=?", (token_hash,))
+
+    def prune_web_sessions(self, now: float) -> int:
+        """يحذف الجلسات المنتهية. يرجّع العدد المحذوف. غير مدمّر للجلسات السارية."""
+        with self._conn:
+            cur = self._conn.execute("DELETE FROM web_sessions WHERE expires_at <= ?", (float(now),))
+            return int(cur.rowcount)
+
+    def count_web_sessions(self) -> int:
+        row = self._conn.execute("SELECT COUNT(*) AS n FROM web_sessions").fetchone()
+        return int(row["n"])
+
     def list_watched(self) -> list[Watched]:
+        """كل صفوف المتابعة **غير المتشاهدة حذفًا** (منع إفصاح عنوان شات محذوف).
+
+        OHB2-RESIDUAL: بنستبعد أي `conversation_id` عليه شاهد حذف دائم — الحذف المؤكّد
+        بيشيل صف المتابعة أصلًا، لكن خلال نافذة `deleting`/`uncertain` الصف بيفضل موجود؛
+        الاستبعاد هنا يمنع ظهور عنوانه في قوايم البوت/الـ Mini App (وبيمنح المراقب نفس
+        النتيجة اللي بيفرضها حرسه الخاص). الصفوف نفسها ما بتتحذفش (استرجاع الحذف/الإحياء
+        الصريح يفضلوا شغالين)، بنستبعدها من العرض بس.
+        """
         rows = self._conn.execute(
             "SELECT conversation_id, title, last_state, chat_id, submitted_at, added_at, "
-            "retry_count, pending_delivery_state, watch_seq FROM watched"
+            "retry_count, pending_delivery_state, watch_seq FROM watched "
+            "WHERE NOT EXISTS (SELECT 1 FROM deleted_conversations d "
+            "WHERE d.conversation_id = watched.conversation_id)"
         ).fetchall()
         return [
             Watched(
@@ -1158,6 +2642,8 @@ class Database:
         kind: str | None,
         title: str | None = None,
         now: datetime | None = None,
+        *,
+        commit: bool = True,
     ) -> None:
         stamp = (now or datetime.now(timezone.utc)).isoformat() if kind else None
         self._conn.execute(
@@ -1168,10 +2654,351 @@ class Database:
             "awaiting_title=excluded.awaiting_title",
             (telegram_id, conversation_id, kind, stamp, title),
         )
-        self._conn.commit()
+        if commit:
+            self._conn.commit()
 
     def clear_awaiting(self, telegram_id: int) -> None:
         self.set_awaiting(telegram_id, None, None)
+
+    def renew_awaiting(self, telegram_id: int, now: datetime | None = None) -> None:
+        """يجدّد مهلة توجيه `route` **بدون استهلاك** (route مستمر مش لمرة واحدة).
+
+        بنستخدمها في `handle_text` بدل `take_awaiting` عشان مسار route مايعملش أي
+        استهلاك؛ الاستهلاك الذرّي بقى للحالات لمرة واحدة بس جوه كتابة السجل الدائم.
+        """
+        stamp = (now or datetime.now(timezone.utc)).isoformat()
+        self._conn.execute(
+            "UPDATE user_state SET awaiting_at=? WHERE telegram_id=?", (stamp, telegram_id)
+        )
+        self._conn.commit()
+
+    @staticmethod
+    def awaiting_is_expired(since: datetime | None, now: datetime | None = None) -> bool:
+        """هل انتهت مهلة حالة الانتظار؟ (نفس معيار `take_awaiting` بالحرف)."""
+        if since is None:
+            return True
+        return (now or datetime.now(timezone.utc)) - since > AWAITING_TTL
+
+    def awaiting_state(
+        self, telegram_id: int
+    ) -> tuple[str | None, str | None, str | None, datetime | None]:
+        """يقرأ حالة الانتظار **بدون استهلاك** (قراءة فقط، بدون أي كتابة).
+
+        P1: بديل `take_awaiting` في `handle_text` — الاستهلاك (مسح الحالة لمرة واحدة أو
+        تجديد route) بقى منفصلًا وذرّيًا مع كتابة السجل الدائم. بترجّع
+        (conversation_id, kind, title, awaiting_at) أو (None, None, None, None).
+        """
+        row = self._conn.execute(
+            "SELECT awaiting_conversation_id, awaiting_kind, awaiting_title, awaiting_at "
+            "FROM user_state WHERE telegram_id=?",
+            (telegram_id,),
+        ).fetchone()
+        if not row or not row["awaiting_kind"]:
+            return None, None, None, None
+        return (
+            row["awaiting_conversation_id"],
+            row["awaiting_kind"],
+            row["awaiting_title"],
+            _parse_iso(row["awaiting_at"]),
+        )
+
+    def _clear_awaiting_nocommit(self, telegram_id: int) -> None:
+        """يمسح حالة الانتظار **جوه معاملة المستدعي** (بدون commit)."""
+        self._conn.execute(
+            "UPDATE user_state SET awaiting_conversation_id=NULL, awaiting_kind=NULL, "
+            "awaiting_at=NULL, awaiting_title=NULL WHERE telegram_id=?",
+            (telegram_id,),
+        )
+
+    def consume_one_shot_awaiting(
+        self, telegram_id: int, expected_kind: str, update_id: int | None, now: str
+    ) -> bool:
+        """يستهلك حالة انتظار **لمرة واحدة** ويسجّل «معالَج» **ذرّيًا** (معاملة واحدة).
+
+        P1 (مسارات بلا سجل عمل دائم، زي بحث المستودعات): الحالة والعلامة إما يتحفظوا معًا
+        أو ولا واحد. تُرجّع True لو استهلكناها فعلًا، False لو الحالة اتغيّرت/انتهت/مستهلكة
+        قبل كده. **بعد** ما الأثر (إرسال القائمة) ينجح — عشان عطل قبل كده يخلّي إعادة
+        التسليم تعيد التنفيذ (مفيش فقد)، والتكرار المحتمل (قائمة مكرّرة) غير ضار.
+        """
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if update_id is not None and self.update_is_processed(update_id):
+                conn.rollback()
+                return False
+            row = conn.execute(
+                "SELECT awaiting_kind, awaiting_at FROM user_state WHERE telegram_id=?",
+                (telegram_id,),
+            ).fetchone()
+            if row is None or row["awaiting_kind"] != expected_kind:
+                conn.rollback()
+                return False
+            if self.awaiting_is_expired(_parse_iso(row["awaiting_at"]), _parse_iso(now)):
+                conn.rollback()
+                return False
+            self._clear_awaiting_nocommit(telegram_id)
+            # OHB2-MANUAL-POLLING-OUTCOME: النتيجة الدائمة ذرّية مع الاستهلاك (إرسال القايمة
+            # نجح فعلًا قبل النداء ده).
+            self._mark_processed_nocommit(update_id, now, update_outcomes.DURABLE_COMPLETED)
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+
+    # ------------------------------------------------- telegram update dedup
+    # OHB2-DUPLICATE-TELEGRAM-PROMPT-DISPATCH: مفتاح منع التكرار على مستوى **التحديث**.
+    # الضمان: تحديث تيليجرام واحد ⇒ قرار معالجة واحد (إرسال واحد لشات موجود، أو إنشاء
+    # شات واحد، أو رد واحد) حتى لو وصل مرتين (إعادة تسليم/إعادة تشغيل/تزامن). المفتاح
+    # `update_id` فريد على مستوى تيليجرام، فالإدراج ذرّي (`INSERT OR IGNORE`) بيخلّي أول
+    # معالج يفوز والبقية تُرفض قبل أي عملية خارجية. ده **كشف تكرار**، مش ضمان exactly-once
+    # خارجي (نفس عقد المشروع: at-most-once + تسوية يدوية للنتائج الغامضة).
+    def update_is_processed(self, update_id: int) -> bool:
+        """هل التحديث مسجّل «معالَج» بالفعل؟ (فحص قراءة فقط، بدون أي كتابة).
+
+        P1: الحاجز بقى **فحص قراءة** — التسجيل نفسه بيحصل **ذرّيًا مع كتابة السجل الدائم**
+        جوه معاملة `add_or_group_outbox`/`add_creation_job`. كده مايحصلش أبدًا إن تحديث
+        يتسجّل «معالَج» من غير ما يكون سجله الدائم اتكتب: إما الاتنين يتكتبوا مع بعض (نفس
+        المعاملة)، أو ولا واحد (لو العملية ماتت/فشلت قبل الـ commit) ⇒ إعادة التسليم بتنفّذ.
+        """
+        row = self._conn.execute(
+            "SELECT 1 FROM processed_updates WHERE update_id=?", (int(update_id),)
+        ).fetchone()
+        return row is not None
+
+    def mark_update_processed(self, update_id: int, now: str) -> bool:
+        """يسجّل التحديث «معالَج» **ذرّيًا** (INSERT OR IGNORE على مفتاح أساسي).
+
+        True لو أول مرة، False لو موجود قبل كده. الدالة دي مسار **وحدة/متوافق** (بتستخدمها
+        اختبارات الحاجز)؛ المسار الحقيقي في البوت بيسجّل ذرّيًا مع السجل الدائم عبر
+        `_mark_processed_nocommit` جوه معاملة كتابة العملية.
+        """
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO processed_updates(update_id, processed_at) VALUES(?, ?)",
+            (int(update_id), now),
+        )
+        self._conn.commit()
+        return cur.rowcount == 1
+
+    def _mark_processed_nocommit(
+        self, update_id: int | None, now: str, outcome: str | None = None
+    ) -> None:
+        """يسجّل «معالَج» داخل معاملة المستدعي (no-op لو `update_id` None).
+
+        P1: بيتنادى **في نفس معاملة** كتابة السجل الدائم (outbox/creation) ⇒ التسجيل
+        والكتابة إما ينجحوا معًا أو يفشلوا معًا (ذرّية حقيقية، مش ادّعاء).
+
+        OHB2-MANUAL-POLLING-OUTCOME: `outcome` (لو متمرّر) بيتكتب **في نفس المعاملة** ⇒
+        النتيجة الدائمة (دليل الإقرار) بتُحفظ ذرّيًا مع العملية اللي نفّذت النية. لو التحديث
+        مسجّل قبل كده (مسار تكرار/تزامن)، بنرقّي النتيجة بـ COALESCE (مفيش clobber بقيمة
+        NULL) من غير ما نلمس `processed_at`.
+        """
+        if update_id is None:
+            return
+        self._conn.execute(
+            "INSERT INTO processed_updates(update_id, processed_at, outcome) VALUES(?, ?, ?) "
+            "ON CONFLICT(update_id) DO UPDATE SET "
+            "outcome=COALESCE(excluded.outcome, processed_updates.outcome)",
+            (int(update_id), now, outcome),
+        )
+
+    # ---------------------------------------------- OHB2-MANUAL-POLLING-OUTCOME
+    def mark_update_outcome(
+        self,
+        update_id: int,
+        now: str,
+        outcome: str,
+        *,
+        reason: str | None = None,
+        commit: bool = True,
+    ) -> None:
+        """يسجّل **نتيجة دائمة** لتحديث (بـ upsert).
+
+        - النتائج **المؤهّلة** (`durable_*`/`explicitly_ignored`/`duplicate_completed`)
+          بتتكتب في `processed_updates.outcome` (دليل الإقرار).
+        - النتائج **غير المؤهّلة** (`failed_*`/`partial_or_unknown`) بتتكتب في
+          `update_failures` (قرار مُوثَّق) **و** `processed_updates.outcome` (للرصد) —
+          فمستحيل تتحوّل لنجاح.
+
+        `commit=False` للاستخدام **جوه معاملة المستدعي** (ذرّية مع العملية الدائمة).
+        """
+        from . import update_outcomes as _uo
+
+        if _uo.is_ack_eligible(outcome):
+            self._conn.execute(
+                "INSERT INTO processed_updates(update_id, processed_at, outcome) VALUES(?, ?, ?) "
+                "ON CONFLICT(update_id) DO UPDATE SET outcome=excluded.outcome",
+                (int(update_id), now, outcome),
+            )
+        else:
+            # **مهم**: الفشل **مايتكتبش** في `processed_updates` — الجدول ده هو مصدر
+            # الديدَب (`update_is_processed`)، وكتابة صف فشل فيه كانت هتخلّي إعادة التسليم
+            # تُرفض كتكرار ⇒ فقد التحديث. الفشل بيتسجّل في `update_failures` بس، فغياب
+            # النتيجة في `processed_updates` = غير مؤهّل (fail-closed) + إعادة التسليم تنفّذ.
+            self._conn.execute(
+                "INSERT INTO update_failures(update_id, outcome, reason, failed_at) "
+                "VALUES(?, ?, ?, ?) "
+                "ON CONFLICT(update_id) DO UPDATE SET "
+                "outcome=excluded.outcome, reason=excluded.reason, failed_at=excluded.failed_at",
+                (int(update_id), outcome, reason, now),
+            )
+        if commit:
+            self._conn.commit()
+
+    def update_outcome(self, update_id: int) -> str | None:
+        """فئة نتيجة التحديث كما هي مسجّلة **بثبات**.
+
+        بتقرا `processed_updates.outcome` الأول (دليل الإقرار)، وترجع لـ
+        `update_failures.outcome` لو التحديث مسجّل فشل بس (للرصد). `None` لو مالوش أي
+        نتيجة مسجّلة (⇒ غير مؤهّل، fail-closed).
+        """
+        row = self._conn.execute(
+            "SELECT outcome FROM processed_updates WHERE update_id=?", (int(update_id),)
+        ).fetchone()
+        if row is not None and row["outcome"] is not None:
+            return row["outcome"]
+        return self.update_failure(update_id)
+
+    def update_failure(self, update_id: int) -> str | None:
+        """فئة فشل التحديث من `update_failures` (None لو مفيش فشل مسجّل)."""
+        row = self._conn.execute(
+            "SELECT outcome FROM update_failures WHERE update_id=?", (int(update_id),)
+        ).fetchone()
+        return row["outcome"] if row else None
+
+    def is_update_acknowledgment_eligible(self, update_id: int) -> bool:
+        """هل التحديث مؤهّل للإقرار؟ (fail-closed: أي نتيجة غير مؤهّلة أو NULL ⇒ False)."""
+        from . import update_outcomes as _uo
+
+        return _uo.is_ack_eligible(self.update_outcome(update_id))
+
+    def acknowledgment_boundary(self, received_ids: list[int]) -> int | None:
+        """أطول بادئة مؤهّلة بترتيب الاستقبال ⇒ معرّف آخر تحديث مؤهّل (أو None).
+
+        بتحسب النتائج من `processed_updates.outcome` **المُـcommit**، فحدّ الإقرار مبني على
+        دليل دائم مش على رجوع الـ handler. البادئة بتتوقف عند أول تحديث غير مؤهّل.
+        """
+        from . import update_outcomes as _uo
+
+        outcomes = {uid: self.update_outcome(uid) for uid in received_ids}
+        return _uo.acknowledgment_boundary(received_ids, outcomes)
+
+    def commit_batch_outcomes(
+        self, outcomes: list[tuple[int, str]], now: str
+    ) -> int | None:
+        """يثبّت نتائج دفعة **و** الحدّ المحلي **في معاملة واحدة** (ذرّي/restart-safe).
+
+        - `outcomes`: [(update_id, outcome), ...] **بترتيب الاستقبال**.
+        - بيكتب كل نتيجة (نفس دلالات `mark_update_outcome`) + بيحسب حدّ الإقرار من
+          **نفس الحالة داخل نفس المعاملة** + بيثبّت الحدّ في `settings` (مفتاح
+          `acknowledgment_boundary`) — كله أو ولا حاجة.
+        - بترجّع الحدّ الجديد (أو None)، وبيستخدمه أي مستدعي يستطلِع لاحقًا بـ
+          `getUpdates(offset=boundary+1)`.
+
+        **مش** إقرار تيليجرام: ده تسجيل محلي بس. الإقرار الفعلي بيحصل لما طلب
+        `getUpdates` التالي يحمل موضع أعلى — وده مسؤولية حلقة الاستطلاع (بره نطاق
+        التغيير ده؛ دلالات الـ offset/الإقرار متجمّدة).
+        """
+        from . import update_outcomes as _uo
+
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for update_id, outcome in outcomes:
+                if _uo.is_ack_eligible(outcome):
+                    conn.execute(
+                        "INSERT INTO processed_updates(update_id, processed_at, outcome) "
+                        "VALUES(?, ?, ?) "
+                        "ON CONFLICT(update_id) DO UPDATE SET outcome=excluded.outcome",
+                        (int(update_id), now, outcome),
+                    )
+                else:
+                    # نفس قرار `mark_update_outcome`: الفشل **مايدخلش** `processed_updates`
+                    # (مصدر الديدَب) ⇒ إعادة التسليم تنفّذ + الحدّ يتوقف عنده (fail-closed).
+                    conn.execute(
+                        "INSERT INTO update_failures(update_id, outcome, reason, failed_at) "
+                        "VALUES(?, ?, ?, ?) "
+                        "ON CONFLICT(update_id) DO UPDATE SET "
+                        "outcome=excluded.outcome, reason=excluded.reason, "
+                        "failed_at=excluded.failed_at",
+                        (int(update_id), outcome, None, now),
+                    )
+            boundary = _uo.acknowledgment_boundary(
+                [uid for uid, _ in outcomes],
+                {uid: self._outcome_in_txn(uid) for uid, _ in outcomes},
+            )
+            if boundary is not None:
+                # OHB2-STAGE2 (D4/monotonicity): حارس مونوتونية — الحدّ **مايتراجعش أبدًا**.
+                # بنقرا القيمة الحالية **جوه نفس المعاملة** (`BEGIN IMMEDIATE` ⇒ مفيش كتابة
+                # متزامنة)، وبنكتب بس لو الحدّ الجديد **أعلى** من المحفوظ. مساواة/أقل ⇒ no-op
+                # (الحدّ القديم محفوظ). النتيجة + الحدّ بيتثبّتوا معًا (نفس المعاملة) ⇒ ذرّي.
+                row = conn.execute(
+                    "SELECT value FROM settings WHERE key=?", (self.ACK_BOUNDARY_KEY,)
+                ).fetchone()
+                current = (
+                    int(row["value"]) if row is not None and row["value"] is not None else None
+                )
+                if current is None or int(boundary) > current:
+                    conn.execute(
+                        "INSERT INTO settings(key, value) VALUES(?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (self.ACK_BOUNDARY_KEY, str(int(boundary))),
+                    )
+            conn.commit()
+            return boundary
+        except Exception:
+            conn.rollback()
+            raise
+
+    def _outcome_in_txn(self, update_id: int) -> str | None:
+        row = self._conn.execute(
+            "SELECT outcome FROM processed_updates WHERE update_id=?", (int(update_id),)
+        ).fetchone()
+        return row["outcome"] if row else None
+
+    def get_acknowledgment_boundary(self) -> int | None:
+        """الحدّ المحلي المُثبَّت (None لو مفيش). ده **مش** إقرار تيليجرام."""
+        raw = self.get_setting(self.ACK_BOUNDARY_KEY)
+        return int(raw) if raw is not None else None
+
+    def prune_processed_updates(
+        self, keep: int | None = None, boundary: int | None = None
+    ) -> int:
+        """يقلّم سجل التحديثات المعالَجة بأمان اعتمادًا على **حدّ الإقرار** (Stage 3).
+
+        قاعدة السلامة: صفوف `update_id <= boundary` **مايحتاجهاش** الديدَب بعد كده، لأن حلقة
+        الاستطلاع بتستأنف من `boundary+1` (والحدّ مونوتوني) ⇒ تيليجرام **مش** هيعيد تسليمها.
+        صفوف `> boundary` (الذيل غير المؤكَّد) بتفضل دايمًا (احتمال إعادة تسليم بعد انهيار).
+
+        - `boundary is None` (مفيش إقرار مؤكَّد إطلاقًا) ⇒ **no-op**: ممكن إعادة تسليم أي حاجة.
+        - `keep is None` ⇒ مفيش سقف إضافي: بنشيل **كل** الصفوف `<= boundary`.
+        - `keep` (عدد صحيح) ⇒ بنسيب أحدث `keep` صف **من اللي `<= boundary`** بس.
+
+        بترجّع عدد الصفوف المشالة.
+        """
+        if boundary is None:
+            return 0
+        # بنرتّب بـ (processed_at, update_id): update_id هو الترتيب الطبيعي للتحديثات،
+        # وبنضمّه مع الوقت لتفادي أي التباس لو الساعة اتأخّرت.
+        if keep is None:
+            cur = self._conn.execute(
+                "DELETE FROM processed_updates WHERE update_id <= ?",
+                (int(boundary),),
+            )
+        else:
+            cur = self._conn.execute(
+                "DELETE FROM processed_updates WHERE update_id <= ? AND update_id NOT IN ("
+                "  SELECT update_id FROM processed_updates WHERE update_id <= ? "
+                "  ORDER BY processed_at DESC, update_id DESC LIMIT ?"
+                ")",
+                (int(boundary), int(boundary), int(keep)),
+            )
+        self._conn.commit()
+        return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+    def count_processed_updates(self) -> int:
+        row = self._conn.execute("SELECT COUNT(*) AS n FROM processed_updates").fetchone()
+        return int(row["n"]) if row else 0
 
     def take_awaiting(
         self, telegram_id: int, now: datetime | None = None
@@ -1223,13 +3050,6 @@ class Database:
             raise
         return result
 
-    def pop_awaiting(self, telegram_id: int) -> tuple[str | None, str | None]:
-        """نفس take_awaiting من غير العنوان؛ المنتهي بيرجّع (None, None)."""
-        conv, kind, _title = self.take_awaiting(telegram_id)
-        if kind == "expired":
-            return None, None
-        return conv, kind
-
     def get_awaiting(self, telegram_id: int) -> tuple[str | None, str | None]:
         row = self._conn.execute(
             "SELECT awaiting_conversation_id, awaiting_kind FROM user_state WHERE telegram_id=?",
@@ -1259,6 +3079,8 @@ class Database:
         window: timedelta | None = None,
         client_ref: str | None = None,
         reengage: bool = False,
+        update_id: int | None = None,
+        consume_awaiting: tuple[int, str] | None = None,
     ) -> int:
         """تجميع (القرار 2): لو فيه برومت 'pending' لنفس الوجهة اتحدّث خلال `window`،
 
@@ -1279,11 +3101,38 @@ class Database:
         الـ POST المتأخّر (أو إعادة المحاولة/الضغط المزدوج) من إحياء شات اتحذف. العمليات من
         غير `client_ref` (مسار البوت) زي ما هي: الصريح (`reengage=True`) يشيل الشاهد، وغير
         الصريح يُرفض. الفحص كله جوه BEGIN IMMEDIATE ⇒ محصّن ضد حذف متزامن.
+
+        P1 (OHB2-ONE-SHOT-CRASH): `consume_awaiting=(telegram_id, expected_kind)` بيخلّي
+        **استهلاك حالة انتظار لمرة واحدة** (reply) يحصل **جوه نفس المعاملة** اللي بتكتب
+        السجل الدائم. لو الحالة اتغيّرت/انتهت/مستهلكة، بنرجّع 0 من غير أي كتابة (ما
+        نستهلكش حالة مش متوقّعة). لو العملية فشلت، الاتنين يتراجعوا معًا ⇒ مفيش نافذة فقد
+        (الحالة تفضل قائمة فإعادة التسليم تنفّذ).
         """
         window = window if window is not None else GROUP_WINDOW
         conn = self._conn
         conn.execute("BEGIN IMMEDIATE")
         try:
+            # P1 (إغلاق سباق التزامن): الحاجز في group=-1 فحص قراءة، فنداءين متزامنين لنفس
+            # `update_id` ممكن يوصلوا هنا الاتنين. الفحص جوه قفل الكتابة (`BEGIN IMMEDIATE`)
+            # بيخلّي التاني يشوف «معالَج» ويرجع 0 (مفيش ازدواج). التزامن مُسلسَل: التاني
+            # بياخد القفل بعد ما الأول يـcommit.
+            if update_id is not None and self.update_is_processed(update_id):
+                conn.rollback()
+                return 0
+            if consume_awaiting is not None:
+                # P1: استهلاك حالة الانتظار (لمرة واحدة) ذرّيًا مع كتابة السجل الدائم.
+                tg_id, expected_kind = consume_awaiting
+                arow = conn.execute(
+                    "SELECT awaiting_kind, awaiting_at FROM user_state WHERE telegram_id=?",
+                    (tg_id,),
+                ).fetchone()
+                if arow is None or arow["awaiting_kind"] != expected_kind:
+                    conn.rollback()
+                    return 0
+                if self.awaiting_is_expired(_parse_iso(arow["awaiting_at"]), _parse_iso(now)):
+                    self._clear_awaiting_nocommit(tg_id)
+                    conn.commit()
+                    return 0
             if self.is_deleted(conversation_id):
                 # شات متشاهد: مفيش إحياء. عمليات `client_ref` (Mini App) مرفوضة دايمًا،
                 # والعمليات من غير `client_ref` (البوت) لازم تكون صريحة (`reengage`).
@@ -1299,6 +3148,11 @@ class Database:
                     (conversation_id, chat_id, client_ref),
                 ).fetchone()
                 if existing is not None:
+                    # OHB2-MANUAL-POLLING-OUTCOME: سجل العمل الدائم موجود بالفعل (نفس
+                    # client_ref) ⇒ النتيجة «مكتمل مكرّر» (دليل دائم موجود).
+                    self._mark_processed_nocommit(
+                        update_id, now, update_outcomes.DUPLICATE_COMPLETED
+                    )
                     conn.commit()
                     return int(existing["id"])
             row = conn.execute(
@@ -1338,6 +3192,18 @@ class Database:
                     (conversation_id, chat_id, text, OUTBOX_PENDING, now, now, client_ref),
                 )
                 out_id = int(cur.lastrowid)
+            # P1: استهلاك حالة الانتظار (لمرة واحدة) **في نفس المعاملة** مع الكتابة الدائمة
+            # (outbox/creation) وعلامة «معالَج» ⇒ إما الثلاثة يتحفظوا معًا أو ولا واحد.
+            if consume_awaiting is not None:
+                self._clear_awaiting_nocommit(consume_awaiting[0])
+            # P1: تسجيل «معالَج» **في نفس معاملة** كتابة السجل الدائم ⇒ ذرّية حقيقية
+            # (التسجيل والكتابة إما ينجحوا معًا أو يفشلوا معًا). مسارات Mini App:
+            # `update_id` None ⇒ no-op (مفيش حاجز تحديث أصلًا).
+            # OHB2-MANUAL-POLLING-OUTCOME: النية الدائمة اتكتبت (صف 'pending') ⇒ النتيجة
+            # `durable_intent_recorded` (دليل إقرار دائم؛ التسليم الخارجي لسه معلّق).
+            self._mark_processed_nocommit(
+                update_id, now, update_outcomes.DURABLE_INTENT_RECORDED
+            )
             conn.commit()
         except Exception:
             conn.rollback()
@@ -1483,8 +3349,18 @@ class Database:
         ).fetchone()
         return int(row["id"]) if row else None
 
-    def get_outbox(self, outbox_id: int) -> OutboxItem | None:
-        row = self._conn.execute("SELECT * FROM outbox WHERE id=?", (outbox_id,)).fetchone()
+    def get_outbox(self, outbox_id: int, chat_id: int | None = None) -> OutboxItem | None:
+        """يجيب سجل صندوق بالمعرّف.
+
+        OHB2-PHASE1D: `chat_id` اختياري لفرض **ملكية** الصف (نطاق المالك). الـ Mini App
+        بيمرّره دايمًا؛ المسارات الداخلية (البوت/الـ workers) بتستدعيها من غير نطاق.
+        """
+        if chat_id is None:
+            row = self._conn.execute("SELECT * FROM outbox WHERE id=?", (outbox_id,)).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT * FROM outbox WHERE id=? AND chat_id=?", (outbox_id, int(chat_id))
+            ).fetchone()
         return self._row_to_outbox(row) if row else None
 
     def list_outbox_by_status(self, status: str) -> list[OutboxItem]:
@@ -1528,28 +3404,89 @@ class Database:
 
     # ----------------------------------------------------------- creation jobs
     def add_creation_job(
-        self, chat_id: int, repo: str | None, text: str, now: str, client_ref: str | None = None
+        self,
+        chat_id: int,
+        repo: str | None,
+        text: str,
+        now: str,
+        client_ref: str | None = None,
+        update_id: int | None = None,
+        consume_awaiting: tuple[int, str] | None = None,
     ) -> int:
         """يسجّل طلب شات جديد (status='pending') قبل أي POST بدء (مفيش conversation_id).
 
         OHB2-07 (idempotency): لو `client_ref` اتزوّد وفيه طلب موجود بنفس
         (chat_id, client_ref)، بنرجّع الـ id بتاعه من غير إنشاء طلب جديد — فإعادة
         المحاولة بعد انقطاع الرد ما بتبدأش شات تاني.
+
+        OHB2-PHASE1D-F4: الحماية دي للحالات **النشطة** بس. لو الصف الموجود خلص **من غير
+        شات بعيد** (failed/discarded)، إرسال جديد بنفس المعرّف = محاولة إنشاء **جديدة**،
+        فبنعمل صف جديد (وإلا طلب ملغي كان بيسدّ نفس (مستودع+نص) للأبد).
+        **مهم:** `done` **مش** ضمن دول — لو الرد ضاع بعد نجاح الإنشاء والعميل أعاد
+        نفس المعرّف، لازم نرجّع نفس الصف (مفيش شات مكرّر). ops.js بيعمل معرّف جديد بعد
+        `done` فمفيش إعادة استخدام في المسار العادي.
+
+        P1 (OHB2-ONE-SHOT-CRASH): `consume_awaiting=(telegram_id, expected_kind)` بخلّي
+        استهلاك حالة انتظار لمرة واحدة (newchat) ذرّيًا مع كتابة الطلب الدائم.
         """
-        if client_ref:
-            existing = self._conn.execute(
-                "SELECT id FROM creation_jobs WHERE chat_id=? AND client_ref=? "
-                "ORDER BY id DESC LIMIT 1",
-                (chat_id, client_ref),
-            ).fetchone()
-            if existing is not None:
-                return int(existing["id"])
-        cur = self._conn.execute(
-            "INSERT INTO creation_jobs(chat_id, repo, text, status, created_at, updated_at, client_ref) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?)",
-            (chat_id, repo, text, CREATION_PENDING, now, now, client_ref),
-        )
-        self._conn.commit()
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # P1 (إغلاق سباق التزامن): نفس منطق `add_or_group_outbox` — الفحص جوه قفل
+            # الكتابة يمنع إنشاء شات مكرّر لو نفس التحديث وصل مرتين متزامنتين.
+            if update_id is not None and self.update_is_processed(update_id):
+                conn.rollback()
+                return 0
+            if consume_awaiting is not None:
+                # P1: استهلاك حالة الانتظار (لمرة واحدة) ذرّيًا مع كتابة الطلب الدائم.
+                tg_id, expected_kind = consume_awaiting
+                arow = conn.execute(
+                    "SELECT awaiting_kind, awaiting_at FROM user_state WHERE telegram_id=?",
+                    (tg_id,),
+                ).fetchone()
+                if arow is None or arow["awaiting_kind"] != expected_kind:
+                    conn.rollback()
+                    return 0
+                if self.awaiting_is_expired(_parse_iso(arow["awaiting_at"]), _parse_iso(now)):
+                    self._clear_awaiting_nocommit(tg_id)
+                    conn.commit()
+                    return 0
+            if client_ref:
+                existing = conn.execute(
+                    "SELECT id, status FROM creation_jobs WHERE chat_id=? AND client_ref=? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (chat_id, client_ref),
+                ).fetchone()
+                if existing is not None and existing["status"] not in (
+                    CREATION_FAILED,
+                    CREATION_DISCARDED,
+                ):
+                    # OHB2-MANUAL-POLLING-OUTCOME: طلب الإنشاء الدائم موجود (نفس client_ref)
+                    # ⇒ «مكتمل مكرّر» (دليل دائم).
+                    self._mark_processed_nocommit(
+                        update_id, now, update_outcomes.DUPLICATE_COMPLETED
+                    )
+                    conn.commit()
+                    return int(existing["id"])
+            cur = conn.execute(
+                "INSERT INTO creation_jobs(chat_id, repo, text, status, created_at, updated_at, client_ref) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?)",
+                (chat_id, repo, text, CREATION_PENDING, now, now, client_ref),
+            )
+            # P1: استهلاك حالة الانتظار (لمرة واحدة) **في نفس المعاملة** مع الكتابة الدائمة
+            # (outbox/creation) وعلامة «معالَج» ⇒ إما الثلاثة يتحفظوا معًا أو ولا واحد.
+            if consume_awaiting is not None:
+                self._clear_awaiting_nocommit(consume_awaiting[0])
+            # P1: تسجيل «معالَج» **في نفس معاملة** كتابة السجل الدائم ⇒ ذرّية حقيقية.
+            # OHB2-MANUAL-POLLING-OUTCOME: طلب الإنشاء الدائم اتكتب (صف 'pending') ⇒
+            # `durable_intent_recorded` (دليل إقرار دائم).
+            self._mark_processed_nocommit(
+                update_id, now, update_outcomes.DURABLE_INTENT_RECORDED
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         return int(cur.lastrowid)
 
     def find_creation_job_by_ref(self, chat_id: int, client_ref: str) -> CreationJob | None:
@@ -1560,9 +3497,54 @@ class Database:
         ).fetchone()
         return self._row_to_creation(row) if row else None
 
-    def get_creation_job(self, job_id: int) -> CreationJob | None:
-        row = self._conn.execute("SELECT * FROM creation_jobs WHERE id=?", (job_id,)).fetchone()
+    def get_creation_job(self, job_id: int, chat_id: int | None = None) -> CreationJob | None:
+        """يجيب طلب شات جديد بالمعرّف.
+
+        OHB2-PHASE1D: `chat_id` اختياري لفرض **ملكية** الصف (نطاق المالك). الـ Mini App
+        بيمرّره دايمًا؛ المسارات الداخلية بتستدعيها من غير نطاق.
+        """
+        if chat_id is None:
+            row = self._conn.execute(
+                "SELECT * FROM creation_jobs WHERE id=?", (job_id,)
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT * FROM creation_jobs WHERE id=? AND chat_id=?", (job_id, int(chat_id))
+            ).fetchone()
         return self._row_to_creation(row) if row else None
+
+    def list_creation_jobs_for_owner(
+        self, chat_id: int, page: int = 0, page_size: int = 10
+    ) -> tuple[list[CreationJob], bool]:
+        """قايمة طلبات الشات الجديد **المملوكة** لـ `chat_id` (الأحدث أولاً) + has_more.
+
+        OHB2-PHASE1D: نطاق المالك مفروض في الاستعلام نفسه، والترتيب ثابت
+        (created_at DESC, id DESC) والترقيم بـ offset — نفس دلالات قايمة الشاتات.
+
+        AUD-04 (دفاع في العمق): رقم الصفحة لازم يكون عددًا صحيحًا داخل [0, MAX_PAGE]
+        قبل حساب `offset = page × size`، عشان القيم الكبيرة ما تعملش OverflowError
+        جوّه SQLite. رفض القيمة هنا آخر خط دفاع؛ طبقة الـ API بترفضها بـ 400 قبل كده.
+        """
+        page = int(page)
+        if page < 0 or page > MAX_PAGE:
+            raise ValueError("رقم الصفحة خارج النطاق المسموح")
+        size = int(page_size)
+        # `size + 1` (جلب عنصر زيادة لمعرفة has_more) لازم يفضل داخل نطاق SQLite.
+        if size < 1 or size >= MAX_SQLITE_INT:
+            raise ValueError("حجم الصفحة خارج النطاق المسموح")
+        offset = page * size
+        if offset > MAX_SQLITE_INT:
+            raise ValueError("إزاحة الصفحة خارج نطاق SQLite")
+        rows = self._conn.execute(
+            "SELECT * FROM creation_jobs WHERE chat_id=? "
+            "AND NOT EXISTS (SELECT 1 FROM deleted_conversations d "
+            "WHERE d.conversation_id = creation_jobs.conversation_id) "
+            "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+            (int(chat_id), size + 1, offset),
+        ).fetchall()
+        has_more = len(rows) > size
+        jobs = [self._row_to_creation(r) for r in rows[:size]]
+        return jobs, has_more
 
     def list_creation_jobs_by_status(self, status: str) -> list[CreationJob]:
         rows = self._conn.execute(
@@ -1627,21 +3609,32 @@ class Database:
         now: str,
         allowed_statuses,
         error: str | None = None,
+        chat_id: int | None = None,
     ) -> bool:
         """تحويل حالة طلب شات **ذرّي مشروط** (CAS) — نظير `set_outbox_status_if_in`.
 
         القرار والكتابة في جملة SQL واحدة؛ لو سبقنا كاتب تاني، الـ rowcount=0 ومفيش
         تغيير. بترجّع True لو الحالة اتغيّرت فعلاً.
+
+        OHB2-PHASE1D: `chat_id` اختياري لفرض **ملكية** الصف في الـ UPDATE (دفاع في العمق).
+        المسارات الداخلية (البوت/الـ workers) بتستدعيها من غير نطاق؛ الـ Mini App بيمرّره.
         """
         allowed = tuple(allowed_statuses)
         if not allowed:
             return False
         placeholders = ", ".join("?" for _ in allowed)
-        cur = self._conn.execute(
-            f"UPDATE creation_jobs SET status=?, error=?, updated_at=? "
-            f"WHERE id=? AND status IN ({placeholders})",
-            (new_status, error, now, job_id, *allowed),
-        )
+        if chat_id is None:
+            cur = self._conn.execute(
+                f"UPDATE creation_jobs SET status=?, error=?, updated_at=? "
+                f"WHERE id=? AND status IN ({placeholders})",
+                (new_status, error, now, job_id, *allowed),
+            )
+        else:
+            cur = self._conn.execute(
+                f"UPDATE creation_jobs SET status=?, error=?, updated_at=? "
+                f"WHERE id=? AND chat_id=? AND status IN ({placeholders})",
+                (new_status, error, now, job_id, int(chat_id), *allowed),
+            )
         changed = cur.rowcount == 1
         self._conn.commit()
         return changed
@@ -1737,23 +3730,55 @@ class Database:
             return "not_confirmed"
         return "terminal"
 
-    def discard_creation_job(self, job_id: int, now: str, reason: str | None = None) -> str:
-        """شطب ذرّي لطلب شات مع تمييز حدّ الإلغاء — نفس دلالات `discard_outbox`."""
-        cur = self._conn.execute(
-            "UPDATE creation_jobs SET status=?, error=?, updated_at=? "
-            "WHERE id=? AND status IN (?, ?)",
-            (CREATION_DISCARDED, reason, now, job_id, CREATION_PENDING, CREATION_CLAIMED),
-        )
+    def discard_creation_job(
+        self, job_id: int, now: str, reason: str | None = None, chat_id: int | None = None
+    ) -> str:
+        """شطب ذرّي لطلب شات مع تمييز حدّ الإلغاء — نفس دلالات `discard_outbox`.
+
+        OHB2-PHASE1D: `chat_id` اختياري لفرض **ملكية** الصف في الـ UPDATE والقراءة
+        اللاحقة (دفاع في العمق). المسارات الداخلية (البوت/الـ workers) بتستدعيها من غير
+        نطاق؛ الـ Mini App بيمرّره دايمًا بعد فحص الملكية في الخدمة.
+        """
+        if chat_id is None:
+            cur = self._conn.execute(
+                "UPDATE creation_jobs SET status=?, error=?, updated_at=? "
+                "WHERE id=? AND status IN (?, ?) AND task_id IS NULL",
+                (CREATION_DISCARDED, reason, now, job_id, CREATION_PENDING, CREATION_CLAIMED),
+            )
+        else:
+            cur = self._conn.execute(
+                "UPDATE creation_jobs SET status=?, error=?, updated_at=? "
+                "WHERE id=? AND chat_id=? AND status IN (?, ?) AND task_id IS NULL",
+                (
+                    CREATION_DISCARDED,
+                    reason,
+                    now,
+                    job_id,
+                    int(chat_id),
+                    CREATION_PENDING,
+                    CREATION_CLAIMED,
+                ),
+            )
         if cur.rowcount == 1:
             self._conn.commit()
             return "discarded"
-        row = self._conn.execute(
-            "SELECT status FROM creation_jobs WHERE id=?", (job_id,)
-        ).fetchone()
+        if chat_id is None:
+            row = self._conn.execute(
+                "SELECT status, task_id FROM creation_jobs WHERE id=?", (job_id,)
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT status, task_id FROM creation_jobs WHERE id=? AND chat_id=?",
+                (job_id, int(chat_id)),
+            ).fetchone()
         self._conn.commit()
         if row is None:
             return "terminal"
         if row["status"] in (CREATION_STARTING, CREATION_UNKNOWN):
+            return "not_confirmed"
+        # OHB2-PHASE1D-F1: `pending`/`claimed` بس عليه `task_id` ⇒ الـ POST البدء رجع
+        # فعلاً ⇒ الإلغاء غير مؤكد (مفيش شطب). حرس دفاع في العمق لكل المستدعين.
+        if row["status"] in (CREATION_PENDING, CREATION_CLAIMED) and row["task_id"]:
             return "not_confirmed"
         return "terminal"
 
@@ -2141,6 +4166,8 @@ class Database:
     # إعدادات عامة مفاتيح/قيم. منفصلة عن الأسرار (الأسرار متغيرات بيئة بس). تفضيل
     # الإشعارات الافتراضي «مفعّل» (الميزة شغّالة افتراضيًا)، وبيبقى موجود بعد إعادة التشغيل.
     NOTIFICATIONS_KEY = "notifications_enabled"
+    # OHB2-MANUAL-POLLING-OUTCOME: مفتاح الحدّ المحلي للإقرار (مش إقرار تيليجرام).
+    ACK_BOUNDARY_KEY = "acknowledgment_boundary"
     _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 
     def get_setting(self, key: str, default: str | None = None) -> str | None:
@@ -2164,6 +4191,44 @@ class Database:
 
     def set_notifications_enabled(self, enabled: bool) -> None:
         self.set_setting(self.NOTIFICATIONS_KEY, "1" if enabled else "0")
+
+    def toggle_notifications_once(self, update_id: int | None, now: str) -> bool | None:
+        """يبدّل تفضيل الإشعارات **مرة واحدة** لكل `update_id` (P3).
+
+        التبديل وعلامة «معالَج» في **نفس المعاملة** ⇒ إعادة تسليم نفس التحديث
+        (`update_id` متكرر) ما بتعكسش الحالة تاني. بترجّع:
+        - True  : بقى **مفعّل** (تبديل ناجح من متوقف).
+        - False : بقى **متوقف** (تبديل ناجح من مفعّل).
+        - None  : مرفوض — نفس التحديث اتعالج قبل كده (مفيش تبديل تاني).
+
+        `update_id` None (مسار غير تيليجرام/اختبار) ⇒ تبديل عادي بدون حاجز.
+        """
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if update_id is not None and self.update_is_processed(update_id):
+                conn.rollback()
+                return None
+            row = conn.execute(
+                "SELECT value FROM settings WHERE key=?", (self.NOTIFICATIONS_KEY,)
+            ).fetchone()
+            raw = row["value"] if row else None
+            current = True if raw is None else raw.strip().lower() in self._TRUE_VALUES
+            new_state = not current
+            conn.execute(
+                "INSERT INTO settings(key, value) VALUES(?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (self.NOTIFICATIONS_KEY, "1" if new_state else "0"),
+            )
+            # OHB2-MANUAL-POLLING-OUTCOME: التبديل الدائم اتـcommit ⇒ نتيجة مكتملة.
+            self._mark_processed_nocommit(
+                update_id, now, update_outcomes.DURABLE_COMPLETED
+            )
+            conn.commit()
+            return new_state
+        except Exception:
+            conn.rollback()
+            raise
 
     # ------------------------------------------------- notification snapshots
     # لقطة حالة كل محادثة (للمُبلّغ العام). `notified_status` = آخر حالة اتّبعت/اتخطّى
@@ -2682,27 +4747,34 @@ class Database:
         السياسة (OHB2-08-05 Batch 3R-FIX):
         - الصفوف **المعلّقة** (`pending`) و**غير المقروءة** (`read_at IS NULL`)
           **مايتقلّمش أبدًا** — إشعار مستني تسليم أو لسه ماتشافش مايتحذفش صامت.
-        - الصفوف **المقروءة** بس هي المؤهّلة للتقليم، الأقدم أولًا (تحديد ثابت: `id ASC`).
+        - الصفوف **المؤرشفة** (`archived_at IS NOT NULL`) **مايتقلّمش أبدًا** (OHB2-PHASE1C):
+          الأرشفة إجراء **مقصود من المستخدم** للاحتفاظ بالإشعار؛ التقليم التلقائي مايلغيهاش.
+        - الصفوف **المقروءة وغير المؤرشفة** بس هي المؤهّلة للتقليم، الأقدم أولًا (تحديد
+          ثابت: `id ASC`).
         - السقف لكل محادثة (`INBOX_MAX_PER_CONVERSATION`) والسقف العام (`INBOX_MAX_TOTAL`)
           بيفضلوا **سقوفًا ناعمة**: لو الصفوف المحمية لوحدها تعدّي السقف، الجدول يتعدّاه
           (مفيش حذف لصف محمي عشان نرضي سقف). التقليم بيتخطّى الصفوف المحمية باستمرار.
         """
-        # 1) تقليم لكل محادثة (المقروءة بس).
+        # 1) تقليم لكل محادثة (المقروءة غير المؤرشفة بس).
         conn.execute(
             "DELETE FROM notification_inbox "
             "WHERE conversation_id=? AND delivery_status!='pending' AND read_at IS NOT NULL "
+            "AND archived_at IS NULL "
             "AND id NOT IN ("
             "SELECT id FROM notification_inbox "
             "WHERE conversation_id=? AND delivery_status!='pending' AND read_at IS NOT NULL "
+            "AND archived_at IS NULL "
             "ORDER BY id DESC LIMIT ?)",
             (conversation_id, conversation_id, INBOX_MAX_PER_CONVERSATION),
         )
-        # 2) تقليم عام (المقروءة بس).
+        # 2) تقليم عام (المقروءة غير المؤرشفة بس).
         conn.execute(
             "DELETE FROM notification_inbox "
-            "WHERE delivery_status!='pending' AND read_at IS NOT NULL AND id NOT IN ("
+            "WHERE delivery_status!='pending' AND read_at IS NOT NULL "
+            "AND archived_at IS NULL AND id NOT IN ("
             "SELECT id FROM notification_inbox "
             "WHERE delivery_status!='pending' AND read_at IS NOT NULL "
+            "AND archived_at IS NULL "
             "ORDER BY id DESC LIMIT ?)",
             (INBOX_MAX_TOTAL,),
         )
@@ -2710,7 +4782,8 @@ class Database:
     _INBOX_COLUMNS = (
         "id, conversation_id, title, kind, message, created_at, read_at, event_key, "
         "delivery_status, delivery_attempts, last_attempt_at, delivered_at, last_error, "
-        "next_retry_at, chat_id, transition_status, transition_seq, claim_token, claim_at"
+        "next_retry_at, chat_id, transition_status, transition_seq, claim_token, claim_at, "
+        "archived_at"
     )
 
     @staticmethod
@@ -2721,13 +4794,49 @@ class Database:
             r["delivery_status"], r["delivery_attempts"], r["last_attempt_at"],
             r["delivered_at"], r["last_error"], r["next_retry_at"], r["chat_id"],
             r["transition_status"], r["transition_seq"], r["claim_token"], r["claim_at"],
+            r["archived_at"],
+        )
+
+    @staticmethod
+    def _inbox_visibility_clause(archived: bool) -> str:
+        """شرط محور الأرشفة + استبعاد الشاتات المتشاهدة حذفًا (منع إفصاح محتوى شات محذوف).
+
+        `archived=False` (الافتراضي) = الصندوق النشط (غير المؤرشف)؛ `archived=True` =
+        الأرشيف بس. وفي **الحالتين** بنستبعد أي صف `conversation_id` عليه شاهد حذف دائم
+        (نفس معنى `is_deleted`) — كشرط SQL واحد ⇒ مايظهرش عنوان/نص شات محذوف في الصندوق
+        (ولا في عدّاد غير المقروء). الصفوف نفسها **ما بتتحذفش** (بتفضل أثر تدقيق للـ
+        تسوية/المنع) وبنستبعدها من العرض بس.
+        """
+        axis = "archived_at IS NOT NULL" if archived else "archived_at IS NULL"
+        return (
+            f"({axis}) AND NOT EXISTS (SELECT 1 FROM deleted_conversations d "
+            "WHERE d.conversation_id = notification_inbox.conversation_id)"
         )
 
     def list_inbox(
-        self, *, limit: int = INBOX_PAGE_SIZE, offset: int = 0, unread_only: bool = False
+        self,
+        *,
+        limit: int = INBOX_PAGE_SIZE,
+        offset: int = 0,
+        unread_only: bool = False,
+        archived: bool = False,
     ) -> list[InboxItem]:
-        """قايمة الصندوق (الأحدث أولًا)، بترقيم محدود على مستوى SQL (payload محدود)."""
-        where = "WHERE read_at IS NULL" if unread_only else ""
+        """قايمة الصندوق (الأحدث أولًا)، بترقيم محدود على مستوى SQL (payload محدود).
+
+        `archived=False` (الافتراضي) = الصندوق النشط (غير المؤرشف). `archived=True` =
+        عرض الأرشيف بس. الأرشفة محور مستقل ⇒ ما بتغيّرش ترتيب `id DESC` ولا حالة القراءة.
+
+        AUD-04 (دفاع في العمق): `limit`/`offset` لازم يكونوا داخل نطاق SQLite قبل
+        الـ binding؛ أي قيمة أكبر ترفض بدل ما ترمي OverflowError (500).
+        """
+        limit = int(limit)
+        offset = int(offset)
+        if limit < 0 or offset < 0 or limit > MAX_SQLITE_INT or offset > MAX_SQLITE_INT:
+            raise ValueError("حدود الصفحة خارج النطاق المسموح")
+        clauses = [self._inbox_visibility_clause(archived)]
+        if unread_only:
+            clauses.append("read_at IS NULL")
+        where = "WHERE " + " AND ".join(clauses)
         rows = self._conn.execute(
             f"SELECT {self._INBOX_COLUMNS} FROM notification_inbox {where} "
             f"ORDER BY id DESC LIMIT ? OFFSET ?",
@@ -2753,14 +4862,20 @@ class Database:
         ).fetchone()
         return self._inbox_from_row(row) if row else None
 
-    def count_inbox(self, *, unread_only: bool = False, pending_only: bool = False) -> int:
-        """عدد عناصر الصندوق (كلها / غير المقروءة / المعلّقة)."""
-        clauses = []
+    def count_inbox(
+        self, *, unread_only: bool = False, pending_only: bool = False, archived: bool = False
+    ) -> int:
+        """عدد عناصر الصندوق (كلها / غير المقروءة / المعلّقة) داخل نطاق الأرشفة.
+
+        `archived=False` (الافتراضي) = العناصر **النشطة** (غير المؤرشفة) بس — فالشارة
+        وعدّ غير المقروء بيفضلوا على الصندوق الفعلي (الأرشيف محور مستقل).
+        """
+        clauses = [self._inbox_visibility_clause(archived)]
         if unread_only:
             clauses.append("read_at IS NULL")
         if pending_only:
             clauses.append("delivery_status='pending'")
-        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        where = "WHERE " + " AND ".join(clauses)
         row = self._conn.execute(
             f"SELECT COUNT(*) AS n FROM notification_inbox {where}"
         ).fetchone()
@@ -2790,6 +4905,133 @@ class Database:
         )
         conn.commit()
         return int(cur.rowcount or 0)
+
+    def archive_inbox_item(self, item_id: int, now: str) -> bool | None:
+        """يؤرشف صف صندوق (idempotent). True لو بقى مؤرشف، False لو العنصر مش موجود.
+
+        OHB2-PHASE1C: الأرشفة **قابلة للعكس** ومستقلة تمامًا عن محور التسليم/القراءة —
+        بتكتب `archived_at` بس. أرشفة صف مؤرشف بالفعل ما بتغيّرش وقت الأرشفة الأصلي
+        (COALESCE) ⇒ idempotent، ومفيش أي مساس بالتسليم/العملية/القراءة.
+        """
+        conn = self._conn
+        cur = conn.execute(
+            "UPDATE notification_inbox SET archived_at=COALESCE(archived_at, ?) WHERE id=?",
+            (now, int(item_id)),
+        )
+        conn.commit()
+        if cur.rowcount and cur.rowcount > 0:
+            return True
+        row = conn.execute(
+            "SELECT 1 FROM notification_inbox WHERE id=?", (int(item_id),)
+        ).fetchone()
+        return True if row is not None else False
+
+    def unarchive_inbox_item(self, item_id: int) -> bool | None:
+        """يلغي أرشفة صف (idempotent). True لو بقى نشط، False لو العنصر مش موجود.
+
+        ما بيمسحش الصف؛ بيمسح `archived_at` بس ⇒ الصف يرجع للصندوق النشط بنفس الهوية
+        وبنفس حالة القراءة/التسليم.
+        """
+        conn = self._conn
+        cur = conn.execute(
+            "UPDATE notification_inbox SET archived_at=NULL WHERE id=?", (int(item_id),)
+        )
+        conn.commit()
+        if cur.rowcount and cur.rowcount > 0:
+            return True
+        row = conn.execute(
+            "SELECT 1 FROM notification_inbox WHERE id=?", (int(item_id),)
+        ).fetchone()
+        return True if row is not None else False
+
+    def has_open_outbox(self, conversation_id: str) -> bool:
+        """هل فيه برومت **غير منتهٍ** (pending/claimed/sending) لنفس المحادثة؟
+
+        OHB2-PHASE1C: حارس الحذف النهائي — إشعار لمحادثة عليها عملية إرسال جارية أو
+        معلّقة مايتحذفش (حتى لو مُسلَّم+مقروء) عشان ما نفقدش دليل العملية المعلّقة.
+        """
+        row = self._conn.execute(
+            "SELECT 1 FROM outbox WHERE conversation_id=? "
+            "AND status IN (?, ?, ?) LIMIT 1",
+            (conversation_id, OUTBOX_PENDING, OUTBOX_CLAIMED, OUTBOX_SENDING),
+        ).fetchone()
+        return row is not None
+
+    def has_notifier_pending(self, conversation_id: str) -> bool:
+        """هل فيه علامة تسليم معلّقة (`notifier_pending`) لنفس المحادثة؟
+
+        OHB2-PHASE1C: حارس الحذف النهائي — علامة التسوية المعلّقة دليل تشغيلي حيّ
+        (بتُستخدم للاسترجاع/التسوية)، فإشعار نفس المحادثة مايتحذفش نهائيًا.
+        """
+        row = self._conn.execute(
+            "SELECT 1 FROM notifier_pending WHERE conversation_id=? LIMIT 1",
+            (conversation_id,),
+        ).fetchone()
+        return row is not None
+
+    def inbox_item_delete_eligibility(self, item_id: int) -> str:
+        """تصنيف أهلية الصف للحذف النهائي: deleted / protected / missing.
+
+        OHB2-PHASE1C — سياسة الحذف النهائي (مُفرَضة على السيرفر، **fail-closed**):
+        - `missing`  : الصف مش موجود.
+        - `protected`: الصف محمي. الحالات المحمية:
+            * `kind` **غير معروف** (مش في `INBOX_DELETABLE_KINDS`) — أي نوع لسه
+              ماتقيّمش/غريب بيتعامَل محميًا (ما نفقدش دليلًا ما عرفناش دلالته).
+            * `delivery_status != 'delivered'` — لسه معلّق أو فشل (دليل تسليم).
+            * غير مقروء (`read_at IS NULL`) — المستخدم لسه ما شافهوش.
+            * مرجع في `notifier_pending.event_id` — دليل تسوية معلّق لازم للاسترجاع.
+            * المحادثة عليها علامة `notifier_pending` — دليل تسوية حيّ لنفس المحادثة.
+            * المحادثة عليها برومت **غير منتهٍ** في `outbox` — عملية جارية/معلّقة.
+        - `deleted`  : مؤهّل (نوع آمن + مُسلَّم + مقروء + مفيش دليل تسوية/عملية مرتبط).
+          ده **أضيق** من مجموعة التقليم، فما فيش تقليل لأي ضمان.
+        """
+        row = self._conn.execute(
+            "SELECT conversation_id, kind, read_at, delivery_status "
+            "FROM notification_inbox WHERE id=?",
+            (int(item_id),),
+        ).fetchone()
+        if row is None:
+            return INBOX_DELETE_MISSING
+        # سياسة fail-closed: نوع غير معروف (أو `proactive`) ⇒ محمي.
+        if row["kind"] not in INBOX_DELETABLE_KINDS:
+            return INBOX_DELETE_PROTECTED
+        if row["delivery_status"] != INBOX_DELIVERY_DELIVERED or row["read_at"] is None:
+            return INBOX_DELETE_PROTECTED
+        ref = self._conn.execute(
+            "SELECT 1 FROM notifier_pending WHERE event_id=? LIMIT 1", (int(item_id),)
+        ).fetchone()
+        if ref is not None:
+            return INBOX_DELETE_PROTECTED
+        conversation_id = row["conversation_id"]
+        if self.has_notifier_pending(conversation_id):
+            return INBOX_DELETE_PROTECTED
+        if self.has_open_outbox(conversation_id):
+            return INBOX_DELETE_PROTECTED
+        return INBOX_DELETE_DELETED
+
+    def delete_inbox_item(self, item_id: int) -> str:
+        """يحذف صف صندوق **نهائيًا** لو مؤهّل، في معاملة ذرّية واحدة.
+
+        يرجّع `deleted` (اتحذف فعلًا) / `protected` (محمي، مفيش تغيير) / `missing`
+        (مش موجود). الأهلية بتُعاد فحصها **داخل** المعاملة (`BEGIN IMMEDIATE`) ⇒ مفيش
+        سباق مع تسجيل تسليم/ربط `notifier_pending` في نفس اللحظة. الحذف بيلمس جدول
+        `notification_inbox` بس — مفيش أي مساس بصفوف outbox/creation/watched/
+        notification_state/notifier_pending (مفيش حذف عرضي لسجل عملية أو تسوية).
+        """
+        ident = int(item_id)
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            verdict = self.inbox_item_delete_eligibility(ident)
+            if verdict != INBOX_DELETE_DELETED:
+                conn.commit()
+                return verdict
+            conn.execute("DELETE FROM notification_inbox WHERE id=?", (ident,))
+            conn.commit()
+            return INBOX_DELETE_DELETED
+        except Exception:
+            conn.rollback()
+            raise
 
     def mark_inbox_delivered(self, item_id: int, now: str, *, _commit: bool = True) -> bool:
         """يسجّل نجاح تسليم تليجرام للحدث (delivery_status='delivered'). idempotent.
@@ -2996,6 +5238,9 @@ class Database:
         try:
             self.optimize()
             self.checkpoint()
+            # OHB2-PHASE1A: تنظيف جلسات الـ Mini App المنتهية عند الإقلاع (داخل نفس
+            # دورة الصيانة — مفيش worker/مجدول جديد). غير حرج: لو فشل ما نوقفش الإقلاع.
+            self.prune_web_sessions(time.time())
         except sqlite3.Error as exc:
             # الصيانة مش حرجة: القاعدة سليمة، فمنعطّلش البوت عشانها.
             log.warning("صيانة قاعدة البيانات اتخطّت (%s)", type(exc).__name__)

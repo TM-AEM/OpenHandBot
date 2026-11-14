@@ -1,9 +1,13 @@
 """NTF-04/05: أزرار وأوامر الإشعارات — العرض، التبديل، الصلاحيات، ودورة الحياة."""
 import asyncio
+import logging
 import re
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
+
+from telegram.error import BadRequest, TimedOut
 
 from bot import handlers as h
 from bot import keyboards as kb
@@ -136,6 +140,125 @@ def test_toggle_ignored_in_group(tmp_path):
     asyncio.run(h.notifications_toggle(cb_update(q, chat_type="group"), ctx))
     assert q.edits == []
     assert ctx.bot_data["db"].get_notifications_enabled() is True
+
+
+# ------------------------------------------- OHB2-SW09: فشل تأكيد الكولباك بعد الـ commit
+class _AnswerRaisesQ(Q):
+    """Q تأكيده (بعد الـ commit) يرمي استثناء، ويسجّل عدد المحاولات."""
+
+    def __init__(self, data, exc):
+        super().__init__(data)
+        self.exc = exc
+        self.answer_attempts = 0
+
+    async def answer(self, *args, **kw):
+        self.answer_attempts += 1
+        raise self.exc
+
+
+def _counting_toggle(monkeypatch, db):
+    """يلفّ `toggle_notifications_once` بعدّاد للتحقق من «مرة واحدة بالظبط»."""
+    calls = {"n": 0}
+    real = db.toggle_notifications_once
+
+    def counting(update_id, now):
+        calls["n"] += 1
+        return real(update_id, now)
+
+    monkeypatch.setattr(db, "toggle_notifications_once", counting)
+    return calls
+
+
+def test_sw09_post_commit_answer_failure_still_edits(tmp_path, monkeypatch, caplog):
+    """A: فشل تأكيد الكولباك بعد الـ commit مايوقفش تعديل الواجهة، والتبديل مرة واحدة."""
+    ctx = make_context(1, tmp_path)
+    db = ctx.bot_data["db"]
+    calls = _counting_toggle(monkeypatch, db)
+    q = _AnswerRaisesQ(kb.NOTIF_TOGGLE, TimedOut("timed out"))
+    with caplog.at_level(logging.WARNING, logger="bot.handlers"):
+        asyncio.run(h.notifications_toggle(cb_update(q), ctx))  # مايرميش (الفشل مُحتوى)
+    # المعالج كمّل وعدّل الرسالة بالحالة **المعمّلة** (كانت مفعّلة ⇒ بقت متوقفة).
+    assert len(q.edits) == 1
+    assert "متوقفة" in q.edits[0]
+    assert kb.NOTIF_TURN_ON in [
+        b.text for row in q.markups[0].inline_keyboard for b in row
+    ]
+    # التبديل حصل **مرة واحدة بالظبط** (مفيش ازدواج بسبب فشل الكولباك).
+    assert calls["n"] == 1
+    assert db.get_notifications_enabled() is False
+    # تأكيد واحد اتحاول، مفيش إعادة محاولة.
+    assert q.answer_attempts == 1
+    # سجل: نوع الخطأ فقط، بدون نص الاستثناء (ممكن يحتوي أسرار).
+    assert "تعذّر الرد على الكولباك" in caplog.text
+    assert "TimedOut" in caplog.text
+    assert "timed out" not in caplog.text
+
+
+def test_sw09_bad_request_failure_still_edits(tmp_path, monkeypatch, caplog):
+    """A (نوع استثناء آخر): رفض تيليجرام (كولباك منتهي) كذلك مايوقفش تعديل الواجهة."""
+    ctx = make_context(1, tmp_path)
+    db = ctx.bot_data["db"]
+    calls = _counting_toggle(monkeypatch, db)
+    q = _AnswerRaisesQ(kb.NOTIF_TOGGLE, BadRequest("Query is too old and response timeout expired"))
+    with caplog.at_level(logging.WARNING, logger="bot.handlers"):
+        asyncio.run(h.notifications_toggle(cb_update(q), ctx))
+    assert len(q.edits) == 1 and "متوقفة" in q.edits[0]
+    assert calls["n"] == 1
+    assert db.get_notifications_enabled() is False
+    assert "BadRequest" in caplog.text
+
+
+def test_sw09_db_failure_no_success_ack(tmp_path, monkeypatch):
+    """B: فشل القاعدة قبل التأكيد ⇒ مفيش تأكيد نجاح، مفيش عرض «اتحدّثت»، الحالة مااتغيّرتش."""
+    ctx = make_context(1, tmp_path)
+    db = ctx.bot_data["db"]
+
+    def boom(update_id, now):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(db, "toggle_notifications_once", boom)
+    q = Q(kb.NOTIF_TOGGLE)
+    with pytest.raises(sqlite3.OperationalError):
+        asyncio.run(h.notifications_toggle(cb_update(q), ctx))
+    assert q.answers == []  # مفيش تأكيد نجاح
+    assert q.edits == []  # مفيش عرض نجاح
+    assert db.get_notifications_enabled() is True  # مااتغيّرش
+
+
+def test_sw09_normal_success_unchanged(tmp_path, monkeypatch):
+    """C: المسار العادي — التبديل مرة واحدة، تأكيد النجاح، والتعديل المتوقّع."""
+    ctx = make_context(1, tmp_path)
+    db = ctx.bot_data["db"]
+    calls = _counting_toggle(monkeypatch, db)
+    q = Q(kb.NOTIF_TOGGLE)
+    asyncio.run(h.notifications_toggle(cb_update(q), ctx))
+    assert calls["n"] == 1
+    assert q.answers == [("تم التحديث ✅",)]  # تأكيد النجاح زي ما هو
+    assert len(q.edits) == 1 and "متوقفة" in q.edits[0]
+    assert db.get_notifications_enabled() is False
+
+
+def test_sw09_failed_answer_no_duplicate_toggle(tmp_path, monkeypatch):
+    """D: فشل الكولباك مايعملش تبديل تاني ولا يعيد محاولة القاعدة."""
+    ctx = make_context(1, tmp_path)
+    db = ctx.bot_data["db"]
+    calls = _counting_toggle(monkeypatch, db)
+    q = _AnswerRaisesQ(kb.NOTIF_TOGGLE, TimedOut("timed out"))
+    asyncio.run(h.notifications_toggle(cb_update(q), ctx))
+    assert calls["n"] == 1  # مفيش إعادة محاولة للقاعدة بسبب فشل الكولباك
+    assert q.answer_attempts == 1  # مفيش إعادة محاولة للكولباك كذلك
+
+
+def test_sw09_cancellation_not_swallowed(tmp_path):
+    """E: `CancelledError` ينتشر (مفيش ابتلاع بـ `except Exception`)."""
+    ctx = make_context(1, tmp_path)
+    db = ctx.bot_data["db"]
+    q = _AnswerRaisesQ(kb.NOTIF_TOGGLE, asyncio.CancelledError())
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(h.notifications_toggle(cb_update(q), ctx))
+    # الـ commit حصل قبل الـ answer (تصميم)، لكن الإلغاء مااتبلعش.
+    assert db.get_notifications_enabled() is False
+    assert q.edits == []  # ماوصلش للتعديل (الإلغاء قطع التنفيذ)
 
 
 @pytest.mark.parametrize("data", ["notif:toggle", "notif:", "notif", "menu", "", "list:0", "notif:menuX"])

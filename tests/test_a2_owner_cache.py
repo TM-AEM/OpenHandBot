@@ -151,9 +151,21 @@ def test_fileservice_null_owner_forbidden():
 
 
 def test_fileservice_identity_failure_is_not_success():
+    """OHB2-SW-04: فشل `/users/me` (upstream) يفضل `UPSTREAM_ERROR` مش `UNAUTHORIZED`.
+
+    لسه **مفيش نجاح كاذب** (conv=None) — بس التفصيل محفوظ عشان ما يتلبّسش عطل خدمة
+    بوصف «رفض تفويض عادي». ده اللي كان بيسبب 403 بدل 502 قبل الإصلاح.
+    """
     client = CountingClient(me_error=ApiError("upstream", 503))
     conv, status = asyncio.run(FileService(client).authorize("c1"))
-    assert conv is None and status is FileStatus.UNAUTHORIZED  # مفيش نجاح كاذب
+    assert conv is None and status is FileStatus.UPSTREAM_ERROR  # مفيش نجاح كاذب
+
+
+def test_fileservice_identity_unknown_is_unauthorized_not_upstream():
+    """تحكّم مقابل: غياب الهوية (`{}`) يفضل `UNAUTHORIZED` (مش upstream)."""
+    client = CountingClient(uid=None)
+    conv, status = asyncio.run(FileService(client).authorize("c1"))
+    assert conv is None and status is FileStatus.UNAUTHORIZED
 
 
 # ------------------------------------------------- credential-model proof

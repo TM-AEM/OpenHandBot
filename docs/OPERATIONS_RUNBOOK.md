@@ -33,7 +33,7 @@ cp .env.example .env                  # واملأ القيم
 قبل أي تشغيل حقيقي، شغّل بوابة الانحدار مرة عشان تتأكد إن البيئة سليمة:
 
 ```bash
-python -m pyflakes bot/ main.py tests/
+python -m pyflakes bot/ automation/ main.py tests/
 python -m pytest -q
 ```
 
@@ -135,12 +135,18 @@ python main.py
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pyflakes bot/ main.py tests/   # لازم يخرج من غير أي تحذير
-python -m pytest -q                      # كل الاختبارات لازم تعدّي
+python -m pyflakes bot/ automation/ main.py tests/  # لازم يخرج من غير أي تحذير
+python -m pip_audit -r requirements-dev.txt                # SCA: لازم «No known vulnerabilities found»
+python -m bandit -r bot/ automation/ main.py -lll -s B613  # SAST: مفيش نتائج عالية الخطورة
+python -m pytest -q                                        # كل الاختبارات لازم تعدّي
 ```
 
-- نفس الخطوتين بتشتغلوا تلقائيًا في CI على `push`/`pull_request` لـ `main`، على
-  **Python 3.11 و3.13** (وظيفتان: «Tests & lint»).
+- نفس الخطوات بتشتغل تلقائيًا في CI على `push`/`pull_request` لـ `main`، على
+  **Python 3.11 و3.13** (وظيفتان: «Tests & lint» للـ Python + «Frontend tests (Node)»).
+- `pyflakes` بقى يغطّي `automation/` كمان (فحص ثابت AST، مش استيراد/تنفيذ ⇒ مفيش تشغيل
+  لأتمتة/autopush). `pip-audit` و`bandit` اتضافوا في OHB2-PHASE1E، و`bandit` كمان بقى
+  يغطّي `automation/` (AUD-07) — نفس سياسة الفشل عند أي نتيجة عالية الخطورة.
+- استثناء `B613` في bandit **مقصود**: علامات bidi (RTL) في التعليقات العربية، مش trojan-source.
 - تشغيلات سريعة مركّزة (اختيارية):
 
 ```bash
@@ -197,6 +203,74 @@ python -m pytest -q tests/test_watcher.py tests/test_u01_watcher.py
 - **مش exactly-once:** لو العملية اتقطعت بين ما تيليجرام يقبل الرسالة وما نسجّل النجاح
   (شيل المتابعة)، ممكن الإشعار يتبعت تاني بعد إعادة التشغيل — مفيش آلية idempotency
   مثبّتة بين تيليجرام والقاعدة. ده قيد معروف ومقصود، مش عطل.
+
+### حدود الاحتفاظ بحاجز تكرار التحديثات (`processed_updates`)
+
+حاجز الإدخال (`bot/handlers.py::dedupe_update`، مجموعة `-1`) بيمنع معالجة نفس `update_id`
+مرتين **طول ما سجله لسه موجود**. السجل نفسه (`processed_updates`) **محدود الحجم**، فالحماية
+**مش دائمة**. التفاصيل:
+
+**سياسة الاحتفاظ (retention):**
+- الثابت `PROCESSED_UPDATES_KEEP = 50_000` (`bot/handlers.py`). القيمة دي **عدد صفوف
+  محتفظ بيها (retention count)** — مش مدة زمنية، ومش حجم دفعة حذف.
+- التقليم بيحصل **مرة واحدة عند الإقلاع** (`bot/app.py::_post_init`، البند 1.1b) عبر
+  `Database.prune_processed_updates(keep)` (`bot/db.py`).
+- الترتيب المستخدم: **`ORDER BY processed_at DESC, update_id DESC`** ⇒ بيُحتفظ بأحدث
+  `keep` صف، والأقدم بيتحذف.
+- لو التقليم فشل، بيتسجّل `WARNING` و**مايمنعش الإقلاع** (مقصود: التقليم غير حرج).
+- **مهم:** الـ 50,000 **مش** «نافذة آمنة لإعادة التسليم». هو مجرد حدّ لحجم السجل؛ أي
+  `update_id` أقدم من آخر 50,000 سجل «معالَج» **مش محميّ** من إعادة التنفيذ.
+
+**طبيعة الضمان:**
+- `processed_updates` بيوفّر **كشف تكرار دائم للسجلات اللي لسه متخزّنة** (مفتاح أساسي
+  `update_id`، إدراج `INSERT OR IGNORE`).
+- التسجيل الدائم **بيحصل ذرّيًا مع كتابة العملية** في نفس معاملة SQLite (المسارات:
+  `add_or_group_outbox`، `add_creation_job`، `consume_one_shot_awaiting`،
+  `toggle_notifications_once`) ⇒ إما الاتنين يتكتبوا أو ولا واحد.
+- **بعد ما السجل يتقلّم، الحاجز مابيعرفش الـ `update_id` ده تاني.** لو نفس التحديث اتسلّم
+  تاني بعد كده، **ممكن يعدّي الحاجز وينفّذ عمليته تاني**.
+- يعني الميكانيزم **كشف تكرار محدود (bounded)**، **مش ضمان exactly-once**.
+- **استثناء مقصود:** عمليات مابتكتبش سجل تكرار دائم (أوامر، تنقّل، أزرار قراءة،
+  `watch:`/`unwatch:`) ⇒ إعادة تسليمها بتعيد التنفيذ عادي (أغلبها idempotent/قابلة
+  للتكرار عمدًا). ده **مختلف** عن مسار الحماية العادي اللي بيسجّل `update_id`.
+
+**دلالات polling في تيليجرام وPTB (مُتحقَّق منها في PTB v22.8):**
+- PTB بيقدّم `_last_update_id` **بعد** ما يحط التحديثات المجلوبة في طابور التحديثات،
+  **وقبل** ما الـ handler يخلّص (`.venv/.../telegram/ext/_updater.py`: `update_queue.put`
+  ثم `_last_update_id = updates[-1].update_id + 1`).
+- تيليجرام بيعدّ التحديث **مؤكَّدًا (confirmed)** لما نداء `getUpdates` لاحق يستخدم
+  `offset` أكبر من `update_id` بتاعه (توثيق Bot API الرسمي).
+- البوت بيشتغل بـ `run_polling(drop_pending_updates=True)` (`main.py`) ⇒ عند كل إقلاع
+  التحديثات المعلّقة على خادم تيليجرام **بتترمى**.
+- السلوكيات دي **بتقلّل** أو **بتلغي عمدًا** بعض فرص إعادة التسليم، لكنها **ماتحوّلش**
+  آلية الاحتفاظ في القاعدة لضمان exactly-once.
+
+**تمييز لازم (4 طبقات منفصلة):**
+1. تأكيد تيليجرام من جهة الخادم (عند `offset` أعلى).
+2. تقدّم `offset` في PTB (عند وضع التحديثات في الطابور).
+3. الكشف الدائم في التطبيق (`processed_updates`).
+4. اكتمال معاملة العملية (`commit`).
+مفيش طبقة فيهم بتوفّر ضمان «مرة واحدة بالظبط» بشكل مستقل.
+
+**المخاطر والحدود** (بحسب أدلة تحقيق `OHB2-PROCESSED-UPDATES-PRUNING-INVESTIGATION`):
+- تجربة **معزولة داخل الذاكرة** أثبتت إن تقليم سجل بيسمح لنفس `update_id` إنه يعدّي
+  الحاجز الحالي وينفّذ عملية دائمة تاني. التجربة بتثبت **الميكانيزم على مستوى التطبيق**،
+  **مش** إعادة تسليم فعلية من تيليجرام.
+- **إعادة التسليم الفعلية في الإنتاج لسه غير مُثبَتة**، والاحتمالية العملية **منخفضة جدًا**
+  في الإعداد الحالي (التقليم عند الإقلاع فقط + `drop_pending_updates=True`).
+- ده **قيد احتفاظ محدود (bounded-retention limitation)**، **مش** دليل على فساد بيانات
+  حالي ولا حادثة إنتاج مؤكّدة.
+
+**اعتبار مستقبلي (غير مُعتمد — للمراجعة فقط):** مراجعة تصميم مستقبلية ممكن تدرس سياسة
+احتفاظ بنافذة زمنية متوافقة مع مدة احتفاظ تيليجرام الموثّقة، أو سياسة هجينة (حد أدنى
+بالعدد + نافذة زمنية)، مع موازنة نمو التخزين والعبء التشغيلي. **مفيش سياسة جديدة
+مختارة أو مُنفَّذة هنا، ومفيش سياسة 24 ساعة معتمدة.**
+
+**مراجع المصدر:** `bot/handlers.py` (`PROCESSED_UPDATES_KEEP`، `dedupe_update`)،
+`bot/db.py` (`processed_updates`، `update_is_processed`، `_mark_processed_nocommit`،
+`prune_processed_updates`، دوال الكتابة الذرّية)، `bot/app.py` (استدعاء التقليم في
+`_post_init`)، `main.py` (`run_polling(drop_pending_updates=True)`)،
+`.venv/.../telegram/ext/_updater.py` (تقدّم `offset`).
 
 ## 8) الفحص والتسوية اليدوية
 

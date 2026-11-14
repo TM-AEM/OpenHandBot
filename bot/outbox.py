@@ -21,6 +21,7 @@ from .db import (
     CREATION_STARTING,
     CREATION_UNKNOWN,
     OUTBOX_CLAIMED,
+    OUTBOX_DISCARDED,
     OUTBOX_FAILED,
     OUTBOX_PENDING,
     OUTBOX_SENDING,
@@ -222,6 +223,78 @@ async def deliver_outbox(client, db, bot, outbox_id: int) -> None:
     await _post_claimed(client, db, bot, claimed)
 
 
+def _tombstoned(db, conversation_id: str) -> bool:
+    """هل الشات عليه شاهد حذف فعّال؟ **فشل مغلق**: أي خطأ قراءة ⇒ نعتبره متشاهد.
+
+    نفس سلوك حرّاس المراقب/المُبلّل: مسار إشعار المستخدم مايتكلّمش مع شات محذوف، وفشل
+    قراءة الشاهد أأمن نتيجته تخطّي الإرسال (مش إرسال محتمل لشات محذوف).
+
+    **قصدًا** حرّاس **القرار** في `_post_claimed` (المدخل + حدّ CAS) بتستخدم `db.is_deleted`
+    مباشرةً: خطأ قراءة هناك المفروض يطلع استثناء **قبل أي إرسال**. والحرس اللي بيمسك الاستثناء
+    غير المتوقّع (F-01) بعد كده بيرجّع السجل **'pending'** بـ CAS من 'claimed' (الـ POST
+    مابدأش ⇒ آمن)، أو 'failed' عند استنفاد الحد — والـ CAS من 'claimed' بس، فمستحيل يلخبط
+    سجل اتشطب/اتحسم بالتوازي. الحرس fail-closed ده للـ **إشعارات** بس، عشان خطأ عابر مايخلّيش
+    الإشعار يروح لشات محذوف.
+    """
+    try:
+        return db.is_deleted(conversation_id)
+    except Exception:  # noqa: BLE001 — قاعدة غير متاحة ⇒ فشل مغلق (تخطّي)
+        log.warning(
+            "تعذّر قراءة شاهد الحذف للشات %s؛ هيتخطّى إشعار المستخدم (فشل مغلق).",
+            conversation_id,
+        )
+        return True
+
+
+async def _recover_pre_cas_unexpected(db, bot, item, exc: BaseException) -> None:
+    """F-01: تعافي آمن لاستثناء **غير متوقّع** وقع في مرحلة ما قبل CAS الإرسال.
+
+    المرحلة دي كلها قبل CAS `claimed`⇒`sending`، يعني الـ POST **مابدأش** خالص، فالسجل
+    ممكن يفضل 'claimed' لو الاستثناء خرج من نداء بعيد (قراءة الشات/تشغيل الـ sandbox).
+    من غير التعافي ده السجل يفضل عالقًا لحد إعادة تشغيل العملية. نرجّعه **'pending'** بنفس
+    سياسة المحاولات الموجودة بالظبط (نفس `bump_outbox_attempt`/`MAX_OUTBOX_ATTEMPTS`/CAS من
+    'claimed') — مفيش سياسة جديدة ولا إعادة إرسال ولا حلقة.
+
+    - مفيش `await` بين قراءة العدّاد والـ CAS، والـ CAS من 'claimed' بس: أي تغيير متوازي
+      (شطب/حسم) ⇒ rowcount=0 ⇒ ما بنلمسش حاجة (مفيش clobber، مفيش إحياء).
+    - لو عملية التعافي نفسها فشلت (قاعدة غير متاحة) بنسجّل الفشل **مع** الاستثناء الأصلي
+      وما بنعلنش نجاح (مفيش ادّعاء تعافٍ وهمي).
+    """
+    outbox_id = item.id
+    label = f"خطأ غير متوقع ({type(exc).__name__})"
+    try:
+        attempts = db.bump_outbox_attempt(outbox_id, now_iso(), label)
+    except Exception:  # noqa: BLE001 — فشل التعافي نفسه: نسجّل الاستثناء الأصلي، ما نعلنش نجاح
+        log.exception(
+            "فشل تعافي السجل %s بعد خطأ غير متوقّع قبل CAS الإرسال (%s)",
+            outbox_id, type(exc).__name__,
+        )
+        return
+    if attempts == 0:
+        # السجل مش مملوك لينا دلوقتي (اتشطب/اتحسم بالتوازي) ⇒ ما نلمسش حاجة.
+        return
+    try:
+        if attempts >= MAX_OUTBOX_ATTEMPTS:
+            changed = db.set_outbox_status_if_in(
+                outbox_id, OUTBOX_FAILED, now_iso(), {OUTBOX_CLAIMED},
+                f"استنفد {attempts} محاولات",
+            )
+            if changed and not _tombstoned(db, item.conversation_id):
+                await safe_send(bot, item.chat_id, _OUTBOX_EXHAUSTED_NOTICE)
+        else:
+            changed = db.set_outbox_status_if_in(
+                outbox_id, OUTBOX_PENDING, now_iso(), {OUTBOX_CLAIMED}, label
+            )
+            if changed:
+                log.info("تعافي pre-CAS: السجل %s رجع 'pending' (خطأ غير متوقّع)", outbox_id)
+                if attempts == 1 and not _tombstoned(db, item.conversation_id):
+                    await safe_send(bot, item.chat_id, f"فشل الإرسال: {error_text(exc)}")
+    except Exception:  # noqa: BLE001 — فشل كتابة التعافي: نسجّل، وما نعلنش نجاح
+        log.exception(
+            "فشل كتابة تعافي السجل %s بعد خطأ غير متوقّع قبل CAS الإرسال", outbox_id
+        )
+
+
 async def _post_claimed(client, db, bot, item) -> None:
     """يحاول الـ POST لعنصر محجوز (claimed) ولسه الإرسال مابدأش.
 
@@ -230,13 +303,47 @@ async def _post_claimed(client, db, bot, item) -> None:
     هيفشل (rowcount=0) وما بنبعتش الـ POST خالص — فمفيش إرسال بعد إلغاء، ومفيش ادّعاء إلغاء
     وهمي. أي إلغاء/انقطاع قبل كده بيسيب 'claimed' ⇒ يتعافى 'pending' (آمن، الـ POST مابدأش).
     أي إلغاء/انقطاع بعد الـ CAS بيسيب 'sending' ⇒ يتعافى 'unknown' (غامض، مايتعادش تلقائياً).
+
+    F-1: بنفرض **شاهد الحذف** (fail-closed) مرتين قبل أي إرسال حامل للمحتوى: عند المدخل
+    (قبل أي نداء بعيد) وفورًا قبل CAS الإرسال (بعد التحضير اللي فيه `await` طويل). كده
+    أي شاهد يُكتب في **أي لحظة قبل** نجاح CAS `claimed`⇒`sending` بيمنع الإرسال تمامًا —
+    ونعلّم السجل `discarded` (CAS من `claimed`). الحدّ الوحيد اللي مابيتغطّاش محليًا هو
+    شاهد يُكتب **بعد** نجاح الـ CAS/بدء الـ POST فعلًا: ساعتها الحسم خارجي (شبكة/خدمة
+    بعيدة) ومابيتسحبش — والـ CAS في المسار بيتعامل معاه بأمان (النتيجة الغامضة ⇒ 'unknown'
+    بلا إعادة إرسال تلقائية).
+
+    F-01: استثناء **غير متوقّع** في مرحلة ما قبل CAS الإرسال (الـ POST مابدأش) مايسيبش السجل
+    عالقًا 'claimed': بنرجّعه 'pending' بـ CAS من 'claimed' وبنفس سياسة المحاولات (شوف
+    `_recover_pre_cas_unexpected`). أما بعد نجاح الـ CAS، الحالة 'sending' **ما تتلمسش**
+    تلقائيًا (at-most-once: ممكن الـ POST يكون اتقبل) — أي استثناء هناك يتحسم داخليًا
+    (ApiError ⇒ failed/unknown، CancelledError ⇒ unknown، عام ⇒ unknown) ومايتعادش أبدًا.
     """
     outbox_id = item.id
     conversation_id = item.conversation_id
     chat_id = item.chat_id
     text = item.text
 
+    # F-1 (إغلاق TOCTOU الحذف): الشات ممكن ياخد شاهد حذف **قبل** ما نوصل هنا. حذف الـ Mini App
+    # بيكتب الشاهد و'deleting' **قبل** النداء البعيد (`deletion.delete_conversation_remote`
+    # عبر `begin_remote_deletion`)، وسجلات الصندوق **ما بتتشطبش** غير في الإنهاء النهائي
+    # (`delete_conversation`) — يعني خلال نافذة deleting/uncertain السجل يفضل 'pending'/'claimed'
+    # والـ CAS 'claimed'⇒'sending' بينجح، فيتبعت محتوى شات اتحذف. الحرس ده أول حاجة (fail-closed
+    # عند فشل القراءة): لو فيه شاهد ⇒ مفيش أي نداء بعيد خالص، ونعلّم السجل 'discarded' (CAS من
+    # 'claimed') عشان مايتعاودش تلقائيًا ومايفضلش عالقًا. فيه حرس **تاني** عند حدّ الـ CAS
+    # (قبل الإرسال مباشرة) لتغطية شاهد يُكتب أثناء التحضير (الحالة 3).
+    #
+    # الحرس ده **جوه** try المرحلة pre-CAS عن قصد (F-01): فشل قراءة الشاهد (SQLite عابر)
+    # استثناء غير متوقّع **قبل** الـ CAS ⇒ لازم يتعافى 'pending' (إعادة محاولة) مش يسيب
+    # السجل عالقًا 'claimed'. وده بيحقّق النية الموثّقة في `_tombstoned` (الـ worker يرجّع
+    # السجل 'pending'). الحماية نفسها محفوظة: الشاهد بيتفحص **قبل** أي نداء بعيد.
     try:
+        if db.is_deleted(conversation_id):
+            db.set_outbox_status_if_in(
+                outbox_id, OUTBOX_DISCARDED, now_iso(), {OUTBOX_CLAIMED}, "اتحذف قبل الإرسال"
+            )
+            log.info("تخطّي الإرسال: الشات %s عليه شاهد حذف (قبل أي نداء بعيد)", conversation_id)
+            return
+
         conv = await get_conversation(client, conversation_id)
         sandbox_id = conv.get("sandbox_id")
         status = str(conv.get("sandbox_status", "")).upper()
@@ -258,7 +365,11 @@ async def _post_claimed(client, db, bot, item) -> None:
                     outbox_id, OUTBOX_FAILED, now_iso(), {OUTBOX_CLAIMED},
                     f"استنفد {attempts} محاولات (sandbox غير جاهز)",
                 )
-                await safe_send(bot, chat_id, _OUTBOX_EXHAUSTED_NOTICE)
+                # F-1 (فرض الشاهد على مسار إشعار المستخدم): لو الشات اتشاهد **أثناء**
+                # التحضير (شاهد اتكتب بعد حرس المدخل)، مانبعتش إشعارًا لشات محذوف — حتى
+                # لو النص خالٍ من المحتوى. fail-closed: أي خطأ قراءة ⇒ نتخطّى الإرسال.
+                if not _tombstoned(db, conversation_id):
+                    await safe_send(bot, chat_id, _OUTBOX_EXHAUSTED_NOTICE)
             else:
                 # محاولة آمنة فاشلة (قبل الـ POST) ⇒ نرجّع السجل مؤهّل 'pending' بـ CAS
                 # (الـ worker ياخده تاني بعد backoff). CAS من 'claimed' بس.
@@ -266,69 +377,32 @@ async def _post_claimed(client, db, bot, item) -> None:
                     outbox_id, OUTBOX_PENDING, now_iso(), {OUTBOX_CLAIMED},
                     "sandbox غير جاهز",
                 )
-                if attempts == 1:
+                if attempts == 1 and not _tombstoned(db, conversation_id):
                     await safe_send(bot, chat_id, _SANDBOX_NOT_READY_NOTICE)
             return
 
         # الإرسال هيبدأ حالاً: CAS 'claimed'⇒'sending' بثبات قبل الـ POST مباشرة (الـ commit
         # جوّه set_outbox_status_if_in). ده آخر حد آمن: بعده النتيجة غامضة. لو الـ CAS
         # فشل (المستخدم شطب العنصر في الأثناء) ⇒ مفيش POST خالص.
+        #
+        # F-1 (إغلاق السباق في النافذة): حرس المدخل فوق بيفحص الشاهد **مرة** قبل التحضير،
+        # لكن التحضير (get_conversation ثم resume_sandbox/wait_running — لحد 120 ثانية)
+        # فيه `await` طويل. لو الحذف اتخلّل خلاله (الحالة 3)، حرس المدخل بيبقى عدّى. نعيد
+        # الفحص هنا **فورًا قبل CAS الإرسال**، ومفيش `await` بين الفحص والـ CAS ⇒ الإرسال
+        # مايبدأش أبدًا لو الشاهد اتكتب في أي لحظة قبل حدّ الـ CAS. ده أقوى حدّ محلي ممكن
+        # (بعد الـ CAS الحسم خارجي ولا يمكن سحبه). CAS من 'claimed' بس (ما نلخبطش حسمًا أحدث).
+        if db.is_deleted(conversation_id):
+            db.set_outbox_status_if_in(
+                outbox_id, OUTBOX_DISCARDED, now_iso(), {OUTBOX_CLAIMED}, "اتحذف قبل الإرسال"
+            )
+            log.info("تخطّي الإرسال: الشات %s اتشاهد أثناء التحضير (قبل الـ CAS)", conversation_id)
+            return
         submitted_at = now_iso()  # قبل الـ POST: أي حدث للـ run الجديد لازم يكون أحدث منه
         if not db.set_outbox_status_if_in(
             outbox_id, OUTBOX_SENDING, submitted_at, {OUTBOX_CLAIMED}
         ):
             log.info("تخطّي الإرسال: السجل %s مش مملوك (اتشطب/اتغيّر قبل الـ POST)", outbox_id)
             return
-        try:
-            await client.send_message(conversation_id, text)
-        except ApiError as exc:
-            # رفض مؤكد (4xx) ⇒ 'failed'؛ غير كده (شبكة/مهلة/5xx) ⇒ 'unknown' — مش إعادة
-            # تلقائية. CAS من 'sending' بس: لو حالة أحدث (نهائية) حسمت السجل، ما نلخبطهاش.
-            if is_permanent(exc):
-                db.set_outbox_status_if_in(
-                    outbox_id, OUTBOX_FAILED, now_iso(), {OUTBOX_SENDING},
-                    f"HTTP {exc.status_code}",
-                )
-                await safe_send(bot, chat_id, f"البرومت اترفض: {describe_status(exc.status_code)}")
-            else:
-                db.set_outbox_status_if_in(
-                    outbox_id, OUTBOX_UNKNOWN, now_iso(), {OUTBOX_SENDING},
-                    safe_error_label(exc),
-                )
-                await safe_send(
-                    bot, chat_id,
-                    "مش قادرين نتأكد إن البرومت وصل. راجعه من الموقع قبل ما تعيد الإرسال.",
-                )
-            return
-        except asyncio.CancelledError:
-            # اتقطع أثناء الإرسال (shutdown) ⇒ النتيجة غامضة، مايتعادش تلقائياً.
-            db.set_outbox_status_if_in(
-                outbox_id, OUTBOX_UNKNOWN, now_iso(), {OUTBOX_SENDING}, "اتقطع أثناء الإرسال"
-            )
-            raise
-
-        if not db.complete_outbox_sent(
-            outbox_id,
-            now_iso(),
-            chat_id=chat_id,
-            conversation_id=conversation_id,
-            title=conv.get("title", ""),
-            last_state=conv.get("execution_status") or "",
-            submitted_at=submitted_at,
-            notice_text=_OUTBOX_SENT_NOTICE,
-        ):
-            # حالة أحدث حسمت السجل (نظرياً) ⇒ ما نعلنش نجاح فوق حسم أحدث.
-            log.info("السجل %s اتحسم بحالة أحدث قبل تسجيل 'sent'", outbox_id)
-            return
-        # OHB2-POST-PUB-01/F02 + OHB2-STABILIZATION-F02: الانتقال 'sent' وintent الإكمال
-        # المحلي اتسجّلوا في **معاملة واحدة** (مستحيل يبقى 'sent' من غير intent). دلوقتي
-        # ننفّذ الإكمال المحلي (إشعار + متابعة) — idempotent وقابل للتعافي، وبدون أي POST
-        # خارجي (at-most-once محفوظ). نبدأ المتابعة من الحالة الفعلية المرصودة للشات، مش
-        # "running" مفترضة (السبب في تقرير TASK 04A-3): الـ API مابيرجّعش معرّف run يربط
-        # البرومت الجديد بالـ run بتاعه، فتسجيل "running" ممكن يدّي المراقب انتقال وهمي.
-        await _complete_outbox(
-            db, bot, db.get_completion_pending(COMPLETION_KIND_OUTBOX, outbox_id)
-        )
     except ApiError as exc:
         # فشل قبل الـ POST (قراءة الشات / تشغيل الـ sandbox): الإرسال مابدأش ⇒ آمن يتعاود،
         # بس بحد (TASK 53): أول محاولة بتبلّغ (مؤقّت)، وبعد استنفاد الحد نعلّمه 'failed'
@@ -341,15 +415,102 @@ async def _post_claimed(client, db, bot, item) -> None:
                 outbox_id, OUTBOX_FAILED, now_iso(), {OUTBOX_CLAIMED},
                 f"استنفد {attempts} محاولات",
             )
-            await safe_send(bot, chat_id, _OUTBOX_EXHAUSTED_NOTICE)
+            # F-1: نفس حرس الإشعار — لو الشات أخد شاهد حذف أثناء التحضير (شاهد اتكتب
+            # خلال `await` النداء البعيد اللي رمى ApiError)، ما نبلّغش شات محذوف.
+            if not _tombstoned(db, conversation_id):
+                await safe_send(bot, chat_id, _OUTBOX_EXHAUSTED_NOTICE)
         else:
             # محاولة آمنة فاشلة (قبل الـ POST) ⇒ نرجّع السجل 'pending' بـ CAS من 'claimed'.
             db.set_outbox_status_if_in(
                 outbox_id, OUTBOX_PENDING, now_iso(), {OUTBOX_CLAIMED},
                 safe_error_label(exc),
             )
-            if attempts == 1:
+            if attempts == 1 and not _tombstoned(db, conversation_id):
                 await safe_send(bot, chat_id, f"فشل الإرسال: {error_text(exc)}")
+        # ⚠️ `return` إلزامي: كتلة POST-CAS تحت الكتلة دي، فأي سقوط هنا (تعافي pre-CAS
+        # ناجح) كان هيوصل لـ `client.send_message` رغم إن السجل ماوصلش 'sending' ⇒ POST
+        # مكرّر/خاطئ. تعافي pre-CAS **لازم** يقفل الدالة.
+        return
+    except Exception as exc:  # noqa: BLE001 — F-01: خطأ غير متوقّع **قبل** CAS الإرسال
+        # أي استثناء غير `ApiError` (خطأ برمجي/فكّ ترميز/قاعدة بيانات محلية...) قبل CAS
+        # `claimed`⇒`sending` معناه الـ POST **مابدأش** ⇒ آمن نرجّع السجل 'pending' بدل ما
+        # يفضل عالقًا لحد إعادة التشغيل. التعافي بنفس سياسة المحاولات والـ CAS من 'claimed'.
+        #
+        # ⚠️ النطاق مهم: الحرس ده بيغطّي **مرحلة ما قبل الـ CAS فقط**. الـ `try` الرئيسي
+        # بيتقفل عند نجاح CAS الإرسال؛ أي استثناء بعده (بما فيه `client.send_message`)
+        # بيتعالج جوه الـ `try` الداخلي المخصص (ApiError/CancelledError/عام) **مش** هنا،
+        # فمستحيل نصنّف فشل ما بعد الـ CAS على إنه آمن. و`asyncio.CancelledError` مش
+        # سليل `Exception` (BaseException) فمابيتـcaughtش هنا خالص ⇒ مفيش كتم إلغاء.
+        await _recover_pre_cas_unexpected(db, bot, item, exc)
+        return
+
+    # ===================== POST-CAS (السجل بقى 'sending' بثبات) =====================
+    # المنطقة دي بتشتغل **بس** لو الـ try اللي فوق خلص طبيعيًا، يعني CAS `claimed`⇒`sending`
+    # نجح (فشل الـ CAS بيرجع من جوه الـ try قبل ما نوصل هنا). من هنا الـ POST ممكن يبدأ،
+    # والنتيجة غامضة، فممنوع أي رجوع تلقائي لـ 'pending' وممنوع أي POST تاني.
+    try:
+        await client.send_message(conversation_id, text)
+    except ApiError as exc:
+        # رفض مؤكد (4xx) ⇒ 'failed'؛ غير كده (شبكة/مهلة/5xx/429) ⇒ 'unknown' — مش إعادة
+        # تلقائية. CAS من 'sending' بس: لو حالة أحدث (نهائية) حسمت السجل، ما نلخبطهاش.
+        if is_permanent(exc):
+            db.set_outbox_status_if_in(
+                outbox_id, OUTBOX_FAILED, now_iso(), {OUTBOX_SENDING},
+                f"HTTP {exc.status_code}",
+            )
+            await safe_send(bot, chat_id, f"البرومت اترفض: {describe_status(exc.status_code)}")
+        else:
+            db.set_outbox_status_if_in(
+                outbox_id, OUTBOX_UNKNOWN, now_iso(), {OUTBOX_SENDING},
+                safe_error_label(exc),
+            )
+            await safe_send(
+                bot, chat_id,
+                "مش قادرين نتأكد إن البرومت وصل. راجعه من الموقع قبل ما تعيد الإرسال.",
+            )
+        return
+    except asyncio.CancelledError:
+        # اتقطع أثناء الإرسال (shutdown) ⇒ النتيجة غامضة، مايتعادش تلقائياً. نعلّم 'unknown'
+        # من 'sending' بس، و**نعيد رفع** الإلغاء (ممنوع كتمه).
+        db.set_outbox_status_if_in(
+            outbox_id, OUTBOX_UNKNOWN, now_iso(), {OUTBOX_SENDING}, "اتقطع أثناء الإرسال"
+        )
+        raise
+    except Exception:  # noqa: BLE001 — خطأ غير متوقّع **بعد** الـ POST
+        # الـ POST ممكن يكون اتقبل بالفعل ⇒ at-most-once: ممنوع أي إعادة تلقائية. نسجّل
+        # 'unknown' (CAS من 'sending' بس) ونبلّغ المستخدم يراجع، وما نعملش أي POST تاني.
+        log.exception("خطأ غير متوقّع بعد CAS الإرسال للسجل %s", outbox_id)
+        db.set_outbox_status_if_in(
+            outbox_id, OUTBOX_UNKNOWN, now_iso(), {OUTBOX_SENDING}, "خطأ غير متوقّع بعد الإرسال"
+        )
+        await safe_send(
+            bot, chat_id,
+            "مش قادرين نتأكد إن البرومت وصل. راجعه من الموقع قبل ما تعيد الإرسال.",
+        )
+        return
+
+    if not db.complete_outbox_sent(
+        outbox_id,
+        now_iso(),
+        chat_id=chat_id,
+        conversation_id=conversation_id,
+        title=conv.get("title", ""),
+        last_state=conv.get("execution_status") or "",
+        submitted_at=submitted_at,
+        notice_text=_OUTBOX_SENT_NOTICE,
+    ):
+        # حالة أحدث حسمت السجل (نظرياً) ⇒ ما نعلنش نجاح فوق حسم أحدث.
+        log.info("السجل %s اتحسم بحالة أحدث قبل تسجيل 'sent'", outbox_id)
+        return
+    # OHB2-POST-PUB-01/F02 + OHB2-STABILIZATION-F02: الانتقال 'sent' وintent الإكمال
+    # المحلي اتسجّلوا في **معاملة واحدة** (مستحيل يبقى 'sent' من غير intent). دلوقتي
+    # ننفّذ الإكمال المحلي (إشعار + متابعة) — idempotent وقابل للتعافي، وبدون أي POST
+    # خارجي (at-most-once محفوظ). نبدأ المتابعة من الحالة الفعلية المرصودة للشات، مش
+    # "running" مفترضة (السبب في تقرير TASK 04A-3): الـ API مابيرجّعش معرّف run يربط
+    # البرومت الجديد بالـ run بتاعه، فتسجيل "running" ممكن يدّي المراقب انتقال وهمي.
+    await _complete_outbox(
+        db, bot, db.get_completion_pending(COMPLETION_KIND_OUTBOX, outbox_id)
+    )
 
 
 async def outbox_recover(app) -> None:

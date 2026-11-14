@@ -634,3 +634,72 @@ def test_collect_conversations_dedupe_does_not_loop_forever():
     assert c.calls == 4                       # محدود بالحد، مفيش حلقة
     assert [i["id"] for i in out["items"]] == ["dup"]  # اتدمج لصف واحد
     assert out["truncated"] is True           # لسه فيه صفحات ⇒ إعلان صريح
+
+
+# --------------------------------------------------- OHB2-MINIAPP: remote deletion
+def test_delete_conversation_calls_delete_and_returns_true():
+    seen = {}
+
+    def handler(request):
+        seen["method"] = request.method
+        seen["path"] = request.url.path
+        seen["auth"] = request.headers.get("authorization")
+        return httpx.Response(200, json={"success": True})
+
+    import asyncio
+
+    client = make_client(handler)
+    assert asyncio.run(client.delete_conversation("c1")) is True
+    assert seen["method"] == "DELETE"
+    assert seen["path"] == "/api/v1/app-conversations/c1"
+    assert seen["auth"] == "Bearer key"
+
+
+def test_delete_conversation_404_raises_with_status():
+    def handler(request):
+        return httpx.Response(404, json={"detail": "not found"})
+
+    import asyncio
+
+    client = make_client(handler)
+    with pytest.raises(ApiError) as exc:
+        asyncio.run(client.delete_conversation("gone"))
+    assert exc.value.status_code == 404
+
+
+def test_delete_conversation_non_success_envelope_is_rejected():
+    """200 بجسم `{"success": false}` (أو شكل غير متوقع) ممنوع يتحسب نجاح."""
+    def handler(request):
+        return httpx.Response(200, json={"success": False})
+
+    import asyncio
+
+    client = make_client(handler)
+    with pytest.raises(ApiError):
+        asyncio.run(client.delete_conversation("c1"))
+
+
+def test_conversation_exists_true_and_false():
+    state = {"present": True}
+
+    def handler(request):
+        assert request.url.path == "/api/v1/app-conversations"
+        return httpx.Response(200, json=[{"id": "c1"}] if state["present"] else [])
+
+    import asyncio
+
+    client = make_client(handler)
+    assert asyncio.run(client.conversation_exists("c1")) is True
+    state["present"] = False
+    assert asyncio.run(client.conversation_exists("c1")) is False
+
+
+def test_conversation_exists_upstream_error_raises():
+    def handler(request):
+        return httpx.Response(503, json={"detail": "down"})
+
+    import asyncio
+
+    client = make_client(handler)
+    with pytest.raises(ApiError):
+        asyncio.run(client.conversation_exists("c1"))

@@ -62,6 +62,54 @@ def test_copy_and_full_patterns_registered_without_clash(tmp_path):
         assert not any(re.match(p, other) for p in copy_full)
 
 
+def test_post_init_prunes_only_at_or_below_boundary(tmp_path, monkeypatch):
+    """OHB2-PLAN-01-STAGE3: الـ post_init يقلّم الصفوف `<= الحدّ` بس، ويحترم الذيل غير المؤكَّد."""
+    monkeypatch.setattr("bot.handlers.PROCESSED_UPDATES_KEEP", 1)  # سقف صغير لإظهار التقليم
+    app = build_application(make_config(tmp_path))
+    db = app.bot_data["db"]
+    # 1..4 مُعالَجة ومؤهّلة، والحدّ الدائم عند 3 ⇒ 1..3 مؤهّلين للتقليم، و4 ذيل محفوظ.
+    for i in range(1, 5):
+        db.mark_update_outcome(i, "t", "durable_completed")
+    db.set_setting(db.ACK_BOUNDARY_KEY, "3")
+
+    async def lifecycle():
+        await app.post_init(app)
+        # بنقرا **قبل** post_shutdown (اللي بيقفل القاعدة).
+        pruned = {
+            "count": db.count_processed_updates(),
+            "one": db.mark_update_processed(1, "t"),
+            "three": db.mark_update_processed(3, "t"),
+            "four": db.mark_update_processed(4, "t"),
+        }
+        await app.post_shutdown(app)
+        return pruned
+
+    result = asyncio.run(lifecycle())
+
+    # الحدّ=3 وkeep=1 ⇒ أحدث صف واحد من 1..3 (يعني 3) يفضل، و1/2 يتشالوا؛ و4 (فوق الحدّ) يفضل.
+    assert result["one"] is True   # اتشال (<= الحدّ وخارج نافذة keep)
+    assert result["three"] is False  # محفوظ (أحدث صف <= الحدّ)
+    assert result["four"] is False   # محفوظ (فوق الحدّ، ذيل غير مؤكَّد)
+    assert result["count"] == 2
+
+
+def test_post_init_does_not_prune_without_boundary(tmp_path, monkeypatch):
+    """مفيش حدّ ⇒ مفيش تقليم (كل الصفوف تفضل للديدَب) حتى مع سقف صغير."""
+    monkeypatch.setattr("bot.handlers.PROCESSED_UPDATES_KEEP", 1)
+    app = build_application(make_config(tmp_path))
+    db = app.bot_data["db"]
+    for i in range(1, 4):
+        db.mark_update_processed(i, "t")
+
+    async def lifecycle():
+        await app.post_init(app)
+        count = db.count_processed_updates()
+        await app.post_shutdown(app)
+        return count
+
+    assert asyncio.run(lifecycle()) == 3
+
+
 def test_post_init_single_worker_after_recovery_and_clean_shutdown(tmp_path, monkeypatch):
     calls = {"worker_start": 0, "worker_stop": 0, "watcher_start": 0, "watcher_stop": 0}
     order = []

@@ -221,7 +221,7 @@ test("بعد نجاح الحذف الشات بيختفي من القايمة ف�
   fetch.route((c) => c.path === "/conversations/c1/files", () => ({ status: 200, data: { conversation_id: "c1", files: [] } }));
   fetch.route((c) => c.method === "DELETE" && c.path === "/conversations/c1", () => {
     deleted = true;
-    return { status: 200, data: { ok: true, deleted: true, local_only: true } };
+    return { status: 200, data: { ok: true, deleted: true, remote_deleted: true } };
   });
 
   doc.getElementById("tab-chats").click();
@@ -241,4 +241,37 @@ test("بعد نجاح الحذف الشات بيختفي من القايمة ف�
   rows = doc.getElementById("chats-list").children.filter((c) => c.className.split(" ").includes("row"));
   assert.equal(rows.length, 0, "الشات اختفى من القايمة بعد الحذف");
   assert.equal(doc.getElementById("view-chats").hidden, false, "رجعنا لقايمة الشاتات");
+});
+
+// ---------------------------------------------- OHB2-MINIAPP: remote deletion UX
+test("نص التأكيد بيقول إن الحذف من OpenHands (مش محلي)", async () => {
+  const env = await mkEnv();
+  await openDetail(env, { id: "c1", title: "T", watched: false });
+  const { doc } = env;
+  const view = doc.getElementById("view-detail");
+
+  const note = findText(view, "متأكد إنك عايز تحذف");
+  assert.ok(note, "لازم يكون فيه نص تأكيد");
+  assert.ok(note.textContent.indexOf("OpenHands") !== -1, "النص يوضّح إن الحذف من OpenHands");
+  assert.equal(note.textContent.indexOf("حذف محلي"), -1, "مفيش ادّعاء حذف محلي");
+});
+
+test("نجاح الحذف البعيد يرجّع للقايمة برسالة نجاح", async () => {
+  const env = await mkEnv();
+  await openDetail(env, { id: "c1", title: "T", watched: false });
+  const { doc, fetch } = env;
+
+  fetch.route((c) => c.method === "DELETE" && c.path === "/conversations/c1", () => ({
+    status: 200, data: { ok: true, deleted: true, remote_deleted: true },
+  }));
+
+  findButton(doc.getElementById("view-detail"), "🗑 حذف الشات").click();
+  await flush();
+  findButton(doc.getElementById("view-detail"), "🗑 أكّد الحذف").click();
+  await flush();
+
+  assert.equal(doc.getElementById("view-chats").hidden, false, "رجعنا لقايمة الشاتات");
+  const toast = doc.getElementById("toast");
+  assert.equal(toast.hidden, false, "لازم تبان رسالة نجاح");
+  assert.ok(toast.textContent.indexOf("OpenHands") !== -1, "الرسالة تذكر OpenHands");
 });

@@ -1,0 +1,6 @@
+{
+  "name": "OpenHandBot",
+  "description": "Imported TM-AEM/OpenHandBot repository workspace.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

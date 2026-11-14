@@ -15,13 +15,20 @@ import logging
 import math
 import time
 
-from ..errors import ApiError
+from ..errors import ApiError, ResponseTooLargeError
 from ..messages import get_status, pr_url, state_label, truncate
 from ..openhands_client import collect_conversations
 from .. import features
 from .. import outbox
+from .. import deletion
 from .. import db as db_module
-from ..db import INBOX_PAGE_SIZE
+from ..db import (
+    INBOX_DELETE_DELETED,
+    INBOX_DELETE_MISSING,
+    INBOX_PAGE_SIZE,
+    MAX_PAGE,
+    MAX_SQLITE_INT,
+)
 from ..files import (
     CONVERSATION_ERRORS,
     FILE_CONTENT_STATUSES,
@@ -40,6 +47,10 @@ log = logging.getLogger(__name__)
 PAGE_SIZE = 10
 MAX_PROMPT_CHARS = 8000
 MAX_REPO_LEN = 200
+# OHB2-PHASE1B: حدّ أعلى لنص الرد الكامل اللي بيتحوّل للواجهة عند «نسخ الرد الكامل».
+# المعاينة العادية في التفاصيل محدودة بـ 4000 محرف؛ النسخ الكامل بياخد النص الأطول
+# (محدود) عشان مايتقصّش بصريًا، مع سقف صلب يمنع تضخيم ذاكرة/رد غير محدود.
+MAX_FULL_REPLY_CHARS = 100_000
 # OHB2-07: معرّف العملية اللي العميل يولّده (idempotency). قاصر على حروف/أرقام/شرطة
 # وشرطة سفلية، بطول محدود، عشان ما يتحوّلش لقناة حقن أو مفتاح ضخم في الذاكرة/القاعدة.
 MAX_REF_LEN = 64
@@ -72,6 +83,41 @@ _TERMINAL_OUTBOX = {db_module.OUTBOX_SENT, db_module.OUTBOX_FAILED, db_module.OU
 # الحالية بعلامة "الإلغاء غير مؤكد" (حدّ الإلغاء C2). ده يمنع ادّعاء إلغاء وهمي.
 _DISCARDABLE_OUTBOX = {db_module.OUTBOX_PENDING, db_module.OUTBOX_CLAIMED}
 _NOT_CONFIRMED_OUTBOX = {db_module.OUTBOX_SENDING, db_module.OUTBOX_UNKNOWN}
+# OHB2-PHASE1D: نفس مجموعات الحدّ لطلب الشات الجديد (creation job) — parity مع البوت.
+# الحالات النهائية: done/failed/discarded. الإلغاء (cancel/discard) مسموح **بس** في
+# `pending`/`claimed` (اللي الكود بيثبت إن الـ POST لسه مابدأش). `starting`/`unknown`
+# = الـ POST ممكن يكون بدأ ⇒ مفيش ادّعاء إلغاء (not_confirmed). `done` ⇒ فيه محادثة
+# بعيدة، مستحيل نلغيه أو نعمل POST تاني (at-most-once محفوظ).
+_TERMINAL_CREATION = {db_module.CREATION_DONE, db_module.CREATION_FAILED, db_module.CREATION_DISCARDED}
+_DISCARDABLE_CREATION = {db_module.CREATION_PENDING, db_module.CREATION_CLAIMED}
+_NOT_CONFIRMED_CREATION = {db_module.CREATION_STARTING, db_module.CREATION_UNKNOWN}
+# OHB2-PHASE1D: وصف آمن لحدّ POST البدء (للعرض فقط؛ القرار النهائي في `reconcile_creation`).
+#   not_started : الكود بيثبت إن POST البدء لسه مابدأش (pending/claimed).
+#   uncertain   : POST البدء ممكن يكون بدأ ونتيجته غامضة (starting/unknown).
+#   started     : POST البدء اتأكد ونجح (done) — فيه محادثة بعيدة.
+#   failed      : رفض نهائي مؤكد (failed).
+#   cancelled   : اتلغى قبل الإرسال (discarded).
+_CREATION_POST_STATE = {
+    db_module.CREATION_PENDING: "not_started",
+    db_module.CREATION_CLAIMED: "not_started",
+    db_module.CREATION_STARTING: "uncertain",
+    db_module.CREATION_UNKNOWN: "uncertain",
+    db_module.CREATION_DONE: "started",
+    db_module.CREATION_FAILED: "failed",
+    db_module.CREATION_DISCARDED: "cancelled",
+}
+
+
+def _creation_post_started(job) -> bool:
+    """هل POST البدء **بدأ فعلاً** (أو ممكن يكون بدأ) لهذا الطلب؟
+
+    `task_id` دليل قاطع: الكود بيسجّله **بس** بعد ما `client.start_conversation`
+    يرجّعه (`outbox.py`)، وبيفضل محفوظ بعد التعافي (بيتحجز `claimed` بـ `RETURNING *`
+    والاستعادة بترجّعه `pending`). فأي صف عليه `task_id` = الـ POST اترجع ⇒ **مستحيل**
+    نعتبره "لسه مابدأش" حتى لو حالته `pending`/`claimed` (قبل الإصلاح ده كان بيدّي
+    إلغاء كاذب ويحوّل شات بعيد حقيقي لـ 'discarded' من غير تسجيل conversation_id).
+    """
+    return bool(getattr(job, "task_id", None)) or job.status not in _DISCARDABLE_CREATION
 
 
 class ValidationError(ValueError):
@@ -115,8 +161,22 @@ def _require_id(value: str | None) -> str:
     return text
 
 
-def _require_text(value: str | None) -> str:
-    text = (value or "").strip()
+def _as_str(value, message: str) -> str:
+    """يرجّع الحقل كنص، أو يرفضه بـ ValidationError.
+
+    حقول JSON الخام ممكن تكون رقم/قائمة/كائن؛ `(value or "").strip()` عليها يضرب
+    AttributeError (500). نفس نمط إصلاح OHB2-PHASE1D-F3، لكن في طبقة الخدمة عشان
+    كل المسارات اللي بتمرّر حقول JSON تستفيد (مش مسار واحد).
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValidationError(message)
+    return value
+
+
+def _require_text(value) -> str:
+    text = _as_str(value, "النص لازم يكون نص").strip()
     if not text:
         raise ValidationError("النص مطلوب")
     if len(text) > MAX_PROMPT_CHARS:
@@ -124,8 +184,8 @@ def _require_text(value: str | None) -> str:
     return text
 
 
-def _require_repo(value: str | None) -> str:
-    text = (value or "").strip()
+def _require_repo(value) -> str:
+    text = _as_str(value, "اسم المستودع غير صالح").strip()
     if not text or len(text) > MAX_REPO_LEN:
         raise ValidationError("اسم المستودع غير صالح")
     parts = text.split("/")
@@ -142,20 +202,54 @@ def _optional_repo(value: str | None) -> str | None:
     فاضي/غايب ⇒ None (شات بدون مستودع). لو فيه قيمة ⇒ نفس تحقق `_require_repo`
     الصارم (شكل owner/repo). كده ما بنسمحش بمستودع مشوّه، وبنسمح صريحًا ببدونه.
     """
-    text = (value or "").strip()
+    text = _as_str(value, "اسم المستودع غير صالح").strip()
     if not text:
         return None
     return _require_repo(text)
 
 
-def _require_ref(value: str | None) -> str:
+def _require_ref(value) -> str:
     """يتحقّق من معرّف العملية اللي العميل يولّده (idempotency) أو يرجّع فاضي."""
-    text = (value or "").strip()
+    text = _as_str(value, "معرّف العملية غير صالح").strip()
     if not text:
         return ""
     if len(text) > MAX_REF_LEN or not all(ch.isalnum() or ch in "-_" for ch in text):
         raise ValidationError("معرّف العملية غير صالح")
     return text
+
+
+def _page_number(page) -> int:
+    """يرجّع رقم الصفحة كـ int داخل `[0, MAX_PAGE]` أو يرفضه بـ ValidationError.
+
+    AUD-04: نتحقق **قبل** أي ضرب. الرفض موحّد عبر كل مسارات الترقيم (400) — مفيش
+    تكميم صامت لقيمة سالبة/ضخمة، عشان المدخل غير الصالح يبان للمستخدم بدل ما يتحوّل
+    لصفحة أولى مضلّلة. القيم المسموحة (بما فيها 0 والصفحات الفاضية داخل السقف)
+    بتتحفظ بنفس دلالات الترقيم القائمة.
+    """
+    try:
+        value = int(page)
+    except (TypeError, ValueError):
+        raise ValidationError("رقم الصفحة غير صالح") from None
+    if isinstance(page, bool) or (not isinstance(page, (int, str))):
+        raise ValidationError("رقم الصفحة غير صالح")
+    if value < 0 or value > MAX_PAGE:
+        raise ValidationError("رقم الصفحة غير صالح")
+    return value
+
+
+def _page_offset(page, size: int) -> int:
+    """يحوّل رقم صفحة إلى offset آمن أو يرفضه بـ ValidationError.
+
+    AUD-04: كل مسارات الترقيم بتمرّ من هنا. بنتحقق إن `page` عدد صحيح داخل
+    `[0, MAX_PAGE]` **قبل** أي ضرب، ونتأكد إن `offset = page × size` داخل نطاق
+    SQLite (64-bit). كده مستحيل يوصل `offset` ضخم لـ SQLite ⇒ مفيش OverflowError/500،
+    ومفيش استعلام بيتنفّذ بقيمة غير صالحة. نفس دلالة الرفض لكل المسارات (400).
+    """
+    value = _page_number(page)
+    offset = value * int(size)
+    if offset < 0 or offset > MAX_SQLITE_INT:
+        raise ValidationError("رقم الصفحة غير صالح")
+    return offset
 
 
 def _conversation_dto(conv: dict, watched: bool) -> dict:
@@ -239,6 +333,27 @@ def _cost_dto(conv: dict) -> dict:
     }
 
 
+# OHB2-PHASE1B: تصدير الشات من الـ Mini App بنفس صيغة البوت (zip من OpenHands) ونفس
+# الحدود. اسم الملف بيتولّد من معرّف **متفوَّض عليه** (بعد التحقق)، وبيتنقّى لمجموعة
+# محارف آمنة عشان مايتحوّلش لقناة حقن في الهيدر (CR/LF) أو مسار.
+EXPORT_CONTENT_TYPE = "application/zip"
+_EXPORT_NAME_SAFE = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+)
+
+
+def export_filename(conversation_id: str) -> str:
+    """اسم ملف تنزيل آمن (`conversation-<id>.zip`).
+
+    المعرّف لازم يكون **صالح** (حروف/أرقام/`-`/`_` بطول محدود) — نتأكد تاني هنا
+    (دفاع بعمق) وبعدين ننقّي أي محرف تاني. النتيجة قاصر على محارف آمنة ⇒ مفيش CR/LF
+    ولا اقتباس ولا مسار، فمفيش response-header injection ولا اجتياز مسار.
+    """
+    cid = conversation_id if is_valid_conversation_id(conversation_id) else ""
+    safe = "".join(ch for ch in cid if ch in _EXPORT_NAME_SAFE)
+    return f"conversation-{safe}.zip" if safe else "conversation.zip"
+
+
 class MiniAppService:
     """عمليات الـ Mini App فوق نفس client/db/outbox بتاع البوت."""
 
@@ -257,16 +372,24 @@ class MiniAppService:
             raise ApiError("خدمة OpenHands مش متاحة دلوقتي.", 503)
         return self._client
 
-    async def _authorize_conversation(self, conversation_id: str) -> dict:
+    async def _authorize_conversation(self, conversation_id: str, *, allow_deleted: bool = False) -> dict:
         """يفوّض شات واحد عبر الخدمة المشتركة **قبل** أي جلب بيانات محمية (OHB2-09-A2-02).
 
         بترجّع الميتاداتا المتفوَّض عليها أو بترمي `FileApiError` منظّم (403/404/502).
         كل مسار شات في الـ Mini App بيعدي من هنا — مفيش مقارنة مالك مكرّرة في مسار.
+
+        F-1: بنمرّر قاعدة البيانات المالكة (`self._db`) عشان فرض شاهد الحذف يحصل **قبل**
+        أي نداء بعيد — الشات المتشاهد يُرفض بـ `DELETED` ⇒ رد «مش موجود» (404).
+        `allow_deleted=True` استثناء مقصود لعمليتين صريحتين بس (مش قراءة): **إعادة
+        التفاعل (`watch`)** و**إعادة محاولة الحذف** — دول بيعتمدوا على طبقة القاعدة
+        (reengage/CAS الحذف) للتعامل مع الحالة المتشاهدة بأمان.
         """
         client = self._require_client()
         if self._identity is None:
             self._identity = IdentityCache(client)
-        conv, status = await authorize_conversation(client, self._identity, conversation_id)
+        conv, status = await authorize_conversation(
+            client, self._identity, conversation_id, self._db, allow_deleted=allow_deleted
+        )
         if conv is None:
             raise self._conversation_error(status)
         return conv
@@ -279,12 +402,24 @@ class MiniAppService:
         return CodedApiError(code, message, http)
 
     def _wake(self, key: str) -> None:
-        """ينبّه الـ worker المالك الموجود (نفس العملية) لو موجود — بدون إنشاء worker."""
+        """ينبّه الـ worker المالك الموجود (نفس العملية) لو موجود — بدون إنشاء worker.
+
+        بعض كيانات `bot_data` (Watcher/Notifier) **ملهاش** `wake()`؛ النداء الأعمى عليها
+        كان يضرب AttributeError (500) بعد حذف بعيد **نجح بالفعل**، فيبان للمستخدم فشل
+        مش موجود. بننادي `wake()` بس لو موجودة فعلاً، وأي استثناء من التنبيه نفسه
+        (مش من العملية الأصلية) بنبتلعه بعد تسجيله — التنبيه ثانوي ومستحيل يفشّل عملية
+        نجحت. (ده مش إخفاء خطأ: العملية الأصلية مسجّلة ومُرجَعة بحالتها الحقيقية.)
+        """
         if self._application is None:
             return
         worker = self._application.bot_data.get(key)
-        if worker is not None:
-            worker.wake()
+        wake = getattr(worker, "wake", None)
+        if not callable(wake):
+            return
+        try:
+            wake()
+        except Exception:  # noqa: BLE001 — تنبيه ثانوي لا يفشّل عملية نجحت
+            log.warning("فشل تنبيه الـ worker %r بعد عملية ناجحة؛ بنتجاهله.", key)
 
     def _list_cache(self):
         if self._application is None:
@@ -334,25 +469,32 @@ class MiniAppService:
         return bool(enabled)
 
     # ------------------------------------------------------ notification inbox
-    def list_notifications(self, page: int = 0, unread_only: bool = False) -> dict:
+    def list_notifications(
+        self, page: int = 0, unread_only: bool = False, archived: bool = False
+    ) -> dict:
         """قايمة صندوق الإشعارات (الأحدث أولًا) بترقيم محدود على مستوى SQL.
 
         payload محدود (LIMIT/OFFSET) زي باقي القوايم؛ `unread_count` بيساعد الواجهة
         تعرض شارة غير المقروء من غير ما تجيب كل الصفحات. لو القاعدة مش متاحة، نرجّع
         فاضي بدل ما نكسّر الصفحة (زي `bootstrap`).
+
+        OHB2-PHASE1C: `archived=False` (الافتراضي) = الصندوق النشط؛ `archived=True` =
+        عرض الأرشيف. `unread_count` بيفضل على النشط دايمًا (الأرشيف ما بيأثّرش على الشارة).
         """
         if self._db is None:
             return {"page": 0, "has_more": False, "unread_count": 0, "items": []}
-        page = max(0, page)
-        offset = page * INBOX_PAGE_SIZE
+        page = _page_number(page)
+        offset = _page_offset(page, INBOX_PAGE_SIZE)
         items = self._db.list_inbox(
-            limit=INBOX_PAGE_SIZE, offset=offset, unread_only=unread_only
+            limit=INBOX_PAGE_SIZE, offset=offset, unread_only=unread_only, archived=archived
         )
         # لو الصفحة فاضية بسبب تجاوز الحد، نرجع للأولى (زي قايمة المتابعات).
         if not items and page > 0:
             page, offset = 0, 0
-            items = self._db.list_inbox(limit=INBOX_PAGE_SIZE, offset=0, unread_only=unread_only)
-        total = self._db.count_inbox(unread_only=unread_only)
+            items = self._db.list_inbox(
+                limit=INBOX_PAGE_SIZE, offset=0, unread_only=unread_only, archived=archived
+            )
+        total = self._db.count_inbox(unread_only=unread_only, archived=archived)
         return {
             "page": page,
             "has_more": total > offset + len(items),
@@ -360,8 +502,13 @@ class MiniAppService:
             "items": [self._inbox_dto(it) for it in items],
         }
 
-    @staticmethod
-    def _inbox_dto(item) -> dict:
+    def _inbox_dto(self, item) -> dict:
+        # OHB2-PHASE1C: هل السيرفر يعتبر الصف مؤهّلًا للحذف النهائي؟ بنستدعي **نفس** فحص
+        # الأهلية بتاع مسار الحذف (`inbox_item_delete_eligibility`) عشان الإشارة للواجهة
+        # ما تختلفش عن التنفيذ أبدًا. القرار النهائي بيتفرض على السيرفر وقت الحذف نفسه.
+        deletable = False
+        if self._db is not None and item.id is not None:
+            deletable = self._db.inbox_item_delete_eligibility(item.id) == INBOX_DELETE_DELETED
         return {
             "id": item.id,
             "conversation_id": item.conversation_id,
@@ -370,6 +517,9 @@ class MiniAppService:
             "message": item.message or "",
             "created_at": item.created_at or "",
             "read": not item.unread,
+            # OHB2-PHASE1C: محور الأرشفة (مستقل) — الواجهة تعرف تعرض زر أرشفة/استرجاع.
+            "archived": bool(item.archived),
+            "deletable": deletable,
             # OHB2-08-05 (Batch 3R): حالة التسليم المتينة — عشان الواجهة تفرّق بين
             # إشعار اتسلّم وإشعار لسه معلّق أو فشل (event-first، مش تسجيل تاريخي بس).
             "delivery_status": getattr(item, "delivery_status", None) or "delivered",
@@ -380,12 +530,7 @@ class MiniAppService:
     def mark_notification_read(self, item_id) -> dict:
         if self._db is None:
             raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
-        try:
-            ident = int(item_id)
-        except (TypeError, ValueError):
-            raise ValidationError("معرّف الإشعار غير صالح")
-        if ident <= 0:
-            raise ValidationError("معرّف الإشعار غير صالح")
+        ident = self._inbox_item_id(item_id)
         ok = self._db.mark_inbox_read(ident, outbox.now_iso())
         if not ok:
             raise ApiError("الإشعار مش موجود.", 404)
@@ -396,6 +541,66 @@ class MiniAppService:
             raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
         changed = self._db.mark_all_inbox_read(outbox.now_iso())
         return {"ok": True, "marked": changed, "unread_count": self._db.count_inbox(unread_only=True)}
+
+    @staticmethod
+    def _inbox_item_id(item_id) -> int:
+        """يتحقّق من معرّف عنصر الصندوق (عدد صحيح موجب) أو يرفع ValidationError."""
+        try:
+            ident = int(item_id)
+        except (TypeError, ValueError):
+            raise ValidationError("معرّف الإشعار غير صالح")
+        if ident <= 0 or ident > MAX_SQLITE_INT:
+            raise ValidationError("معرّف الإشعار غير صالح")
+        return ident
+
+    def archive_notification(self, item_id) -> dict:
+        """يؤرشف إشعار (idempotent، قابل للعكس). ما بيغيّرش التسليم/القراءة/العملية."""
+        if self._db is None:
+            raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
+        ident = self._inbox_item_id(item_id)
+        ok = self._db.archive_inbox_item(ident, outbox.now_iso())
+        if not ok:
+            raise ApiError("الإشعار مش موجود.", 404)
+        return {
+            "ok": True,
+            "archived": True,
+            "unread_count": self._db.count_inbox(unread_only=True),
+        }
+
+    def unarchive_notification(self, item_id) -> dict:
+        """يلغي أرشفة إشعار (idempotent) ويرجّعه للصندوق النشط بنفس الهوية."""
+        if self._db is None:
+            raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
+        ident = self._inbox_item_id(item_id)
+        ok = self._db.unarchive_inbox_item(ident)
+        if not ok:
+            raise ApiError("الإشعار مش موجود.", 404)
+        return {
+            "ok": True,
+            "archived": False,
+            "unread_count": self._db.count_inbox(unread_only=True),
+        }
+
+    def delete_notification(self, item_id) -> dict:
+        """يحذف إشعار نهائيًا **بس لو مؤهّل** (القرار بيتفرض على السيرفر).
+
+        الصفوف المحمية (معلّقة/فاشلة/غير مقروءة/مرجع تسوية) بترجّع 409 و`deleted: false`
+        من غير أي تغيير ⇒ مفيش نجاح كاذب ولا فقد دليل تشغيلي.
+        """
+        if self._db is None:
+            raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
+        ident = self._inbox_item_id(item_id)
+        verdict = self._db.delete_inbox_item(ident)
+        if verdict == INBOX_DELETE_MISSING:
+            raise ApiError("الإشعار مش موجود.", 404)
+        if verdict != INBOX_DELETE_DELETED:
+            # محمي: الإشعار لسه بيحمل دليلًا تشغيليًا (تسليم/تسوية) أو لسه ما اتقراش.
+            raise ApiError("الإشعار ده محمي من الحذف النهائي.", 409)
+        return {
+            "ok": True,
+            "deleted": True,
+            "unread_count": self._db.count_inbox(unread_only=True),
+        }
 
     # ------------------------------------------------------ conversations
     async def list_conversations(self, page: int = 0, refresh: bool = False) -> dict:
@@ -417,8 +622,8 @@ class MiniAppService:
         # مصدر القايمة بعيد (search) فمش عارف بالحذف المحلي؛ نفلترها قبل الترقيم عشان
         # الشات المحذوف ما يظهرش تاني بعد refresh (من غير انتظار دورة البوت).
         items = self._without_deleted(items)
-        page = max(0, page)
-        start = page * PAGE_SIZE
+        page = _page_number(page)
+        start = _page_offset(page, PAGE_SIZE)
         chunk = items[start : start + PAGE_SIZE]
         if not chunk and page > 0:
             page, start, chunk = 0, 0, items[:PAGE_SIZE]
@@ -433,17 +638,14 @@ class MiniAppService:
     def _without_deleted(self, items: list[dict]) -> list[dict]:
         """يشيل أي شات عليه شاهد حذف محلي (OHB2-C7) من قايمة الـ Mini App.
 
-        OHB2-AUDIT-FIX-04 (فشل مغلق): لو تعذّر قراءة شواهد الحذف (قاعدة غير متاحة)،
-        بنرجّع قايمة **فاضية** بدل القايمة غير المفلترة — ما نعرّضش شات محذوف للظهور
-        بالغلط. الإخفاء المؤقت أأمن من الإظهار الخاطئ.
+        OHB2-SW03 (كان OHB2-AUDIT-FIX-04): فشل قراءة الشواهد **مايتحوّلش** لقايمة فاضية.
+        بنستخدم `db.is_deleted_with_retry` (إعادة محدودة للعابر BUSY/LOCKED ثم رفع الاستثناء
+        الأصلي)، والفشل بينتشر لحد ما الـ route يحوّله لـ 500 عام — بدل رد 200 فاضي مضلّل.
+        الفراغ الحقيقي (مدخل فاضي أو كل الشاتات متشاهدة) لسه بيرجّع `[]` بشكل مشروع.
         """
         if self._db is None or not items:
             return items
-        try:
-            return [c for c in items if not self._db.is_deleted(c.get("id") or "")]
-        except Exception:  # noqa: BLE001 — قاعدة غير متاحة ⇒ نفشل مقفولين
-            log.warning("تعذّر قراءة شواهد الحذف؛ بنخفي القايمة مؤقتًا (فشل مغلق).")
-            return []
+        return [c for c in items if not self._db.is_deleted_with_retry(c.get("id") or "")]
 
     def _list_item(self, conv: dict, watched: set[str]) -> dict:
         status = get_status(conv)
@@ -491,6 +693,58 @@ class MiniAppService:
         conv = await self._authorize_conversation(cid)
         return _conversation_dto(conv, cid in self._watched_ids())
 
+    async def get_full_reply(self, conversation_id: str) -> dict:
+        """OHB2-PHASE1B: الرد الكامل للـ assistant (مصدر زر «نسخ الرد الكامل»).
+
+        التفويض أولًا (نفس عقد الملكية)، ثم **نفس** `get_last_exchange` اللي البوت
+        بيستخدمه. بترجّع النص الكامل (بلا قصّ بصري) + علم `reply_truncated` لو عدّى
+        السقف الصلب `MAX_FULL_REPLY_CHARS` (حالة نادرة جدًا). مفيش أي معرّفات داخلية
+        ولا بيانات غير مصرّح بها — النص بس + العلم.
+        """
+        cid = _require_id(conversation_id)
+        client = self._require_client()
+        await self._authorize_conversation(cid)
+        _user_text, reply = await client.get_last_exchange(cid)
+        text, cut = truncate(reply, MAX_FULL_REPLY_CHARS)
+        return {"conversation_id": cid, "reply": text, "reply_truncated": cut}
+
+    async def export_conversation(self, conversation_id: str):
+        """OHB2-PHASE1B: تصدير الشات (zip) للمستخدم المصرّح له — نفس صيغة البوت.
+
+        بترجّع `(data, filename)` أو بترمي `CodedApiError` منظّم. الترتيب المهم:
+
+        1. **التفويض قبل أي تنزيل** (ملكية الشات من `/users/me` + `created_by_user_id`،
+           فشل مغلق) — مفيش ثقة في أي هوية من العميل، والمستخدم جاي من الجلسة.
+        2. **فحص شاهد الحذف المحلي** بعد التفويض وقبل التنزيل: شات محذوف/مُعلَّم لا
+           يُصدَّر ولا يُحيا من بيانات محلية قديمة (نفس حماية الحذف البعيد).
+        3. تنزيل **محدود** بنفس `OpenHandsClient.export_conversation` (سقف صلب
+           `MAX_EXPORT_BYTES` عبر `_read_capped`، ومفيش تجميع غير محدود).
+        4. فشل التنزيل/عدّى الحد ⇒ خطأ منظّم، **مفيش** تصدير «ناجح» كاذب.
+        """
+        cid = _require_id(conversation_id)
+        client = self._require_client()
+        await self._authorize_conversation(cid)
+        # شاهد الحذف المحلي (لو فيه قاعدة مربوطة): شات محذوف/مُعلَّم لا يُصدَّر ولا يُحيا
+        # من بيانات محلية قديمة. من غير قاعدة (وضع مستقل) مفيش شواهد محلية نحترمها —
+        # نفس سلوك `_watched_ids`. أي فشل قراءة ⇒ فشل مغلق (مفيش تصدير).
+        if self._db is not None:
+            try:
+                if self._db.is_deleted(cid):
+                    # نفس رسالة «مش موجود» عشان ما نسيبش استنتاج وجود شات متحذف.
+                    raise CodedApiError("not_found", "الشات مش موجود.", 404)
+            except CodedApiError:
+                raise
+            except Exception:  # noqa: BLE001 — قاعدة غير متاحة ⇒ فشل مغلق
+                log.warning("تعذّر قراءة شاهد الحذف؛ بنرفض التصدير (فشل مغلق).")
+                raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
+        try:
+            data = await client.export_conversation(cid)
+        except ResponseTooLargeError:
+            raise CodedApiError(
+                "too_large", "التصدير كبير أوي للتنزيل الآمن. جرّب شات أصغر.", 413
+            )
+        return data, export_filename(cid)
+
     async def associate_repository(self, conversation_id: str, repository: str) -> dict:
         """يربط مستودع بشات موجود (OHB2: إدارة الشاتات).
 
@@ -506,21 +760,114 @@ class MiniAppService:
         return _conversation_dto(conv, cid in self._watched_ids())
 
     async def delete_conversation(self, conversation_id: str) -> dict:
-        """حذف محلي آمن لشات (OHB2-C7): إزالة كل الأثر المحلي، بلا حذف بعيد.
+        """حذف الشات **من OpenHands نفسه** ثم تثبيت الحذف محليًا (OHB2-MINIAPP).
 
-        التفويض أولاً (نفس عقد كل مسارات الشات: معرّف صالح ⇒ ملكية الشات)، وبعدين حذف
-        محلي ذرّي. **مفيش أي نداء حذف بعيد لـ OpenHands** — الشات على الخدمة يفضل زي ما
-        هو؛ إحنا بنشيل بس السجلات المحلية (متابعة/صندوق/إكمال/إشعارات/توجيه).
+        التفويض أولاً (معرّف صالح ⇒ ملكية الشات server-side)، وبعدين:
+        1. وسم الحذف الجاري (شاهد + 'deleting') في القاعدة — قبل أي نداء بعيد.
+        2. `DELETE /app-conversations/{id}` (Bearer) على OpenHands.
+        3. الحذف المحلي + 'confirmed' **بس** بعد تأكيد OpenHands (200) أو إثبات الغياب
+           بقراءات متتالية. 404 **مبهم** (غياب أو فشل خدمة داخلي) ⇒ نفس التسوية، مش نجاح تلقائي.
+
+        الفشل المؤكّد (400/401/403) والنتيجة المجهولة (404/429/5xx/انقطاع) **مايترجّعوش نجاح**:
+        الفشل المؤكّد ⇒ خطأ منظّم (الشات لسه موجود)، والمجهول ⇒ خطأ 'pending' (الشات متقفل
+        محليًا بس الحذف البعيد لسه مش متأكد). مفيش fallback صامت لحذف محلي فقط.
         """
         cid = _require_id(conversation_id)
         if self._db is None:
             raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
-        await self._authorize_conversation(cid)
-        summary = self._db.delete_conversation(cid, outbox.now_iso())
+        client = self._require_client()
+        # idempotent: حذف بعيد **مؤكّد سابقًا** ⇒ نجاح بدون نداء تاني. الشات بقى غايب
+        # بعيدًا فتفويض الملكية كان هيرجّع 404؛ بدل كده نعتبره نجاح (الحذف اتعمل فعلًا).
+        # آمن: الراوت (`_guarded`) بيفرض جلسة + مستخدم مسموح + Origin قبل ما نوصل هنا،
+        # والشاهد المؤكّد ما بيتكتبش غير بعد حذف متفاوَض عليه من نفس المالك.
+        state = self._db.remote_deletion_state(cid)
+        if state == self._db.REMOTE_CONFIRMED:
+            return {"ok": True, "deleted": True, "remote_deleted": True, "conversation_id": cid}
+        # تفويض الملكية **قبل** أي حذف (مفيش IDOR). بيرمي CodedApiError منظّم عند الرفض.
+        # F-1: `allow_deleted=True` — إعادة محاولة الحذف عملية صريحة على شات ممكن يكون
+        # متشاهد (deleting/uncertain). لو الحالة أصلًا معلّقة وOpenHands خلاص حذفه (`not_found`)،
+        # نمرّ لتسوية التحقق (قراءتان متتاليتان) من غير كسر 403/502.
+        try:
+            await self._authorize_conversation(cid, allow_deleted=True)
+        except CodedApiError as exc:
+            if not (
+                exc.code == "not_found"
+                and state in (self._db.REMOTE_DELETING, self._db.REMOTE_UNCERTAIN)
+            ):
+                raise
+        result = await deletion.delete_conversation_remote(client, self._db, cid)
         # نبلّغ أي worker مالك (نفس العملية) إن فيه تغيير — من غير إنشاء worker جديد.
         for key in ("outbox_worker", "creation_worker", "completion_worker", "watcher", "notifier"):
             self._wake(key)
-        return {"ok": True, "deleted": True, "conversation_id": cid, "local_only": True, "summary": summary}
+        if result.status != deletion.STATUS_DELETED:
+            raise CodedApiError(
+                result.code or "remote_delete_failed",
+                result.message,
+                result.http_status or 502,
+            )
+        self._drop_list_cache()
+        return {
+            "ok": True,
+            "deleted": True,
+            "remote_deleted": True,
+            "conversation_id": cid,
+        }
+
+    def list_pending_deletions(self) -> dict:
+        """قايمة عمليات الحذف البعيد المعلّقة ('deleting'/'uncertain') للعرض والتسوية اليدوية."""
+        if self._db is None:
+            raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
+        return {"items": self._db.list_pending_remote_deletions_detail()}
+
+    async def reconcile_deletion(self, conversation_id: str) -> dict:
+        """تسوية يدوية لحذف بعيد معلّق عبر التحقق من الوجود (GET) بدون إعادة إرسال DELETE."""
+        cid = _require_id(conversation_id)
+        if self._db is None:
+            raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
+        client = self._require_client()
+        state, pre_updated_at = self._db.remote_deletion_metadata(cid)
+        if state == self._db.REMOTE_CONFIRMED:
+            return {
+                "ok": True,
+                "deleted": True,
+                "remote_deleted": True,
+                "conversation_id": cid,
+                "status": "deleted",
+                "message": deletion.DELETED_MESSAGE,
+            }
+        if state not in (self._db.REMOTE_DELETING, self._db.REMOTE_UNCERTAIN):
+            raise CodedApiError("not_pending", "مفيش عملية حذف معلّقة للشات ده.", 409)
+        try:
+            await self._authorize_conversation(cid, allow_deleted=True)
+        except CodedApiError as exc:
+            if exc.code == "upstream_error":
+                attempt_id = self._db.claim_remote_reconcile(cid)
+                if attempt_id is not None:
+                    ts = pre_updated_at if pre_updated_at is not None else outbox.now_iso()
+                    self._db.revert_remote_deletion_cas(
+                        cid, attempt_id, self._db.REMOTE_UNCERTAIN, ts
+                    )
+                raise CodedApiError("remote_delete_pending", deletion.PENDING_MESSAGE, 503)
+            if exc.code != "not_found":
+                raise
+        result = await deletion.reconcile_pending_deletion(client, self._db, cid)
+        for key in ("outbox_worker", "creation_worker", "completion_worker", "watcher", "notifier"):
+            self._wake(key)
+        if result.status != deletion.STATUS_DELETED:
+            raise CodedApiError(
+                result.code or "remote_delete_failed",
+                result.message,
+                result.http_status or 502,
+            )
+        self._drop_list_cache()
+        return {
+            "ok": True,
+            "deleted": True,
+            "remote_deleted": True,
+            "conversation_id": cid,
+            "status": "deleted",
+            "message": result.message,
+        }
 
     async def get_cost(self, conversation_id: str) -> dict:
         """OHB2-09-04: تكلفة/استهلاك شات واحد (من نفس نداء التفاصيل — مفيش نداء إضافي)."""
@@ -540,7 +887,7 @@ class MiniAppService:
         client = self._require_client()
         if self._identity is None:
             self._identity = IdentityCache(client)
-        return FileService(client, identity=self._identity)
+        return FileService(client, identity=self._identity, db=self._db)
 
     async def list_files(self, conversation_id: str) -> dict:
         """قايمة ملفات شات مصرّح به (نتيجة منظّمة، مفيش استثناءات للـ route)."""
@@ -590,7 +937,11 @@ class MiniAppService:
         # OHB2-09-A2-02: تفويض ملكية الشات **قبل** تسجيل أي برومت في الصندوق — نفس
         # عقد باقي مسارات الشات (تفاصيل/حالة/تكلفة/ملفات/متابعة). كده مستخدم مصادَق
         # (مش المالك) مايقدرش يوجّه برومت لشات مش بتاعه. مفيش أي أثر (سجل صندوق) قبل القرار.
-        await self._authorize_conversation(cid)
+        # F-1: `allow_deleted=True` مقصود — إرسال برومت من الـ Mini App **مش** مسار قراءة،
+        # ورده المتّفق عليه (والموثّق/المُختبَر) للشات المتشاهد هو **409 conversation_deleted**
+        # من طبقة القاعدة (الفحص الذرّي جوّه `add_or_group_outbox` مع `reengage=False`)،
+        # مش 404. كده مفيش تفاعل مع شات متشاهد، والقاعدة هي الحاجز الموثوق (race-safe).
+        await self._authorize_conversation(cid, allow_deleted=True)
         chat_id = self._config.owner_id
         # OHB2-AUDIT-FIX-01: `reengage=False` — مسار الـ Mini App **مش** إعادة تفاعل صريح
         # (إعادة المتابعة عند الـ Mini App بتحصل عبر `watch`، مش عبر إرسال برومت). كده أي
@@ -612,22 +963,47 @@ class MiniAppService:
 
     # --------------------------------------------------- operation status
     def outbox_operation(self, outbox_id: int) -> dict:
-        """حالة عملية برومت (DTO آمن: مفيش نص البرومت ولا تفاصيل داخلية خام)."""
+        """حالة عملية برومت (DTO آمن: مفيش نص البرومت ولا تفاصيل داخلية خام).
+
+        OHB2-PHASE1D: البحث **مقيّد بالمالك** (نفس `owner_id`) — أي id لمستخدم تاني ⇒ 404
+        (مفيش تسريب وجود صف ولا محتوى غيره).
+        """
         if self._db is None:
             raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
-        item = self._db.get_outbox(outbox_id)
+        item = self._db.get_outbox(outbox_id, self._config.owner_id)
         if item is None:
             raise ApiError("العملية مش موجودة.", 404)
         return self._outbox_dto(item)
 
     def creation_operation(self, job_id: int) -> dict:
-        """حالة عملية إنشاء شات (DTO آمن)."""
+        """حالة عملية إنشاء شات (DTO آمن).
+
+        OHB2-PHASE1D: البحث **مقيّد بالمالك** — أي job لمستخدم تاني ⇒ 404.
+        """
         if self._db is None:
             raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
-        job = self._db.get_creation_job(job_id)
+        job = self._db.get_creation_job(job_id, self._config.owner_id)
         if job is None:
             raise ApiError("العملية مش موجودة.", 404)
         return self._creation_dto(job)
+
+    def list_creation_jobs(self, page: int = 0) -> dict:
+        """قايمة طلبات الشات الجديد **المملوكة للمالك** (قراءة فقط) + الترقيم.
+
+        OHB2-PHASE1D: نطاق المالك مفروض في الاستعلام؛ الترقيم offset ثابت؛ أي محاولة
+        تمرير معرّف مستخدم من الواجهة مُتجاهَلة (المصدر الوحيد هو `config.owner_id`).
+        """
+        if self._db is None:
+            raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
+        page = _page_number(page)
+        jobs, has_more = self._db.list_creation_jobs_for_owner(
+            self._config.owner_id, page=page, page_size=PAGE_SIZE
+        )
+        return {
+            "page": page,
+            "has_more": has_more,
+            "items": [self._creation_dto(j) for j in jobs],
+        }
 
     def reconcile_outbox(self, outbox_id: int, action: str) -> dict:
         """OHB2-09-05: تسوية يدوية لعملية برومت معلّقة (parity مع أوامر البوت).
@@ -643,7 +1019,7 @@ class MiniAppService:
             raise ValidationError("إجراء غير معروف")
         if self._db is None:
             raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
-        item = self._db.get_outbox(outbox_id)
+        item = self._db.get_outbox(outbox_id, self._config.owner_id)
         if item is None:
             raise ApiError("العملية مش موجودة.", 404)
         status = item.status
@@ -668,14 +1044,14 @@ class MiniAppService:
             )
             if not changed:
                 # حد تاني حسم السجل بين القراءة والـ CAS ⇒ نرجّع الحالة الحقيقية.
-                current = self._db.get_outbox(outbox_id)
+                current = self._db.get_outbox(outbox_id, self._config.owner_id)
                 if current is not None and current.status in _NOT_CONFIRMED_OUTBOX:
                     dto = self._outbox_dto(current)
                     dto["cancellation"] = "not_confirmed"
                     return dto
                 raise CodedApiError("already_terminal", "العملية خلاص في حالة نهائية.", 409)
             log.info("reconcile: outbox=%s discard", outbox_id)
-            result = self._outbox_dto(self._db.get_outbox(outbox_id))
+            result = self._outbox_dto(self._db.get_outbox(outbox_id, self._config.owner_id))
             result["cancellation"] = "discarded"
             return result
         else:  # mark_sent
@@ -692,12 +1068,83 @@ class MiniAppService:
             )
             if not changed:
                 # حد تاني حسم السجل بين القراءة والكتابة ⇒ ما بنغيّرش حاجة.
-                current = self._db.get_outbox(outbox_id)
+                current = self._db.get_outbox(outbox_id, self._config.owner_id)
                 if current is not None and current.status == db_module.OUTBOX_SENT:
                     return self._outbox_dto(current)
                 raise CodedApiError("invalid_state", "الأمر ده للسجلات 'unknown' بس.", 409)
             log.info("reconcile: outbox=%s mark_sent", outbox_id)
-        return self._outbox_dto(self._db.get_outbox(outbox_id))
+        return self._outbox_dto(self._db.get_outbox(outbox_id, self._config.owner_id))
+
+    def reconcile_creation(self, job_id: int, action: str) -> dict:
+        """OHB2-PHASE1D: تسوية يدوية لطلب شات جديد معلّق (parity مع أوامر البوت).
+
+        - `cancel`   : نفس دلالات `discard_creation_job` — مسموح **بس** في `pending`/
+          `claimed` (اللي الكود بيثبت إن POST البدء لسه مابدأش). CAS ذرّي ⇒ `discarded`
+          (نهائي، مستحيل يرجع `pending` ⇒ مفيش إعادة POST). لو الـ POST ممكن يكون بدأ
+          (`starting`/`unknown`) ⇒ مفيش ادّعاء إلغاء: نرجّع الحالة الحالية + علامة
+          `cancellation="not_confirmed"` والقاعدة ماتتغيّرش. حالة نهائية ⇒ 409.
+        - `mark_sent` (`done`): مسموح **بس** من `unknown` ⇒ `done` (تأكيد المالك، مش إثبات
+          من OpenHands). `done` أصلاً ⇒ no-op (idempotent). أي حالة تانية ⇒ 409.
+
+        التسوية **مابتعملش** أي POST شبكة، والتحويلات نهائية (at-most-once محفوظ).
+        البحث مقيّد بالمالك.
+        """
+        if action not in ("cancel", "mark_sent"):
+            raise ValidationError("إجراء غير معروف")
+        if self._db is None:
+            raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
+        job = self._db.get_creation_job(job_id, self._config.owner_id)
+        if job is None:
+            raise ApiError("العملية مش موجودة.", 404)
+        status = job.status
+        if action == "cancel":
+            if status in _TERMINAL_CREATION:
+                raise CodedApiError("already_terminal", "العملية خلاص في حالة نهائية.", 409)
+            # OHB2-PHASE1D-F1: وجود `task_id` = الـ POST البدء رجع فعلاً ⇒ مفيش ادّعاء
+            # "قبل الإرسال" وممنوع الشطب (كان بيضيّع conversation_id ويحوّل شات بعيد
+            # حقيقي لـ discarded). نرجّع الحالة الحالية + علامة "not_confirmed".
+            if status in _NOT_CONFIRMED_CREATION or _creation_post_started(job):
+                # الـ POST ممكن يكون بدأ ⇒ مفيش ادّعاء إلغاء. نرجّع الحالة الحالية + علامة.
+                log.info("reconcile: creation=%s cancel not confirmed (state=%s)", job_id, status)
+                dto = self._creation_dto(job)
+                dto["cancellation"] = "not_confirmed"
+                return dto
+            # CAS ذرّي: الشرط جوّه الـ UPDATE ⇒ لو الـ worker حجز/بدأ بين القراءة والكتابة
+            # الـ rowcount=0 (مفيش clobber). نفس دلالات أمر البوت `outbox_discard`.
+            outcome = self._db.discard_creation_job(
+                job_id, outbox.now_iso(), "اتلغى يدوياً", chat_id=self._config.owner_id
+            )
+            if outcome == "discarded":
+                log.info("reconcile: creation=%s cancel", job_id)
+                result = self._creation_dto(self._db.get_creation_job(job_id, self._config.owner_id))
+                result["cancellation"] = "discarded"
+                return result
+            current = self._db.get_creation_job(job_id, self._config.owner_id)
+            if current is not None and current.status in _NOT_CONFIRMED_CREATION:
+                dto = self._creation_dto(current)
+                dto["cancellation"] = "not_confirmed"
+                return dto
+            raise CodedApiError("already_terminal", "العملية خلاص في حالة نهائية.", 409)
+        # mark_sent ⇒ done
+        if status == db_module.CREATION_DONE:
+            return self._creation_dto(job)  # idempotent
+        if status != db_module.CREATION_UNKNOWN:
+            raise CodedApiError("invalid_state", "الأمر ده للطلبات 'ambiguous' بس.", 409)
+        changed = self._db.set_creation_status_if_in(
+            job_id,
+            db_module.CREATION_DONE,
+            outbox.now_iso(),
+            {db_module.CREATION_UNKNOWN},
+            "أكّده المالك",
+            chat_id=self._config.owner_id,
+        )
+        if not changed:
+            current = self._db.get_creation_job(job_id, self._config.owner_id)
+            if current is not None and current.status == db_module.CREATION_DONE:
+                return self._creation_dto(current)
+            raise CodedApiError("invalid_state", "الأمر ده للطلبات 'ambiguous' بس.", 409)
+        log.info("reconcile: creation=%s mark_sent", job_id)
+        return self._creation_dto(self._db.get_creation_job(job_id, self._config.owner_id))
 
     def find_outbox_operation(self, conversation_id: str, client_ref: str) -> dict | None:
         """يبحث عن عملية برومت بمعرّف العميل (للاستعلام بعد نتيجة غامضة) أو None."""
@@ -733,11 +1180,26 @@ class MiniAppService:
 
     @staticmethod
     def _creation_dto(job) -> dict:
+        status = job.status
+        terminal = status in _TERMINAL_CREATION
+        # OHB2-PHASE1D-F1: حدّ الإرسال بيتحسب بالحالة **ووجود task_id**. أي صف عليه
+        # task_id = الـ POST البدء رجع فعلاً ⇒ ممنوع ندّعي "لسه مابدأش" وممنوع نسمح
+        # بإلغاء يدّعي إنه قبل الإرسال (كان بيحوّل شات بعيد حقيقي لـ discarded ويضيّع
+        # conversation_id). مفيش أي تراجع في at-most-once: الإلغاء لسه CAS على الحالات.
+        post_started = _creation_post_started(job)
         return {
             "kind": "creation",
             "id": job.id,
             "repository": job.repo or "",
-            "state": _CREATION_STATES.get(job.status, "unknown"),
+            "state": _CREATION_STATES.get(status, "unknown"),
+            # OHB2-PHASE1D: حقول آمنة مشتقّة على السيرفر (مش من الواجهة) لوصف حدّ الإرسال
+            # والعمليات المتاحة. القرار النهائي يفضل جوّه `reconcile_creation` (إعادة فحص).
+            "post_state": ("uncertain" if post_started else "not_started")
+            if status in _DISCARDABLE_CREATION
+            else _CREATION_POST_STATE.get(status, "uncertain"),
+            "terminal": terminal,
+            "cancellable": status in _DISCARDABLE_CREATION and not post_started,
+            "resolvable": status == db_module.CREATION_UNKNOWN,
             "conversation_id": job.conversation_id or "",
             "created_at": job.created_at,
             "updated_at": job.updated_at,
@@ -750,8 +1212,8 @@ class MiniAppService:
         if self._db is None:
             raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
         items = self._db.list_watched()
-        page = max(0, page)
-        start = page * PAGE_SIZE
+        page = _page_number(page)
+        start = _page_offset(page, PAGE_SIZE)
         chunk = items[start : start + PAGE_SIZE]
         if not chunk and page > 0:
             page, start, chunk = 0, 0, items[:PAGE_SIZE]
@@ -776,7 +1238,10 @@ class MiniAppService:
         if self._db is None:
             raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
         # OHB2-09-A2-02: نفس عقد الملكية قبل إضافة الشات للمتابعة (مفيش شات غير مملوك).
-        conv = await self._authorize_conversation(cid)
+        # F-1: `allow_deleted=True` — زر «متابعة» هو **إعادة التفاعل الصريح** الوحيد
+        # الموثّق اللي بيشيل الشاهد ويبدأ دورة نظيفة (طبقة القاعدة عبر `reengage=True`).
+        # ده مش مسار قراءة، فبنستثنيه من فرض الشاهد عن قصد.
+        conv = await self._authorize_conversation(cid, allow_deleted=True)
         self._db.add_watched(cid, conv.get("title", ""), self._config.owner_id, new_lifecycle=False, reengage=True)
         self._db.set_last_state(cid, conv.get("execution_status") or "")
         return {"ok": True, "watched": True}
@@ -810,8 +1275,8 @@ class MiniAppService:
     async def list_repositories(self, query: str = "", page: int = 0) -> dict:
         client = self._require_client()
         repos = await client.search_repositories(query=(query or "").strip())
-        page = max(0, page)
-        start = page * 8
+        page = _page_number(page)
+        start = _page_offset(page, 8)
         chunk = repos[start : start + 8]
         if not chunk and page > 0:
             page, start, chunk = 0, 0, repos[:8]

@@ -155,6 +155,14 @@ the same transition again.
 - The Mini App fetches `GET /notifications?page=N` for the inbox tab.
 - Items are rendered with an unread style, a kind label, and a delivery pill
   (`بيتسلّم…` for `pending`, `فشل التسليم` for `failed`; `delivered` shows no pill).
+- A filter bar switches between **all** / **unread** (`unread=1`) / **archived**
+  (`archived=1`); switching resets to page 0. Filtering never changes read state — only
+  the explicit read action (`…/read`) or read-all does. If the filter changes while a
+  list request is in flight, the stale result (success **or** failure) is discarded and
+  the list reloads for the current filter (no cross-filter race).
+- Each row has an **archive/unarchive** button (reversible). Rows the server marks
+  `deletable` also get a two-step **delete** action (explicit confirmation before any
+  request; the server re-checks eligibility and can still answer `409`).
 - Clicking an unread item POSTs `…/read` and opens the conversation detail.
 - A tab badge shows `unread_count` from `bootstrap` and from each list response.
 - A visibility-aware poll refreshes the list while the tab is visible (§6.3).
@@ -215,6 +223,7 @@ and `CREATE ... IF NOT EXISTS`); no destructive column change is performed.
 | `transition_status` | observed status at creation (**descriptive** only) |
 | `transition_seq` | transition epoch (**identity**), see §3.3 |
 | `claim_token`, `claim_at` | atomic claim lease for an in-flight delivery (§4.4) |
+| `archived_at` | NULL = active inbox; set = archived (reversible, §3.7) |
 
 **`watched`** (pre-existing) carries `pending_delivery_state`, `watch_seq`,
 `retry_count` used by the Watcher's write-ahead marker and lifecycle identity.
@@ -237,6 +246,10 @@ exist so older databases upgrade cleanly):
   later genuine transition of the same status is not blocked.
 - `idx_inbox_delivery_pending` **partial** on `(delivery_status, id)
   WHERE delivery_status='pending'` — cheap pending-recovery scan.
+
+`archived_at` has no dedicated index: the active inbox lists `archived_at IS NULL`
+rows ordered by the monotonic PK (`id DESC`), and the archived view is small, so the
+PK scan with a residual filter is sufficient (see §3.7).
 
 OHB2-08-04 outbox indexes (unrelated to the inbox but part of the same batch):
 `idx_outbox_status_updated (status, updated_at)` and
@@ -283,8 +296,8 @@ the prompt) · `proactive` (general Notifier notification).
 ### 3.5 Retention rules (`_prune_inbox`, run inside the insert transaction)
 
 - **Protected rows are never pruned**: rows with `delivery_status='pending'` **or**
-  `read_at IS NULL` are always kept.
-- Only **read** rows are eligible for pruning, oldest first (`id ASC`).
+  `read_at IS NULL` **or** `archived_at IS NOT NULL` are always kept.
+- Only **read, non-archived** rows are eligible for pruning, oldest first (`id ASC`).
 - Soft caps: `INBOX_MAX_PER_CONVERSATION` = 50 per conversation and
   `INBOX_MAX_TOTAL` = 500 overall. If protected rows alone exceed a cap, the table
   is allowed to exceed it — a protected row is never deleted to satisfy a cap.
@@ -295,6 +308,63 @@ the prompt) · `proactive` (general Notifier notification).
 Because unread rows are protected, a notification the user has not seen is never
 deleted by retention, regardless of delivery state. Reading an item (`read_at` set)
 makes it eligible for pruning once it is also non-pending.
+
+### 3.7 Archiving and safe deletion (OHB2-PHASE1C)
+
+Archiving is a **separate, reversible axis** (`archived_at`). It changes only
+visibility: an archived row is hidden from the active inbox and shown in the archived
+view, and it **never** touches `delivery_status`, `read_at`, `claim_*`,
+`transition_seq` or any operation record (`outbox`, `notifier_pending`, `watched`).
+Unarchiving clears `archived_at` and restores the row to the active inbox with the
+same identity, so nothing is lost. The unread badge (`unread_count`) and pagination
+count the **active** inbox only (`archived_at IS NULL`), so archiving an unread item
+does not keep it in the badge. Archive is **idempotent** (a repeated archive keeps the
+original `archived_at`). Archiving is a deliberate user action to keep a notification,
+so retention (§3.5) **never prunes archived rows**; after unarchiving, a read row
+becomes prunable again like any other read row.
+
+### 3.8 Deleted-conversation visibility (OHB2-RESIDUAL)
+
+`delete_conversation` keeps `notification_inbox` rows as an **audit trace** (it only
+flags a still-pending delivery as `superseded`; the row and its `title`/`message`
+remain). To avoid exposing content of a deleted chat, inbox **reads** exclude any row
+whose `conversation_id` has a deletion witness (`deleted_conversations`):
+
+- `list_inbox` and `count_inbox` add `NOT EXISTS (SELECT 1 FROM deleted_conversations d
+  WHERE d.conversation_id = notification_inbox.conversation_id)` (via
+  `_inbox_visibility_clause`), in **both** the active and archived views. So a deleted
+  chat's notification never appears in `GET /api/v1/notifications` and never counts
+  toward `unread_count`.
+- The row itself is **not deleted** (retention and the `superseded` trace are intact),
+  and the tombstone semantics are unchanged; this is a read-time filter only.
+- The same exclusion applies to `list_watched` (watch lists in the bot and the Mini App
+  never show the title of a tombstoned conversation during the `deleting`/`uncertain`
+  window; after a confirmed delete the watch row is removed anyway).
+
+Deleting an inbox row permanently is **eligibility-gated on the server** (never on the
+client) and **fail-closed**. `notification_inbox.kind` is the deciding axis: only the
+**status/outcome report kinds** that have no linked executable operation are eligible
+(`INBOX_DELETABLE_KINDS = {terminal, timeout, missing, stale_report}`). `proactive`
+(Notifier live-state notification) and **any unknown/unclassified kind** are protected.
+A row is deletable only when **all** of these hold:
+
+- its `kind` is in `INBOX_DELETABLE_KINDS` (unknown kinds are protected — fail-closed),
+  **and**
+- `delivery_status = 'delivered'` (no pending/failed delivery evidence), **and**
+- `read_at IS NOT NULL` (the user has seen it), **and**
+- it is not referenced as the reconciliation marker of a durable `notifier_pending`
+  row (`notifier_pending.event_id`; that row is a crash-recovery witness), **and**
+- its conversation has no durable `notifier_pending` marker, **and**
+- its conversation has no **open** outbox prompt (`pending`/`claimed`/`sending`).
+
+Otherwise the delete is refused with `409` and no change is made (no false success).
+The eligibility is re-checked **inside** the `BEGIN IMMEDIATE` delete transaction, so a
+concurrent change (e.g. a new open outbox prompt for the same conversation) cannot be
+raced past. An unread actionable failure therefore stays protected even after the user
+opens the inbox; a permanently-deleted row is reported `missing` (404) on repeat.
+Deleting an inbox row never deletes the conversation, its outbox records, its watch,
+or its tombstones. The client `deletable` flag (§5) mirrors these rules but the server
+remains the final authority.
 
 ---
 
@@ -387,9 +457,12 @@ valid `Origin` header.
 
 | Method & path | Auth | Body / query | Success response |
 | --- | --- | --- | --- |
-| `GET /notifications` | session | `page` (int, default 0), `unread` (`1`/`true`) | inbox page (below) |
+| `GET /notifications` | session | `page` (int, default 0), `unread` (`1`/`true`), `archived` (`1`/`true`) | inbox page (below) |
 | `POST /notifications/{item_id}/read` | session + Origin | none | `{"ok": true, "unread_count": n}` |
 | `POST /notifications/read-all` | session + Origin | none | `{"ok": true, "marked": n, "unread_count": n}` |
+| `POST /notifications/{item_id}/archive` | session + Origin | none | `{"ok": true, "archived": true, "unread_count": n}` |
+| `POST /notifications/{item_id}/unarchive` | session + Origin | none | `{"ok": true, "archived": false, "unread_count": n}` |
+| `DELETE /notifications/{item_id}` | session + Origin | none | `{"ok": true, "deleted": true, "unread_count": n}` |
 | `POST /app/notifications` | session + Origin | `{"enabled": bool}` | `{"ok": true, "notifications_enabled": bool}` |
 
 `GET /notifications` response:
@@ -408,6 +481,8 @@ valid `Origin` header.
       "message": "…",
       "created_at": "2026-10-13T10:00:00+00:00",
       "read": false,
+      "archived": false,
+      "deletable": false,
       "delivery_status": "delivered",
       "delivery_attempts": 0,
       "delivered_at": "2026-10-13T10:00:01+00:00"
@@ -416,23 +491,42 @@ valid `Origin` header.
 }
 ```
 
+`archived` reflects `archived_at IS NOT NULL`; `deletable` is the server's current
+delete-eligibility verdict (§3.7) and is the only signal the UI may use to show the
+delete control. The client never derives deletability on its own when the server sends
+`deletable`; its fallback (no `deletable` field) mirrors the server allowlist
+(`terminal`/`timeout`/`missing`/`stale_report` + delivered + read) and is **fail-closed**
+for unknown kinds.
+
 Pagination and error behavior (as implemented):
 
 - Page size is fixed at `INBOX_PAGE_SIZE` = 10; offset = `page * 10`; ordering is
   `id DESC` (stable, since `id` is monotonic).
-- `page` is clamped to `>= 0`. If a requested page is empty because it exceeds the
-  range, the service falls back to page 0 and reports `page: 0` (mirrors the watches
-  list behavior). This is why the frontend must synchronize its page from the server
-  response (§6.5).
-- `has_more` = `total > offset + len(items)`, where `total` respects `unread_only`.
-- `unread_count` is always the unread-only count.
+- `page` must be an integer in `[0, MAX_PAGE]` (`MAX_PAGE = 1_000_000`, `bot/db.py`).
+  A negative, non-numeric, or out-of-range value is rejected with
+  `400 {"error":"bad_request"}` **before** any `page * size` arithmetic or SQLite
+  binding — it is never silently clamped (a huge `page` such as `2**62` would otherwise
+  overflow SQLite's 64-bit `OFFSET` and raise an internal error). If a requested page
+  within range is empty because it exceeds the row count, the service falls back to
+  page 0 and reports `page: 0` (mirrors the watches list behavior). This is why the
+  frontend must synchronize its page from the server response (§6.5).
+- `has_more` = `total > offset + len(items)`, where `total` respects `unread_only`
+  and `archived`.
+- `unread_count` is always the unread-only count of the **active** inbox (archived
+  rows excluded).
 - Malformed `page` → `400 {"error":"bad_request"}`.
 - Missing/invalid session → `401`; disallowed user → `403`; missing/foreign Origin on
   a state-changing route → `403 {"error":"bad_origin"}`.
 - Reading a non-existent item → `404 {"error": "الإشعار مش موجود."}`; invalid id →
-  `400`.
+  `400`. Archive/unarchive of a missing item → `404`; invalid id → `400`.
+- Deleting a missing item → `404`; invalid id → `400`; a **protected** item (unknown
+  or `proactive` kind, pending, failed, unread, a reconciliation reference, a
+  conversation with a durable `notifier_pending` marker, or a conversation with an
+  open outbox prompt) → `409 {"error":"الإشعار ده محمي من
+  الحذف النهائي."}` with no change.
 - If the database is unavailable, `GET /notifications` returns an empty page
-  (`page 0, has_more false, items []`) rather than failing; read/read-all return `503`.
+  (`page 0, has_more false, items []`) rather than failing; read/read-all/archive/
+  unarchive/delete return `503`.
 - The inbox DTO does **not** expose `event_key`, `claim_token`, or `transition_seq`
   (internal fields).
 
@@ -656,7 +750,8 @@ clean (verified 2026-11-02):
 
 Notification-relevant Python suites:
 `tests/test_notifier.py`, `tests/test_watcher.py`, `tests/test_u01_watcher.py`,
-`tests/test_miniapp_inbox.py`, `tests/test_miniapp_api.py`,
+`tests/test_miniapp_inbox.py`, `tests/test_miniapp_inbox_manage.py`,
+`tests/test_miniapp_api.py`,
 `tests/test_miniapp_features.py`, `tests/test_notifications_controls.py`,
 `tests/test_notifications_pref.py`, `tests/test_batch3r_fix.py`,
 `tests/test_batch3r_fix2.py`, `tests/test_batch3r_fix2_f1.py`,
@@ -667,6 +762,12 @@ Frontend test sections in `inbox_watch.test.js`:
 - A1–A5b initial load; B1–B6 pagination basics; C1–C7 read/read-all; D1–D10
   watch/unwatch; E1–E6 refresh/toast; F1–F4 server-page sync;
   G1–G6 visibility/silent refresh; H1–H10 R5-01 retry-after-failure.
+
+OHB2-PHASE1C suites: `tests/test_miniapp_inbox_manage.py` (45 tests: unread filter,
+archive/unarchive isolation, safe-delete eligibility including unknown/`proactive` kind,
+open-outbox and `notifier_pending` protection, session/expiry/rate-limit/origin guards,
+no false success) and `tests/frontend/inbox_manage.test.js` (F1–F10 filter + filter race,
+A1–A4 archive, D1–D8 delete + conservative `canDelete` fallback).
 
 The H1–H3 tests are non-vacuous: reverting the R5-01 `inbox-next` handler makes them
 fail (verified by a `/tmp`-only mutation; no repository file was modified).
@@ -686,10 +787,14 @@ fail (verified by a `/tmp`-only mutation; no repository file was modified).
 - **Offset pagination** can overlap when new items arrive between page fetches; the
   frontend deduplicates by id, but a page boundary can still shift. A cursor-based
   scheme would remove the overlap entirely (not implemented).
-- **No user-facing delete/archive** for inbox items; retention is automatic at the
-  caps, and there is no cleanup worker (pruning happens inside the insert
-  transaction).
-- **No "unread-only" filter in the UI** (the API supports `unread=1`, the UI does not
-  expose it).
+- **Deletion is eligibility-gated**, not a general "empty the inbox": unknown or
+  `proactive` kinds, pending, failed, unread, reconciliation-referenced rows, and rows
+  whose conversation has a durable `notifier_pending` marker or an open outbox prompt
+  cannot be deleted (they are refused with `409`). Automatic retention still prunes
+  read, non-archived, non-pending rows at the caps
+  (§3.5); there is no cleanup worker (pruning happens inside the insert transaction).
+- **Archived rows are hidden from the active inbox and the unread badge.** The archived
+  view is a single flat list (no per-conversation grouping, no bulk unarchive). Archived
+  rows are exempt from retention pruning (archiving is a deliberate keep action).
 - **Notifier recovery heuristics** (`_watched_event_stuck`, superseded-epoch takeover)
   are subtle; changes there require care to avoid duplicate or lost deliveries.

@@ -65,6 +65,26 @@ class FakeDb:
         self.outbox: list = []
         self.creation: list = []
         self.removed: list = []
+        # OHB2-PHASE1A: تخزين جلسات وهمي (in-memory) يطابق واجهة `Database` الجديدة.
+        self.sessions: dict[str, tuple] = {}
+
+    def add_web_session(self, token_hash, user_id, created_at, expires_at, profile_json):
+        self.sessions[token_hash] = (int(user_id), float(created_at), float(expires_at), profile_json)
+
+    def get_web_session(self, token_hash, now):
+        row = self.sessions.get(token_hash)
+        if row is None or row[2] <= float(now):
+            return None
+        return row
+
+    def delete_web_session(self, token_hash):
+        self.sessions.pop(token_hash, None)
+
+    def prune_web_sessions(self, now):
+        expired = [h for h, r in self.sessions.items() if r[2] <= float(now)]
+        for h in expired:
+            self.sessions.pop(h, None)
+        return len(expired)
 
     def get_notifications_enabled(self):
         return self.notifications
@@ -110,9 +130,9 @@ class FakeDb:
         self.outbox.append(item)
         return item["id"]
 
-    def get_outbox(self, outbox_id):
+    def get_outbox(self, outbox_id, chat_id=None):
         for item in self.outbox:
-            if item["id"] == outbox_id:
+            if item["id"] == outbox_id and (chat_id is None or item["chat_id"] == chat_id):
                 return _Row(
                     id=item["id"], conversation_id=item["cid"], status=item["status"],
                     created_at="t", updated_at="t",
@@ -145,12 +165,13 @@ class FakeDb:
         self.creation.append(job)
         return job["id"]
 
-    def get_creation_job(self, job_id):
+    def get_creation_job(self, job_id, chat_id=None):
         for job in self.creation:
-            if job["id"] == job_id:
+            if job["id"] == job_id and (chat_id is None or job["chat_id"] == chat_id):
                 return _Row(
                     id=job["id"], repo=job["repo"], status=job["status"],
                     conversation_id=job["conversation_id"], created_at="t", updated_at="t",
+                    task_id=job.get("task_id"),
                 )
         return None
 

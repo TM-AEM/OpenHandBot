@@ -274,3 +274,68 @@ def test_auth_limiter_enforces_both_windows_independently():
     # الـ11 عند t=541 (نفس دقيقة الـ10) ⇒ مسموحة (الدقيقة فيها حدثين، الساعة 11<30).
     clock.now = 541.0
     assert lim.allow("ip")[0] is True
+
+
+# ================================================= OHB2-PLAN-02-D: طرد LRU حقيقي
+# الباگ المؤكَّد (Stage 0): الوصف بيقول LRU لكن الطرد كان بترتيب الإدراج (FIFO)،
+# و`allow`/`retry_after` ما كانوش بيحدّثوا الحداثة. الإصلاح: أي وصول ناجح لمفتاح
+# موجود يخلّيه «الأحدث استعمالًا»، والطرد عند تجاوز `max_keys` بيشيل الأقل حداثة.
+
+def test_recent_successful_access_protects_key_from_eviction():
+    """وصول `allow` ناجح لمفتاح موجود يحدّث حداثته ⇒ مايتطردش قبل مفتاح أقدم (Test A)."""
+    clock = FakeClock()
+    lim = SlidingWindowLimiter([Limit(5, 60.0)], clock=clock, max_keys=2)
+    assert lim.allow("A")[0] is True   # A (الأقدم إدراجًا)
+    assert lim.allow("B")[0] is True   # B
+    assert lim.allow("A")[0] is True   # وصول ناجح لـ A ⇒ A الأحدث استعمالًا
+    assert lim.allow("C")[0] is True   # إدخال C ⇒ تجاوز الحد ⇒ طرد الأقل حداثة (B)
+    assert "A" in lim._events          # A محمي (اتستخدم مؤخّرًا)
+    assert "B" not in lim._events      # B هو اللي يتطرد
+    assert "C" in lim._events
+
+
+def test_retry_after_updates_recency():
+    """وصول `retry_after` لمفتاح موجود يحدّث حداثته ⇒ مايتطردش (Test B)."""
+    clock = FakeClock()
+    lim = SlidingWindowLimiter([Limit(5, 60.0)], clock=clock, max_keys=2)
+    assert lim.allow("A")[0] is True   # A
+    assert lim.allow("B")[0] is True   # B
+    assert lim.retry_after("A") == 0.0  # وصول retry_after لـ A ⇒ A الأحدث
+    assert lim.allow("C")[0] is True   # تجاوز ⇒ طرد الأقل حداثة (B)
+    assert "A" in lim._events
+    assert "B" not in lim._events
+    assert "C" in lim._events
+
+
+def test_least_recently_used_is_evicted_without_reaccess():
+    """بدون إعادة وصول، الأقل حداثة = الأقدم إدراجًا ⇒ يتطرد أولًا (Test C)."""
+    clock = FakeClock()
+    lim = SlidingWindowLimiter([Limit(5, 60.0)], clock=clock, max_keys=2)
+    assert lim.allow("old")[0] is True
+    assert lim.allow("mid")[0] is True
+    assert lim.allow("new")[0] is True  # تجاوز ⇒ طرد الأقل حداثة (old)
+    assert "old" not in lim._events
+    assert "mid" in lim._events
+    assert "new" in lim._events
+
+
+def test_ordered_dict_and_blocked_allow_updates_recency():
+    """Blocked allow() برضه يحدّث الحداثة في OrderedDict من غير تسجيل حدث مرفوض."""
+    from collections import OrderedDict
+
+    clock = FakeClock()
+    lim = SlidingWindowLimiter([Limit(1, 60.0)], clock=clock, max_keys=2)
+    assert isinstance(lim._events, OrderedDict)
+    assert lim.allow("A")[0] is True   # A الأحدث (1/1)
+    assert lim.allow("B")[0] is True   # B الأحدث، A الأقدم
+    clock.advance(10.0)
+    allowed, retry = lim.allow("A")    # مرفوض ⇒ لكنه لمس A فيحدّث حداثته ويفضل B الأقدم
+    assert allowed is False
+    assert retry == pytest.approx(50.0)
+    assert lim.allow("C")[0] is True   # يتطرد B (الأقدم)، A يفضل موجود وممنوع لحد نهاية نافذته
+    assert "A" in lim._events
+    assert "B" not in lim._events
+    assert "C" in lim._events
+    assert lim.allow("A")[0] is False
+    clock.advance(50.1)
+    assert lim.allow("A")[0] is True

@@ -179,6 +179,10 @@ def callbacks(markup):
 
 
 def test_api_error_shown_to_user_has_no_secret(tmp_path):
+    """OHB2-SW-07: فشل upstream 5xx في القايمة: الرسالة تتعرض متنقّحة **و**الاستثناء ينتشر.
+
+    الأهم هنا: الرسالة المعروضة مابتسرّبش السر (register_secrets/redact).
+    """
     register_secrets(KEY)
 
     class C:
@@ -187,7 +191,8 @@ def test_api_error_shown_to_user_has_no_secret(tmp_path):
 
     ctx = make_context(1, tmp_path, client=C())
     q = Q("list:0")
-    asyncio.run(h.list_conversations(cb_update(q), ctx))
+    with pytest.raises(h.OperationalApiFailure):
+        asyncio.run(h.list_conversations(cb_update(q), ctx))
     assert q.edits and KEY not in q.edits[0]
 
 
@@ -644,7 +649,7 @@ def test_open_auth_failures_do_not_activate_route(tmp_path, code):
     assert db.get_awaiting(1) == ("prev", "route")  # ما اتغيّرش لـ A
 
 
-# 4) 429/5xx/مهلة/انقطاع: بدون إعادة محاولة تلقائية --------------------------
+# 4) 429/5xx/مهلة/انقطاع: فشل تشغيلي ⇒ ينتشر بعد عرض الرسالة (مفيش إتمام كاذب) ----
 @pytest.mark.parametrize("exc", [
     ApiError("too many", 429),
     ApiError("server", 500),
@@ -653,12 +658,15 @@ def test_open_auth_failures_do_not_activate_route(tmp_path, code):
     ApiError("تعذّر الاتصال"),        # انقطاع: بدون status
 ])
 def test_open_transient_errors_do_not_retry_and_preserve_state(tmp_path, exc):
+    """OHB2-SW-07: الفشل العابر (429/5xx/بلا كود) ينتشر بعد عرض الرسالة، ومفيش نداء API
+    تاني (مفيش إعادة محاولة تلقائية)، والحالة (توجيه/صندوق/إنشاء) ما بتتغيّرش."""
     calls = []
     ctx = make_context(1, tmp_path, client=OpenFlowClient(CONV, open_error=exc, list_calls=calls))
     db = ctx.bot_data["db"]
     db.set_awaiting(1, "prev", "route", title="t")
     q = Q("open:A")
-    asyncio.run(h.open_conversation(cb_update(q), ctx))
+    with pytest.raises(h.OperationalApiFailure):
+        asyncio.run(h.open_conversation(cb_update(q), ctx))
     assert len(calls) == 1                     # نداء API واحد بالظبط — مفيش retry
     assert db.get_awaiting(1) == ("prev", "route")
     assert db.count_outbox() == 0 and db.list_open_creation_jobs() == []
@@ -728,11 +736,16 @@ def test_client_non_dict_entries_are_dropped():
 
 
 def test_open_malformed_response_shows_controlled_error_no_route(tmp_path):
+    """OHB2-SW-07: `ApiError` بلا status (رد غير متوقّع) ⇒ رسالة آمنة **و**انتشار.
+
+    لا يرمي `JSONDecodeError` خام؛ يرمي `OperationalApiFailure` المصنّف، ومفيش توجيه جديد.
+    """
     ctx = make_context(1, tmp_path, client=OpenFlowClient(CONV, open_error=ApiError("رد غير متوقع من OpenHands")))
     db = ctx.bot_data["db"]
     db.set_awaiting(1, "prev", "route", title="t")
     q = Q("open:A")
-    asyncio.run(h.open_conversation(cb_update(q), ctx))  # مايرميش JSONDecodeError
+    with pytest.raises(h.OperationalApiFailure):
+        asyncio.run(h.open_conversation(cb_update(q), ctx))
     assert q.edits and "غير متوقع" in q.edits[0]
     assert db.get_awaiting(1) == ("prev", "route")
 
@@ -767,6 +780,10 @@ def test_open_render_failure_leaves_no_route(tmp_path):
 
 # 8) الفشل ما بيلمسش watched/outbox/creation ---------------------------------
 def test_open_failure_preserves_watched_and_does_not_touch_jobs(tmp_path):
+    """OHB2-SW-07: فشل upstream 5xx ينتشر **مع** الحفاظ الكامل على الحالة الدائمة.
+
+    التوجيه/المتابعة/الصندوق/الإنشاء ما بيتغيّروش — الانتشار ما بيعملش أي أثر جانبي.
+    """
     ctx = make_context(1, tmp_path, client=OpenFlowClient(CONV, open_error=ApiError("server", 500)))
     db = ctx.bot_data["db"]
     db.add_watched("w1", "عنوان", chat_id=99)
@@ -776,7 +793,8 @@ def test_open_failure_preserves_watched_and_does_not_touch_jobs(tmp_path):
     job = db.add_creation_job(99, "o/r", "نص", "2026-01-01T00:00:00+00:00")
 
     q = Q("open:A")
-    asyncio.run(h.open_conversation(cb_update(q), ctx))
+    with pytest.raises(h.OperationalApiFailure):
+        asyncio.run(h.open_conversation(cb_update(q), ctx))
 
     after = [(w.conversation_id, w.last_state, w.chat_id) for w in db.list_watched()]
     assert after == before                                   # المتابعة زي ما هي
@@ -800,12 +818,14 @@ def test_open_missing_edit_failure_is_handled(tmp_path):
 
 
 def test_open_api_error_edit_failure_is_handled(tmp_path):
-    # خطأ API (5xx) + تعديل رسالة الخطأ فشل: مفيش انهيار ولا توجيه جديد.
+    """OHB2-SW-07: خطأ API (5xx) + فشل تعديل الرسالة: الرسالة الآمنة اتجرّبت، مفيش توجيه
+    جديد، والفشل التشغيلي **ينتشر** (مفيش إتمام كاذب)."""
     ctx = make_context(1, tmp_path, client=OpenFlowClient(CONV, open_error=ApiError("server", 500)))
     db = ctx.bot_data["db"]
     db.set_awaiting(1, "prev", "route", title="t")
     q = FailQuery("open:A", BadRequest("message to edit not found"))
-    asyncio.run(h.open_conversation(_open_update(q), ctx))  # مايرميش
+    with pytest.raises(h.OperationalApiFailure):
+        asyncio.run(h.open_conversation(_open_update(q), ctx))
     assert q.edits == ["server"]                 # رسالة الخطأ الآمنة اتجرّبت
     assert db.get_awaiting(1) == ("prev", "route")  # ما اتغيّرش لـ A
 
@@ -821,16 +841,19 @@ def test_open_missing_not_modified_is_handled(tmp_path):
 
 
 def test_open_api_error_not_modified_is_handled(tmp_path):
+    """OHB2-SW-07: خطأ API (5xx) + "not modified" ⇒ الانتشار محفوظ، مفيش توجيه جديد."""
     ctx = make_context(1, tmp_path, client=OpenFlowClient(CONV, open_error=ApiError("x", 500)))
     db = ctx.bot_data["db"]
     db.set_awaiting(1, "prev", "route", title="t")
     q = FailQuery("open:A", BadRequest("Message is not modified"))
-    asyncio.run(h.open_conversation(_open_update(q), ctx))  # مايرميش
+    with pytest.raises(h.OperationalApiFailure):
+        asyncio.run(h.open_conversation(_open_update(q), ctx))
     assert db.get_awaiting(1) == ("prev", "route")
 
 
 def test_open_api_error_edit_failure_preserves_all_state(tmp_path):
-    # فشل تعديل على مسار خطأ الـ API: التوجيه + المتابعة + الصندوق + الإنشاء ما بيتغيّروش.
+    """OHB2-SW-07: فشل تعديل على مسار خطأ الـ API: التوجيه + المتابعة + الصندوق + الإنشاء
+    ما بيتغيّروش، والفشل التشغيلي ينتشر (مفيش أثر جانبي للانتشار)."""
     ctx = make_context(1, tmp_path, client=OpenFlowClient(CONV, open_error=ApiError("server", 500)))
     db = ctx.bot_data["db"]
     db.set_awaiting(1, "prev", "route", title="t")
@@ -841,7 +864,8 @@ def test_open_api_error_edit_failure_preserves_all_state(tmp_path):
     job = db.add_creation_job(99, "o/r", "نص", "2026-01-01T00:00:00+00:00")
 
     q = FailQuery("open:A", BadRequest("message to edit not found"))
-    asyncio.run(h.open_conversation(_open_update(q), ctx))  # مايرميش
+    with pytest.raises(h.OperationalApiFailure):
+        asyncio.run(h.open_conversation(_open_update(q), ctx))
 
     assert db.get_awaiting(1) == ("prev", "route")
     assert [(w.conversation_id, w.last_state, w.chat_id) for w in db.list_watched()] == before

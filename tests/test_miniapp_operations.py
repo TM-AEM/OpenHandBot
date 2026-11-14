@@ -247,3 +247,56 @@ def test_prompt_invalid_client_ref_rejected(tmp_path):
         headers={"origin": ORIGIN},
     )
     assert r.status_code == 400
+
+
+# ============================== OHB2-PHASE1E-F2/F3: malformed input => 400, not 500
+HUGE = 10 ** 25  # أكبر من INTEGER (64-bit) ⇒ OverflowError في SQLite ⇒ 500 قبل الإصلاح
+
+
+def test_f2_huge_outbox_id_is_400(tmp_path):
+    """F2: `?id=10**25` كان بيضرب OverflowError (500) في `get_outbox`."""
+    db = Database(str(tmp_path / "d.sqlite3"))
+    c = _authed(tmp_path, _kwargs={"db": db, "client": FakeClient()})
+    assert c.get(f"/api/v1/operations/outbox?id={HUGE}").status_code == 400
+
+
+def test_f2_reconcile_huge_id_is_400(tmp_path):
+    """F2: حقل `id` ضخم في تسوية الصندوق ⇒ 400 مش 500."""
+    db = Database(str(tmp_path / "d.sqlite3"))
+    c = _authed(tmp_path, _kwargs={"db": db, "client": FakeClient()})
+    r = c.post(
+        "/api/v1/operations/outbox/reconcile",
+        json={"id": HUGE, "action": "discard"},
+        headers={"origin": ORIGIN},
+    )
+    assert r.status_code == 400
+
+
+def test_f3_reconcile_non_string_action_is_400(tmp_path):
+    """F3: `action` غير نصي كان بيضرب AttributeError (500) في `.strip()`."""
+    db = Database(str(tmp_path / "d.sqlite3"))
+    oid = db.add_outbox("c1", 1, "x", "t0")
+    c = _authed(tmp_path, _kwargs={"db": db, "client": FakeClient()})
+    for bad in (5, [1], {"a": 1}, True):
+        r = c.post(
+            "/api/v1/operations/outbox/reconcile",
+            json={"id": oid, "action": bad},
+            headers={"origin": ORIGIN},
+        )
+        assert r.status_code == 400, bad
+
+
+def test_f3_non_string_chat_fields_are_400(tmp_path):
+    """F3: حقول نصية غير نصية في create_chat/prompt/repository ⇒ 400 مش 500."""
+    db = Database(str(tmp_path / "d.sqlite3"))
+    c = _authed(tmp_path, _kwargs={"db": db, "client": FakeClient(convs={"c1": {"id": "c1"}})})
+    assert c.post(
+        "/api/v1/chats", json={"repository": "a/b", "text": 5}, headers={"origin": ORIGIN}
+    ).status_code == 400
+    assert c.post(
+        "/api/v1/conversations/c1/prompt", json={"text": {"x": 1}}, headers={"origin": ORIGIN}
+    ).status_code == 400
+    assert c.patch(
+        "/api/v1/conversations/c1/repository", json={"repository": 5}, headers={"origin": ORIGIN}
+    ).status_code == 400
+

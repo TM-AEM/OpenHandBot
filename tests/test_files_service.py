@@ -196,8 +196,21 @@ def test_list_files_denies_when_identity_unknown():
 
 
 def test_list_files_denies_when_me_errors():
+    """OHB2-SW-04: فشل `/users/me` (upstream) ⇒ `UPSTREAM_ERROR` (مش UNAUTHORIZED).
+
+    لسه ممنوع (fail closed) ومفيش قايمة ملفات، بس الحالة بتحفظ التفصيل: عطل خدمة
+    ≠ رفض تفويض. قبل الإصلاح كانت بتتلخبط مع `UNAUTHORIZED` وتطلع 403 بدل 502.
+    """
     res = run(svc(convs={"c1": _conv()}, errors={"me": ApiError("x", 500)}).list_files("c1"))
+    assert res.status == FileStatus.UPSTREAM_ERROR
+    assert res.files == ()  # مفيش أي قايمة ملفات (فشل مغلق)
+
+
+def test_list_files_denies_when_identity_missing_is_unauthorized():
+    """تحكّم مقابل: هوية مفقودة (`{}`) تفضل `UNAUTHORIZED` مش upstream."""
+    res = run(svc(me={}, convs={"c1": _conv()}).list_files("c1"))
     assert res.status == FileStatus.UNAUTHORIZED
+    assert res.files == ()
 
 
 def test_list_files_not_found_for_unknown_conversation():

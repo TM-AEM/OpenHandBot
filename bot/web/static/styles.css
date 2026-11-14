@@ -120,9 +120,15 @@ html, body {
 .tab { flex: 1 0 auto; padding: 8px 12px; border: 1px solid #334155; background: transparent; color: inherit; border-radius: 999px; font-size: 13px; }
 .tab.active { background: #1d4ed8; border-color: #1d4ed8; color: #fff; }
 .toolbar { display: flex; justify-content: flex-end; margin-bottom: 8px; }
+.filter-bar { display: flex; gap: 6px; margin-bottom: 8px; overflow-x: auto; padding: 2px 0; }
+.chip { flex: 0 0 auto; padding: 6px 12px; border: 1px solid #334155; background: transparent; color: inherit; border-radius: 999px; font-size: 13px; }
+.chip.active { background: #1d4ed8; border-color: #1d4ed8; color: #fff; }
 .list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
 .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 12px; border: 1px solid #334155; border-radius: 12px; cursor: pointer; }
-.row-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.row-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 auto; }
+.row-pills { display: flex; gap: 4px; align-items: center; flex: 0 0 auto; }
+.row-actions { display: flex; gap: 4px; align-items: center; flex: 0 0 auto; }
+.row.archived { opacity: .7; }
 .row-title { font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row-sub { font-size: 12px; opacity: .65; }
 

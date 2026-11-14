@@ -5,7 +5,7 @@
   var API = "/api/v1";
   var tg = (window.Telegram && window.Telegram.WebApp) || null;
   var REQUEST_TIMEOUT = 12000;
-  var state = { chatsPage: 0, currentChat: null, selectedRepo: null, inboxPage: 0, inboxLoading: false, inboxIds: {}, inboxHasMore: false, inboxVisible: false, inboxLastRefreshAt: 0, detailSeq: 0 };
+  var state = { chatsPage: 0, currentChat: null, selectedRepo: null, inboxPage: 0, inboxLoading: false, inboxIds: {}, inboxHasMore: false, inboxVisible: false, inboxLastRefreshAt: 0, inboxFilter: "all", detailSeq: 0, chatsSeq: 0, reposSeq: 0, watchesSeq: 0, jobsPage: 0, jobsLoading: false, jobsHasMore: false };
   // OHB2-08-07: مؤقّت التحديث الدوري (مرئي فقط) + آخر وقت تحديث (للتهدئة).
   var inboxPollTimer = null;
 
@@ -31,7 +31,7 @@
     // الردود القديمة (`currentChat`) فعالًا لوحده: رد تفاصيل جاي بعد ما المستخدم ساب
     // الشاشة (تنقّل/رجوع) مايدهسش الشاشة الجديدة، مش بس لو فتح شات تاني.
     if (name !== "view-detail") { state.currentChat = null; }
-    ["view-chats", "view-detail", "view-watches", "view-inbox", "view-new", "view-settings"].forEach(function (id) {
+    ["view-chats", "view-detail", "view-watches", "view-inbox", "view-jobs", "view-new", "view-settings"].forEach(function (id) {
       var n = $(id);
       if (n) { n.hidden = (id !== name); }
     });
@@ -109,10 +109,19 @@
   if (!OPS) { throw new Error("RecovoOps مش محمّل (ops.js)"); }
   var INBOX = window.RecovoInbox;
   if (!INBOX) { throw new Error("RecovoInbox مش محمّل (inbox.js)"); }
+  // OHB2-PHASE1D: منطق عرض/إدارة طلبات الشات الجديد — مشترك ومُختبر في jobs.js.
+  var JOBS = window.RecovoJobs;
+  if (!JOBS) { throw new Error("RecovoJobs مش محمّل (jobs.js)"); }
   var FILES = window.RecovoFiles;
   if (!FILES) { throw new Error("RecovoFiles مش محمّل (files.js)"); }
   var COST = window.RecovoCost;
   if (!COST) { throw new Error("RecovoCost مش محمّل (cost.js)"); }
+  var COPY = window.RecovoCopy;
+  if (!COPY) { throw new Error("RecovoCopy مش محمّل (copy.js)"); }
+  var EXPORT = window.RecovoExport;
+  if (!EXPORT) { throw new Error("RecovoExport مش محمّل (export.js)"); }
+  // OHB2-PHASE1B: مرجع آمن لـ navigator (مش موجود في بيئة الاختبار المصغّرة).
+  var NAV = (typeof navigator !== "undefined") ? navigator : null;
   // OHB2-09-02: منع طلبات الملفات المكرّرة المتزامنة (نفس الشات/الملف).
   var filesDeduper = FILES.createDeduper();
   function opKey(parts) { return OPS.identityKey(parts); }
@@ -368,9 +377,17 @@
     // حالة التحميل الجاري. بيتصفّر في then/catch تحت.
     if (state.inboxLoading) { return; }
     state.inboxLoading = true;
+    // OHB2-PHASE1C: نلتقط الفلتر اللي الطلب ده بتاعه. لو المستخدم غيّر الفلتر أثناء
+    // الطلب، الرد ده بقى قديم ⇒ نتجاهله ونعيد التحميل بالفلتر الحالي (منع سباق
+    // بين تغيير الفلتر والترقيم والتحديثات).
+    var reqFilter = state.inboxFilter;
+    var unreadOnly = reqFilter === "unread";
+    var archived = reqFilter === "archived";
+    var query = INBOX.filterQuery(page || 0, unreadOnly, archived);
     if (page === 0) { state.inboxIds = {}; if (!silent) { list.innerHTML = ""; list.appendChild(el("li", "loading-row", "بيتم التحميل…")); } }
-    get("/notifications?page=" + (page || 0)).then(function (res) {
+    get("/notifications?" + query).then(function (res) {
       state.inboxLoading = false;
+      if (reqFilter !== state.inboxFilter) { loadInbox(0); return; }
       var data = res.data || {};
       if (!res.ok) {
         // فشل تحديث خلفي ⇒ نتجاهله ونحافظ على المعروض (مفيش وميض/مسح).
@@ -389,39 +406,364 @@
       renderInboxBadge(data.unread_count);
       var items = data.items || [];
       if (page === 0) { list.innerHTML = ""; }
-      if (page === 0 && !items.length) { list.appendChild(el("li", "empty-row", "مفيش إشعارات.")); }
+      if (page === 0 && !items.length) { list.appendChild(el("li", "empty-row", INBOX.emptyText(unreadOnly, archived))); }
       items.forEach(function (it) {
         // OHB2-08-06: منع تكرار نفس الإشعار — الترقيم بـ offset ممكن يتداخل لما
         // إشعارات جديدة تتصدّر القايمة، فنفس المعرّف يظهر في صفحتين.
         var idKey = String(it.id);
         if (state.inboxIds[idKey]) { return; }
         state.inboxIds[idKey] = true;
-        var unread = INBOX.isUnread(it);
-        var li = el("li", "row" + (unread ? " unread" : ""));
-        var main = el("div", "row-main");
-        main.appendChild(el("span", "row-title", it.title || it.conversation_id || ""));
-        main.appendChild(el("span", "row-sub", kindLabel(it.kind)));
-        li.appendChild(main);
-        // OHB2-08-05 (Batch 3R): شارة حالة التسليم (مفيش شارة لو اتسلّم).
-        var delivery = INBOX.deliveryLabel(it.delivery_status);
-        if (delivery) { li.appendChild(el("span", "pill delivery", delivery)); }
-        li.appendChild(el("span", "pill", unread ? "جديد" : "مقروء"));
-        li.addEventListener("click", function () {
-          if (unread) {
-            post("/notifications/" + encodeURIComponent(it.id) + "/read", {}).then(function (r2) {
-              if (r2.ok) { renderInboxBadge(r2.data && r2.data.unread_count); }
-            }).catch(function () { /* نتجاهل: العرض لسه شغال */ });
-          }
-          if (it.conversation_id) { openDetail(it.conversation_id); }
-        });
-        list.appendChild(li);
+        list.appendChild(renderInboxRow(it));
       });
       var more = $("inbox-more");
       if (more) { more.hidden = !data.has_more; }
     }).catch(function () {
       state.inboxLoading = false;
+      // OHB2-PHASE1C: نفس حارس السباق في مسار الفشل (رفض الشبكة) — لو الفلتر اتغيّر
+      // أثناء الطلب، مانعرضش خطأ للفلتر القديم؛ نعيد التحميل بالفلتر الحالي.
+      if (reqFilter !== state.inboxFilter) { loadInbox(0); return; }
       if (page === 0 && !silent) { list.innerHTML = ""; list.appendChild(el("li", "empty-row", "مش قادر أوصل للسيرفر.")); }
     });
+  }
+
+  // OHB2-PHASE1C: صف إشعار واحد + أزرار الأرشفة/الاسترجاع/الحذف. الحذف النهائي بيتطلب
+  // تأكيد صريح (خطوتين) في الواجهة، والسيرفر بيفرض الأهلية تاني بشكل مستقل.
+  function renderInboxRow(it) {
+    var unread = INBOX.isUnread(it);
+    var archived = INBOX.isArchived(it);
+    var li = el("li", "row" + (unread ? " unread" : "") + (archived ? " archived" : ""));
+    var main = el("div", "row-main");
+    main.appendChild(el("span", "row-title", it.title || it.conversation_id || ""));
+    main.appendChild(el("span", "row-sub", kindLabel(it.kind)));
+    li.appendChild(main);
+    var pills = el("div", "row-pills");
+    // OHB2-08-05 (Batch 3R): شارة حالة التسليم (مفيش شارة لو اتسلّم).
+    var delivery = INBOX.deliveryLabel(it.delivery_status);
+    if (delivery) { pills.appendChild(el("span", "pill delivery", delivery)); }
+    pills.appendChild(el("span", "pill", unread ? "جديد" : "مقروء"));
+    li.appendChild(pills);
+    var actions = el("div", "row-actions");
+    // أرشفة/استرجاع (قابل للعكس دائمًا).
+    var archiveBtn = el("button", "btn ghost small", archived ? "استرجاع" : "أرشفة");
+    archiveBtn.addEventListener("click", function (e) {
+      if (e && e.stopPropagation) { e.stopPropagation(); }
+      setInboxArchived(it, !archived, archiveBtn);
+    });
+    actions.appendChild(archiveBtn);
+    // حذف نهائي — بس لو السيرفر قال إنه مؤهّل، ومع تأكيد صريح.
+    if (INBOX.canDelete(it)) {
+      var delBtn = el("button", "btn danger small", "🗑 حذف");
+      var confirmBtn = el("button", "btn danger small", "أكّد الحذف");
+      confirmBtn.hidden = true;
+      var cancelBtn = el("button", "btn ghost small", "إلغاء");
+      cancelBtn.hidden = true;
+      var deleting = false;
+      delBtn.addEventListener("click", function (e) {
+        if (e && e.stopPropagation) { e.stopPropagation(); }
+        delBtn.hidden = true; confirmBtn.hidden = false; cancelBtn.hidden = false;
+      });
+      cancelBtn.addEventListener("click", function (e) {
+        if (e && e.stopPropagation) { e.stopPropagation(); }
+        delBtn.hidden = false; confirmBtn.hidden = true; cancelBtn.hidden = true;
+      });
+      confirmBtn.addEventListener("click", function (e) {
+        if (e && e.stopPropagation) { e.stopPropagation(); }
+        if (deleting) { return; }
+        deleting = true;
+        confirmBtn.disabled = true; cancelBtn.disabled = true;
+        del("/notifications/" + encodeURIComponent(it.id)).then(function (res) {
+          if (res.ok) {
+            renderInboxBadge(res.data && res.data.unread_count);
+            toast("اتحذف الإشعار نهائيًا ✅");
+            loadInbox(0);
+          } else {
+            deleting = false; confirmBtn.disabled = false; cancelBtn.disabled = false;
+            toast(friendlyMessage(res.status, res.data));
+          }
+        }).catch(function () {
+          // انقطاع الشبكة: النتيجة غامضة ⇒ نسمح بإعادة المحاولة (مفيش نجاح كاذب).
+          deleting = false; confirmBtn.disabled = false; cancelBtn.disabled = false;
+          toast("مش قادر أوصل للسيرفر — جرّب تاني.");
+        });
+      });
+      actions.appendChild(delBtn);
+      actions.appendChild(confirmBtn);
+      actions.appendChild(cancelBtn);
+    }
+    li.appendChild(actions);
+    li.addEventListener("click", function () {
+      if (unread) {
+        post("/notifications/" + encodeURIComponent(it.id) + "/read", {}).then(function (r2) {
+          if (r2.ok) { renderInboxBadge(r2.data && r2.data.unread_count); }
+        }).catch(function () { /* نتجاهل: العرض لسه شغال */ });
+      }
+      if (it.conversation_id) { openDetail(it.conversation_id); }
+    });
+    return li;
+  }
+
+  // OHB2-PHASE1C: أرشفة/استرجاع إشعار (قابل للعكس). ما بنحدّثش العرض كذبًا: بنعيد التحميل
+  // من السيرفر بعد النجاح بس، وأي فشل يعرض رسالة من غير ما يغيّر الحالة المعروضة.
+  function setInboxArchived(it, wantArchived, btn) {
+    var path = "/notifications/" + encodeURIComponent(it.id) + (wantArchived ? "/archive" : "/unarchive");
+    if (btn) { btn.disabled = true; }
+    post(path, {}).then(function (res) {
+      if (btn) { btn.disabled = false; }
+      if (res.ok) {
+        renderInboxBadge(res.data && res.data.unread_count);
+        toast(wantArchived ? "اتأرشف ✅" : "اتسترجع ✅");
+        loadInbox(0);
+      } else {
+        toast(friendlyMessage(res.status, res.data));
+      }
+    }).catch(function () {
+      if (btn) { btn.disabled = false; }
+      toast("مش قادر أوصل للسيرفر.");
+    });
+  }
+
+  // OHB2-PHASE1C: تبديل فلتر الصندوق (الكل / غير المقروء / المؤرشف). بيصفّر الترقيم
+  // عشان ما نتخطّاش سجلات عند تغيير الفلتر، وبيعيد التحميل من أول صفحة.
+  function setInboxFilter(filter) {
+    state.inboxFilter = filter;
+    ["inbox-filter-all", "inbox-filter-unread", "inbox-filter-archived"].forEach(function (id) {
+      var btn = $(id);
+      if (!btn) { return; }
+      var on = btn.getAttribute("data-filter") === filter;
+      btn.className = on ? "chip active" : "chip";
+    });
+    state.inboxPage = 0;
+    state.inboxIds = {};
+    state.inboxHasMore = false;
+    state.inboxLastRefreshAt = Date.now();
+    loadInbox(0);
+  }
+
+  // OHB2-PHASE1D: قايمة طلبات الشات الجديد (قراءة فقط، مقيّدة بالمالك على السيرفر).
+  // `page===0` بتصفّر القايمة؛ الفشل الصامت (silent) بيحافظ على المعروض.
+  function loadJobs(page, silent) {
+    var list = $("jobs-list");
+    if (!list) { return; }
+    if (state.jobsLoading) { return; }
+    state.jobsLoading = true;
+    var p = page || 0;
+    if (p === 0 && !silent) {
+      list.innerHTML = "";
+      list.appendChild(el("li", "loading-row", "بيتم التحميل…"));
+    }
+    get("/operations/creation/list?page=" + encodeURIComponent(p)).then(function (res) {
+      state.jobsLoading = false;
+      var data = res.data || {};
+      if (!res.ok) {
+        if (silent) { return; }
+        if (p === 0) { list.innerHTML = ""; }
+        list.appendChild(el("li", "empty-row", friendlyMessage(res.status, res.data)));
+        return;
+      }
+      if (typeof data.page === "number" && data.page >= 0) { state.jobsPage = data.page; }
+      state.jobsHasMore = !!data.has_more;
+      var items = data.items || [];
+      if (p === 0) { list.innerHTML = ""; }
+      if (p === 0 && !items.length) {
+        list.appendChild(el("li", "empty-row", "مفيش طلبات بدء شات لسه."));
+      }
+      items.forEach(function (it) { list.appendChild(renderJobRow(it)); });
+      var more = $("jobs-more");
+      if (more) { more.hidden = !data.has_more; }
+    }).catch(function () {
+      state.jobsLoading = false;
+      if (p === 0 && !silent) {
+        list.innerHTML = "";
+        list.appendChild(el("li", "empty-row", "مش قادر أوصل للسيرفر."));
+      }
+    });
+  }
+
+  // OHB2-PHASE1D: صف طلب شات جديد. الأزرار بتظهر **بس** حسب أعلام السيرفر
+  // (`cancellable`/`resolvable`) — مفيش قرار من الواجهة، والسيرفر بيفرض الأهلية تاني.
+  function renderJobRow(it) {
+    var li = el("li", "row");
+    var main = el("div", "row-main");
+    var title = el("div", "row-title", "طلب بدء #" + it.id + (it.repository ? (" — " + it.repository) : ""));
+    main.appendChild(title);
+    var meta = el("div", "row-meta");
+    meta.appendChild(el("span", "op-pill", JOBS.stateLabel(it.state)));
+    var postLabel = JOBS.postStateLabel(it.post_state);
+    if (postLabel) { meta.appendChild(el("span", "pill", "الإرسال: " + postLabel)); }
+    if (it.terminal) { meta.appendChild(el("span", "pill", "نهائي")); }
+    main.appendChild(meta);
+    main.appendChild(el("p", "op-note", JOBS.note(it)));
+    li.appendChild(main);
+
+    var actions = el("div", "row-actions");
+    // إلغاء آمن — بس قبل الإرسال المؤكد، ومع تأكيد صريح (خطوتين).
+    if (JOBS.canCancel(it)) {
+      var cancelBtn = el("button", "btn danger small", "إلغاء الطلب");
+      var confirmBtn = el("button", "btn danger small", "أكّد الإلغاء");
+      confirmBtn.hidden = true;
+      var backBtn = el("button", "btn ghost small", "رجوع");
+      backBtn.hidden = true;
+      var busy = false;
+      cancelBtn.addEventListener("click", function () {
+        cancelBtn.hidden = true; confirmBtn.hidden = false; backBtn.hidden = false;
+      });
+      backBtn.addEventListener("click", function () {
+        cancelBtn.hidden = false; confirmBtn.hidden = true; backBtn.hidden = true;
+      });
+      confirmBtn.addEventListener("click", function () {
+        if (busy) { return; }
+        busy = true;
+        confirmBtn.disabled = true; backBtn.disabled = true;
+        reconcileJob(it.id, "cancel").then(function (res) {
+          if (res.ok) {
+            var data = res.data || {};
+            if (data.cancellation === "not_confirmed") {
+              toast("الإلغاء غير مؤكد — الإرسال ممكن يكون بدأ. استعلم عن الحالة.");
+            } else {
+              toast("اتلغى قبل الإرسال ✅");
+            }
+            loadJobs(0);
+          } else {
+            busy = false; confirmBtn.disabled = false; backBtn.disabled = false;
+            toast(friendlyMessage(res.status, res.data));
+          }
+        }).catch(function () {
+          busy = false; confirmBtn.disabled = false; backBtn.disabled = false;
+          toast("مش قادر أوصل للسيرفر — جرّب تاني.");
+        });
+      });
+      actions.appendChild(cancelBtn);
+      actions.appendChild(confirmBtn);
+      actions.appendChild(backBtn);
+    }
+    // تأكيد البدء (حسم الغموض) — بس لو السيرفر قال إن الطلب غامض، ومع تأكيد صريح.
+    if (JOBS.canResolve(it)) {
+      var markBtn = el("button", "btn small", "أكّد إنه بدأ");
+      var markConfirm = el("button", "btn small", "تأكيد نهائي");
+      markConfirm.hidden = true;
+      var markBack = el("button", "btn ghost small", "رجوع");
+      markBack.hidden = true;
+      var markBusy = false;
+      markBtn.addEventListener("click", function () {
+        markBtn.hidden = true; markConfirm.hidden = false; markBack.hidden = false;
+      });
+      markBack.addEventListener("click", function () {
+        markBtn.hidden = false; markConfirm.hidden = true; markBack.hidden = true;
+      });
+      markConfirm.addEventListener("click", function () {
+        if (markBusy) { return; }
+        markBusy = true;
+        markConfirm.disabled = true; markBack.disabled = true;
+        reconcileJob(it.id, "mark_sent").then(function (res) {
+          if (res.ok) { toast("اتأكد إنه بدأ ✅"); loadJobs(0); }
+          else {
+            markBusy = false; markConfirm.disabled = false; markBack.disabled = false;
+            toast(friendlyMessage(res.status, res.data));
+          }
+        }).catch(function () {
+          markBusy = false; markConfirm.disabled = false; markBack.disabled = false;
+          toast("مش قادر أوصل للسيرفر — جرّب تاني.");
+        });
+      });
+      actions.appendChild(markBtn);
+      actions.appendChild(markConfirm);
+      actions.appendChild(markBack);
+    }
+    // فتح المحادثة المرتبطة — بس لو السيرفر رجّع معرّف محادثة (بدليل).
+    if (JOBS.hasConversation(it)) {
+      var openBtn = el("button", "btn ghost small", "افتح الشات");
+      openBtn.addEventListener("click", function () { openDetail(it.conversation_id); });
+      actions.appendChild(openBtn);
+    }
+    li.appendChild(actions);
+    return li;
+  }
+
+  // OHB2-PHASE1D: تسوية طلب شات (cancel/mark_sent) عبر مسار مصادَق (POST).
+  function reconcileJob(id, action) {
+    return post("/operations/creation/reconcile", { id: id, action: action });
+  }
+
+  var DELETION_STATE_LABEL = {
+    deleting: "جاري الحذف (معلّق)",
+    uncertain: "غير محسوم"
+  };
+
+  function loadDeletions(silent) {
+    var list = $("deletions-list");
+    if (!list) { return; }
+    if (!silent) {
+      list.innerHTML = "";
+      list.appendChild(el("li", "loading-row", "بيتم التحميل…"));
+    }
+    get("/operations/deletions/list").then(function (res) {
+      if (!res.ok) {
+        if (silent) { return; }
+        list.innerHTML = "";
+        list.appendChild(el("li", "empty-row", friendlyMessage(res.status, res.data)));
+        return;
+      }
+      var items = (res.data && res.data.items) || [];
+      list.innerHTML = "";
+      if (!items.length) {
+        list.appendChild(el("li", "empty-row", "مفيش عمليات حذف معلّقة."));
+        return;
+      }
+      items.forEach(function (it) { list.appendChild(renderDeletionRow(it)); });
+    }).catch(function () {
+      if (!silent) {
+        list.innerHTML = "";
+        list.appendChild(el("li", "empty-row", "مش قادر أوصل للسيرفر."));
+      }
+    });
+  }
+
+  function renderDeletionRow(it) {
+    var li = el("li", "row");
+    var main = el("div", "row-main");
+    main.appendChild(el("div", "row-title", "حذف شات: " + (it.conversation_id || "")));
+    var meta = el("div", "row-meta");
+    meta.appendChild(el("span", "op-pill", DELETION_STATE_LABEL[it.state] || it.state || "معلّق"));
+    if (it.updated_at) { meta.appendChild(el("span", "pill", it.updated_at)); }
+    main.appendChild(meta);
+    li.appendChild(main);
+
+    var actions = el("div", "row-actions");
+    var checkBtn = el("button", "btn small", "تحقق الآن");
+    var confirmBtn = el("button", "btn small", "أكّد التحقق");
+    confirmBtn.hidden = true;
+    var backBtn = el("button", "btn ghost small", "رجوع");
+    backBtn.hidden = true;
+    var busy = false;
+    checkBtn.addEventListener("click", function () {
+      checkBtn.hidden = true; confirmBtn.hidden = false; backBtn.hidden = false;
+    });
+    backBtn.addEventListener("click", function () {
+      checkBtn.hidden = false; confirmBtn.hidden = true; backBtn.hidden = true;
+    });
+    confirmBtn.addEventListener("click", function () {
+      if (busy) { return; }
+      busy = true;
+      confirmBtn.disabled = true; backBtn.disabled = true;
+      post("/operations/deletions/reconcile", { conversation_id: it.conversation_id }).then(function (res) {
+        if (res.ok) {
+          toast((res.data && res.data.message) || "اتحذف الشات نهائيًا من OpenHands ✅");
+          loadDeletions(false);
+        } else {
+          busy = false; confirmBtn.disabled = false; backBtn.disabled = false;
+          toast(friendlyMessage(res.status, res.data));
+          loadDeletions(false);
+        }
+      }).catch(function () {
+        busy = false; confirmBtn.disabled = false; backBtn.disabled = false;
+        toast("مش قادر أوصل للسيرفر — جرّب تاني.");
+      });
+    });
+    actions.appendChild(checkBtn);
+    actions.appendChild(confirmBtn);
+    actions.appendChild(backBtn);
+    li.appendChild(actions);
+    return li;
   }
 
   // OHB2-08-07: تحديث صندوق الإشعارات لو الصفحة مرئية وتبويب الإشعارات مفتوح فعلاً،
@@ -476,10 +818,16 @@
 
   function loadChats(refresh) {
     var list = $("chats-list");
+    // OHB2-MINIAPP-STALE-FIX: حرس الردود القديمة بنفس نمط `detailSeq`. كل طلب جديد
+    // بيلغي الطلبات الأقدم؛ الرد (نجاح/فشل/رفض شبكة) مايلمسش الـ DOM غير لو لسه
+    // تابع للجيل الحالي. كده رد قديم مايستعيدش شات اتحذف ولا يدهس قايمة/صفحة أحدث.
+    var seq = ++state.chatsSeq;
+    function current() { return state.chatsSeq === seq; }
     list.innerHTML = "";
     list.appendChild(el("li", "loading-row", "بيتم التحميل…"));
     var q = "?page=" + state.chatsPage + (refresh ? "&refresh=1" : "");
     return get("/conversations" + q).then(function (res) {
+      if (!current()) { return; }
       if (!res.ok) { list.innerHTML = ""; list.appendChild(el("li", "empty-row", friendlyMessage(res.status, res.data))); return; }
       var data = res.data || {};
       list.innerHTML = "";
@@ -497,6 +845,13 @@
       });
       var more = $("chats-more");
       if (more) { more.hidden = !data.has_more; }
+    }).catch(function () {
+      // OHB2-MINIAPP-STALE-FIX: رفض الشبكة كان بيسيب صف «بيتم التحميل…» للأبد وبيرمي
+      // unhandled rejection. دلوقتي بنستبدله برسالة قابلة للاسترجاع — لكن برضه بحرس
+      // الجيل، عشان فشل قديم مايدهسش نجاح أحدث.
+      if (!current()) { return; }
+      list.innerHTML = "";
+      list.appendChild(el("li", "empty-row", "مش قادر أوصل للسيرفر."));
     });
   }
 
@@ -540,6 +895,29 @@
       rb.appendChild(el("span", "bubble-label", "آخر رد"));
       rb.appendChild(el("p", "bubble-text", d.last_reply || "لسه مفيش رد."));
       box.appendChild(rb);
+      // OHB2-PHASE1B: زر نسخ **الرد الكامل** (مش المعاينة المقصوصة). بيجيب النص
+      // الكامل من الـ endpoint المصادَق وقت الضغط، وبيبلّغ بنجاح/فشل النسخ بصدق.
+      var copyRow = el("div", "toolbar");
+      var copyBtn = el("button", "btn ghost small", "📋 نسخ الرد الكامل");
+      if (!d.last_reply) { copyBtn.disabled = true; }
+      copyBtn.addEventListener("click", function () {
+        if (copyBtn.disabled) { return; }
+        copyBtn.disabled = true;
+        get("/conversations/" + encodeURIComponent(id) + "/reply").then(function (res) {
+          if (!res.ok) {
+            copyBtn.disabled = false;
+            toast(friendlyMessage(res.status, res.data));
+            return;
+          }
+          var full = (res.data && res.data.reply) || "";
+          COPY.copyText(full, { navigator: NAV, document: document }).then(function (result) {
+            copyBtn.disabled = false;
+            toast(COPY.feedback(result));
+          });
+        }).catch(function () { copyBtn.disabled = false; toast("مش قادر أوصل للسيرفر."); });
+      });
+      copyRow.appendChild(copyBtn);
+      box.appendChild(copyRow);
 
       var prompt = el("textarea", "textarea");
       prompt.rows = 3;
@@ -586,6 +964,41 @@
         });
       });
 
+      // OHB2-PHASE1B: زر تصدير الشات (zip) — تنزيل مباشر عبر رابط مصادَق. بنقرأ اسم
+      // الملف الآمن من هيدر `Content-Disposition`، ولو فشل الطلب بنعرض رسالة واضحة
+      // (مفيش تنزيل وهمي). التنزيل بيحصل على مسار المصادقة/الكوكي نفسه (same-origin).
+      var exportBtn = el("button", "btn ghost small", "⬇️ تصدير الشات");
+      exportBtn.addEventListener("click", function () {
+        if (exportBtn.disabled) { return; }
+        exportBtn.disabled = true;
+        var url = API + "/conversations/" + encodeURIComponent(id) + "/export";
+        fetch(url, { method: "GET", credentials: "same-origin", cache: "no-store" })
+          .then(function (res) {
+            if (!res.ok) {
+              return res.json().catch(function () { return {}; }).then(function (data) {
+                exportBtn.disabled = false;
+                var code = data && data.error;
+                toast(EXPORT.errorLabel(code, friendlyMessage(res.status, data)));
+              });
+            }
+            var name = EXPORT.filenameFromDisposition(res.headers.get("content-disposition"));
+            return res.blob().then(function (blob) {
+              var objUrl = URL.createObjectURL(blob);
+              var a = el("a", "link", "");
+              a.href = objUrl;
+              a.download = name;
+              document.body.appendChild(a);
+              a.click();
+              if (a.remove) { a.remove(); }
+              setTimeout(function () { URL.revokeObjectURL(objUrl); }, 0);
+              exportBtn.disabled = false;
+              toast("تم تنزيل التصدير ✅");
+            });
+          })
+          .catch(function () { exportBtn.disabled = false; toast("مش قادر أوصل للسيرفر."); });
+      });
+      box.appendChild(exportBtn);
+
       var watchBtn = el("button", "btn ghost small", d.watched ? "إلغاء المتابعة" : "متابعة");
       watchBtn.addEventListener("click", function () {
         watchBtn.disabled = true;
@@ -600,12 +1013,12 @@
       });
       box.appendChild(watchBtn);
 
-      // OHB2-C7: حذف محلي للشات (بتأكيد صريح). ما بنحذفش الشات من OpenHands — إحنا
-      // بنشيل بس السجل المحلي (المتابعة/الصندوق/الإشعارات). حرس الضغط المزدوج عبر
-      // `deleting` + تعطيل الأزرار، والحالة الغامضة (انقطاع) تفضل retryable.
+      // OHB2-MINIAPP: حذف الشات **من OpenHands نفسه** (بتأكيد صريح). الـ backend بيعمل
+      // نداء الحذف البعيد الأول، وبيرجّع 200 بس لما OpenHands يأكّد. أي فشل/نتيجة غامضة
+      // بترجع رسالة واضحة وبتفضل على الشاشة (retryable) — مفيش نجاح كاذب.
       var delNote = el(
         "p", "delete-confirm-note",
-        "متأكد إنك عايز تحذف «" + (d.title || "بدون عنوان") + "»؟ (حذف محلي)"
+        "متأكد إنك عايز تحذف «" + (d.title || "بدون عنوان") + "» نهائيًا من OpenHands؟"
       );
       delNote.hidden = true;
       box.appendChild(delNote);
@@ -635,7 +1048,7 @@
         cancelBtn.disabled = true;
         del("/conversations/" + encodeURIComponent(id)).then(function (res) {
           if (res.ok) {
-            toast("اتشال من هنا ✅ (حذف محلي — الشات لسه على OpenHands).");
+            toast("اتحذف من OpenHands نهائيًا ✅");
             showView("view-chats");
             loadChats(true);
           } else {
@@ -686,6 +1099,9 @@
 
     var list = el("ul", "list");
     var previewBox = el("div", "file-preview");
+    // OHB2-MINIAPP-STALE-FIX: جيل المعاينة الحالي (بيتزوّد في كل طلب معاينة، وفي `load`
+    // كمان عشان تحديث قايمة الملفات يلغي أي معاينة معلّقة قبل ما ترسم).
+    var previewSeq = 0;
     wrap.appendChild(list);
     wrap.appendChild(previewBox);
 
@@ -695,6 +1111,12 @@
     }
 
     function loadPreview(path) {
+      // OHB2-MINIAPP-STALE-FIX: حرس خاص بالمعاينة. كل طلب معاينة جديد (مسار مختلف أو
+      // نفس المسار مرة تانية) بياخد رقم جيل؛ الرد مايكتبش في `previewBox` غير لو لسه
+      // الجيل الحالي. ده منفصل عن `filesDeduper` (اللي بيمنع تكرار نفس المفتاح الجاري
+      // بس، ومش بيحمي من رد قديم لمسار تاني).
+      var seq = ++previewSeq;
+      function current() { return previewSeq === seq; }
       previewBox.innerHTML = "";
       previewBox.appendChild(el("p", "loading-row", "بيتم تحميل الملف…"));
       // نفس المفتاح (شات/مسار) أثناء التحميل ⇒ نفس الطلب (مفيش تكرار).
@@ -703,6 +1125,7 @@
           "/conversations/" + encodeURIComponent(id) + "/file?path=" + encodeURIComponent(path)
         );
       }).then(function (res) {
+        if (!current()) { return; }
         previewBox.innerHTML = "";
         if (!res.ok) { previewBox.appendChild(el("p", "empty-row", filesErrorText(res))); return; }
         var pre = el("pre", "file-text", FILES.previewText(res.data));
@@ -711,6 +1134,7 @@
           previewBox.appendChild(el("p", "hint", "المعاينة مقصوصة (الملف أكبر)."));
         }
       }).catch(function () {
+        if (!current()) { return; }
         previewBox.innerHTML = "";
         previewBox.appendChild(el("p", "empty-row", "مش قادر أوصل للسيرفر."));
       });
@@ -718,6 +1142,8 @@
 
     function load() {
       showLoading(list);
+      // OHB2-MINIAPP-STALE-FIX: تحديث قايمة الملفات يلغي أي معاينة معلّقة (ما ترسمش فوق الحالة الجديدة).
+      previewSeq += 1;
       previewBox.innerHTML = "";
       filesDeduper.run("files:" + id, function () {
         return get("/conversations/" + encodeURIComponent(id) + "/files");
@@ -767,9 +1193,13 @@
   // ------------------------------------------------------------ watches
   function loadWatches() {
     var list = $("watches-list");
+    // OHB2-MINIAPP-STALE-FIX: حرس الجيل — طلب أحدث يلغي ردود المتابعات الأقدم.
+    var seq = ++state.watchesSeq;
+    function current() { return state.watchesSeq === seq; }
     list.innerHTML = "";
     list.appendChild(el("li", "loading-row", "بيتم التحميل…"));
     get("/watches").then(function (res) {
+      if (!current()) { return; }
       list.innerHTML = "";
       if (!res.ok) { list.appendChild(el("li", "empty-row", friendlyMessage(res.status, res.data))); return; }
       var items = (res.data && res.data.items) || [];
@@ -783,15 +1213,23 @@
         li.addEventListener("click", function () { openDetail(w.id); });
         list.appendChild(li);
       });
-    }).catch(function () { list.innerHTML = ""; list.appendChild(el("li", "empty-row", "مش قادر أوصل للسيرفر.")); });
+    }).catch(function () {
+      if (!current()) { return; }
+      list.innerHTML = "";
+      list.appendChild(el("li", "empty-row", "مش قادر أوصل للسيرفر."));
+    });
   }
 
   // ----------------------------------------------------------- new chat
   function loadRepos(query) {
     var list = $("repo-list");
+    // OHB2-MINIAPP-STALE-FIX: حرس الجيل — بحث أحدث يلغي ردود البحث الأقدم (نجاح/فشل/رفض).
+    var seq = ++state.reposSeq;
+    function current() { return state.reposSeq === seq; }
     list.innerHTML = "";
     list.appendChild(el("li", "loading-row", "بيتم التحميل…"));
     get("/repositories?q=" + encodeURIComponent(query || "")).then(function (res) {
+      if (!current()) { return; }
       list.innerHTML = "";
       if (!res.ok) { list.appendChild(el("li", "empty-row", friendlyMessage(res.status, res.data))); return; }
       var items = (res.data && res.data.items) || [];
@@ -802,7 +1240,11 @@
         li.addEventListener("click", function () { pickRepo(r.full_name); });
         list.appendChild(li);
       });
-    }).catch(function () { list.innerHTML = ""; list.appendChild(el("li", "empty-row", "مش قادر أوصل للسيرفر.")); });
+    }).catch(function () {
+      if (!current()) { return; }
+      list.innerHTML = "";
+      list.appendChild(el("li", "empty-row", "مش قادر أوصل للسيرفر."));
+    });
   }
 
   function pickRepo(fullName) {
@@ -894,6 +1336,7 @@
           if (view === "chats") { state.chatsPage = 0; loadChats(false); }
           if (view === "watches") { loadWatches(); }
           if (view === "inbox") { state.inboxLastRefreshAt = Date.now(); loadInbox(0); }
+          if (view === "jobs") { state.jobsPage = 0; loadJobs(0, false); loadDeletions(false); }
           if (view === "new") { loadRepos(""); }
         });
       })(tabs[i]);
@@ -902,6 +1345,10 @@
     $("chats-next").addEventListener("click", function () { state.chatsPage += 1; loadChats(false); });
     $("watches-refresh").addEventListener("click", loadWatches);
     $("inbox-refresh").addEventListener("click", function () { state.inboxLastRefreshAt = Date.now(); loadInbox(0); });
+    ["inbox-filter-all", "inbox-filter-unread", "inbox-filter-archived"].forEach(function (id) {
+      var btn = $(id);
+      if (btn) { btn.addEventListener("click", function () { setInboxFilter(btn.getAttribute("data-filter")); }); }
+    });
     $("inbox-next").addEventListener("click", function () {
       if (state.inboxLoading) { return; }
       if (!state.inboxHasMore) { return; }  // OHB2-08-08: مفيش المزيد ⇒ ما نطلبش صفحة مش موجودة.
@@ -910,6 +1357,13 @@
       loadInbox(INBOX.nextPage(state.inboxPage, true));
     });
     $("inbox-read-all").addEventListener("click", markAllRead);
+    // OHB2-PHASE1D: تحديث/المزيد لطلبات البدء + عمليات الحذف المعلّقة.
+    $("jobs-refresh").addEventListener("click", function () { state.jobsPage = 0; loadJobs(0, false); loadDeletions(false); });
+    $("jobs-next").addEventListener("click", function () {
+      if (state.jobsLoading) { return; }
+      if (!state.jobsHasMore) { return; }
+      loadJobs(state.jobsPage + 1, false);
+    });
     $("repo-search-btn").addEventListener("click", function () { loadRepos($("repo-search").value); });
     $("repo-search").addEventListener("keydown", function (e) { if (e.key === "Enter") { loadRepos($("repo-search").value); } });
     $("newchat-send").addEventListener("click", createChat);

@@ -49,6 +49,9 @@ class FakeConfig:
         self.allowed_telegram_ids = frozenset({allowed_id})
         self.owner_id = allowed_id
         self.openhands_base_url = "https://app.all-hands.dev"
+        # OHB2-MINIAPP: زر web_app بيتعرض بس لما الميزة مفعّلة والرابط مهيّأ.
+        self.mini_app_enabled = False
+        self.mini_app_url = ""
 
     def is_allowed(self, user_id):
         return user_id in self.allowed_telegram_ids
@@ -835,7 +838,23 @@ def test_open_no_reply_has_no_copy_button(tmp_path):
     q = CQ("open:A")
     asyncio.run(h.open_conversation(_t55_cb_update(q), ctx))
     assert "لسه مفيش رد." in q.edits[0]
+    assert "عرض للنسخ اليدوي" not in q.edits[0]
     assert "copy:A" not in _markup_callbacks(q.markups[-1])
+
+
+def test_open_with_reply_explains_manual_copy_and_links_mini_app(tmp_path):
+    ctx = make_context(1, tmp_path, client=ExchangeClient(CONV55, "ب", "رد مفيد"))
+    ctx.bot_data["config"].mini_app_enabled = True
+    ctx.bot_data["config"].mini_app_url = "https://app.example.com/mini"
+    ctx.bot = RecBot()
+    q = CQ("open:A")
+    asyncio.run(h.open_conversation(_t55_cb_update(q), ctx))
+    assert "عرض للنسخ اليدوي" in q.edits[0]
+    assert "code block" in q.edits[0]
+    assert "Mini App" in q.edits[0]
+    web_btns = [b for row in q.markups[-1].inline_keyboard for b in row if b.web_app is not None]
+    assert len(web_btns) == 1
+    assert web_btns[0].web_app["url"] == "https://app.example.com/mini"
 
 
 def test_open_missing_chat_message(tmp_path):
@@ -857,11 +876,17 @@ def test_open_missing_priority_over_exchange_error(tmp_path):
 
 
 def test_open_exchange_error_shows_error_and_no_route(tmp_path):
+    """OHB2-SW-07: فشل upstream (5xx) في آخر تبادل: الرسالة تتعرض **و**الاستثناء ينتشر.
+
+    قبل الإصلاح كان بيرجع عاديًّا (ابتلاع فشل تشغيلي). دلوقتي: نفس الرسالة للمستخدم،
+    لكن الفشل ينتشر (مفيش إتمام كاذب)، ومفيش توجيه جديد.
+    """
     client = ExchangeClient(CONV55, exchange_error=ApiError("server", 500))
     ctx = make_context(1, tmp_path, client=client)
     ctx.bot = RecBot()
     q = CQ("open:A")
-    asyncio.run(h.open_conversation(_t55_cb_update(q), ctx))
+    with pytest.raises(h.OperationalApiFailure):
+        asyncio.run(h.open_conversation(_t55_cb_update(q), ctx))
     assert q.edits and "server" in q.edits[0]
     assert ctx.bot_data["db"].get_awaiting(1) == (None, None)
 
@@ -895,11 +920,17 @@ def test_copy_reply_no_reply_message(tmp_path):
 
 
 def test_copy_reply_api_error_sends_new_message_only(tmp_path):
+    """OHB2-SW-07: فشل upstream (5xx) في آخر تبادل: رسالة الخطأ **و**انتشار الاستثناء.
+
+    قبل الإصلاح كان بيرجع عاديًّا. دلوقتي الشاشة لسه ما اتغيّرتش (رسالة جديدة) لكن
+    الفشل التشغيلي ينتشر بدل ما يتحوّل لإتمام ناجح.
+    """
     client = ExchangeClient(CONV55, exchange_error=ApiError("server", 500))
     ctx = make_context(1, tmp_path, client=client)
     ctx.bot = RecBot()
     q = CQ("copy:A")
-    asyncio.run(h.copy_reply(_t55_cb_update(q), ctx))
+    with pytest.raises(h.OperationalApiFailure):
+        asyncio.run(h.copy_reply(_t55_cb_update(q), ctx))
     assert ctx.bot.messages and "server" in ctx.bot.messages[0][0]
     assert q.edits == []  # الشاشة ما اتغيّرتش
 
@@ -1035,7 +1066,9 @@ def test_unwatch_db_failure_shows_error_and_keeps_retry(tmp_path):
     ctx.bot_data["db"] = _RemoveFailsDb(str(tmp_path / "t2.sqlite3"))
     ctx.bot_data["db"].add_watched("c1")
     update = _cb_update(1, "unwatch:c1")
-    asyncio.run(h.unwatch_conversation(update, ctx))
+    # OHB2-SW-06: الفشل الدائم (disk I/O) **ينتشر** بدل ما يتحوّل لنجاح صامت.
+    with pytest.raises(sqlite3.Error):
+        asyncio.run(h.unwatch_conversation(update, ctx))
     edits = update.callback_query.edits
     assert len(edits) == 1
     assert "تعذّر" in edits[0]  # رسالة خطأ واضحة
@@ -1059,7 +1092,9 @@ def test_unwatch_via_watcher_failure_shows_error(tmp_path):
     ctx.bot_data["db"].add_watched("c1")
     ctx.bot_data["watcher"] = _RemoveFailsWatcher()
     update = _cb_update(1, "unwatch:c1")
-    asyncio.run(h.unwatch_conversation(update, ctx))
+    # OHB2-SW-06: فشل المراقب (فشل دائم) ينتشر كذلك.
+    with pytest.raises(sqlite3.Error):
+        asyncio.run(h.unwatch_conversation(update, ctx))
     assert "تعذّر" in update.callback_query.edits[0]
     assert ctx.bot_data["db"].is_watched("c1")  # لسه متابَع
 
@@ -1112,6 +1147,7 @@ def test_app_command_without_url_is_graceful(tmp_path):
 
 def test_app_command_with_url_sends_web_app_button(tmp_path):
     ctx = make_context(1, tmp_path)
+    ctx.bot_data["config"].mini_app_enabled = True
     ctx.bot_data["config"].mini_app_url = "https://app.example.com/mini"
     update = make_update(1)
     asyncio.run(h.app_command(update, ctx))
@@ -1128,6 +1164,7 @@ def test_app_open_callback_without_url_shows_unavailable(tmp_path):
 
 def test_app_open_callback_with_url_edits_to_web_app_button(tmp_path):
     ctx = make_context(1, tmp_path)
+    ctx.bot_data["config"].mini_app_enabled = True
     ctx.bot_data["config"].mini_app_url = "https://app.example.com/mini"
     update = _cb_update(1, "app:open")
     asyncio.run(h.app_open(update, ctx))
@@ -1137,6 +1174,7 @@ def test_app_open_callback_with_url_edits_to_web_app_button(tmp_path):
 
 def test_start_menu_includes_web_app_button_when_configured(tmp_path):
     ctx = make_context(1, tmp_path)
+    ctx.bot_data["config"].mini_app_enabled = True
     ctx.bot_data["config"].mini_app_url = "https://app.example.com/mini"
     update = make_update(1)
     asyncio.run(h.start(update, ctx))
@@ -1172,8 +1210,10 @@ class F1ListClient:
     async def get_current_user(self):
         return {"id": F1_OWNER_UUID}
 
-    async def delete_conversation(self, conversation_id):  # لو الكود حاول حذف بعيد
+    async def delete_conversation(self, conversation_id):
+        # OHB2-MINIAPP: العميل بيرجّع True بس لما OpenHands يأكّد النجاح.
         self.deleted_remote_calls += 1
+        return True
 
 
 def _f1_items(n, prefix="c"):
@@ -1259,7 +1299,7 @@ def test_list_keeps_valid_when_unrelated_tombstone_exists(tmp_path):
 
 
 def test_confirm_delete_invalidates_list_cache(tmp_path):
-    """الحذف المؤكَّد الناجح يبطّل كاش القايمة (زي البرومت/بدء الشات) ومايحذفش بعيد."""
+    """الحذف المؤكَّد الناجح يبطّل كاش القايمة (زي البرومت/بدء الشات) ويحذف من OpenHands."""
     client = F1ListClient(conv={"id": "c1", "title": "شات"})
     ctx = make_context(1, tmp_path, client=client)
     ctx.bot_data["db"].add_watched("c1", "شات", chat_id=99)
@@ -1273,7 +1313,8 @@ def test_confirm_delete_invalidates_list_cache(tmp_path):
 
     assert "list_cache" not in ctx.bot_data  # اتبطّل
     assert ctx.bot_data["db"].is_deleted("c1") is True  # اتحذف محليًا
-    assert client.deleted_remote_calls == 0  # مفيش حذف بعيد
+    assert client.deleted_remote_calls == 1  # اتحذف من OpenHands نفسه
+    assert ctx.bot_data["db"].remote_deletion_state("c1") == ctx.bot_data["db"].REMOTE_CONFIRMED
 
 
 def test_stale_cache_cannot_display_deleted_conversation(tmp_path):
@@ -1470,7 +1511,7 @@ class _ListFakeClient:
 
 
 def test_bot_list_recovers_after_transient_db_failure(tmp_path):
-    """البوت: فشل مؤقت في قراءة الشواهد ⇒ فشل مغلق، وبعد الرجوع ⇒ القايمة ترجع."""
+    """البوت: فشل قراءة الشواهد ⇒ رسالة فشل عامة (مش «ما فيهاش شاتات»)، وبعد الرجوع ⇒ القايمة ترجع."""
     items = [
         {"id": "c1", "title": "واحد", "execution_status": "running"},
         {"id": "c2", "title": "اتنين", "execution_status": "running"},
@@ -1494,14 +1535,61 @@ def test_bot_list_recovers_after_transient_db_failure(tmp_path):
 
     db.is_deleted = flaky  # type: ignore[assignment]
 
-    # 1) انقطاع مؤقت: الفلترة تفشل ⇒ فشل مغلق (مفيش إظهار).
+    # 1) الفشل: الفلترة تفشل ⇒ رسالة فشل **عامة**، وممنوع «ما فيهاش شاتات» الكاذبة.
     second = _t55_cb_update(CQ("list:0"))
     asyncio.run(h.list_conversations(second, ctx))
-    assert _shown_ids(second) == [], "الفشل المؤقت ⇒ مفيش شاتات معروضة"
-    assert "ما فيهاش شاتات" in second.callback_query.edits[-1]
+    assert _shown_ids(second) == [], "الفشل ⇒ مفيش قايمة شاتات"
+    assert "ما فيهاش شاتات" not in second.callback_query.edits[-1]
+    assert "تعذّر عرض الشاتات" in second.callback_query.edits[-1]
 
     # 2) التعافي: القاعدة رجعت ⇒ القايمة ترجع كاملة.
     state["failing"] = False
     third = _t55_cb_update(CQ("list:0"))
     asyncio.run(h.list_conversations(third, ctx))
     assert _shown_ids(third) == ["c1", "c2"]
+
+
+def test_bot_list_permanent_db_error_shows_generic_not_empty(tmp_path):
+    """فشل **دائم** في قراءة الشواهد ⇒ رسالة فشل عامة (مفيش رسالة «ما فيهاش شاتات»)."""
+    import sqlite3
+
+    items = [{"id": "c1", "title": "واحد", "execution_status": "running"}]
+    ctx = make_context(1, tmp_path, client=_ListFakeClient(items))
+    db = ctx.bot_data["db"]
+    # نملأ الكاش الأول (قاعدة سليمة)، وبعدين نخرّب القراءة بخطأ **دائم**.
+    first = _t55_cb_update(CQ("list:0"))
+    asyncio.run(h.list_conversations(first, ctx))
+    assert _shown_ids(first) == ["c1"]
+
+    calls = {"n": 0}
+
+    def permanent(_cid):
+        calls["n"] += 1
+        raise sqlite3.OperationalError("no such table: deleted_conversations")
+
+    db.is_deleted = permanent  # type: ignore[assignment]
+
+    second = _t55_cb_update(CQ("list:0"))
+    asyncio.run(h.list_conversations(second, ctx))
+    assert _shown_ids(second) == []
+    assert "ما فيهاش شاتات" not in second.callback_query.edits[-1]
+    assert "تعذّر عرض الشاتات" in second.callback_query.edits[-1]
+    # الفشل الدائم **مش** بيتعاد (مفيش انتظار/إعادة بلا داعي).
+    assert calls["n"] == 1
+
+
+def test_bot_without_deleted_no_partial_list_on_late_failure(tmp_path):
+    """فشل بعد نجاح بعض القراءات ⇒ **مفيش** قايمة جزئية؛ الاستثناء ينتشر."""
+    items = [{"id": "c1"}, {"id": "c2"}, {"id": "c3"}]
+    calls = {"n": 0}
+
+    class _LateFail:
+        def is_deleted_with_retry(self, cid):
+            calls["n"] += 1
+            if calls["n"] == 3:  # فشل عند العنصر التالت
+                raise RuntimeError("boom")
+            return False
+
+    with pytest.raises(RuntimeError, match="boom"):
+        h._without_deleted(_LateFail(), items)
+    assert calls["n"] == 3

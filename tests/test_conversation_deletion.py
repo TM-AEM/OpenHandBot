@@ -17,6 +17,7 @@ import os
 from types import SimpleNamespace
 
 import httpx
+import pytest
 from starlette.testclient import TestClient
 
 import bot.handlers as h
@@ -60,9 +61,11 @@ class MockAPI:
         path = request.url.path
         method = request.method
         if method == "DELETE":
-            # لو الكود حاول يحذف الشات بعيدًا، نرصدها (المطلوب: مفيش حذف بعيد).
+            # OHB2-MINIAPP: الحذف البعيد مدعوم ⇒ نفس عقد OpenAPI (200 {"success": true})
+            # والشات يختفي بعيدًا (كده التحقق من الغياب يرجّع False).
             self.deleted_remote_calls += 1
-            return httpx.Response(200, json={"ok": True})
+            self.convs_present = False
+            return httpx.Response(200, json={"success": True})
         if path == "/api/v1/users/me":
             if self.owner_uuid is None:
                 return httpx.Response(200, json={})
@@ -111,9 +114,102 @@ def test_miniapp_owner_can_delete(tmp_path):
     r = tc.delete(f"/api/v1/conversations/{CID}", headers={"origin": ORIGIN})
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["deleted"] is True and body["local_only"] is True
+    assert body["deleted"] is True and body["remote_deleted"] is True
     assert db.get_watched(CID) is None  # اتشال محليًا
-    assert api.deleted_remote_calls == 0  # مفيش حذف بعيد
+    assert api.deleted_remote_calls == 1  # اتحذف من OpenHands نفسه
+    assert db.remote_deletion_state(CID) == db.REMOTE_CONFIRMED
+
+
+# ============================ OHB2-REMOTE-DELETE-404: ambiguous 404 via real route
+def _mock_404_then_exists(exists_after, exists_status=200):
+    """MockTransport: التفويض يقرا (قبل DELETE) ⇒ الشات موجود؛ وبعد DELETE (404) نرجّع
+    نتيجة فحص الوجود المطلوبة. `exists_after`: موجود/غايب. `exists_status`: ترميز GET بعد الحذف.
+    """
+    conv = {"id": CID, "title": "شات", "execution_status": "running",
+            "created_by_user_id": OWNER_UUID}
+    state = {"delete_calls": 0, "exists_calls": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "DELETE":
+            state["delete_calls"] += 1
+            return httpx.Response(404, json={"detail": "Conversation not found"})
+        if path == "/api/v1/users/me":
+            return httpx.Response(200, json={"id": OWNER_UUID, "role": "owner"})
+        if path == "/api/v1/app-conversations":
+            if state["delete_calls"] == 0:
+                return httpx.Response(200, json=[conv])  # قراءة التفويض (قبل الحذف)
+            state["exists_calls"] += 1
+            if exists_status != 200:
+                return httpx.Response(exists_status, json={"detail": "down"})
+            return httpx.Response(200, json=[conv] if exists_after else [])
+        if path.endswith("/events/search"):
+            return httpx.Response(200, json={"items": []})
+        return httpx.Response(404, json={"detail": "no"})
+
+    return state, handler
+
+
+def _client_with(handler) -> OpenHandsClient:
+    return OpenHandsClient("https://example.test", "key", transport=httpx.MockTransport(handler))
+
+
+def test_miniapp_404_with_present_conversation_is_failure(tmp_path):
+    """404 مبهم + الشات لسه موجود ⇒ فشل منظّم، الشات ما اتحذفش محليًا (مفيش نجاح كاذب)."""
+    db = _db(tmp_path)
+    db.add_watched(CID, "شات", chat_id=OWNER)
+    state, handler = _mock_404_then_exists(exists_after=True)
+    tc = TestClient(build_web_app(make_config(), db, client=_client_with(handler)),
+                    raise_server_exceptions=False)
+    login(tc)
+    r = tc.delete(f"/api/v1/conversations/{CID}", headers={"origin": ORIGIN})
+    assert r.status_code == 502, r.text
+    assert r.json()["error"] == "remote_delete_failed"
+    assert db.get_watched(CID) is not None  # لسه موجود محليًا
+    assert db.is_deleted(CID) is False
+    assert state["delete_calls"] == 1 and state["exists_calls"] >= 1
+
+
+def test_miniapp_404_with_confirmed_absence_is_success(tmp_path):
+    """404 + غياب مؤكّد (قراءات فاضية) ⇒ نجاح idempotent مؤكّد."""
+    db = _db(tmp_path)
+    db.add_watched(CID, "شات", chat_id=OWNER)
+    state, handler = _mock_404_then_exists(exists_after=False)
+    tc = TestClient(build_web_app(make_config(), db, client=_client_with(handler)),
+                    raise_server_exceptions=False)
+    login(tc)
+    r = tc.delete(f"/api/v1/conversations/{CID}", headers={"origin": ORIGIN})
+    assert r.status_code == 200, r.text
+    assert r.json()["deleted"] is True and r.json()["remote_deleted"] is True
+    assert db.get_watched(CID) is None
+    assert db.remote_deletion_state(CID) == db.REMOTE_CONFIRMED
+
+
+def test_miniapp_404_with_inconclusive_check_is_pending(tmp_path):
+    """404 + تعذّر التحقق (فشل GET) ⇒ '503 remote_delete_pending'، والحالة 'uncertain'."""
+    db = _db(tmp_path)
+    db.add_watched(CID, "شات", chat_id=OWNER)
+    state, handler = _mock_404_then_exists(exists_after=False, exists_status=503)
+    tc = TestClient(build_web_app(make_config(), db, client=_client_with(handler)),
+                    raise_server_exceptions=False)
+    login(tc)
+    r = tc.delete(f"/api/v1/conversations/{CID}", headers={"origin": ORIGIN})
+    assert r.status_code == 503, r.text
+    assert r.json()["error"] == "remote_delete_pending"
+    assert db.remote_deletion_state(CID) == db.REMOTE_UNCERTAIN
+
+
+def test_miniapp_404_non_owner_still_rejected_no_remote_call(tmp_path):
+    """التفويض قبل أي حذف: مالك تاني ⇒ 403 ومفيش نداء DELETE خالص (حتى مع 404)."""
+    api, db = MockAPI(), _db(tmp_path)
+    api.conv_owner = "someone-else"
+    db.add_watched(CID, "شات", chat_id=OWNER)
+    tc = make_client(api, db)
+    login(tc)
+    r = tc.delete(f"/api/v1/conversations/{CID}", headers={"origin": ORIGIN})
+    assert r.status_code == 403 and r.json()["error"] == "unauthorized"
+    assert db.get_watched(CID) is not None
+    assert api.deleted_remote_calls == 0  # مفيش حذف بعيد اتبعت خالص
 
 
 def test_miniapp_non_owner_cannot_delete(tmp_path):
@@ -161,8 +257,9 @@ def test_miniapp_repeated_delete_idempotent(tmp_path):
     r1 = tc.delete(f"/api/v1/conversations/{CID}", headers={"origin": ORIGIN})
     r2 = tc.delete(f"/api/v1/conversations/{CID}", headers={"origin": ORIGIN})
     assert r1.status_code == 200 and r2.status_code == 200
-    assert r1.json()["summary"]["watched_deleted"] == 1
-    assert r2.json()["summary"]["watched_deleted"] == 0  # idempotent
+    # الحذف البعيد اتعمل **مرة واحدة** بس (المرة التانية مقفولة على 'confirmed').
+    assert api.deleted_remote_calls == 1
+    assert r2.json()["deleted"] is True  # idempotent
 
 
 # ============================================================ bot handlers
@@ -222,8 +319,10 @@ class _BotClient:
             return {}
         return {"id": self._owner_uuid}
 
-    async def delete_conversation(self, conversation_id):  # لو الكود حاول حذف بعيد
+    async def delete_conversation(self, conversation_id):
+        # OHB2-MINIAPP: العميل بيرجّع True بس لما OpenHands يأكّد النجاح.
         self.deleted_remote_calls += 1
+        return True
 
 
 class _FakeConfig:
@@ -271,8 +370,8 @@ def test_bot_delete_confirm_owner_ok(tmp_path):
     update = _cb_update(OWNER, f"deleteok:{CID}")
     asyncio.run(h.delete_conversation_confirm(update, ctx))
     assert db.get_watched(CID) is None  # اتحذف محليًا
-    assert client.deleted_remote_calls == 0  # مفيش حذف بعيد
-    assert any("اتشال" in t for t in update.callback_query.edits)
+    assert client.deleted_remote_calls == 1  # اتحذف من OpenHands نفسه
+    assert any("OpenHands" in t for t in update.callback_query.edits)
 
 
 def test_bot_delete_confirm_non_owner_rejected(tmp_path):
@@ -490,35 +589,40 @@ def test_unwatch_behavior_unchanged(tmp_path):
     assert db.get_watched(CID) is None
 
 
-def test_delete_never_calls_remote_api(tmp_path):
-    """تأكيد صريح: مسار الحذف مابيعملش أي نداء DELETE بعيد (local-only)."""
+def test_delete_calls_remote_api(tmp_path):
+    """تأكيد صريح: مسار الحذف **بيعمل** نداء DELETE بعيد على OpenHands (مش local-only)."""
     api, db = MockAPI(), _db(tmp_path)
     db.add_watched(CID, "شات", chat_id=OWNER)
     tc = make_client(api, db)
     login(tc)
-    tc.delete(f"/api/v1/conversations/{CID}", headers={"origin": ORIGIN})
-    assert api.deleted_remote_calls == 0
+    r = tc.delete(f"/api/v1/conversations/{CID}", headers={"origin": ORIGIN})
+    assert r.status_code == 200
+    assert api.deleted_remote_calls == 1
 
 
 def test_bot_and_miniapp_delete_are_consistent(tmp_path):
-    """تكافؤ: الاتنين بيشيلوا نفس السجل المحلي (watched) بدون حذف بعيد."""
-    # Mini App
-    api, mdb = MockAPI(), _db(tmp_path)
+    """تكافؤ: الاتنين بيحذفوا من OpenHands **و** بيشيلوا نفس السجل المحلي (watched)."""
+    # Mini App (قاعدة مستقلة)
+    mini_dir = tmp_path / "mini"
+    mini_dir.mkdir()
+    api, mdb = MockAPI(), _db(mini_dir)
     mdb.add_watched(CID, "شات", chat_id=OWNER)
     tc = make_client(api, mdb)
     login(tc)
     assert tc.delete(f"/api/v1/conversations/{CID}", headers={"origin": ORIGIN}).status_code == 200
     assert mdb.get_watched(CID) is None
 
-    # البوت
+    # البوت (قاعدة مستقلة)
+    bot_dir = tmp_path / "bot"
+    bot_dir.mkdir()
     client = _BotClient()
-    ctx = _ctx(tmp_path, client)
+    ctx = _ctx(bot_dir, client)
     bdb = ctx.bot_data["db"]
     bdb.add_watched(CID, "شات", chat_id=OWNER)
     update = _cb_update(OWNER, f"deleteok:{CID}")
     asyncio.run(h.delete_conversation_confirm(update, ctx))
     assert bdb.get_watched(CID) is None
-    assert api.deleted_remote_calls == 0 and client.deleted_remote_calls == 0
+    assert api.deleted_remote_calls == 1 and client.deleted_remote_calls == 1
 
 
 # ===================================================== PHASE6-ALIGN: shared lifecycle
@@ -533,9 +637,9 @@ def test_both_interfaces_share_same_backend_lifecycle(tmp_path, monkeypatch):
     calls: list[str] = []
     original = Database.delete_conversation
 
-    def _spy(self, conversation_id, now):
+    def _spy(self, conversation_id, now, **kw):
         calls.append(conversation_id)
-        return original(self, conversation_id, now)
+        return original(self, conversation_id, now, **kw)
 
     monkeypatch.setattr(Database, "delete_conversation", _spy)
 
@@ -598,6 +702,10 @@ class _ListClient:
     async def get_current_user(self):
         return {"id": OWNER_UUID}
 
+    async def delete_conversation(self, conversation_id):
+        # OHB2-MINIAPP: الحذف البعيد بينجح (يرجّع True).
+        return True
+
 
 class _FakeApp:
     def __init__(self):
@@ -657,36 +765,49 @@ def test_miniapp_list_cache_refresh_still_hides_deleted(tmp_path):
     assert "c1" not in [i["id"] for i in r.json()["items"]]
 
 
-# ===================================== OHB2-AUDIT-FIX-04: fail-closed tombstone filter
+# ==================== OHB2-SW03: tombstone read failures propagate (explicit failure)
 class _RaisingDB:
     """قاعدة وهمية: `is_deleted` بترمي (محاكاة قاعدة غير متاحة/تالفة)."""
 
+    def __init__(self, exc=None):
+        self._exc = exc or RuntimeError("database unavailable")
+        self.calls = 0
+
     def is_deleted(self, conversation_id):
-        raise RuntimeError("database unavailable")
+        self.calls += 1
+        raise self._exc
+
+    def is_deleted_with_retry(self, conversation_id):
+        # نفس عقد القاعدة الحقيقية: ترفع بعد الإعادة المحدودة.
+        return self.is_deleted(conversation_id)
 
 
-def test_bot_without_deleted_fails_closed_on_db_error():
-    """handlers._without_deleted: خطأ قاعدة ⇒ قايمة فاضية (مش القايمة غير المفلترة)."""
+def test_bot_without_deleted_propagates_db_error():
+    """handlers._without_deleted: خطأ قاعدة ⇒ **يُرفع** (مش قايمة فاضية مضلّلة)."""
     items = [{"id": "c1"}, {"id": "c2"}]
-    assert h._without_deleted(_RaisingDB(), items) == []
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        h._without_deleted(_RaisingDB(), items)
 
 
 def test_bot_without_deleted_empty_input_short_circuits():
     """مدخل فاضي ⇒ فاضي (مفيش نداء للقاعدة أصلًا)."""
-    assert h._without_deleted(_RaisingDB(), []) == []
+    db = _RaisingDB()
+    assert h._without_deleted(db, []) == []
+    assert db.calls == 0  # مسار سريع: مفيش قراءة
 
 
-def test_miniapp_without_deleted_fails_closed_on_db_error(tmp_path):
-    """MiniAppService._without_deleted: خطأ قاعدة ⇒ قايمة فاضية (فشل مغلق)."""
+def test_miniapp_without_deleted_propagates_db_error(tmp_path):
+    """MiniAppService._without_deleted: خطأ قاعدة ⇒ **يُرفع** (مش 200 فاضي)."""
     from bot.web.services import MiniAppService
 
     svc = MiniAppService(make_config(), _RaisingDB())
     items = [{"id": "c1"}, {"id": "c2"}]
-    assert svc._without_deleted(items) == []
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        svc._without_deleted(items)
 
 
-def test_miniapp_list_hides_all_on_db_error(tmp_path):
-    """تكاملي: قاعدة بتفشل في is_deleted ⇒ الـ API يرجّع قايمة فاضية (مفيش إظهار بالغلط)."""
+def test_miniapp_list_returns_500_on_db_error(tmp_path):
+    """تكاملي: قاعدة بتفشل في is_deleted ⇒ الـ API يرجّع **500 server_error** (مش 200 فاضي)."""
     db = _db(tmp_path)
     items = [
         {"id": "c1", "title": "واحد", "execution_status": "running", "created_by_user_id": OWNER_UUID},
@@ -701,19 +822,23 @@ def test_miniapp_list_hides_all_on_db_error(tmp_path):
     login(tc)
     assert tc.get("/api/v1/conversations?refresh=1").status_code == 200  # يملأ الكاش
 
-    # نخرّب قراءة الشواهد فقط (بعد ما الكاش اتملى) ⇒ الفلترة تفشل ⇒ فشل مغلق.
+    # نخرّب قراءة الشواهد فقط (بعد ما الكاش اتملى) ⇒ الفلترة تفشل ⇒ 500 عام.
     def _boom(_cid):
         raise RuntimeError("db down")
 
     db.is_deleted = _boom  # type: ignore[assignment]
     r = tc.get("/api/v1/conversations?refresh=1")
-    assert r.status_code == 200
-    assert r.json()["items"] == [], "لازم نخفي القايمة كلها بدل ما نعرّض شات محذوف"
+    assert r.status_code == 500
+    body = r.json()
+    assert body["error"] == "server_error"
+    # مفيش كشف لأي تفاصيل داخلية (اسم الاستثناء/SQL/مسار).
+    blob = str(body)
+    assert "db down" not in blob and "RuntimeError" not in blob and "Traceback" not in blob
 
 
-# ===================== OHB2-PHASE5-FIX-04: fail-closed then recovery (P3-02)
+# ================= OHB2-SW03: explicit failure then recovery (supersedes P3-02 fail-closed)
 def test_miniapp_list_recovers_after_transient_db_failure(tmp_path):
-    """Mini App: فشل مؤقت في قراءة الشواهد ⇒ فشل مغلق (قايمة فاضية)، وبعد الرجوع ⇒ القايمة ترجع."""
+    """Mini App: فشل قراءة الشواهد ⇒ **500** (مش 200 فاضي)، وبعد الرجوع ⇒ القايمة ترجع مفلترة."""
     db = _db(tmp_path)
     items = [_conv("c1"), _conv("c2")]
     app = _FakeApp()
@@ -736,16 +861,59 @@ def test_miniapp_list_recovers_after_transient_db_failure(tmp_path):
 
     db.is_deleted = flaky  # type: ignore[assignment]
 
-    # 1) الفشل المؤقت: الفلترة تفشل ⇒ فشل مغلق (مفيش إظهار لأي شات).
+    # 1) الفشل: الفلترة تفشل ⇒ 500 عام (مفيش رد 200 فاضي مضلّل).
     r1 = tc.get("/api/v1/conversations?refresh=1")
-    assert r1.status_code == 200
-    assert r1.json()["items"] == [], "الفشل المؤقت ⇒ مفيش إظهار لأي شات"
+    assert r1.status_code == 500
+    assert r1.json()["error"] == "server_error"
 
     # 2) التعافي: القاعدة رجعت ⇒ القايمة ترجع مفلترة (مفيش انقطاع دائم).
     state["failing"] = False
     r2 = tc.get("/api/v1/conversations?refresh=1")
     assert r2.status_code == 200
     assert [i["id"] for i in r2.json()["items"]] == ["c1", "c2"]
+
+
+def test_miniapp_list_genuine_empty_returns_200_empty(tmp_path):
+    """فراغ حقيقي (البحث رجع مفيش شاتات) ⇒ 200 + `items=[]` (سلوك ناجح مش فشل)."""
+    db = _db(tmp_path)
+    app = _FakeApp()
+    tc = TestClient(
+        build_web_app(make_config(), db, client=_ListClient([]), application=app),
+        raise_server_exceptions=False,
+    )
+    login(tc)
+    r = tc.get("/api/v1/conversations?refresh=1")
+    assert r.status_code == 200
+    assert r.json()["items"] == []
+    assert r.json()["has_more"] is False
+
+
+def test_miniapp_list_all_tombstoned_returns_200_empty(tmp_path):
+    """كل الشاتات متشاهدة ⇒ 200 + `items=[]` (فلترة F-1 ناجحة، مش فشل قاعدة)."""
+    db = _db(tmp_path)
+    items = [_conv("c1"), _conv("c2")]
+    for cid in ("c1", "c2"):
+        db.delete_conversation(cid, outbox.now_iso(), remote_confirmed=True)
+    app = _FakeApp()
+    tc = TestClient(
+        build_web_app(make_config(), db, client=_ListClient(items), application=app),
+        raise_server_exceptions=False,
+    )
+    login(tc)
+    r = tc.get("/api/v1/conversations?refresh=1")
+    assert r.status_code == 200
+    assert r.json()["items"] == []
+
+
+def test_miniapp_without_deleted_filters_and_preserves_order(tmp_path):
+    """فلترة ناجحة: واحد متشاهد يُزال، والباقي بترتيبه (سلوك F-1 ما اتغيّرش)."""
+    from bot.web.services import MiniAppService
+
+    db = _db(tmp_path)
+    db.delete_conversation("c2", outbox.now_iso(), remote_confirmed=True)
+    svc = MiniAppService(make_config(), db)
+    items = [_conv("c1"), _conv("c2"), _conv("c3")]
+    assert [c["id"] for c in svc._without_deleted(items)] == ["c1", "c3"]
 
 
 # ================================== OHB2-AUDIT-FIX-05: Mini App list collects all pages
@@ -812,3 +980,113 @@ def test_miniapp_list_flags_truncation(tmp_path):
     r = tc.get("/api/v1/conversations?refresh=1")
     assert r.status_code == 200, r.text
     assert r.json()["truncated"] is True
+
+
+# ================================ OHB2-PHASE1E-F1: delete must not 500 after success
+class _DummyBot:
+    pass
+
+
+class _RealEntitiesApp:
+    """تطبيق فيه **كيانات حقيقية** في `bot_data` زي الإنتاج (Watcher/Notifier بدون wake)."""
+
+    def __init__(self, client, db):
+        from bot.watcher import Watcher
+        from bot.notifier import Notifier
+
+        self.bot = _DummyBot()
+        self.bot_data = {
+            "watcher": Watcher(client, db, self.bot, chat_id=OWNER),
+            "notifier": Notifier(client, db, self.bot, chat_id=OWNER),
+        }
+
+
+def test_delete_does_not_500_when_watcher_has_no_wake(tmp_path):
+    """F1: الحذف البعيد بينجح، لكن `_wake` كان بينادي `wake()` على Watcher/Notifier
+    (ملهاش الدالة) ⇒ AttributeError ⇒ 500 بعد نجاح الحذف. دلوقتي لازم يرجّع 200.
+    """
+    api, db = MockAPI(), _db(tmp_path)
+    db.add_watched(CID, "شات", chat_id=OWNER)
+    client = OpenHandsClient(
+        "https://example.test", "key", transport=httpx.MockTransport(api.handler)
+    )
+    app = _RealEntitiesApp(client, db)
+    assert not hasattr(app.bot_data["watcher"], "wake")
+    assert not hasattr(app.bot_data["notifier"], "wake")
+    tc = TestClient(
+        build_web_app(make_config(), db, client=client, application=app),
+        raise_server_exceptions=False,
+    )
+    login(tc)
+    r = tc.delete(f"/api/v1/conversations/{CID}", headers={"origin": ORIGIN})
+    assert r.status_code == 200, r.text
+    assert r.json()["remote_deleted"] is True
+    assert api.deleted_remote_calls == 1  # الحذف البعيد اتعمل فعلًا مرة واحدة
+    assert db.get_watched(CID) is None
+
+
+class _RaisingWorker:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def wake(self) -> None:
+        self.calls += 1
+        raise RuntimeError("wake failed")
+
+
+class _RaisingWakeApp:
+    """تطبيق فيه workers بـ `wake()` بترمي استثناء — أسوأ حالة للتنبيه الثانوي."""
+
+    def __init__(self) -> None:
+        self.bot = _DummyBot()
+        self.outbox_worker = _RaisingWorker()
+        self.bot_data = {
+            "outbox_worker": self.outbox_worker,
+            "creation_worker": _RaisingWorker(),
+            "completion_worker": _RaisingWorker(),
+            "watcher": _RaisingWorker(),
+            "notifier": _RaisingWorker(),
+        }
+
+
+def test_delete_succeeds_even_when_all_wakes_raise(tmp_path):
+    """AUD-01: تنبيه ثانوي بيرمي استثناء مستحيل يقلب حذفًا بعيدًا **نجح** لـ 500."""
+    api, db = MockAPI(), _db(tmp_path)
+    db.add_watched(CID, "شات", chat_id=OWNER)
+    client = OpenHandsClient(
+        "https://example.test", "key", transport=httpx.MockTransport(api.handler)
+    )
+    app = _RaisingWakeApp()
+    tc = TestClient(
+        build_web_app(make_config(), db, client=client, application=app),
+        raise_server_exceptions=False,
+    )
+    login(tc)
+    r = tc.delete(f"/api/v1/conversations/{CID}", headers={"origin": ORIGIN})
+    assert r.status_code == 200, r.text
+    assert r.json()["remote_deleted"] is True
+    assert api.deleted_remote_calls == 1
+    assert db.get_watched(CID) is None
+    # التنبيهات اتنادت فعلًا (مش متجاهلة) لكن فشلها اتّبلع.
+    assert app.outbox_worker.calls == 1
+
+
+def test_failed_remote_delete_is_not_reported_as_success_even_if_wake_raises(tmp_path):
+    """AUD-01: لو الحذف البعيد فشل فشلًا مؤكّدًا، لازم خطأ منظّم — مش نجاح،
+    حتى مع وجود تنبيه بيرمي استثناء (الحالة الحقيقية للعملية هي اللي تتحكم)."""
+    api, db = MockAPI(), _db(tmp_path)
+    api.conv_owner = "another-owner"  # مش مالك ⇒ رفض تفويض (403) قبل أي حذف
+    db.add_watched(CID, "شات", chat_id=OWNER)
+    client = OpenHandsClient(
+        "https://example.test", "key", transport=httpx.MockTransport(api.handler)
+    )
+    tc = TestClient(
+        build_web_app(make_config(), db, client=client, application=_RaisingWakeApp()),
+        raise_server_exceptions=False,
+    )
+    login(tc)
+    r = tc.delete(f"/api/v1/conversations/{CID}", headers={"origin": ORIGIN})
+    assert r.status_code == 403, r.text
+    assert api.deleted_remote_calls == 0  # مفيش حذف بعيد اتبعت خالص
+    assert db.get_watched(CID) is not None  # الشات لسه موجود محليًا
+

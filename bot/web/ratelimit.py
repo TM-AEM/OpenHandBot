@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from typing import Callable
 
@@ -48,7 +48,7 @@ class SlidingWindowLimiter:
         self._limits = list(limits)
         self._clock = clock
         self._max_keys = max(1, int(max_keys))
-        self._events: dict[str, deque[float]] = {}
+        self._events: OrderedDict[str, deque[float]] = OrderedDict()
         self._widest = max(lim.window_seconds for lim in self._limits)
 
     def allow(self, key: str, now: float | None = None) -> tuple[bool, float]:
@@ -56,7 +56,7 @@ class SlidingWindowLimiter:
 
         كل قاعدة بتتحسب على نافذتها **بمفردها** (عدد الأحداث اللي جوه نافذتها بس).
         لو أكثر من قاعدة متجاوزة، `retry_after` = أطول انتظار مطلوب (لحد ما كل
-        النوافذ المتجاوزة تبقى سليمة). لو اتمنع، ما بيتسجّلش أي حدث.
+        النوافذ المتجاوزة تبقى سليمة). لو اتمنع، ما بيتسجّلش أي حدث (مع تحديث الحداثة).
         """
         current = self._clock() if now is None else now
         bucket = self._events.get(key)
@@ -65,6 +65,8 @@ class SlidingWindowLimiter:
             self._events[key] = bucket
             self._evict_if_needed()
         else:
+            # وصول لمفتاح موجود ⇒ يحدّث حداثته (LRU) سواء اتسمح أو اتمنع.
+            self._touch(key)
             self._prune(bucket, current)
 
         blocked = self._blocked_retry(bucket, current)
@@ -78,8 +80,9 @@ class SlidingWindowLimiter:
         """الوقت المتبقي لحد ما المفتاح يبقى مسموح تاني (0 لو مسموح دلوقتي)."""
         current = self._clock() if now is None else now
         bucket = self._events.get(key)
-        if not bucket:
+        if bucket is None:
             return 0.0
+        self._touch(key)  # وصول لمفتاح موجود ⇒ يحدّث حداثته (LRU)
         self._prune(bucket, current)
         return self._blocked_retry(bucket, current) or 0.0
 
@@ -121,11 +124,14 @@ class SlidingWindowLimiter:
         while bucket and bucket[0] <= cutoff:
             bucket.popleft()
 
+    def _touch(self, key: str) -> None:
+        """يعلّم المفتاح كـ«الأحدث استعمالًا» بنقله لآخر OrderedDict (LRU)."""
+        self._events.move_to_end(key)
+
     def _evict_if_needed(self) -> None:
-        # الطرد بالترتيب (dict بترتيب الإدخال) للأقدم — كفاية لحماية الذاكرة.
+        # الطرد بترتيب الحداثة: أقدم مفتاح في OrderedDict = الأقل استعمالًا (LRU).
         while len(self._events) > self._max_keys:
-            oldest_key = next(iter(self._events))
-            self._events.pop(oldest_key, None)
+            self._events.popitem(last=False)
 
 
 def auth_limiter(config, *, clock: Callable[[], float] = time.monotonic) -> SlidingWindowLimiter:

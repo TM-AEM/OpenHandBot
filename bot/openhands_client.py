@@ -338,6 +338,38 @@ class OpenHandsClient:
         body = {"role": "user", "content": [{"type": "text", "text": text}], "run": True}
         await self._request("POST", f"/app-conversations/{conversation_id}/send-message", json=body)
 
+    async def delete_conversation(self, conversation_id: str) -> bool:
+        """يحذف شات OpenHands **نهائيًا** عبر `DELETE /app-conversations/{id}`.
+
+        الموثّق (OpenAPI v1.79.0): 200 بجسم `{"success": true}` عند النجاح، و404 **مبهم**،
+        و400 لو المعرّف غير صالح. **404 مش دليل حذف**: المصدر الرسمي بيرجّعه في حالتين —
+        (أ) الشات مش موجود فعلًا (`'Conversation not found'`)، و(ب) الخدمة فشلت داخليًا
+        (`'Failed to delete conversation'`). فالمستدعي (`bot/deletion.py`) **لازم** يتحقق
+        من الوجود بعد 404 قبل ما يعتبر الحذف تم. بيرجّع True بس لما `success` تكون `True`
+        صراحةً؛ أي جسم تاني (مش dict أو `success` مش True) ⇒ ApiError آمن (ما نعتبرهوش
+        نجاح). 401/403/429/5xx/انقطاع بتطلع `ApiError` بترميز الحالة للمستدعي.
+
+        تحذير: العملية غير قابلة للرجوع (بتحذف الشات والـ sandbox المرتبط لو مفيش شات
+        تاني بيستخدمه). المستدعي مسؤول عن التأكيد والملكية قبل النداء.
+        """
+        resp = await self._request("DELETE", f"/app-conversations/{conversation_id}")
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            raise ApiError("رد غير متوقع من OpenHands") from exc
+        if not isinstance(payload, dict) or payload.get("success") is not True:
+            raise ApiError("رد غير متوقع من OpenHands")
+        return True
+
+    async def conversation_exists(self, conversation_id: str) -> bool:
+        """هل الشات لسه موجود على OpenHands؟ (للتسوية بعد نتيجة غامضة).
+
+        بتستخدم نفس `GET /app-conversations?ids=` (قراءة آمنة قابلة للتكرار). أي خطأ
+        upstream بطلع `ApiError` للمستدعي (ما بنفسّروش كـ «مش موجود» — عدم اليقين يفضل).
+        """
+        convs = await self.get_conversations([conversation_id])
+        return bool(convs)
+
     async def resume_sandbox(self, sandbox_id: str) -> None:
         await self._request("POST", f"/sandboxes/{sandbox_id}/resume")
 

@@ -984,6 +984,38 @@ def test_inbox_event_key_migrated_onto_old_table(tmp_path):
     db2.close()
 
 
+def test_inbox_archived_at_migrated_onto_old_table(tmp_path):
+    """قاعدة فيها جدول الصندوق من غير عمود `archived_at` بتاخده عند الفتح (ترحيل تراكمي)."""
+    path = str(tmp_path / "old.sqlite3")
+    db = Database(path)
+    db._conn.execute("DROP TABLE notification_inbox")
+    db._conn.execute(
+        "CREATE TABLE notification_inbox ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id TEXT NOT NULL, "
+        "title TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL DEFAULT '', "
+        "message TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, read_at TEXT, "
+        "delivery_status TEXT NOT NULL DEFAULT 'delivered')"
+    )
+    db._conn.execute(
+        "INSERT INTO notification_inbox(conversation_id, title, kind, message, created_at) "
+        "VALUES('c1','t','terminal','قديم','t0')"
+    )
+    db._conn.commit()
+    db.close()
+
+    db2 = Database(path)  # الفتح التاني يعمل ALTER (idempotent)
+    cols = {r["name"] for r in db2._conn.execute("PRAGMA table_info(notification_inbox)")}
+    assert "archived_at" in cols
+    # السجل القديم محفوظ ونشط افتراضيًا (archived_at=NULL).
+    assert db2.count_inbox() == 1
+    assert db2.count_inbox(archived=True) == 0
+    # الأرشفة تشتغل على الصف القديم بعد الترحيل.
+    old_id = db2.list_inbox(limit=1)[0].id
+    assert db2.archive_inbox_item(old_id, "t1") is True
+    assert db2.count_inbox(archived=True) == 1
+    db2.close()
+
+
 def test_inbox_global_cap_prunes_oldest(tmp_path):
     """السقف العام بيحتفظ بأحدث INBOX_MAX_TOTAL عبر كل المحادثات (للمقروءة)."""
     from bot.db import INBOX_MAX_TOTAL

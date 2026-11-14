@@ -44,8 +44,11 @@ DELETE_CANCEL = "إلغاء"
 WATCH = "تابع"
 UNWATCH = "إلغاء"
 CANCEL_ROUTE = "إلغاء التوجيه"
-COPY_REPLY = "📋 نسخ الرد"
+COPY_REPLY = "📄 عرض للنسخ اليدوي"
+COPY_MINI_APP = "📋 نسخ مباشر من التطبيق"
 FULL_REPLY = "عرض كامل"
+# OHB2-BOT-REPLY-TXT-FILE-BUTTON: زر منفصل لتنزيل الرد الكامل كملف .txt (مش نسخ).
+TXT_REPLY = "ملف النص"
 NOTIFICATIONS = "الإشعارات"
 NOTIF_MENU = "notif:menu"
 NOTIF_TOGGLE = "notif:toggle"
@@ -126,6 +129,7 @@ def conversation_actions(
     *,
     has_reply: bool = False,
     reply_cut: bool = False,
+    mini_app_url: str = "",
 ) -> InlineKeyboardMarkup:
     # الميزات المؤجّلة (القرار 4): الملفات/التكلفة/التصدير مخفية، وزر المتابعة اليدوية
     # (تابع/إلغاء المتابعة) مخفي مع «متابعاتي». الأزرار الأساسية (رد/تحديث/رجوع/إلغاء
@@ -143,6 +147,12 @@ def conversation_actions(
         if reply_cut:
             copy_row.append(_btn(FULL_REPLY, callback_data=f"full:{conversation_id}"))
         rows.append(copy_row)
+        # OHB2-BOT-REPLY-TXT-FILE-BUTTON: زر منفصل تمامًا (callback مختلف) لتنزيل الرد
+        # الكامل كملف .txt. لو الـ Mini App متاح، نضيف رابط النسخ المباشر للحافظة جنبه.
+        txt_row = [_btn(TXT_REPLY, callback_data=f"txt:{conversation_id}")]
+        if mini_app_url:
+            txt_row.append(InlineKeyboardButton(COPY_MINI_APP, web_app={"url": mini_app_url}))
+        rows.append(txt_row)
     rows.append(
         [
             _btn(REPLY, callback_data=f"reply:{conversation_id}"),
@@ -177,7 +187,7 @@ def conversation_actions(
 
 
 def delete_confirm_menu(conversation_id: str) -> InlineKeyboardMarkup:
-    """تأكيد حذف الشات (OHB2-C7): زر تأكيد صريح + زر إلغاء. الحذف محلي فقط."""
+    """تأكيد حذف الشات (OHB2-MINIAPP): زر تأكيد صريح + زر إلغاء. الحذف بعيد فعلي (من OpenHands) ثم تثبيت محلي."""
     return InlineKeyboardMarkup(
         [
             [_btn(DELETE_CONFIRM, callback_data=f"deleteok:{conversation_id}")],

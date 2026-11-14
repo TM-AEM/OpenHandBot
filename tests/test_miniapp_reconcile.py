@@ -269,3 +269,158 @@ def test_reconcile_mark_sent_never_clobbers_a_discard(tmp_path):
     else:
         assert discard.status_code == 409
         assert discard.json()["error"] == "already_terminal"
+
+
+# =============================== OHB2-PLAN-02: pending remote deletion list & reconcile
+class _DelClient:
+    def __init__(self, *, owner_uuid="owner-1", conv_owner="owner-1", exists=False, get_status=200):
+        self.owner_uuid = owner_uuid
+        self.conv_owner = conv_owner
+        self.exists = exists
+        self.get_status = get_status
+        self.delete_calls = 0
+        self.get_calls = 0
+
+    async def get_current_user(self):
+        return {"id": self.owner_uuid}
+
+    async def get_conversations(self, ids):
+        from bot.errors import ApiError
+
+        self.get_calls += 1
+        if self.get_status != 200:
+            raise ApiError("upstream", self.get_status)
+        if not self.exists:
+            return []
+        return [{"id": cid, "title": "t", "created_by_user_id": self.conv_owner} for cid in ids]
+
+    async def conversation_exists(self, cid):
+        from bot.errors import ApiError
+
+        self.get_calls += 1
+        if self.get_status != 200:
+            raise ApiError("upstream", self.get_status)
+        return self.exists
+
+    async def delete_conversation(self, cid):
+        self.delete_calls += 1
+        return True
+
+
+def _del_authed(tmp_path, db, client):
+    c = TestClient(build_web_app(make_config(tmp_path), db=db, client=client), raise_server_exceptions=False)
+    c.post("/api/v1/auth", json={"initData": make_init_data(OWNER)})
+    return c
+
+
+def test_pending_deletions_list_auth_and_filtering(tmp_path):
+    db = Database(str(tmp_path / "del_list.sqlite3"))
+    unauthed = TestClient(build_web_app(make_config(tmp_path), db=db, client=_DelClient()))
+    assert unauthed.get("/api/v1/operations/deletions/list").status_code == 401
+
+    db.begin_remote_deletion("c_del", "2026-01-01T00:00:00Z")
+    db.begin_remote_deletion("c_unc", "2026-01-02T00:00:00Z")
+    db.set_remote_deletion_state("c_unc", db.REMOTE_UNCERTAIN, "2026-01-02T00:00:00Z")
+    db.delete_conversation("c_done", "2026-01-03T00:00:00Z", remote_confirmed=True)
+    db.delete_conversation("c_legacy", "2026-01-04T00:00:00Z", remote_confirmed=False)
+
+    c = _del_authed(tmp_path, db, _DelClient())
+    r = c.get("/api/v1/operations/deletions/list")
+    assert r.status_code == 200
+    items = r.json()["items"]
+    assert [it["conversation_id"] for it in items] == ["c_unc", "c_del"]
+    assert [it["state"] for it in items] == ["uncertain", "deleting"]
+
+
+def test_deletion_reconcile_guards_and_validation(tmp_path):
+    db = Database(str(tmp_path / "del_guard.sqlite3"))
+    c = _del_authed(tmp_path, db, _DelClient())
+    assert c.post("/api/v1/operations/deletions/reconcile", json={"conversation_id": "c1"}).status_code == 403
+    assert c.post(
+        "/api/v1/operations/deletions/reconcile",
+        json={"conversation_id": "bad id!"},
+        headers={"origin": ORIGIN},
+    ).status_code == 400
+    r409 = c.post(
+        "/api/v1/operations/deletions/reconcile",
+        json={"conversation_id": "c1"},
+        headers={"origin": ORIGIN},
+    )
+    assert r409.status_code == 409 and r409.json()["error"] == "not_pending"
+
+
+def test_deletion_reconcile_never_bypasses_owner_mismatch(tmp_path):
+    db = Database(str(tmp_path / "del_owner.sqlite3"))
+    db.begin_remote_deletion("c1", "2026-01-01T00:00:00Z")
+    client = _DelClient(owner_uuid="owner-1", conv_owner="other-owner", exists=True)
+    c = _del_authed(tmp_path, db, client)
+    r = c.post(
+        "/api/v1/operations/deletions/reconcile",
+        json={"conversation_id": "c1"},
+        headers={"origin": ORIGIN},
+    )
+    assert r.status_code == 403 and r.json()["error"] == "unauthorized"
+    assert client.delete_calls == 0
+
+
+def test_deletion_reconcile_absent_confirms_without_delete_call(tmp_path):
+    db = Database(str(tmp_path / "del_absent.sqlite3"))
+    db.add_watched("c1", "شات", chat_id=OWNER)
+    db.begin_remote_deletion("c1", "2026-01-01T00:00:00Z")
+    db.set_remote_deletion_state("c1", db.REMOTE_UNCERTAIN, "2026-01-01T00:00:00Z")
+    client = _DelClient(exists=False)
+    c = _del_authed(tmp_path, db, client)
+    r = c.post(
+        "/api/v1/operations/deletions/reconcile",
+        json={"conversation_id": "c1"},
+        headers={"origin": ORIGIN},
+    )
+    assert r.status_code == 200
+    assert r.json()["deleted"] is True and r.json()["status"] == "deleted"
+    assert client.delete_calls == 0
+    assert db.remote_deletion_state("c1") == db.REMOTE_CONFIRMED
+    assert c.get("/api/v1/operations/deletions/list").json()["items"] == []
+
+
+def test_deletion_reconcile_present_restores_local_and_returns_502(tmp_path):
+    db = Database(str(tmp_path / "del_present.sqlite3"))
+    db.begin_remote_deletion("c1", "2026-01-01T00:00:00Z")
+    client = _DelClient(exists=True)
+    c = _del_authed(tmp_path, db, client)
+    r = c.post(
+        "/api/v1/operations/deletions/reconcile",
+        json={"conversation_id": "c1"},
+        headers={"origin": ORIGIN},
+    )
+    assert r.status_code == 502 and r.json()["error"] == "remote_delete_failed"
+    assert client.delete_calls == 0
+    assert db.is_deleted("c1") is False
+    assert db.remote_deletion_state("c1") is None
+
+
+def test_deletion_reconcile_upstream_error_returns_503_and_stays_uncertain(tmp_path):
+    db = Database(str(tmp_path / "del_err.sqlite3"))
+    db.begin_remote_deletion("c1", "2026-01-01T00:00:00Z")
+    client = _DelClient(get_status=503)
+    c = _del_authed(tmp_path, db, client)
+    r = c.post(
+        "/api/v1/operations/deletions/reconcile",
+        json={"conversation_id": "c1"},
+        headers={"origin": ORIGIN},
+    )
+    assert r.status_code == 503 and r.json()["error"] == "remote_delete_pending"
+    assert client.delete_calls == 0
+    assert db.remote_deletion_state("c1") == db.REMOTE_UNCERTAIN
+    assert len(c.get("/api/v1/operations/deletions/list").json()["items"]) == 1
+
+
+def test_delete_endpoint_retry_on_uncertain_when_upstream_gone_reconciles_no_delete(tmp_path):
+    db = Database(str(tmp_path / "del_retry.sqlite3"))
+    db.begin_remote_deletion("c1", "2026-01-01T00:00:00Z")
+    db.set_remote_deletion_state("c1", db.REMOTE_UNCERTAIN, "2026-01-01T00:00:00Z")
+    client = _DelClient(exists=False)
+    c = _del_authed(tmp_path, db, client)
+    r = c.delete("/api/v1/conversations/c1", headers={"origin": ORIGIN})
+    assert r.status_code == 200 and r.json()["deleted"] is True
+    assert client.delete_calls == 0
+    assert db.remote_deletion_state("c1") == db.REMOTE_CONFIRMED

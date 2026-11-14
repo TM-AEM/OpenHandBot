@@ -4,24 +4,45 @@ from __future__ import annotations
 import logging
 from contextlib import AsyncExitStack
 
-from telegram import BotCommand, BotCommandScopeChat, MenuButtonCommands
+from telegram import BotCommand, BotCommandScopeChat, MenuButtonCommands, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
 from . import features, handlers
 from .config import Config
 from .db import Database
+from . import deletion
 from .notifier import Notifier
 from .openhands_client import OpenHandsClient
 from .outbox import CompletionWorker, CreationWorker, OutboxWorker, completion_recover
 from .watcher import Watcher
 
 log = logging.getLogger(__name__)
+
+
+# OHB2-P0-A2: المرفق **المدعوم** الوحيد حاليًا هو `Document` (ملف/مستند) — بيحمل اسم
+# وحجم، وهو حالة الرفع الطبيعية. باقي الوسائط (صور/صوت/فيديو/ملصقات…) بتفضل على مسار
+# الرفض القديم. الفلترين **متمايزين تمامًا** (`Document` vs باقي الوسائط **بعد استبعاد
+# Document`) عشان PTB بينفّذ كل handler مطابق في المجموعة ⇒ مفيش ازدواج معالجة حتى لو
+# الرسالة حملت مستند + وسيط تاني (زي مستند + أنيميشن).
+SUPPORTED_ATTACHMENT_FILTER = filters.Document.ALL
+UNSUPPORTED_ATTACHMENT_FILTER = (
+    filters.PHOTO
+    | filters.AUDIO
+    | filters.VIDEO
+    | filters.VOICE
+    | filters.VIDEO_NOTE
+    | filters.ANIMATION
+    | filters.Sticker.ALL
+    | filters.LIVE_PHOTO
+    | filters.PAID_MEDIA
+) & ~filters.Document.ALL
 
 
 # OHB2-03: قائمة الأوامر المعروضة في قائمة تيليجرام (وصف عربي). لازم تفضل متوافقة مع
@@ -53,10 +74,25 @@ async def _register_commands(application: Application, owner_id: int) -> None:
 def build_application(config: Config) -> Application:
     # U04: بدون concurrent_updates أي أمر بطيء (تصدير/قايمة ملفات) بيأخّر تأكيد
     # "وصل ✅" لأن التحديثات بتتعالج واحد ورا التاني. التزامن آمن هنا لأن حالة
-    # التوجيه بتتستهلك ذرّياً (db.pop_awaiting) وكتابة الصندوق معاملة واحدة.
-    app = Application.builder().token(config.telegram_bot_token).concurrent_updates(True).build()
+    # التوجيه بتتقرأ قراءة فقط (db.awaiting_state)، واستهلاكها المتوقّع النوع مع كتابة
+    # العمل الدائم (صندوق/طلب إنشاء) وعلامة «معالَج» بيحصلوا ذرّياً في معاملة واحدة.
+    # OHB2-STAGE2 (D0): نبني التطبيق **بدون Updater** (`updater(None)`) ⇒ PTB بيسييب
+    # `update_queue` + `_update_fetcher` (بيوزّع على نفس الـ handlers) **بس مفيش سحب تلقائي**
+    # ⇒ مفيش poller تاني؛ حلقة `bot.polling` المخصّصة هي اللي بتسحب (نفس العملية/القاعدة).
+    app = (
+        Application.builder()
+        .token(config.telegram_bot_token)
+        .updater(None)
+        .concurrent_updates(True)
+        .build()
+    )
     client = OpenHandsClient(config.openhands_base_url, config.openhands_api_key)
     db = Database(config.db_path)
+
+    # OHB2-MANUAL-POLLING-OUTCOME: معالج أخطاء PTB يسجّل فشل التحديث **بثبات** (غير مؤهّل
+    # للإقرار) بدل ما يُبتلع كنجاح. بدونه PTB بيسجّل الاستثناء ويرجّع عاديًّا ⇒ رجوع
+    # `process_update` يبان نجاح. ما بيعملش أي عملية خارجية وما بيعيدش رفع الاستثناء.
+    app.add_error_handler(handlers.handle_processing_error)
 
     app.bot_data["config"] = config
     app.bot_data["client"] = client
@@ -65,6 +101,11 @@ def build_application(config: Config) -> Application:
     # الـ readiness بيقراه عشان يعلن الحالة الحقيقية.
     app.bot_data["startup_failed"] = None
 
+    # OHB2-DUPLICATE-TELEGRAM-PROMPT-DISPATCH: حاجز الإدخال في **أعلى أولوية** (group=-1)
+    # لكل أنواع التحديثات (نص/كولباك/أمر). PTB بينفّذ handler واحد بس لكل مجموعة، فهو
+    # أول حاجة تتشغّل وآخر حاجة في مجموعته؛ ولو التحديث مكرّر بيرمي `ApplicationHandlerStop`
+    # فيوقف كل المجموعات ⇒ تحديث واحد = قرار معالجة واحد (إرسال أو إنشاء، مش الاتنين).
+    app.add_handler(TypeHandler(Update, handlers.dedupe_update), group=-1)
     app.add_handler(CommandHandler("start", handlers.start))
     app.add_handler(CommandHandler("cancel", handlers.cancel_route))
     app.add_handler(CommandHandler("help", handlers.help_command))
@@ -83,6 +124,8 @@ def build_application(config: Config) -> Application:
     app.add_handler(CallbackQueryHandler(handlers.open_conversation, pattern=r"^open:"))
     app.add_handler(CallbackQueryHandler(handlers.copy_reply, pattern=r"^copy:"))
     app.add_handler(CallbackQueryHandler(handlers.full_reply, pattern=r"^full:"))
+    # OHB2-BOT-REPLY-TXT-FILE-BUTTON: تنزيل الرد الكامل كملف .txt (إجراء منفصل عن copy/full).
+    app.add_handler(CallbackQueryHandler(handlers.send_reply_txt, pattern=r"^txt:"))
     app.add_handler(CallbackQueryHandler(handlers.show_status, pattern=r"^status:"))
     app.add_handler(CallbackQueryHandler(handlers.reply_prompt, pattern=r"^reply:"))
     app.add_handler(CallbackQueryHandler(handlers.start_new_chat, pattern=r"^newchat$"))
@@ -108,6 +151,24 @@ def build_application(config: Config) -> Application:
         app.add_handler(CallbackQueryHandler(handlers.list_files, pattern=r"^files:"))
         app.add_handler(CallbackQueryHandler(handlers.show_file, pattern=r"^file:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.handle_text))
+    # OHB2-P0-A2: المرفق **المدعوم** (`Document`) ⇒ قبول آمن وربط بمستخدم+محادثة+دفعة.
+    # OHB2-UNSUPPORTED-FILE-SAFE-REJECTION: باقي الوسائط ⇒ رفض واضح (بلا أثر جانبي).
+    # الفلترين متمايزين (Document vs الباقي) ⇒ كل رسالة بتوصل لمعالج واحد بالظبط.
+    app.add_handler(
+        MessageHandler(
+            SUPPORTED_ATTACHMENT_FILTER, handlers.handle_attachment
+        )
+    )
+    app.add_handler(
+        MessageHandler(
+            UNSUPPORTED_ATTACHMENT_FILTER, handlers.handle_unsupported_attachment
+        )
+    )
+    # OHB2-STAGE2 (D1): الـ fallback — آخر handler في group 0 (أدنى أولوية) ⇒ بيتنادى **بس**
+    # لو مفيش أي handler مطابق (زي رسالة نوع مش مدعوم، أو callback بـ pattern مش مطابق)،
+    # وبيسجّل `explicitly_ignored` (مؤهّل للإقرار ⇒ مايحجبش الحدّ للأبد). ما بيكتبش فوق نتيجة
+    # محفوظة، وما بيحوّلش استثناء لتجاهل (شوف `handlers.handle_unmatched_update`).
+    app.add_handler(TypeHandler(Update, handlers.handle_unmatched_update))
 
     async def _post_init(application: Application) -> None:
         # 0) صيانة تشغيل آمنة: فحص سريع للتكامل + تحسين + checkpoint للـ WAL.
@@ -139,6 +200,40 @@ def build_application(config: Config) -> Application:
         # 1.1) OHB2-STABILIZATION-F02: تسوية/تعافي الإكمال المحلي (صفوف قديمة sent/done من
         #      غير intent + إعادة تأهيل العناصر منتهية الإجارة). بدون أي POST خارجي.
         await completion_recover(application)
+        # 1.1b) OHB2-DUPLICATE-TELEGRAM-PROMPT-DISPATCH: تقليم سجل التحديثات المعالَجة
+        #      (إضافي/غير حرج — نافذة احتفاظ ضخمة). مايمنعش الإقلاع لو فشل.
+        #      OHB2-PLAN-01-STAGE3: التقليم بقى **واعيًا بحدّ الإقرار** — بنشيل بس الصفوف
+        #      `<= الحدّ` (مؤكَّدة عند تيليجرام، مش محتاجة ديدَب). الحدّ مونوتوني ومحفوظ ⇒
+        #      مفيش خطر إعادة تنفيذ. لو مفيش حدّ ⇒ no-op (مفيش تقليم بلا watermark مؤكَّد).
+        try:
+            boundary = db.get_acknowledgment_boundary()
+            removed = db.prune_processed_updates(
+                handlers.PROCESSED_UPDATES_KEEP, boundary
+            )
+            if removed:
+                log.info(
+                    "تقليم سجل التحديثات المعالَجة (حدّ=%s): اتشال %s صف (باقي %s)",
+                    boundary, removed, db.count_processed_updates(),
+                )
+        except Exception as exc:  # noqa: BLE001 — التقليم غير حرج
+            log.warning("تقليم سجل التحديثات المعالَجة اتخطّى (%s)", type(exc).__name__)
+        # 1.2) OHB2-MINIAPP: تسوية الحذف البعيد المعلّق (شات اتحذف من OpenHands واتقطع
+        #      قبل ما نثبّت، أو العكس). best-effort: ما تمنعش الإقلاع، وما بتخمّنش (تسيب
+        #      المجهول معلّق). بتشتغل قبل الـ workers عشان مايحصلش إحياء لشات متشاهد.
+        try:
+            await deletion.reconcile_pending_deletions(client, db)
+        except Exception as exc:  # noqa: BLE001 — التسوية ما تمنعش الإقلاع
+            log.warning("تسوية الحذف البعيد المعلّق اتخطّت (%s)", type(exc).__name__)
+        # 1.3) OHB2-P0-A4: كنس الـ staging المحلي للدفعات النهائية/المنتهية + رصد منظّم.
+        #      يُستدعى من hook الإقلاع **الموجود** (مفيش worker/مجدول/عملية/مالك قاعدة جديد).
+        #      محلي فقط (بلا نداء بعيد)؛ idempotent (إعادة الكنس آمنة عند إعادة التشغيل)؛
+        #      best-effort: ما يمنعش الإقلاع لو فشل.
+        try:
+            from datetime import datetime as _datetime, timezone as _timezone
+            from .attachments import AttachmentReaper
+            AttachmentReaper(db, config.db_path).sweep(now=_datetime.now(_timezone.utc))
+        except Exception as exc:  # noqa: BLE001 — الكنس (A4) ما يمنعش الإقلاع
+            log.warning("كنس الـ staging (A4) اتخطّى (%s)", type(exc).__name__)
         # 2) worker واحد مالك لكل جدول — يبدأوا بعد ما التعافي يخلص (عشان مايعالجوش
         #    سجل 'sending'/'starting' قبل ما يتحوّل 'unknown'). الحرس ده يمنع worker
         #    تاني لو اتنادت _post_init تاني (إعادة تهيئة مكرّرة).

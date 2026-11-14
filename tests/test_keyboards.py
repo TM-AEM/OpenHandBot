@@ -167,3 +167,20 @@ def test_mini_app_launch_is_web_app_only():
     assert len(row) == 1
     assert row[0].web_app is not None
     assert row[0].callback_data is None
+
+
+def test_copy_reply_label_clarifies_manual_copy():
+    assert kb.COPY_REPLY == "📄 عرض للنسخ اليدوي"
+    markup = kb.conversation_actions("c1", has_reply=True)
+    assert markup.inline_keyboard[0][0].text == "📄 عرض للنسخ اليدوي"
+
+
+def test_conversation_actions_with_mini_app_url_adds_web_app_when_has_reply():
+    markup = kb.conversation_actions("c1", has_reply=True, mini_app_url="https://app.example.com/mini")
+    web_btns = [b for row in markup.inline_keyboard for b in row if b.web_app is not None]
+    assert len(web_btns) == 1
+    assert web_btns[0].text == kb.COPY_MINI_APP
+    assert web_btns[0].web_app["url"] == "https://app.example.com/mini"
+    # بدون رد، ما يظهرش زر النسخ من التطبيق
+    markup_no_reply = kb.conversation_actions("c1", has_reply=False, mini_app_url="https://app.example.com/mini")
+    assert all(b.web_app is None for row in markup_no_reply.inline_keyboard for b in row)
