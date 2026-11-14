@@ -25,6 +25,48 @@ worker/process/مالك قاعدة تاني.
   بتتحوّل لـ `stored` **بس** بعد كتابة كاملة + تحقّق. أي فشل ⇒ الصف يفضل `pending`
   (بلا `stored` وبلا إرسال) عشان كنس A4 يقدر يلاقيه. **مفيش ادّعاء exactly-once** —
   السلوك at-most-once، و SQLite والملفات **مخزنين منفصلين** (مفيش ادّعاء ذرّية عبرهما).
+
+**حدود الموارد (OHB2-REPAIR-PLAN-01)** — تجعل مسار الإدخال/التخزين محدودًا ومقاومًا للفشل
+بلا تغيير المعمارية أو سياسة المرفقات:
+- **FIX-01**: التنزيل من تيليجرام **متدفّق** بسقف بايت صلب (`max_bytes`)؛ مُكرِّر البثّ
+  (طبقة الـ handler) يرفع `AttachmentTooLargeError` عند التجاوز ⇒ رفض حجم مغلق.
+- **FIX-02**: تحديد التنزيلات المتزامنة (semaphore) مطبّق في طبقة الـ handler
+  (`bot/handlers.py`) حيث التنزيل الفعلي — **مفيش** أي مُجدول/عامل جديد في الوحدة دي.
+- **FIX-03**: سقف **لكل دفعة** (عدد العناصر) وسقف **كلي** لبايتات جذر الـ staging؛ أي
+  تجاوز ⇒ رفض مغلق (`REJECTED_QUOTA`) بلا كتابة جزئية.
+- **FIX-04**: فرض صلاحية جذر الـ staging (`0700`) **يفشل مقفولًا** (فشل الفحص ⇒ رفض،
+  مفيش ابتلاع صامت).
+
+**مسارات استلام المرفقات (FIX-R04 / R-1) — كل مسار **مقبول** بحدّ فعلي على البايتات
+المستلمة:**
+- **بثّ HTTPX** (المسار الأساسي، شبكة تيليجرام): قراءة على قطع + عدّ تراكمي ⇒ توقّف فوري
+  عند تجاوز السقف (سقف فعلي على الذاكرة).
+- **قراءة ملف محلي مقيّدة** (سيرفر Bot API محلي/اختبار): قراءة على قطع بسقف صلب.
+- **مرفوض (fail closed):** `File.download_to_memory` في `python-telegram-bot==22.8` بتلمّ
+  **الرد كامل** في الذاكرة وتنادي `out.write(buf)` **مرّة واحدة** ⇒ **مش** مسار محدود،
+  وعمره ما بيُقبل كسقف صلب. أي حالة تعتمد عليه (بلا URL بلا عميل بثّ، أو بلا ملف محلي)
+  ⇒ `StagingError` (رفض)، **مش** رفض بعد التنزيل الكامل.
+
+**OHB2-REPAIR-PLAN-01-REVIEW-FINDINGS (D-12 / Option A)** — القيم أعلاه للحدود الكمّية
+(عدد لكل دفعة، وبايت كلي) تبقى **مؤقّتة (PROVISIONAL) وغير معتمَدة**، و**مش مفروضة
+افتراضيًّا**: قرار المالك (Option A) = إبقاء فرض حصص D-12 **معطّلًا افتراضيًّا** لحد ما
+يوافق المالك صراحةً، مع الحفاظ على الآلية جاهزة للتفعيل. الآلية **مش** بتتفعّل بأي مسار
+ضمني/env/config: التفعيل يتطلّب تمرير حدّ صريح (`max_items_per_batch`/`max_total_bytes`/
+`max_bytes_per_batch`) من كود معتمَد صراحةً. **تنشيط الحصص الكلّية/لكل-دفعة مستقبلًا
+يتطلّب استراتيجية كنس/تعافٍ معتمَدة منفصلة** (مفيش نقطة كنس عند الإدخال — R-3).
+
+**جدول الحدود (FIX-R05) — المرجع الوحيد لِما هو فعّال:**
+
+| الحدّ | النوع | الافتراضي | الحالة | المُلاحظة |
+| --- | --- | --- | --- | --- |
+| `MAX_ATTACHMENT_BYTES` (3 MiB) | لكل ملف | **مفعّل** | سلامة موارد (مستقلّ) | مش D-12؛ حماية أساسية |
+| `MAX_ITEMS_PER_BATCH` (10) | عدد/دفعة | **معطّل** | مؤقّت (D-12) | يتطلّب تفعيلًا صريحًا |
+| `MAX_STAGING_TOTAL_BYTES` (64 MiB) | بايت كلي | **معطّل** | مؤقّت (D-12) | يتطلّب تفعيلًا صريحًا |
+| `max_bytes_per_batch` | بايت/دفعة | **معطّل** (None) | مؤقّت (D-12) | تصميم مُهيّأ، بلا قيمة افتراضية |
+
+- **D-12 لا يزال غير محسوم**؛ لا توجد حصّة D-12 مفروضة افتراضيًّا.
+- حدّ الملف الواحد (3 MiB) **مستقلّ** ومفعّل دائمًا (سقف أمان موارد، مش سياسة منتج).
+- التفعيل المستقبلي يتطلّب موافقة مالك صريحة + تمرير قيمة صريحة (لا افتراضية).
 """
 from __future__ import annotations
 
@@ -53,6 +95,13 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------- سياسة الحجم/النوع
 # القيم دي **مؤقّتة** (PROVISIONAL) لحد ما D-12 يتحدّد؛ الافتراضي متحفّظ وقابل للعكس.
 MAX_ATTACHMENT_BYTES = 3 * 1024 * 1024  # 3 MiB (مطابق لسقف العميل في proposal §5.7)
+
+# OHB2-REPAIR-PLAN-01/FIX-03: سقوف تخزين الـ staging (PROVISIONAL، متحفّظة وقابلة للعكس).
+# القيم دي **مؤقّتة وغير معتمَدة** (D-12 غير محسوم). تحت قرار المالك Option A:
+# **مش مفروضة افتراضيًّا** — الافتراضيات أدناه `None` = معطّل. القيم الرقمية محفوظة
+# كمرجع للتفعيل المستقبلي الصريح فقط (مش تُستخدم كافتراضي).
+MAX_ITEMS_PER_BATCH = 10                     # مرجع مؤقّت — غير مفروض افتراضيًّا (D-12)
+MAX_STAGING_TOTAL_BYTES = 64 * 1024 * 1024   # مرجع مؤقّت — غير مفروض افتراضيًّا (D-12)
 
 STAGING_DIRNAME = "attachment_staging"
 STAGING_DIR_MODE = 0o700
@@ -96,6 +145,15 @@ class StagingError(RuntimeError):
     """خطأ إعداد/مسار في طبقة الـ staging (رسالة آمنة بلا مسارات مستخدم)."""
 
 
+class AttachmentTooLargeError(RuntimeError):
+    """OHB2-REPAIR-PLAN-01/FIX-01: تجاوز السقف الصلب **أثناء بثّ** التنزيل.
+
+    يرفعه مُكرِّر البايتات (`chunks_factory`) لما مجموع البايتات المقروءة يعدّي السقف،
+    عشان نوقف التنزيل فورًا (بلا لمّ الملف كامل في الذاكرة). `AttachmentService.accept`
+    بيلتقطه ويترجمه لنتيجة `REJECTED_SIZE` (العنصر يفضل `pending` — فشل مغلق).
+    """
+
+
 class StageStatus(str, Enum):
     """نتيجة منظّمة لعملية تخزين (مفيش استثناءات بتتسرّب للمستدعي)."""
 
@@ -105,6 +163,7 @@ class StageStatus(str, Enum):
     REJECTED_NAME = "rejected_name"      # اسم غير صالح
     REJECTED_EMPTY = "rejected_empty"    # صفر بايت
     REJECTED_BATCH = "rejected_batch"    # الدفعة الأب مش موجودة/مش مملوكة/محادثتها غير صالحة
+    REJECTED_QUOTA = "rejected_quota"    # تجاوز سقف الدفعة (عدد) أو السقف الكلي (FIX-03)
     WRITE_FAILED = "write_failed"        # فشل كتابة/مسار
     DB_FAILED = "db_failed"              # فشل قاعدة بيانات (fail closed)
 
@@ -173,6 +232,11 @@ def ensure_staging_root(root: Path) -> Path:
     """ينشئ/يتأكّد من جذر الـ staging كمجلد آمن بصلاحية `0700`.
 
     بيرفض لو المسار symlink أو مش مجلد (منع تحويل الكتابة خارج الجذر).
+
+    **FIX-04 (fail closed):** لو الصلاحية الفعلية مش `0700`، بنحاول `chmod`؛ ولو الفرض
+    فشل (أو الصلاحية لسه غلط بعد المحاولة) ⇒ **بنرفض** (`StagingError`) بدل الابتلاع
+    الصامت. الجذر بصلاحية أوسع من `0700` = تعرّض بايتات المرفقات لمستخدمين تانيين ⇒
+    ماينفعش نكمل كتابة ونعلن نجاح.
     """
     root = Path(root)
     try:
@@ -182,10 +246,24 @@ def ensure_staging_root(root: Path) -> Path:
     if root.is_symlink() or not root.is_dir():
         raise StagingError("مسار الـ staging مش مجلد آمن")
     try:
-        if (os.stat(str(root)).st_mode & 0o777) != STAGING_DIR_MODE:
+        mode = os.stat(str(root)).st_mode & 0o777
+    except OSError as exc:
+        raise StagingError(f"تعذّر فحص صلاحية الـ staging ({type(exc).__name__})") from exc
+    if mode != STAGING_DIR_MODE:
+        try:
             os.chmod(str(root), STAGING_DIR_MODE)
-    except OSError:
-        pass
+        except OSError as exc:
+            raise StagingError(
+                f"تعذّر فرض صلاحية الـ staging 0700 ({type(exc).__name__})"
+            ) from exc
+        try:
+            mode = os.stat(str(root)).st_mode & 0o777
+        except OSError as exc:
+            raise StagingError(
+                f"تعذّر التحقّق من صلاحية الـ staging بعد الفرض ({type(exc).__name__})"
+            ) from exc
+        if mode != STAGING_DIR_MODE:
+            raise StagingError("صلاحية الـ staging لسه مش 0700 بعد الفرض ⇒ رفض")
     return root
 
 
@@ -201,6 +279,31 @@ def _is_within(root: Path, path: Path) -> bool:
     root_r = os.path.realpath(str(root))
     path_r = os.path.realpath(str(path))
     return path_r == root_r or path_r.startswith(root_r + os.sep)
+
+
+def staging_total_bytes(root: Path) -> int:
+    """مجموع بايتات الملفات العادية في جذر الـ staging (FIX-03).
+
+    بيعدّ **الملفات العادية بس** (`lstat`، بلا متابعة symlink) ⇒ مدخلات غير آمنة
+    (symlink/مجلد) ما بتُحسبش ولا بتُتبع. جذر مفقود ⇒ 0. أي فشل قراءة ⇒ ينتشر
+    (المستدعي يفشل مقفولًا بدل ما يقلّل العدّ بصمت).
+    """
+    root = Path(root)
+    try:
+        st = os.lstat(str(root))
+    except FileNotFoundError:
+        return 0
+    if _stat.S_ISLNK(st.st_mode) or not _stat.S_ISDIR(st.st_mode):
+        return 0
+    total = 0
+    for entry in root.iterdir():
+        try:
+            est = os.lstat(str(entry))
+        except OSError:
+            continue
+        if _stat.S_ISREG(est.st_mode):
+            total += est.st_size
+    return total
 
 
 def _is_denied_extension(name: str | None) -> bool:
@@ -351,10 +454,30 @@ class StagingStore:
     `db_path` بيحدّد مكان جذر الـ staging (بجانب قاعدة البيانات — نفس موقع الحالة).
     """
 
-    def __init__(self, db, db_path, *, max_bytes: int = MAX_ATTACHMENT_BYTES) -> None:
+    def __init__(
+        self,
+        db,
+        db_path,
+        *,
+        max_bytes: int = MAX_ATTACHMENT_BYTES,
+        max_items_per_batch: int | None = None,
+        max_total_bytes: int | None = None,
+        max_bytes_per_batch: int | None = None,
+    ) -> None:
+        """`max_bytes` (سقف الملف) مفعّل دائمًا. باقي الحصص **معطّلة افتراضيًّا** (`None`)
+        لحد موافقة المالك الصريحة (D-12 / Option A) — التفعيل بتمرير حدّ صريح من كود
+        معتمَد، بلا أي مسار env/config ضمني.
+        """
         self._db = db
         self._root = staging_root_for(db_path)
         self._max_bytes = int(max_bytes)
+        self._max_items_per_batch = (
+            None if max_items_per_batch is None else int(max_items_per_batch)
+        )
+        self._max_total_bytes = None if max_total_bytes is None else int(max_total_bytes)
+        self._max_bytes_per_batch = (
+            None if max_bytes_per_batch is None else int(max_bytes_per_batch)
+        )
 
     @property
     def root(self) -> Path:
@@ -364,11 +487,94 @@ class StagingStore:
     def max_bytes(self) -> int:
         return self._max_bytes
 
+    @property
+    def max_items_per_batch(self) -> int | None:
+        return self._max_items_per_batch
+
+    @property
+    def max_total_bytes(self) -> int | None:
+        return self._max_total_bytes
+
+    @property
+    def max_bytes_per_batch(self) -> int | None:
+        return self._max_bytes_per_batch
+
+    @property
+    def quota_enabled(self) -> bool:
+        """هل أي حصّة D-12 مفعّلة؟ (الافتراضي: False ⇒ مفيش فرض)."""
+        return (
+            self._max_items_per_batch is not None
+            or self._max_total_bytes is not None
+            or self._max_bytes_per_batch is not None
+        )
+
     def ensure_root(self) -> Path:
         return ensure_staging_root(self._root)
 
+    def _batch_active_files(self, batch_id: str) -> tuple[int, int]:
+        """FIX-R02: (عدد، مجموع بايتات) **الملفات الفعلية على القرص** لعناصر الدفعة.
+
+        المحاسبة على **الموارد الفعلية** لا على الصفوف التاريخية: عنصر مرفوض/منتهي/مكنوس
+        (بلا ملف) ما بيتحسبش ⇒ الرفض/الانتهاء ما بيستهلكش سعة دائمة. عنصر `stored` بيتحسب
+        طول ما ملفه موجود. فشل قراءة القاعدة ينتشر (المستدعي يفشل مقفولًا).
+        """
+        root = self._root
+        count = 0
+        total = 0
+        for it in self._db.list_attachment_items(batch_id):
+            token = it.staging_token
+            if not token or not files.is_safe_workspace_path(token):
+                continue
+            try:
+                st = os.lstat(str(root / token))
+            except OSError:
+                continue
+            if _stat.S_ISREG(st.st_mode):
+                count += 1
+                total += st.st_size
+        return count, total
+
+    def quota_block(self, batch_id: str, *, extra_items: int = 1) -> str | None:
+        """FIX-03/R02: سقف عدد عناصر الدفعة (لو مفعّل صريحًا).
+
+        بيعدّ **الملفات الفعلية** بس (مش الصفوف التاريخية) ⇒ المرفوض/المنتهي/المكنوس ما
+        بيحجبش قبولًا صالحًا. `None` (معطّل) ⇒ مفيش فرض. فشل القراءة ينتشر (فشل مقفول).
+        """
+        if self._max_items_per_batch is None:
+            return None
+        if self._max_items_per_batch <= 0:
+            return "batch_disabled"
+        count, _ = self._batch_active_files(batch_id)
+        if count + int(extra_items) > self._max_items_per_batch:
+            return "batch_items"
+        return None
+
+    def byte_quota_block(self, batch_id: str, *, extra_bytes: int = 0) -> str | None:
+        """FIX-R05: سقف بايتات الدفعة (لو مفعّل صريحًا) — على الملفات الفعلية."""
+        if self._max_bytes_per_batch is None:
+            return None
+        if self._max_bytes_per_batch <= 0:
+            return "batch_disabled"
+        _, total = self._batch_active_files(batch_id)
+        if total + int(extra_bytes) > self._max_bytes_per_batch:
+            return "batch_bytes"
+        return None
+
+    def _effective_cap(self, batch_id: str) -> int:
+        """أصغر سقف كتابة فعّال = min(سقف الملف، المتبقّي الكلي، المتبقّي للدفعة).
+
+        الحصص المعطّلة (`None`) ما بتقيّدش. فشل القراءة ينتشر (المستدعي يفشل مقفولًا).
+        """
+        caps = [self._max_bytes]
+        if self._max_total_bytes is not None:
+            caps.append(self._max_total_bytes - staging_total_bytes(self._root))
+        if self._max_bytes_per_batch is not None:
+            _, used = self._batch_active_files(batch_id)
+            caps.append(self._max_bytes_per_batch - used)
+        return min(caps)
+
     # -- كتابة مقيّدة تحت اسم مُعتِم، محصورة في الجذر، بلا استبدال وبلا تتبّع symlink --
-    def _write_to_path(self, path: Path, chunks) -> int:
+    def _write_to_path(self, path: Path, chunks, cap: int) -> int:
         try:
             fd = os.open(
                 str(path),
@@ -383,7 +589,7 @@ class StagingStore:
                 for chunk in chunks:
                     if not chunk:
                         continue
-                    if written + len(chunk) > self._max_bytes:
+                    if written + len(chunk) > cap:
                         raise _TooLargeError()
                     handle.write(chunk)
                     written += len(chunk)
@@ -447,6 +653,38 @@ class StagingStore:
         if not _is_within(root, path):  # دفاع مزدوج: مفيش خروج من الجذر
             return StageResult(StageStatus.WRITE_FAILED, item_id=item_id, staging_token=token)
 
+        # (0d) FIX-03/R02: سقف عدد عناصر الدفعة (لو مفعّل صريحًا). العدّ على **الملفات
+        #      الفعلية** (مش الصفوف التاريخية) ⇒ المرفوض/المنتهي/المكنوس ما بيحجبش قبولًا.
+        #      `extra_items=1` دايمًا: ملف العنصر الجديد لسه مش موجود على القرص (O_EXCL،
+        #      توكن جديد) — حتى في A2 (`row_created=True`) الصف موجود لكن الملف لأ.
+        try:
+            quota = self.quota_block(batch_id, extra_items=1)
+        except Exception as exc:  # noqa: BLE001 — فشل قاعدة/قرص أثناء الفحص ⇒ رفض مغلق
+            return StageResult(StageStatus.DB_FAILED, item_id=item_id, error=type(exc).__name__)
+        if quota is not None:
+            return StageResult(StageStatus.REJECTED_QUOTA, item_id=item_id, staging_token=token)
+
+        # (0f) FIX-R05: سقف بايتات الدفعة (لو مفعّل صريحًا) — على الملفات الفعلية.
+        try:
+            byte_quota = self.byte_quota_block(batch_id)
+        except Exception as exc:  # noqa: BLE001 — فشل قاعدة/قرص ⇒ رفض مغلق
+            return StageResult(StageStatus.DB_FAILED, item_id=item_id, error=type(exc).__name__)
+        if byte_quota is not None:
+            return StageResult(StageStatus.REJECTED_QUOTA, item_id=item_id, staging_token=token)
+
+        # (0g) سقف الكتابة الفعّال = min(سقف الملف، المتبقّي الكلي، المتبقّي للدفعة). الحصص
+        #      المعطّلة (`None`) ما بتقيّدش ⇒ الافتراضي سقف الملف (3 MiB) بس.
+        try:
+            cap = self._effective_cap(batch_id)
+        except OSError as exc:
+            return StageResult(
+                StageStatus.WRITE_FAILED, item_id=item_id, staging_token=token,
+                error=type(exc).__name__,
+            )
+        if cap <= 0:
+            # سقف فعّال صفري/سالب ⇒ حصّة ممتلئة ⇒ رفض مغلق (بلا كتابة).
+            return StageResult(StageStatus.REJECTED_QUOTA, item_id=item_id, staging_token=token)
+
         # (1) ROW-FIRST: سجل العنصر الدائم (status `pending`) **قبل** أي بايت.
         #     في A2 الصف اتعمل قبل النداء (مع النتيجة ذرّيًّا) ⇒ نتخطّى الإدراج.
         if not row_created:
@@ -462,11 +700,15 @@ class StagingStore:
             except Exception as exc:  # noqa: BLE001 — فشل قاعدة ⇒ رفض مغلق (مفيش ادّعاء نجاح)
                 return StageResult(StageStatus.DB_FAILED, item_id=item_id, error=type(exc).__name__)
 
-        # (2) الكتابة تحت اسم مُعتِم، مقيّدة بالحجم.
+        # (2) الكتابة تحت اسم مُعتِم، مقيّدة بالحجم/السقف الكلي.
         try:
-            written = self._write_to_path(path, chunks if chunks is not None else ())
+            written = self._write_to_path(path, chunks if chunks is not None else (), cap)
         except _TooLargeError:
-            return StageResult(StageStatus.REJECTED_SIZE, item_id=item_id, staging_token=token)
+            # تجاوز السقف: لو السقف الفعّال هو الكلي ⇒ `REJECTED_QUOTA`؛ وإلا `REJECTED_SIZE`.
+            status = (
+                StageStatus.REJECTED_QUOTA if cap < self._max_bytes else StageStatus.REJECTED_SIZE
+            )
+            return StageResult(status, item_id=item_id, staging_token=token)
         except _CollisionError:
             return StageResult(
                 StageStatus.WRITE_FAILED, item_id=item_id, staging_token=token, error="collision"
@@ -553,6 +795,11 @@ class AttachmentService:
         self._client = client
         self._identity = identity
         self._max_bytes = int(max_bytes if max_bytes is not None else store.max_bytes)
+
+    @property
+    def store(self) -> StagingStore:
+        """مخزن الـ staging (للوصول لسقف الملف عند بناء مُكرِّر التنزيل — FIX-01)."""
+        return self._store
 
     async def _authorized(self, conversation_id: str, *, db):
         """تفويض المحادثة (ملكية/معرّف/شاهد حذف، فشل مغلق) — نفس تنفيذ كل المسارات."""
@@ -642,7 +889,17 @@ class AttachmentService:
             return AcceptResult(AcceptOutcome.DUPLICATE)
 
         # (5) تنزيل البايتات (مقيّدة) ⇒ A1 يكتبها ويتحقّق. أي فشل ⇒ العنصر يفضل pending.
-        chunks = await chunks_factory() if chunks_factory is not None else ()
+        #     FIX-01: مُكرِّر البثّ (في طبقة الـ handler) يقف عند السقف الصلب ويرفع
+        #     `AttachmentTooLargeError` (وقف التنزيل فورًا، بلا لمّ الملف في الذاكرة) ⇒
+        #     نترجمه لرفض حجم مغلق (بلا `stored`). FIX-02 (تحديد التنزيلات المتزامنة)
+        #     مطبّق في طبقة الـ handler (حيث التنزيل فعليًّا).
+        try:
+            chunks = await chunks_factory() if chunks_factory is not None else ()
+        except AttachmentTooLargeError:
+            return AcceptResult(
+                AcceptOutcome.ACCEPTED, batch_id=batch_id, item_id=item_id,
+                stage=StageStatus.REJECTED_SIZE,
+            )
         stage = self._store.store(
             telegram_id=int(telegram_id),
             batch_id=batch_id,
@@ -729,9 +986,19 @@ class AttachmentReaper:
         }
     )
 
-    def __init__(self, db, db_path, *, batch_ttl: timedelta = ATTACHMENT_BATCH_TTL) -> None:
+    def __init__(
+        self, db, db_path=None, *, batch_ttl: timedelta = ATTACHMENT_BATCH_TTL, store=None
+    ) -> None:
         self._db = db
-        self._store = StagingStore(db, db_path)
+        # FIX-R04/R-4: جذر الـ staging لازم يكون صريحًا — إمّا مخزن موجود (`store`)، وإمّا
+        # `db_path` محدَّد. ممنوع الاختيار الصامت لجذر نسبي (`attachment_staging` في مجلد
+        # العمل الحالي) لما الاتنين غايبين ⇒ رفض مغلق بدل مسار غير مقصود.
+        if store is None and not db_path:
+            raise StagingError(
+                "AttachmentReaper يحتاج مخزنًا (`store`) أو `db_path` صريحًا (جذر نسبي مرفوض)"
+            )
+        # إعادة استخدام نفس مخزن الـ staging (بلا اتصال قاعدة تاني) لما يُمرَّر صراحةً.
+        self._store = store if store is not None else StagingStore(db, db_path)
         self._root = self._store.root
         self._ttl = batch_ttl
 

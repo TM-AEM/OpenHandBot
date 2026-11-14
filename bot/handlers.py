@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import os
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -1604,6 +1605,10 @@ ATTACHMENT_UNSUPPORTED_TYPE_TEXT = (
 ATTACHMENT_TOO_LARGE_TEXT = (
     "حجم الملف كبير أوي (الحد الأقصى 3 ميجابايت). ابعت ملف أصغر."
 )
+# OHB2-REPAIR-PLAN-01/FIX-03: تجاوز سقف الدفعة (عدد الملفات) أو السقف الكلي للتخزين.
+ATTACHMENT_QUOTA_TEXT = (
+    "وصلت للحد الأقصى لعدد/حجم الملفات في الدفعة دي. ابعت ملفات أقل أو أصغر."
+)
 ATTACHMENT_AUTH_FAILED_TEXT = (
     "مش قادر أتحقّق من صلاحية الشات دلوقتي. جرّب تاني."
 )
@@ -1679,16 +1684,128 @@ def _attachment_service(context: ContextTypes.DEFAULT_TYPE):
     return AttachmentService(db, store, context.bot_data["client"], _identity_cache(context))
 
 
-async def _download_attachment_chunks(context, file_id: str):
-    """مُكرِّر بايتات الملف من تيليجرام (مقيّد بحجم A1 أثناء الكتابة).
+# OHB2-REPAIR-PLAN-01/FIX-02: أقصى عدد تنزيلات مرفقات متزامنة (حصر على مستوى العملية).
+MAX_CONCURRENT_DOWNLOADS = 4
 
-    `download_to_memory` بتقرا الملف كامل في الذاكرة (سقف PTB 20MB)؛ A1 بيكتب بحد
-    3 MiB فبيرفض أي ملف أكبر أثناء الكتابة (قبل أي تجاوز فعلي للقرص بكتير).
+# OHB2-REPAIR-PLAN-01/FIX-01: حجم القطعة المقروءة في كل خطوة (بثّ/قراءة محلية).
+_DOWNLOAD_CHUNK_BYTES = 64 * 1024
+
+# OHB2-REPAIR-PLAN-01/FIX-02: semaphore التنزيلات المتزامنة، مربوط بحلقة الأحداث
+# الجارية (يُعاد إنشاؤه لو تغيّرت الحلقة — آمن مع `asyncio.run` المتكرّر في الاختبارات).
+_download_semaphore: "asyncio.Semaphore | None" = None
+_download_semaphore_loop = None
+
+
+def _get_download_semaphore() -> "asyncio.Semaphore":
+    global _download_semaphore, _download_semaphore_loop
+    loop = asyncio.get_running_loop()
+    if _download_semaphore is None or _download_semaphore_loop is not loop:
+        _download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+        _download_semaphore_loop = loop
+    return _download_semaphore
+
+
+def _telegram_httpx_client(context):
+    """عميل httpx الفعلي داخل طلب PTB (أو None لو مش متاح/مش متوقّع)."""
+    request = getattr(context.bot, "request", None)
+    client = getattr(request, "_client", None)
+    if client is not None and hasattr(client, "stream"):
+        return client
+    return None
+
+
+def _read_local_capped(path: str, max_bytes: int) -> bytes:
+    """قراءة ملف محلي (سيرفر Bot API) على قطع بسقف صلب (FIX-01، بلا لمّ الملف كاملًا)."""
+    from .attachments import AttachmentTooLargeError
+
+    buf = bytearray()
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(_DOWNLOAD_CHUNK_BYTES)
+            if not chunk:
+                break
+            if len(buf) + len(chunk) > max_bytes:
+                raise AttachmentTooLargeError()
+            buf += chunk
+    return bytes(buf)
+
+
+async def _download_attachment_chunks(context, file_id: str, max_bytes: int):
+    """مُكرِّر بايتات الملف من تيليجرام بسقف بايت صلب فعلي (FIX-01 / FIX-R04).
+
+    مسارات الاستلام **المقبولة** فقط — كلها بحدّ فعلي على البايتات المستلمة:
+    1) **بثّ HTTPX** (المسار الأساسي): من شبكة تيليجرام على قطع عبر عميل httpx
+       الموجود في طلب PTB؛ نتوقّف **فورًا** أول ما المجموع يعدّي `max_bytes`.
+    2) **قراءة ملف محلي مقيّدة** (سيرفر Bot API محلي/اختبار): على قطع بسقف صلب.
+
+    **مرفوض (fail closed):** أي حالة تانية (بلا URL مع عميل بثّ متاح، أو بلا ملف محلي
+    قابل للقراءة) ⇒ `StagingError`. **مابنستخدمش `File.download_to_memory` كمسار
+    بديل**: في `python-telegram-bot==22.8` بتلمّ **الرد كامل** في الذاكرة وتنادي
+    `out.write(buf)` **مرّة واحدة** (`telegram/_files/file.py::download_to_memory`
+    + `telegram/request/_httpxrequest.py::do_request` ⇒ `res.content`) ⇒ مش مسار
+    محدود، ومايصحّش نعتبره سقفًا صلبًا.
     """
-    tg_file = await context.bot.get_file(file_id)
-    buffer = io.BytesIO()
-    await tg_file.download_to_memory(buffer)
-    return iter([buffer.getvalue()])
+    from .attachments import AttachmentTooLargeError, StagingError
+
+    # FIX-02: الحصر على مستوى التنزيل الفعلي (القراءة كاملة تتم هنا قبل رجوع المُكرِّر).
+    async with _get_download_semaphore():
+        tg_file = await context.bot.get_file(file_id)
+        file_path = getattr(tg_file, "file_path", None)
+        is_url = isinstance(file_path, str) and file_path[:7] in ("http://", "https:/")
+
+        if not is_url:
+            # مسار محلي (سيرفر Bot API محلي/اختبار): ملف على القرص ⇒ قراءة مقيّدة.
+            if isinstance(file_path, str) and os.path.isfile(file_path):
+                try:
+                    return iter([_read_local_capped(file_path, max_bytes)])
+                except AttachmentTooLargeError:
+                    raise
+                except OSError as exc:  # ملف غير قابل للقراءة ⇒ رفض مغلق (مش فشل صامت)
+                    raise StagingError(
+                        f"تعذّر قراءة ملف تيليجرام المحلي ({type(exc).__name__})"
+                    ) from exc
+            # مفيش URL ومفيش ملف محلي قابل للقراءة ⇒ مفيش مسار استلام محدود ⇒ رفض مغلق.
+            raise StagingError(
+                "تنزيل مرفق تيليجرام غير محدود غير متاح (مفيش URL ولا ملف محلي مقيّد)"
+            )
+
+        client = _telegram_httpx_client(context)
+        if client is None:
+            # مفيش عميل بثّ متاح ⇒ `download_to_memory` غير محدود ⇒ رفض مغلق بدل قبول
+            # غير محدود (ما فيهش تبديل صامت لطريقة تنزيل غير محدودة).
+            raise StagingError(
+                "تنزيل مرفق تيليجرام غير محدود غير متاح (عميل البثّ مش متاح)"
+            )
+
+        url = tg_file._get_encoded_url()
+        buf = bytearray()
+        try:
+            async with client.stream("GET", url, headers={"Accept-Encoding": "identity"}) as resp:
+                # 3xx إعادة توجيه مش محتوى ⇒ رفض آمن (نفس سياسة `read_file_text_bounded`).
+                if 300 <= resp.status_code < 400:
+                    raise StagingError(
+                        f"رد إعادة توجيه غير متوقّع من تيليجرام (HTTP {resp.status_code})"
+                    )
+                if resp.status_code >= 400:
+                    raise StagingError(f"تنزيل تيليجرام فشل (HTTP {resp.status_code})")
+                # ترميز محتوى غير `identity` ⇒ رفض آمن بدل تخزين بايتات مضغوطة (المجموع
+                # التراكمي على البايتات الخام هو الضمان).
+                encoding = resp.headers.get("content-encoding")
+                if encoding is not None and encoding.lower() != "identity":
+                    raise StagingError(f"ترميز محتوى غير متوقّع من تيليجرام ({encoding})")
+                async for chunk in resp.aiter_raw():
+                    if not chunk:
+                        continue
+                    if len(buf) + len(chunk) > max_bytes:
+                        raise AttachmentTooLargeError()
+                    buf += chunk
+        except AttachmentTooLargeError:
+            raise
+        except StagingError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — أي فشل نقل ⇒ ينتشر (فشل مُسجّل، مش نجاح كاذب)
+            raise StagingError(f"تعذّر تنزيل الملف من تيليجرام ({type(exc).__name__})") from exc
+        return iter([bytes(buf)])
 
 
 async def handle_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1739,9 +1856,11 @@ async def handle_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     from .attachments import AcceptOutcome
 
     service = _attachment_service(context)
+    # FIX-01: سقف البايت الصلب = سقف الملف في طبقة الـ staging (مصدر واحد للحقيقة).
+    max_bytes = service.store.max_bytes
 
     async def _chunks_factory():
-        return await _download_attachment_chunks(context, file_id)
+        return await _download_attachment_chunks(context, file_id, max_bytes)
 
     now = datetime.now(timezone.utc)
     try:
@@ -1763,9 +1882,11 @@ async def handle_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if result.outcome is AcceptOutcome.STORED:
         reply = ATTACHMENT_ACCEPTED_TEXT
     elif result.outcome is AcceptOutcome.ACCEPTED:
-        # اتقبل بثبات بس البايتات ماتخزّنتش (حجم/نوع فعلي) ⇒ نقول الحقيقة للمستخدم.
+        # اتقبل بثبات بس البايتات ماتخزّنتش (حجم/نوع/سقف فعلي) ⇒ نقول الحقيقة للمستخدم.
         if stage_value == "rejected_size":
             reply = ATTACHMENT_TOO_LARGE_TEXT
+        elif stage_value == "rejected_quota":
+            reply = ATTACHMENT_QUOTA_TEXT
         elif stage_value in ("rejected_type", "rejected_name"):
             reply = ATTACHMENT_UNSUPPORTED_TYPE_TEXT
         else:
@@ -1773,6 +1894,8 @@ async def handle_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     elif result.outcome is AcceptOutcome.REJECTED:
         if stage_value == "rejected_size":
             reply = ATTACHMENT_TOO_LARGE_TEXT
+        elif stage_value == "rejected_quota":
+            reply = ATTACHMENT_QUOTA_TEXT
         else:
             reply = ATTACHMENT_UNSUPPORTED_TYPE_TEXT
     elif result.outcome is AcceptOutcome.AUTH_FAILED:

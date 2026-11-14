@@ -577,16 +577,22 @@ def test_classify_incoming_file_decisions(tmp_path):
 
 # ============================================== 7) تكامل الـ handler الحقيقي (app)
 class FakeTgFile:
-    def __init__(self, data: bytes):
-        self._data = data
+    """`File` مزيّف بمسار **محلي حقيقي** (نمذجة سيرفر Bot API محلي): التطبيق بيقراه عبر
+    القراءة المقيّدة (`_read_local_capped`). المسار البديل غير المحدود
+    (`download_to_memory`) اتشال (FIX-R04) ⇒ ما نعتمدش عليه."""
 
-    async def download_to_memory(self, buf, **kw):
-        buf.write(self._data)
+    def __init__(self, path: str):
+        self.file_id = "f1"
+        self.file_unique_id = "u1"
+        self.file_size = None
+        self.file_path = path
 
 
 class Harness:
     def __init__(self, tmp_path, *, file_bytes=b"hello", conversations=None) -> None:
         self.file_bytes = file_bytes
+        self.tmp_path = tmp_path
+        self._file_seq = 0
         self.app = app_mod.build_application(make_config(tmp_path))
         self.app._initialized = True  # نتخطّى initialize() (بيفتح جلسة شبكة حقيقية)
         self.app.bot_data["client"] = FakeClient(
@@ -656,7 +662,11 @@ def _patch_telegram(monkeypatch, harness: Harness) -> None:
 
     async def _get_file(self, file_id=None, **kw):
         harness.get_file_calls.append(file_id)
-        return FakeTgFile(harness.file_bytes)
+        # ملف محلي حقيقي فريد (كل نداء) ⇒ المسار المقيّد يقراه بلا شبكة.
+        harness._file_seq += 1
+        path = harness.tmp_path / f"tgf_{harness._file_seq}.bin"
+        path.write_bytes(harness.file_bytes)
+        return FakeTgFile(str(path))
 
     async def _noop(self, *a, **k):
         return True

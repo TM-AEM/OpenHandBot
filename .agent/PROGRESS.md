@@ -472,6 +472,7 @@ Acceptance criteria (testable):
    workers, deletion lifecycle, security, RTL/a11y, deps, docs, tests) with severities.
 3. All documented checks run; exact commands + exit codes + counts recorded; blockers classified.
 4. Only clear in-scope defects fixed, each with a regression test; full suite re-run.
+
 5. Independent-review package prepared (baseline/candidate hashes, diff, evidence, risks).
 6. Final decision (PASS/PASS_WITH_NOTES/BLOCKED/FAIL) + Phase 8 recommendation.
 Out of scope: deploy, publish, merge, push, PR, Telegram/OpenHands production calls, autopush,
@@ -2700,3 +2701,185 @@ P0، مفيش تغيير سلوك، مفيش كود/اختبارات/مخطط.**
 - **الحالة:** DONE (إغلاق موثَّق). لا commit/push/PR؛ لا تفعيل Autopush. لا تعديل كود/اختبار.
 - **الخطوة التالية:** لا شيء مطلوب للإغلاق؛ (اختياري، بموافقة مالك منفصلة) مواءمة F-5 `>=` مع A2 `>`،
   أو إضافة علَم F7.
+
+---
+
+## OHB2-REPAIR-PLAN-01-RESOURCE-STAGING (2026-11-14)
+- **الهدف:** جعل مسار إدخال/تخزين المرفقات المحلي **محدود الموارد ومقاومًا للفشل** بلا تغيير
+  المعمارية أو سياسة المرفقات (A0–A4). أربع إصلاحات مرتّبة: FIX-01 … FIX-04.
+- **خط الأساس (متحقَّق منه فعليًّا):** الفرع `agent/ohb2-repair-plan-01-resource-staging`،
+  HEAD قبل التعديل `02807b155e355f40352fe5e43967c58eea71162e`. الشجرة كانت نظيفة (مفيش
+  تعديلات غير متعلّقة). مجموعة الاختبارات الكاملة: **1 failed** (`test_deploy_manifest.py::
+  test_documented_manifest_is_import_sufficient` — فشل **قائم سابقًا** لا علاقة له بالمهمة)،
+  2899 passed. pyflakes=0.
+- **FIX-01 (بثّ التنزيل بسقف صلب):** `bot/handlers.py::_download_attachment_chunks` بقت تقرا
+  من شبكة تيليجرام **على قطع** (`client.stream` + `aiter_raw`، `Accept-Encoding: identity`)
+  عبر عميل httpx داخل طلب PTB، وتتوقّف فورًا عند تجاوز السقف (ترفع `AttachmentTooLargeError`).
+  مسارات بديلة: ملف محلي (سيرفر Bot API) ⇒ قراءة متدفّقة مقيّدة (`_read_local_capped`)؛ غير
+  كده قراءة كاملة بسقف صلب. ترفض 3xx/`Content-Encoding` غير `identity` (نفس سياسة القراءة
+  المحدودة القائمة). `AttachmentService.accept` بترجم `AttachmentTooLargeError` ⇒ `REJECTED_SIZE`.
+- **FIX-02 (حصر التنزيلات المتزامنة):** semaphore على مستوى العملية (`MAX_CONCURRENT_DOWNLOADS=4`)
+  في `bot/handlers.py`، مربوط بحلقة الأحداث الجارية. الحصر في طبقة الـ handler (حيث التنزيل
+  الفعلي) — **مفيش** `asyncio`/عامل/مُجدول جديد في `bot/attachments.py` (حراسة A4).
+- **FIX-03 (سقوف الـ staging):** `MAX_ITEMS_PER_BATCH=10` و`MAX_STAGING_TOTAL_BYTES=64 MiB`
+  (PROVISIONAL). `StagingStore.__init__` بقى يقبل `max_items_per_batch`/`max_total_bytes`؛
+  `quota_block(batch_id, extra_items=…)`؛ `staging_total_bytes(root)`؛ `store()` بيفرض السقفين
+  قبل أي كتابة/صف ويرجّع `StageStatus.REJECTED_QUOTA` (فشل مغلق، بلا كتابة جزئية). رد handler
+  مخصّص `ATTACHMENT_QUOTA_TEXT`.
+- **FIX-04 (فرض الصلاحية يفشل مقفولًا):** `ensure_staging_root` بقى يرفض (`StagingError`) لو
+  `chmod` فشل أو الصلاحية لسه مش `0700` بعد الفرض — بدل الابتلاع الصامت.
+- **الاختبارات:** `tests/test_repair_plan_01_resource_staging.py` (20 اختبار: سقوف، فشل مغلق
+  للصلاحية، بثّ عبر سوكيت TCP حقيقي، 3xx/ترميز، ترجمة `accept`، حصر التزامن، رد handler).
+- **التحقّق:** full suite **2918 passed / 1 failed** (نفس الفشل القائم سابقًا فقط)؛
+  اختبارات المرفقات A1/A2/A4/Schema/Rejection + الجديدة **181 passed**؛ pyflakes=0؛
+  bandit High=0 (Medium=17 كما الأساس)؛ pip_audit نظيف؛ frontend 223 passed.
+- **افتراضات:** القيم `MAX_ITEMS_PER_BATCH`/`MAX_STAGING_TOTAL_BYTES` مؤقّتة (PROVISIONAL،
+  متحفّظة وقابلة للعكس) لحد قرار D-12. سقف البايت للتنزيل = `store.max_bytes` (مصدر واحد).
+  حصر التزامن في طبقة الـ handler إلزامي لأن حراسة A4 تمنع `asyncio` في `bot/attachments.py`.
+- **الحالة:** DONE محليًّا. **لا** commit/push/PR/merge (تعليمة المهمة صريحة). لا تغيير في
+  المعمارية أو قرارات المالك أو `concurrent_updates(True)`.
+- **الخطوة التالية:** دفع الفرع `agent/*` (بإذن) ليتحقّق CI، أو ضبط قيم السقوف عند حسم D-12.
+
+---
+
+## OHB2-REPAIR-PLAN-01-REVIEW-FINDINGS (2026-11-14)
+- **الهدف:** إصلاح نتائج المراجعة المستقلة `OHB2-REVIEW-PLAN-01-RESOURCE-STAGING`
+  (الحكم السابق `NEEDS_CHANGES`) — **بلا** إعادة تنفيذ FIX-02/FIX-04 (اتأكّد إنهم سليمين)
+  و**بلا** تغيير المعمارية أو سياسة المرفقات (A0–A4).
+- **خط الأساس (متحقَّق منه فعليًّا):** الفرع `agent/ohb2-repair-plan-01-resource-staging`؛
+  HEAD `02807b155e355f40352fe5e43967c58eea71162e` (نفسه). الشجرة كانت **غير نظيفة**:
+  `M .agent/PROGRESS.md`، `M bot/attachments.py`، `M bot/handlers.py`،
+  `?? tests/test_repair_plan_01_resource_staging.py` — كلها من تنفيذ Repair Plan 01
+  (عمل غير مُودَع، **مش** تعديلات مستخدم غريبة). لا حاجة لأي عملية Git مدمِّرة.
+- **الحكم على الإصلاحات الأربعة الأصلية (بالتنفيذ لا بالقراءة فقط):** FIX-01 **سليم**،
+  FIX-04 **سليم**، FIX-02 **سليم لكن غير مؤثّر إنتاجيًّا** (الـ poller الواحد يسلسل التحديثات
+  عبر `process_updates` + `queue.join()`)، FIX-03 **فيه عيوب صحّة/فعالية مؤكّدة**.
+
+### FIX-R01 — تعطيل فرض حصص D-12 غير المعتمَدة افتراضيًّا (Option A)
+- **العيب:** فرض حصص كمّية (`MAX_ITEMS_PER_BATCH=10`، `MAX_STAGING_TOTAL_BYTES=64 MiB`)
+  كـ**افتراضي مفعّل** بينما D-12 **غير محسوم** (`غير محسوم`، القيم **PROVISIONAL/NOT APPROVED**)
+  ⇒ فرض سياسة منتج غير معتمَدة.
+- **الإصلاح:** الافتراضيات بقت `None` = **معطّل**؛ القيم الرقمية محفوظة كمرجع فقط. لا أي مسار
+  env/config يفعّلها ضمنيًّا (تأكيد: `Config` بلا مفاتيح حصص). التفعيل يتطلّب تمرير حدّ صريح
+  من كود معتمَد. سقف الملف الواحد (3 MiB) **مستقلّ ومفعّل دائمًا**. D-12 يفضل غير محسوم.
+- **الأدلّة:** `tests/test_repair_plan_01_review_findings.py` (25 ملف ⇒ كلهم `stored`؛ جدول
+  الحدود؛ التفعيل الصريح يعمل؛ فحوص النوع/الصلاحية/الملكية سليمة).
+
+### FIX-R02 — تصحيح محاسبة العناصر (الموارد الفعلية vs السجل التاريخي)
+- **العيوب المؤكّدة:** (أ) العناصر المرفوضة تستهلك حصّة العدد (3 رفضات + سقف 3 ⇒ رفض صالح)؛
+  (ب) الصفوف **غير محدودة** (السقف يرفض فقط ولا يحدّ الصفوف: سقف 3، 25 رفع ⇒ 25 صفًّا).
+- **الإصلاح:** المحاسبة بقت على **الملفات الفعلية على القرص** (`_batch_active_files` بـ`lstat`
+  بلا تتبّع symlink، بمسارات آمنة) ⇒ العنصر المرفوض/المنتهي/المكنوس (بلا ملف) **ما بيحجبش**
+  قبولًا صالحًا. الصفوف التاريخية تفضل **محفوظة** (مفيش حذف لتمرير الحصّة). `extra_items=1`
+  دايمًا (ملف العنصر الجديد لسه مش موجود — O_EXCL، توكن جديد).
+- **الأدلّة:** رفضات متكرّرة ⇒ قبول صالح؛ `reaped` يحرّر السعة؛ القبول المتزامن (12 مهمة على
+  اتصال SQLite حقيقي) ⇒ 3 stored / 9 rejected بالظبط؛ السجل التاريخي محفوظ.
+
+### FIX-R03 — تصحيح السقف الكلي + تفاعل الانتهاء  ⚠️ **ملغى/مُستبدَل (2026-11-14، R-3)**
+- **العيب المؤكّد:** الكنس (`AttachmentReaper`) كان **عند الإقلاع فقط** (`bot/app.py`) ⇒ بايتات
+  الدفعات المنتهية تفضل على القرص وتحجب الرفع الجديد لحد إعادة التشغيل.
+- **الإصلاح (اتشال):** `StagingStore.opportunistic_cleanup(now=…)` — كنس **متزامن** عند حدّ الإدخال
+  (`AttachmentService.accept`، بساعة `now` المتّسقة)، **يعيد استخدام** `AttachmentReaper.sweep`
+  الموجود (**مفيش** عامل/مجدول/عملية/مالك قاعدة جديد)، ومربوط بـ`quota_enabled` ⇒ **no-op**
+  افتراضيًّا (الحصص معطّلة). المحاسبة على الملفات الفعلية ⇒ **فشل الحذف ما بيحرّرش حصّة كاذبًا**.
+- **الأدلّة:** رفع بعد TTL ينجح (كان `REJECTED_QUOTA`)؛ الحيّ لا يُلمَس؛ ملف غير مرتبط لا يُحذف؛
+  idempotent؛ فشل الحذف ⇒ الحصّة تفضل صحيحة؛ كنس الإقلاع (A4) لسه شغّال.
+
+### FIX-R04 — سقف صلب على **كل** مسار تنزيل (المسار البديل)  ⚠️ **ملغى/مُستبدَل (2026-11-14، R-1/R-2)**
+- **العيب المؤكّد:** المسار البديل (بلا URL/ملف محلي) كان بيلمّ الملف **كاملًا** في `io.BytesIO`
+  غير محدود ثم يفحص السقف ⇒ لمّ غير محدود ممكن (حتى 20 MiB من سقف PTB) قبل الفحص.
+- **الإصلاح (اتشال):** `_CappedByteSink` (حوض بسقف صلب) يُمرَّر لـ`download_to_memory` ⇒ يرفض فورًا أي
+  كتابة تتجاوز السقف (`AttachmentTooLargeError`). أي فشل نقل في البديل ينتشر كـ`StagingError`
+  (نفس عقد المسار الأساسي: فشل مُسجّل، مش نجاح كاذب).
+- **الأدلّة:** سقف مطابق يمرّ، +1 بايت يُرفض؛ البديل الكبير يرفض أثناء الاستلام بلا لمّ كامل؛
+  فشل النقل ينتشر؛ `accept` يترجمه `REJECTED_SIZE`.
+
+### FIX-R05 — توضيح جدول الحدود (توثيق)
+- أُضيف **جدول الحدود** في توثيق `bot/attachments.py` (مفعّل/معطّل/بانتظار الموافقة) +
+  `max_bytes_per_batch` (تصميم مُهيّأ، معطّل افتراضيًّا، `byte_quota_block`) — **بلا** فرض
+  أي قيمة جديدة غير معتمَدة.
+
+### التحقّق (أوامر ونتائج فعلية)
+- `python -m pytest -q --deselect tests/test_deploy_manifest.py` ⇒ **2950 passed**، 6 deselected
+  (132s). الخط الأساس قبل التغيير: `1 failed, 2919 passed`. عدد اختبارات الملفين الجديدين:
+  20 + 36 = **56 passed**.
+- `test_deploy_manifest::test_documented_manifest_is_import_sufficient` ⇒ **1 failed** —
+  فشل **قائم سابقًا** (بيئة: subprocess معزول يخفي `telegram`) — **مش انحدار**.
+- `python -m pyflakes bot/ automation/ main.py tests/` ⇒ exit **0**.
+- `node --test tests/frontend/*.test.js` ⇒ **223 pass / 0 fail**.
+- `python -m bandit -r bot/ automation/ main.py -lll -s B613` ⇒ High **0** (Medium 17، Low 5 — كما الأساس).
+- `python -m pip_audit -r requirements-dev.txt` ⇒ **No known vulnerabilities found**.
+- حراسة A4 (`tests/test_attachment_cleanup_expiration_a4.py` 44/44): مفيش `asyncio` في
+  `bot/attachments.py`، والكنس من hook الإقلاع **الموجود** فقط — لسه سليمة.
+
+### Assumptions / decisions
+- **Option A** لتجاوز D-12: تعطيل الفرض افتراضيًّا مع حفظ الآلية (تفسير محافظ وقابل للعكس).
+- الكنس الانتهاكي **متزامن** ومربوط بالمخزن (احترام حراسة A4: لا `asyncio` في `attachments.py`).
+- لم أُعدّل `concurrent_updates(True)` ولا أي مسار مرفوض/ملكية/امتداد/magic/ترتيب صف-أولًا.
+- الحصص المعطّلة افتراضيًّا ⇒ **مفيش** تغيير سلوكي في الإنتاج (نفس السلوك المرصود قبل الإصلاح
+  باستثناء التصحيحات: المسار البديل المقيّد، والكنس الانتهاكي عند تفعيل الحصص).
+- لم أُعدّل الملفات في مرحلة المراجعة؛ التعديلات دي في مرحلة التنفيذ فقط.
+
+### الحالة
+- **PARTIAL / يحتاج مراجعة مستقلة.** التنفيذ + الاختبارات + البوابة مكتملة محليًّا. **لا**
+  commit/push/PR/merge/نشر/تفعيل Autopush (تعليمة المهمة صريحة).
+- **الخطوة التالية:** طلب مراجعة عدائية مستقلة (جلسة منفصلة) على الشجرة الحالية قبل أي دفع.
+
+## OHB2-REPAIR-PLAN-01-FIX-R04-FALLBACK-BOUNDED-DOWNLOAD (2026-11-14)
+
+**النطاق:** معالجة نتائج المراجعة المستقلّة `OHB2-REVIEW-PLAN-01-REVIEW-FINDINGS`
+(`NEEDS_CHANGES`) — الحاجب **R-1** أولًا، ثم R-2/R-3/R-4/R-5. بلا تغيير المعمارية أو
+سياسة المرفقات (A0–A4). العمل على `agent/ohb2-repair-plan-01-resource-staging`.
+
+### معايير القبول
+1. المسار البديل غير المحدود (`File.download_to_memory`) **مرفوض صراحةً** — مفيش أي استدعاء
+   في `bot/handlers.py`، والرفض **قبل** أي لمّ كامل (fail closed، `StagingError`).
+2. المسارات المقبولة فقط بحدّ فعلي على البايتات المستلمة: بثّ HTTPX (على قطع) + قراءة ملف
+   محلي مقيّدة. كلاهما باختبارات على السقف 3 MiB (مطابق يمرّ، +1 يرفض).
+3. R-3: نقطة الكنس عند الإدخال **اتشالت** (نقطة استدعاء غير معتمَدة في A4)؛ كنس الإقلاع محفوظ.
+4. R-4: بناء `AttachmentReaper` الغامض (بلا `store`/`db_path`) ⇒ `StagingError` (مفيش جذر نسبي صامت).
+5. R-5: توثيق جدول الحدود + مسارات الاستلام مصحَّح في `bot/attachments.py`.
+6. بلا انحدار: كل الاختبارات تفضل خضراء ما عدا الفشل القائم سابقًا `test_deploy_manifest`.
+
+### ما اتعمل
+- **R-1/R-2 (حاجب):** شيل المسار البديل `download_to_memory` من `_download_attachment_chunks`
+  (`bot/handlers.py`) + شيل `_CappedByteSink`. المسار الأساسي (بثّ HTTPX) + القراءة المحلية
+  المقيّدة فقط. حالات بلا مسار محدود (URL بلا عميل بثّ، أو بلا ملف محلي) ⇒ `StagingError` فورًا.
+- **R-3 (بوابة معمارية):** شيل `StagingStore.opportunistic_cleanup` + نقطة ندائها في
+  `AttachmentService.accept` (كانت نقطة استدعاء إضافية غير معتمَدة في A4). كنس الإقلاع
+  (`bot/app.py`) محفوظ كما هو.
+- **R-4:** `AttachmentReaper.__init__` بيمنع البناء بلا `store`/`db_path` (`StagingError`).
+- **R-5:** توثيق `bot/attachments.py` (جدول الحدود + مسارات الاستلام + ملاحظة تنشيط الحصص
+  الكلّية المستقبليّة محتاجة استراتيجية كنس معتمَدة — R-3).
+- **الاختبارات:** أُعيد كتابة أقسام FIX-R03/FIX-R04 في `tests/test_repair_plan_01_review_findings.py`
+  (37 اختبارًا): رفض البديل بلا نداء `download_to_memory`، إثبات سلوك PTB 22.8 الحقيقي
+  (`write()` مرّة واحدة بالرد الكامل)، سقف 3 MiB الفعلي، الإلغاء ينتشر، R-3/R-4.
+  تحديث `tests/test_attachment_batch_lifecycle_a2.py` (الـ harness بقى بمسار ملف محلي حقيقي
+  بدل البديل الملغى).
+
+### التحقّق (أوامر ونتائج فعلية)
+- `python -m pytest -q` ⇒ **1 failed, 2956 passed** (138s). الفشل الوحيد
+  `test_deploy_manifest::test_documented_manifest_is_import_sufficient` **قائم سابقًا**
+  (مؤكَّد على HEAD نضيف عبر `git archive` ⇒ يفشل كذلك؛ سببه بيئة: `import telegram` مفقود
+  في subprocess معزول) ⇒ **مش انحدار**.
+- حِزَم مركّزة: `test_repair_plan_01_resource_staging` + `test_repair_plan_01_review_findings`
+  + `test_attachment_cleanup_expiration_a4` + `test_attachment_batch_lifecycle_a2` +
+  polling/ack/duplicate/real_http ⇒ **275 passed**.
+- `python -m pyflakes bot/ automation/ main.py tests/` ⇒ exit **0**.
+- `node --test tests/frontend/*.test.js` ⇒ **223 pass / 0 fail**.
+- `python -m pip_audit -r requirements-dev.txt` ⇒ **No known vulnerabilities found**.
+- `python -m bandit -r bot/ automation/ main.py -lll -s B613` ⇒ High **0** (Medium 17، Low 5 — كما الأساس).
+
+### Assumptions / decisions
+- **R-1 محسوم بـ fail-closed** (رفض البديل) بدل محاولة تقييده: PTB 22.8 بتلمّ الرد كامل ثم
+  `write()` مرّة واحدة ⇒ مايصحّش نعتبره سقفًا صلبًا (مُوثَّق ومُختبَر). ده أصغر تغيير آمن وقابل للعكس.
+- **R-3:** احترام قيد A4 (الكنس من hook الإقلاع الموجود فقط) ⇒ شيل نقطة الكنس عند الإدخال بدل
+  إضافتها في نقطة غير معتمَدة.
+- **R-4:** رفض مغلق بدل اختيار جذر نسبي صامت (يحافظ على مسار hook الإقلاع الصريح).
+- لم أُعدّل `concurrent_updates(True)`، ولا فحوص الامتداد/magic/الملكية، ولا ترتيب row-first،
+  ولا أي سلوك fail-closed قائم.
+
+### الحالة
+- **PARTIAL / ينتظر مراجعة عدائية مستقلة.** التنفيذ + الاختبارات + البوابة مكتملة محليًّا.
+  **لا** commit/push/PR/merge/نشر/تفعيل Autopush (تعليمة المهمة صريحة).
+- **الخطوة التالية:** مراجعة عدائية مستقلة (جلسة منفصلة) على الشجرة الحالية قبل أي دفع.
