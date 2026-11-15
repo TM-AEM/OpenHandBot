@@ -7,7 +7,8 @@
   2. كتابة البايتات تحت اسم مُعتِم مقيّد بالسقف — `StagingStore._write_to_path` (O_EXCL/NOFOLLOW،
      flush+fsync، وأي BaseException ⇒ حذف الملف الجزئي ثم إعادة الرفع).
   3. تحقّق المحتوى (حجم + بصمة magic) — `_read_head`/`_is_denied_magic` (فشل ⇒ حذف + رفض).
-  4. انتقال الحالة لـ `stored` — `set_attachment_item_status` (بس بعد الكتابة+التحقّق).
+  4. انتقال الحالة لـ `stored` — `try_mark_attachment_item_stored` (CAS ذرّي: العنصر
+     `pending` + الدفعة الأب `pending`؛ F2) بس بعد الكتابة+التحقّق.
   5. إرجاع النتيجة للمستدعي — `AcceptResult` (الرد/الإقرار بعدها في الطبقة الأعلى).
 
 المبادئ المُتحقَّق منها: `stored` ما بيتحطّش غير بعد كتابة+تحقّق؛ الملفات الجزئية قابلة
@@ -233,7 +234,7 @@ def test_case5_failure_during_status_update_to_stored(tmp_path, monkeypatch):
     def boom(*a, **k):
         raise sqlite3.OperationalError("db write failed")
 
-    monkeypatch.setattr(db, "set_attachment_item_status", boom)
+    monkeypatch.setattr(db, "try_mark_attachment_item_stored", boom)
     res = _run(accept(service, chunks=(b"data",)))
     assert res.outcome is AcceptOutcome.ACCEPTED
     assert res.stage is StageStatus.DB_FAILED

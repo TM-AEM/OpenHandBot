@@ -263,12 +263,18 @@ def test_failed_sweep_is_retried_on_next_eligible_trigger(tmp_path, monkeypatch)
         return real_sweep(now=now)
 
     monkeypatch.setattr(reaper, "sweep", flaky)
-    # فشل ⇒ ما بيستهلكش الخنق (الزمن ما اتقدّمش) ⇒ trigger تالي فورًا مسموح.
+    # فشل ⇒ ختم النجاح ما بيتقدّمش، بس خنق «آخر محاولة» بيتطبّق (إعادة محاولة **محدودة**،
+    # مش حلقة ضيّقة). الأول فشل، والتاني **جوه** نافذة الخنق ⇒ يُتخطّى (مفيش محاولة).
     assert sweeper.maybe_sweep(now=NOW_AFTER) is None
+    assert sweeper.last_success_at is None  # مفيش نجاح اتسجّل
+    assert sweeper.maybe_sweep(now=NOW_AFTER) is None  # مخنوق (مفيش كنسة كاملة كل tick)
+    # بعد الخنق ⇒ إعادة المحاولة مؤهّلة، وبتنجح.
     state["fail"] = False
-    rep = sweeper.maybe_sweep(now=NOW_AFTER)  # نفس اللحظة الرتيبة ⇒ لسه مؤهّل
+    clock.advance(60.0)
+    rep = sweeper.maybe_sweep(now=NOW_AFTER)
     assert rep is not None
     assert state["ok"] == 1
+    assert sweeper.last_success_at is not None  # النجاح سجّل ختمه
 
 
 # ============================================================================

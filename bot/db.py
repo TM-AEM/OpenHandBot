@@ -1226,6 +1226,65 @@ class Database:
         self._conn.commit()
         return cur.rowcount == 1
 
+    def try_mark_attachment_item_stored(
+        self,
+        item_id: str,
+        *,
+        size_bytes: int,
+        staging_token: str | None = None,
+    ) -> bool:
+        """OHB2-LIFE-01/F2: انتقال **ذرّي مشروط** للعنصر `pending ⇒ stored` مع فحص الدفعة الأب.
+
+        يمنع **الإحياء السباقي**: كتابة متأخّرة (بايتات اتنزّلت أثناء نافذة غير متزامنة
+        بينما الكنس (LIFE-01) وسم الدفعة `expired` والعنصر `reaped`) ما تقدرش ترجّع العنصر
+        `stored` جوّه دفعة انتهت. الشرط **جوّه نفس الـ`UPDATE`** (تقييم ذرّي لحظة الكتابة،
+        على نفس اتصال القاعدة الوحيد، بلا قراءة-ثم-كتابة عبر `await`):
+
+        - العنصر `status = 'pending'` (مش `stored`/`reaped`/أي حالة تانية).
+        - الدفعة الأب موجودة (`EXISTS`).
+        - الدفعة `status = 'pending'` (مش `expired`/`delivered`/`rejected`/`failed`/
+          `intent_recorded`/`uncertain`/...).
+
+        **ليه فحص حالة الدفعة (`status`) كافي وأدق من فحص المهلة (`t0`):** الكنس بيسجّل
+        الدفعة `expired` (DB-أولًا) **قبل** ما يوسم عناصرها `reaped`؛ فلو عنصر اتكنس،
+        دفعته أكيد مش `pending`. وسم `expired` بيمثّل القرار النهائي (مش مجرد فوات المهلة).
+        الفحصين (عنصر `pending` + دفعة `pending`) **ذاتيين** ⇒ سباق «الكنس وسمها expired
+        ثم الكتابة المتأخّرة» بيتحسم في SQL: إمّا الكتابة تلحق (الدفعة لسه `pending`)،
+        أو تُرفض (الدفعة بقت `expired`/العنصر `reaped`). **مفيش** حالة عنصر `stored` جوّه
+        دفعة **منتهية** (`expired`) — دي الحالة الممنوعة.
+
+        ترجّع True لو صف واحد اتحدّث، وFalse لو مفيش (عنصر غير مؤهّل/دفعة غير `pending`/
+        سباق) — والمستدعي **ما يعلنش نجاح** على False (fail closed). **ما بيلمسش `t0`**
+        (مفيش تمديد). معاملة واحدة (`BEGIN IMMEDIATE` + commit/rollback).
+        """
+        stamp = datetime.now(timezone.utc).isoformat()
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = conn.execute(
+                "UPDATE attachment_items SET status=?, size_bytes=?, staging_token=?, "
+                "updated_at=? WHERE item_id=? AND status=? AND EXISTS ("
+                "SELECT 1 FROM attachment_batches b WHERE b.batch_id="
+                "attachment_items.batch_id AND b.status=?)",
+                (
+                    ATTACHMENT_ITEM_STORED,
+                    int(size_bytes),
+                    staging_token,
+                    stamp,
+                    item_id,
+                    ATTACHMENT_BATCH_PENDING,
+                    ATTACHMENT_BATCH_PENDING,
+                ),
+            )
+            if cur.rowcount == 1:
+                conn.commit()
+                return True
+            conn.rollback()
+            return False
+        except Exception:
+            conn.rollback()
+            raise
+
     # ---------------------------------------------- OHB2-P0-A2: دورة حياة الدفعة
     def latest_pending_attachment_batch(
         self, telegram_id: int, conversation_id: str

@@ -2943,3 +2943,86 @@ P0، مفيش تغيير سلوك، مفيش كود/اختبارات/مخطط.**
 - **PARTIAL / ينتظر مراجعة عدائية مستقلة.** التنفيذ + الاختبارات + البوابة مكتملة محليًّا.
   **لا** commit/push/PR/merge/نشر/تفعيل Autopush.
 - **الخطوة التالية:** مراجعة عدائية مستقلة (جلسة منفصلة) على الشجرة الحالية قبل أي دفع.
+
+---
+
+## OHB2-REPAIR-PLAN-02-LIFE01-F1-F2-RACE-AND-RETRY (2026-11-14)
+
+**الفرع:** `agent/ohb2-plan02-life01-race-retry-fix` من `origin/main` = `25ec46b654b8c2ab3a32f06a1d3be34d3dbf6be8`
+(الخط الأساس المُبلَّغ). **ممنوع** لمس `main` أو أي دفع/PR/نشر (تعليمة المهمة صريحة).
+
+### معايير القبول
+1. F1: كنسة رجّعت `SweepReport(errors>0)` **ما تتقدّمش** ختم آخر نجاح؛ الاستثناء كذلك؛ فقط `errors==0` يتقدّم؛ إعادة المحاولة محدودة وموثّقة (ختم «آخر محاولة» منفصل).
+2. F2: عنصر `reaped` ما يرجعش `stored`؛ دفعة `expired` ما تقبلش تخزينًا متأخّرًا؛ الانتقال النهائي **ذرّي** مع فحص الدفعة الأب؛ كتابة متأخّرة مرفوضة ما تسبّبش ملف يتيم؛ **مفيش** إحياء سباقي.
+3. المسارات النشطة الصحيحة تتخزّن عادي؛ التكرار/idempotency/T0/الهوية محفوظة.
+4. اختبارات سباق حتمية (A/B/C) + اختبار ربط `app._post_init` الحقيقي.
+5. البوابات كاملة + بلا انحدار معماري (R-3، A4، Plan 01).
+
+### Root cause (مؤكَّد من الكود)
+- **F1:** `OpportunisticSweeper.maybe_sweep()` (bot/attachments.py) بيحدّد `self._last_run_at = mono`
+  **بعد أي رجوع** من `sweep()` — حتى لو `report.errors>0` (وده مش استثناء؛ `sweep()` بيمسك
+  أخطاء القاعدة ويرجّع تقريرًا). ⇒ «فشل» بيتعامل كنجاح والخنق بيتطبّق ⇒ مفيش إعادة محاولة.
+- **F2:** `StagingStore.store()` بيعمل `set_attachment_item_status(item, stored)` **غير مشروط**
+  (بس `WHERE item_id`)، بلا فحص حالة الدفعة الأب. لو الكنس (LIFE-01 من tick المراقب) وسم
+  الدفعة `expired` والعنصر `reaped` أثناء نافذة التنزيل غير المتزامنة، الكتابة المتأخّرة
+  بترجّع العنصر `stored` **جوّه دفعة منتهية** ⇒ إحياء.
+
+### خطة التنفيذ
+1. اختبارات فاشلة تُثبت F1/F2 على الكود الحالي.
+2. إصلاح F1 (ختم آخر نجاح + ختم آخر محاولة منفصل + إعادة محاولة محدودة).
+3. إصلاح F2 (CAS ذرّي: عنصر `pending` **و** دفعة أب `pending` **و** غير منتهية؛ رفض متأخّر + تنظيف الأثر المملوك).
+4. اختبار ربط `app._post_init`.
+5. البوابات كاملة + مراجعة ذاتية.
+
+---
+
+## نتيجة التنفيذ (OHB2-REPAIR-PLAN-02-LIFE01-F1-F2) — 2026-11-14
+
+**الحالة:** DONE (محليًّا) — **مفيش** دفع/PR/دمج (تعليمة المهمة). الفرع:
+`agent/ohb2-plan02-life01-race-retry-fix` من `25ec46b`.
+
+### التغييرات
+- `bot/db.py`: `try_mark_attachment_item_stored(item_id, *, size_bytes, staging_token)`
+  — **CAS ذرّي** (`BEGIN IMMEDIATE`) يحدّث العنصر `pending ⇒ stored` **بشرط** العنصر
+  `pending` **و** الدفعة الأب `pending` (فحص `EXISTS` جوّه نفس الـ`UPDATE`، على نفس اتصال
+  القاعدة الوحيد). بيمنع الإحياء السباقي. ما بيلمسش `t0`. `set_attachment_item_status` ما
+  اتشالش (لسه مستخدَم/متوقّع في الاختبارات الأخرى).
+- `bot/attachments.py`:
+  - `OpportunisticSweeper`: ختم **آخر نجاح** (`_last_success_at`) منفصل عن ختم **آخر
+    محاولة** (`_last_attempt_at`). الفشل (استثناء أو `errors>0`) **ما يتقدّمش** ختم النجاح؛
+    الخنق بيتطبّق على آخر محاولة ⇒ إعادة محاولة **محدودة** (مفيش حلقة ضيّقة). property
+    `last_success_at` للرصد.
+  - `StagingStore.store()`: الخطوة (4) بتستخدم الـ CAS الجديد بدل التحديث غير المشروط؛
+    الرفض ⇒ `DB_FAILED` + حذف الملف المُملوك (fail closed، بلا ادّعاء نجاح).
+
+### الأدلّة (أوامر ونتائج حقيقية)
+- إثبات F1/F2 على السلوك القديم (سكربت scratch، مش متعقَّب): القديم ⇒ `last_success_at`
+  اتقدّم مع `errors>0` (**True**)؛ العنصر `reaped` رجع `stored` جوّه دفعة `expired`
+  (**True**). الجديد ⇒ مرفوض.
+- اختبارات جديدة: `test_repair_plan_02_life01_f1_retry.py` (10)،
+  `test_repair_plan_02_life01_f2_race.py` (13)، `test_repair_plan_02_life01_app_wiring.py` (3).
+  سباق A بيثبت إن **السلوك القديم** كان بيعمل إحياء (item=stored, batch=expired) عبر
+  `Watcher.tick` الحقيقي.
+- تحديث 3 اختبارات قديمة كانت بتثبّت السلوك المعطوب/أسماء قديمة (a1، life02، life01 retry).
+- `python -m pytest` الكامل: **1 failed, 3051 passed** — الفشل الوحيد
+  `tests/test_deploy_manifest.py::test_documented_manifest_is_import_sufficient`
+  (**قبل المهمة كذلك**؛ سببه بيئي: الاعتماديات في user-site و`HOME` مقطوع في الـ subprocess
+  ⇒ `ModuleNotFoundError: telegram`. اتأكّد بإعادة التشغيل مع `HOME` الحقيقي ⇒ OK).
+- `node --test tests/frontend/*.test.js`: **223 pass / 0 fail**.
+- `python -m pyflakes bot/ automation/ main.py tests/`: نظيف (exit 0).
+- `python -m pip_audit -r requirements-dev.txt`: No known vulnerabilities.
+- `python -m bandit -r bot/ automation/ main.py -lll -s B613`: **High: 0** (زي الخط الأساس).
+- البوابات المحورية (attachment a1–a4 + life01–04 + plan01): **340 passed**.
+
+### الافتراضات والقرارات
+- الفحص بالحالة (`status`) للدفعة الأب أدق من فحص المهلة (`t0`): الكنس بيسجّل `expired`
+  قبل `reaped`؛ فحص المهلة بالوقت كان هيرفض تخزينًا شرعيًّا لدفعة **لسه `pending`** (وقّتت
+  منتهية) — فحص الحالة هو القرار النهائي الصح.
+- الفشل الجزئي (`errors>0`) يُعامل كفشل (مش نجاح) لإعادة المحاولة والرصد.
+- ما اتلمستش `concurrent_updates(True)`، فحوصات الامتداد/magic/الملكية/الرفض الآمن/ترتيب
+  الصفوف، ولا أي قرار معماري.
+
+### بوابة الاعتماد (مطلوبة — قبل أي دفع/PR/دمج/نشر)
+لا دفع/PR/دمج/نشر في هذه المهمة. الخطوة التالية **مراجعة عدائية مستقلة للقراءة فقط** على
+الفرع `agent/ohb2-plan02-life01-race-retry-fix` (نفس أسلوب LIFE-01). البرومبت الجاهز في
+`docs/reviews/OHB2-REPAIR-PLAN-02-LIFE01-F1-F2-ADVERSARIAL-REVIEW-PROMPT.md`.

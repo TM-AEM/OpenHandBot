@@ -340,7 +340,9 @@ def test_db_failure_on_row_insert_is_fail_closed(tmp_path):
 def test_db_failure_on_status_update_unlinks_file(tmp_path):
     db, store, _ = make_store(tmp_path)
     add_batch(db)
-    db.set_attachment_item_status = lambda *a, **k: False  # مفيش صف اتحدّث
+    # F2: الانتقال النهائي بقى ذرّيًّا عبر `try_mark_attachment_item_stored` (CAS) —
+    # نحاكي رفضه (rowcount=0) ونتأكد إن الملف المُملوك بيتشال ومافيش ادّعاء نجاح.
+    db.try_mark_attachment_item_stored = lambda *a, **k: False  # مفيش صف اتحدّث
     res = store.store(telegram_id=111, batch_id="b1", item_id="i1",
                       display_name="a.txt", chunks=[b"data"])
     assert res.status is StageStatus.DB_FAILED

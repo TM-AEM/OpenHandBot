@@ -741,10 +741,15 @@ class StagingStore:
             _safe_unlink(path)
             return StageResult(StageStatus.REJECTED_TYPE, item_id=item_id, staging_token=token)
 
-        # (4) الانتقال لـ `stored` **بس** بعد كتابة كاملة + تحقّق.
+        # (4) الانتقال لـ `stored` **بس** بعد كتابة كاملة + تحقّق. F2: الانتقال **ذرّي
+        #     مشروط** — العنصر `pending` **و** الدفعة الأب `pending`، كله في نفس الـ`UPDATE`
+        #     (تقييم لحظة الكتابة) ⇒ كتابة متأخّرة على دفعة انتهت/عنصر اتكنس **ما تقدرش**
+        #     ترجّعه `stored` (مفيش إحياء سباقي). الرفض = فشل مغلق.
         try:
-            ok = self._db.set_attachment_item_status(
-                item_id, ATTACHMENT_ITEM_STORED, size_bytes=written
+            ok = self._db.try_mark_attachment_item_stored(
+                item_id,
+                size_bytes=written,
+                staging_token=token,
             )
         except Exception as exc:  # noqa: BLE001 — فشل قاعدة ⇒ رفض مغلق
             _safe_unlink(path)
@@ -752,7 +757,7 @@ class StagingStore:
                 StageStatus.DB_FAILED, item_id=item_id, staging_token=token,
                 error=type(exc).__name__,
             )
-        if not ok:  # مفيش صف اتحدّث ⇒ ما نعلنش نجاح
+        if not ok:  # مفيش صف اتحدّث (عنصر غير مؤهّل/دفعة منتهية/سباق) ⇒ ما نعلنش نجاح
             _safe_unlink(path)
             return StageResult(StageStatus.DB_FAILED, item_id=item_id, staging_token=token)
 
@@ -1374,12 +1379,13 @@ class OpportunisticSweeper:
 
     الخصائص (كلها مفروضة هنا، مش مفترضة):
     - **محدودة زمنيًّا:** كنسة واحدة على الأكثر كل `min_interval` ثانية ⇒ مفيش كنسة كاملة
-      على كل tick/تحديث.
+      على كل tick/تحديث. الخنق بيتطبّق على **آخر محاولة** (`_last_attempt_at`) — نجحت أو
+      فشلت — ⇒ الفشل المتكرّر ما بيعملش كنسة كاملة على كل tick (إعادة محاولة **محدودة**).
     - **حرس إعادة دخول:** الكنسة **متزامنة**؛ `_running` بيمنع أي تداخل حتى لو استُدعيت
       من سياقين (نظريًّا) ⇒ مفيش كنسين متوازيين على نفس الاتصال/الجذر.
-    - **مفيش ابتلاع فشل:** فشل الكنسة بيتسجّل (بأنواع الأخطاء فقط، بلا محتوى/مسارات) وبيُرصد
-      كـ «فشل» صريح، **مش** نجاح كاذب. الحالة الزمنية **ما بتتحدّثش** عند الفشل ⇒ إعادة
-      المحاولة مسموحة على الـ tick المؤهّل التالي (مفيش كبت دائم بعد فشل/كنسة جزئية).
+    - **مفيش ابتلاع فشل:** فشل الكنسة بيتسجّل (بأنواع الأخطاء/أعداد فقط، بلا محتوى/مسارات)
+      وبيُرصد كـ «فشل» صريح، **مش** نجاح كاذب. **ختم آخر نجاح** (`_last_success_at`) ما
+      بيتقدّمش عند: (أ) استثناء، أو (ب) تقرير رجّع `errors>0` (فشل/فشل جزئي).
     - **idempotent:** بيعيد استخدام `AttachmentReaper.sweep` نفسه (مفيش منطق كنس مكرّر).
     - **حرس الأخطاء يفضل شغّال:** كنسة A4 محصورة/بلا تخمين/بلا متابعة symlink (تفاصيل في
       `AttachmentReaper`). الجذر الآمن بيتأكّد جوه `_remove_file`/`_validated_root`.
@@ -1388,6 +1394,11 @@ class OpportunisticSweeper:
     ملاحظة صدق: ده **كنس انتهاكي**، مش كنس دوري مضمون — أثناء خمول تام (مفيش ticks) ممكن
     البايتات تفضل لحد الـ tick التالي/إعادة التشغيل. الحذف الدوري الصارم يتطلّب قرار
     معمارية منفصل (مجدول/عامل)، وده **مش** مُصرَّح به هنا.
+
+    **سياسة إعادة المحاولة (موثّقة):** خنق واحد بسيط بفاصل `min_interval` بيتطبّق على **آخر
+    محاولة** (`_last_attempt_at`) — يعني كنسة واحدة على الأكثر كل `min_interval`، سواء نجحت
+    أو فشلت. الفشل ما بيعملش إعادة محاولة فورية في حلقة ضيّقة؛ أول tick مؤهّل بعد الخنق
+    بيعيد المحاولة. ختم آخر نجاح (`_last_success_at`) منفصل تمامًا وبيمثّل النجاح **فقط**.
     """
 
     def __init__(
@@ -1402,40 +1413,70 @@ class OpportunisticSweeper:
         self._reaper = reaper
         self._min_interval = float(min_interval)
         self._clock = clock or time.monotonic
-        self._last_run_at: float | None = None
+        # ختم آخر **نجاح** (errors==0) — بيتقدّم بس عند نجاح كامل.
+        self._last_success_at: float | None = None
+        # ختم آخر **محاولة** (نجاح أو فشل) — بيتحكّم في خنق إعادة المحاولة. منفصل عن ختم
+        # النجاح عشان الفشل ما يتخزّنش كنجاح، وبرضه ما يعملش حلقة إعادة محاولة ضيّقة.
+        self._last_attempt_at: float | None = None
         self._running = False
 
     @property
     def reaper(self) -> AttachmentReaper:
         return self._reaper
 
+    @property
+    def last_success_at(self) -> float | None:
+        """ختم آخر نجاح (monotonic) أو None — للرصد/الاختبارات."""
+        return self._last_success_at
+
     def maybe_sweep(self, *, now: datetime | None = None) -> SweepReport | None:
         """يشغّل كنسة **واحدة** لو الفترة عدّت ومفيش كنسة شغّالة.
 
         ترجّع `SweepReport` لما الكنسة اشتغلت فعلًا، و`None` لما اتخطّت (خنق زمني أو
-        إعادة دخول) — الفرق ده مقصود للرصد والاختبارات. **لا بترمي** لأخطاء الكنسة
-        المتوقّعة: بتُسجَّل وتُرجَّع `None` (فشل صريح، مش نجاح)، والزمن **ما بيتقدّمش**
-        ⇒ إعادة محاولة على الـ tick التالي.
+        إعادة دخول). **لا بترمي** لأخطاء الكنسة المتوقّعة: بتُسجَّل وتُرجَّع `None` (فشل
+        صريح، مش نجاح)، وختم النجاح **ما بيتقدّمش**.
+
+        **التمييز بين النجاح والفشل (F1):**
+        - استثناء من `sweep()` ⇒ فشل: يُسجَّل، يُرجَّع `None`، وختم النجاح ما بيتقدّمش.
+        - `sweep()` رجّع `SweepReport(errors>0)` ⇒ **فشل/فشل جزئي** (مش نجاح): يُسجَّل
+          بأعداد فقط، يُرجَّع التقرير كما هو للرصد، وختم النجاح ما بيتقدّمش.
+        - `SweepReport(errors==0)` ⇒ نجاح: ختم النجاح يتقدّم.
+
+        **خنق إعادة المحاولة (F1):** أي محاولة (نجاح أو فشل) بتحدّث ختم **آخر محاولة**
+        ⇒ كنسة واحدة على الأكثر كل `min_interval`. الفشل المتكرّر ما بيعملش كنسة كاملة على
+        كل tick (مفيش حلقة ضيّقة)، وأول tick مؤهّل بعد الخنق بيعيد المحاولة.
         """
         if self._running:
             return None  # كنسة شغّالة بالفعل ⇒ مفيش تداخل
         mono = self._clock()
         if (
-            self._last_run_at is not None
-            and (mono - self._last_run_at) < self._min_interval
+            self._last_attempt_at is not None
+            and (mono - self._last_attempt_at) < self._min_interval
         ):
             return None  # لسه بدري (خنق) ⇒ مفيش كنسة كاملة على كل tick
         self._running = True
+        # أي محاولة بتخنق التالية (نجاح أو فشل) ⇒ إعادة محاولة **محدودة**، مفيش حلقة ضيّقة.
+        self._last_attempt_at = mono
         try:
             sweep_now = now if now is not None else datetime.now(timezone.utc)
             report = self._reaper.sweep(now=sweep_now)
         except Exception as exc:  # noqa: BLE001 — فشل الكنسة ⇒ يُسجَّل، مفيش نجاح كاذب
             log.warning(
-                "كنس LIFE-01 الانتهاكي فشل (%s) ⇒ هيتعاود على الـ tick التالي",
+                "كنس LIFE-01 الانتهاكي فشل (%s) ⇒ هيتعاود على أول tick مؤهّل بعد الخنق",
                 type(exc).__name__,
             )
-            return None  # الزمن **ما بيتقدّمش** ⇒ إعادة محاولة مسموحة
+            return None  # ختم النجاح **ما بيتقدّمش** ⇒ الفشل ما يتخزّنش كنجاح
         finally:
             self._running = False
-        self._last_run_at = mono  # نجاح (حتى لو جزئي) ⇒ نطبّق الخنق لحد الـ tick الجاي
+        if report is None:  # دفاع: عقد `sweep` يرجّع تقريرًا دايمًا، لكن ما نعلنش نجاح على None
+            return None
+        if report.errors > 0:
+            # تقرير فيه أخطاء ⇒ فشل/فشل جزئي (F1): مش نجاح ⇒ ختم النجاح ما بيتقدّمش.
+            log.warning(
+                "كنس LIFE-01 الانتهاكي رجّع أخطاء (errors=%s scanned=%s partial=%s retry=%s) "
+                "⇒ فشل/فشل جزئي، مش نجاح",
+                report.errors, report.scanned, report.partial, report.retry,
+            )
+            return report
+        self._last_success_at = mono  # نجاح كامل (errors==0) ⇒ ختم النجاح يتقدّم
         return report
