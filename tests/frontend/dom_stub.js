@@ -351,7 +351,7 @@ function loadApp(opts) {
 
   const root = path.resolve(__dirname, "../../bot/web/static");
   const ctx = vm.createContext(sandbox);
-  for (const file of ["jobs.js", "ops.js", "inbox.js", "files.js", "cost.js", "copy.js", "export.js", "app.js"]) {
+  for (const file of ["jobs.js", "ops.js", "inbox.js", "files.js", "cost.js", "copy.js", "export.js", "attachments.js", "app.js"]) {
     const code = fs.readFileSync(path.join(root, file), "utf8");
     vm.runInContext(code, ctx, { filename: file });
   }

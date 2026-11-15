@@ -205,3 +205,6 @@ html, body {
 /* OHB2-09-04: قسم التكلفة/الاستهلاك. */
 .cost-section { margin-top: 16px; border-top: 1px solid #1e293b; padding-top: 12px; }
 .cost-text { margin: 6px 0 0; padding: 10px; border-radius: 10px; background: #0b1220; color: #e2e8f0; font-size: 13px; white-space: pre-wrap; }
+/* OHB2-MT-2: قسم المرفقات المحلية القابلة للتنزيل (نفس نمط قسم الملفات). */
+.attachments-section { margin-top: 16px; border-top: 1px solid #1e293b; padding-top: 12px; }
+.attachments-section .toolbar { display: flex; justify-content: space-between; align-items: center; }

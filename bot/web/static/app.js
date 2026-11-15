@@ -148,6 +148,9 @@
   if (!COPY) { throw new Error("RecovoCopy مش محمّل (copy.js)"); }
   var EXPORT = window.RecovoExport;
   if (!EXPORT) { throw new Error("RecovoExport مش محمّل (export.js)"); }
+  // OHB2-MT-2: منطق تنزيل المرفقات المحلية — مشترك ومُختبر في attachments.js.
+  var ATTACH = window.RecovoAttachments;
+  if (!ATTACH) { throw new Error("RecovoAttachments مش محمّل (attachments.js)"); }
   // OHB2-PHASE1B: مرجع آمن لـ navigator (مش موجود في بيئة الاختبار المصغّرة).
   var NAV = (typeof navigator !== "undefined") ? navigator : null;
   // OHB2-09-02: منع طلبات الملفات المكرّرة المتزامنة (نفس الشات/الملف).
@@ -1136,6 +1139,9 @@
       // والواجهة ما بتفترضش إن ملف قابل للقراءة لمجرد ظهوره في القايمة.
       box.appendChild(renderFilesSection(id));
 
+      // OHB2-MT-2: قسم المرفقات المحلية الجاهزة للتنزيل (تنزيل محلي بس — مش تسليم).
+      box.appendChild(renderAttachmentsSection(id));
+
       // OHB2-09-04: قسم التكلفة/الاستهلاك (نداء منفصل، ومابيفشّلش التفاصيل لو فشل).
       box.appendChild(renderCostSection(id));
     }).catch(function () {
@@ -1143,6 +1149,108 @@
       box.innerHTML = "";
       box.appendChild(el("p", "empty-row", "مش قادر أوصل للسيرفر."));
     });
+  }
+
+  // ------------------------------------------------------------ attachments (OHB2-MT-2)
+  // قسم المرفقات المحلية: قايمة + تنزيل محلي (fetch → blob → objectURL). التنزيل
+  // محلي بس، ومفيش أي ادّعاء تسليم لـ OpenHands. كل حاجة عبر مسار مصادَق same-origin.
+  function attachmentsErrorText(res) {
+    var data = (res && res.data) || {};
+    return ATTACH.errorLabel(data.error, friendlyMessage(res && res.status, data));
+  }
+
+  function triggerDownload(blob, name) {
+    // تنزيل آمن: objectURL + <a download>، وإبطال الـ URL بعد الاستخدام.
+    var objUrl = URL.createObjectURL(blob);
+    var a = el("a", "link", "");
+    a.href = objUrl;
+    a.download = name;
+    a.rel = "noopener";
+    document.body.appendChild(a);
+    a.click();
+    if (a.remove) { a.remove(); }
+    setTimeout(function () { URL.revokeObjectURL(objUrl); }, 0);
+  }
+
+  function renderAttachmentsSection(id) {
+    var wrap = el("div", "attachments-section");
+    var head = el("div", "toolbar");
+    head.appendChild(el("span", "card-label", "مرفقات محلية جاهزة للتنزيل"));
+    var refresh = el("button", "btn ghost small", "تحديث");
+    head.appendChild(refresh);
+    wrap.appendChild(head);
+    wrap.appendChild(el("p", "card-label", ATTACH.TEXT.localNote));
+
+    var list = el("ul", "list");
+    wrap.appendChild(list);
+    var seq = 0;
+
+    function renderEmpty() {
+      list.innerHTML = "";
+      list.appendChild(el("li", "empty-row", ATTACH.TEXT.empty));
+    }
+
+    function renderItems(items) {
+      list.innerHTML = "";
+      if (!items.length) { renderEmpty(); return; }
+      items.forEach(function (it) {
+        var li = el("li", "row");
+        var main = el("div", "row-main");
+        main.appendChild(el("span", "row-title", it.display_name));
+        var meta = ATTACH.humanSize(it.size_bytes);
+        var left = ATTACH.remainingLabel(it.expires_in);
+        if (left) { meta += " · متاح " + left; }
+        main.appendChild(el("span", "card-label", meta));
+        li.appendChild(main);
+        var btn = el("button", "btn small", "⬇️ تنزيل");
+        btn.addEventListener("click", function () {
+          if (btn.disabled) { return; }
+          btn.disabled = true;
+          var url = API + "/conversations/" + encodeURIComponent(id) +
+            "/attachments/" + encodeURIComponent(it.item_id) + "/download";
+          fetch(url, { method: "GET", credentials: "same-origin", cache: "no-store" })
+            .then(function (res) {
+              if (!res.ok) {
+                return res.json().catch(function () { return {}; }).then(function (data) {
+                  btn.disabled = false;
+                  toast(ATTACH.errorLabel(data && data.error, friendlyMessage(res.status, data)));
+                });
+              }
+              var name = ATTACH.filenameFromDisposition(
+                res.headers.get("content-disposition")
+              );
+              return res.blob().then(function (blob) {
+                triggerDownload(blob, name);
+                btn.disabled = false;
+                // صادق: نزل على الجهاز + تذكير إنه مش تسليم (رسالة واحدة).
+                toast(ATTACH.TEXT.done + " " + ATTACH.TEXT.notDelivered);
+              });
+            })
+            .catch(function () { btn.disabled = false; toast(ATTACH.TEXT.network); });
+        });
+        li.appendChild(btn);
+        list.appendChild(li);
+      });
+    }
+
+    function load() {
+      var mine = ++seq;
+      renderEmpty();
+      get("/conversations/" + encodeURIComponent(id) + "/attachments")
+        .then(function (res) {
+          if (mine !== seq) { return; }
+          if (!res.ok) { toast(attachmentsErrorText(res)); renderEmpty(); return; }
+          renderItems(ATTACH.listItems(res.data));
+        })
+        .catch(function () {
+          if (mine !== seq) { return; }
+          renderEmpty();
+        });
+    }
+
+    refresh.addEventListener("click", load);
+    load();
+    return wrap;
   }
 
   // ------------------------------------------------------------ files (OHB2-09-02)

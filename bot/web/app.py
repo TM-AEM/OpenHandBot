@@ -21,9 +21,17 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from ..config import Config
+from ..attachments import MAX_ATTACHMENT_BYTES
 from ..db import MAX_PAGE, MAX_SQLITE_INT
 from ..errors import ApiError, error_text
 from .clientip import parse_trusted_proxies, resolve_client_ip
+from .download import (
+    DEFAULT_DOWNLOAD_NAME,
+    AttachmentDownloadError,
+    OwnedStreamingResponse,
+    iter_file_chunks,
+    open_staged_file,
+)
 from .initdata import DEFAULT_MAX_AGE, InitDataError, TelegramUser, validate_init_data
 from .ratelimit import api_limiter, auth_limiter
 from .services import MiniAppService, ValidationError, EXPORT_CONTENT_TYPE
@@ -351,6 +359,16 @@ class MiniApp:
             Route(
                 f"{API_PREFIX}/conversations/{{conversation_id}}/export",
                 self.conversation_export,
+                methods=["GET"],
+            ),
+            Route(
+                f"{API_PREFIX}/conversations/{{conversation_id}}/attachments",
+                self.conversation_attachments,
+                methods=["GET"],
+            ),
+            Route(
+                f"{API_PREFIX}/conversations/{{conversation_id}}/attachments/{{item_id}}/download",
+                self.attachment_download,
                 methods=["GET"],
             ),
             Route(
@@ -749,6 +767,63 @@ class MiniApp:
         except ApiError as exc:
             return self._api_error(exc)
         return _attachment(data, filename)
+
+    async def conversation_attachments(self, request):
+        """OHB2-MT-2: قايمة المرفقات المخزَّنة محليًّا القابلة للتنزيل (read-only).
+
+        بيانات وصفية آمنة فقط (مفيش رمز staging ولا مسار ولا محتوى). قايمة فاضية لو
+        مفيش مرفق حيّ أو فاتت مهلة الـ 15 دقيقة (D-15).
+        """
+        session, err = await self._guarded(request, state_changing=False)
+        if err is not None:
+            return err
+        try:
+            data = await self._service.list_staged_attachments(
+                request.path_params.get("conversation_id", ""), session.user_id
+            )
+        except ValidationError as exc:
+            return _error(400, "bad_request", str(exc))
+        except ApiError as exc:
+            return self._api_error(exc)
+        return _json(data)
+
+    async def attachment_download(self, request):
+        """OHB2-MT-2: تنزيل مرفق مصادَق من الـ staging المحلي (بثّ محدود غير حاجب).
+
+        - مصادَقة جلسة + تفويض ملكية الشات + ربط العنصر بدفعته/بالمستخدم/بالمحادثة (فشل مغلق).
+        - الفتح **بعد** كل التفويض، بأمان (`O_NOFOLLOW` + `fstat` + تطابق الحجم).
+        - البثّ عبر مُكرِّر غير متزامن بيقرأ في خيط عامل ويقفل الوصفة دائمًا (مفيش حجب
+          لحلقة الأحداث المشتركة، ومفيش تحميل كامل للذاكرة).
+        - الهيدرز: نوع آمن عام + `Content-Disposition: attachment` باسم منقّى + طول صريح +
+          هيدرز الأمن/عدم التكاش. مفيش مسار داخلي ولا رمز staging في الرد.
+        """
+        session, err = await self._guarded(request, state_changing=False)
+        if err is not None:
+            return err
+        try:
+            dl = await self._service.download_attachment(
+                request.path_params.get("conversation_id", ""),
+                request.path_params.get("item_id", ""),
+                session.user_id,
+            )
+        except ValidationError as exc:
+            return _error(400, "bad_request", str(exc))
+        except ApiError as exc:
+            return self._api_error(exc)
+        # فتح الملف الآمن (بعد التفويض) — أي فشل ⇒ خطأ منظّم (مفيش بثّ).
+        try:
+            fd = open_staged_file(dl.path, dl.size_bytes, max_bytes=MAX_ATTACHMENT_BYTES)
+        except AttachmentDownloadError as exc:
+            return _error(exc.status_code, exc.code, exc.message)
+        safe = "".join(ch for ch in dl.filename if ch in _HEADER_SAFE_NAME) or DEFAULT_DOWNLOAD_NAME
+        headers = dict(_SECURITY_HEADERS)
+        headers["Content-Type"] = dl.content_type
+        headers["Content-Disposition"] = f'attachment; filename="{safe}"'
+        headers["Content-Length"] = str(dl.size_bytes)
+        # البثّ غير المتزامن: القراءة في خيط عامل، والإغلاق الحتمي في `finally` (وكمان
+        # `OwnedStreamingResponse` بيضمن `aclose()` عند انقطاع العميل على ASGI ≥ 2.4).
+        body = iter_file_chunks(fd, dl.size_bytes)
+        return OwnedStreamingResponse(body, media_type=dl.content_type, headers=headers)
 
     async def conversation_files(self, request):
         """OHB2-09-02: قايمة ملفات شات مصرّح به (read-only، مصادَقة)."""

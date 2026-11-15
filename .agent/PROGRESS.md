@@ -3250,3 +3250,669 @@ React/Vite؛ `MINI_APP_ENABLED`؛ Autopush. **صفر تغيير في كود/اخ
 
 **الحالة:** **DONE — READY FOR INDEPENDENT REVIEW** (توثيق فقط). **لا** commit/push/PR/merge/نشر.
 الخطوة التالية: مراجعة مستقلة (قراءة فقط) تفحص الـdiff الفعلي وتتحقّق من اتّساق سجل القرارات.
+
+## OHB2-EXECUTE-PLAN-05-SECURE-ATTACHMENT-DELIVERY-GATED-INVESTIGATION (2026-11-15، محلي غير مُودَع)
+
+**الهدف:** تنفيذ **مراحل التحقيق** فقط لـ`OHB2-REPAIR-PLAN-05-SECURE-ATTACHMENT-DELIVERY` بالترتيب
+الإلزامي UPLOAD-01 → UPLOAD-02 → UPLOAD-03 → UPLOAD-04، والتوقف عند أول بوّابة فاشلة. **ليس تنفيذًا.**
+
+**الحالة الكلية:** **`BLOCKED`** — UPLOAD-01 **PASS** (يوجد مسار رفع مدعوم: `POST /api/file/upload/{path}`
+على Agent Server v0.1.0)، لكن **UPLOAD-02 فشل** ⇒ توقّف UPLOAD-03/UPLOAD-04 (مُبوَّبان).
+
+**الأدلّة الجوهرية (مصادر أولية، جُلبت 2026-11-15، بلا اعتماد/بلا استدعاء إنتاجي):**
+- **Cloud V1** `app.all-hands.dev/openapi.json` = v**1.92.0**، 257 مسارًا؛ `upload/multipart/binary/FileContent` = **0**؛
+  مسارات الملفات **قراءة فقط**؛ `send-message` = `anyOf[TextContent, ImageContent]` فقط (بلا نوع ملف).
+- **Agent Server** `docs.openhands.dev/openapi/agent-sdk.json` = v**0.1.0**، 40 مسارًا؛ مسار الرفع الوحيد
+  `POST /api/file/upload/{path}` (multipart `file`، `format: binary`)؛ `securitySchemes` **فارغ**.
+- **الكود المصدري** (`OpenHands/software-agent-sdk` @ `2aae48b6…`): `_upload_file` فيه **بس** `is_absolute()`
+  + `mkdir(parents=True)` ⇒ **بلا حصر مساحة عمل وبلا حدّ حجم**؛ `api.py` يحمّل كل الراوترات بمفتاح واحد
+  (`check_session_api_key` = `X-Session-API-Key`) يشمل `execute_bash_command` و`…/secrets` ⇒ **مفتاح كامل الصلاحية**.
+- **الأصل** (`OpenHands/enterprise` @ `7e8551f7…`): `conversation_url` من `exposed_urls[AGENT_SERVER]`
+  = `runtime['url']`، و`_build_service_url` ينتج **path-mode أو subdomain-mode** ⇒ **لا نمط مضيف مستقر/موثَّق**.
+
+**المُحصِّلات الحاجبة:** **B1** لا يوجد اعتماد رفع مقيَّد (المفتاح الوحيد = تنفيذ أوامر). **B2** لا يوجد
+allowlist أصل موثوق ومستقر. (تحقّقنا المصدر: `file_router.py`، `api.py`، `dependencies.py`، `remote_sandbox_service.py`.)
+
+**ما لم يُفعَل:** لا تنفيذ UPLOAD-04، لا عميل رفع، لا استخدام اعتماد كامل الصلاحية، لا استدعاء إنتاجي،
+لا تغيير كود/مخطّط/قرار معتمَد، لا جدول/عامل/مالك SQLite جديد. `MINI_APP_ENABLED` وAutopush كما هما.
+
+**الأثر (الملف الوحيد الجديد):** `docs/reviews/OHB2-REPAIR-PLAN-05-SECURE-ATTACHMENT-DELIVERY-INVESTIGATION.md`.
+
+**التحقّق:** `git status --short` = الملف الجديد فقط؛ staged = فارغ؛ `.openhands/` لم يُمَس. **لا** commit/push/PR/merge/نشر.
+
+**الخطوة التالية:** قرار مالك واحد مجمَّع على (B1) نموذج الاعتماد **و** (B2) allowlist الأصل، مع حلّ
+D-10/D-11/D-14/D-15/D-16/D-22؛ حتى ذلك يبقى الرفض الآمن للمرفقات ساريًا (fail-closed).
+
+## OHB2-REPAIR-PLAN-06-ATTACHMENT-DELIVERY-ALTERNATIVE-ARCHITECTURE (2026-11-15، محلي غير مُودَع)
+
+**الهدف:** تحقيق معماري شامل عن بدائل آمنة لتسليم مرفقات تيليجرام إلى **نفس** محادثة/مساحة عمل OpenHands. **تحقيق/تصميم فقط — لا تنفيذ.**
+
+**الحُكم الكلي:** **`INVESTIGATION_COMPLETE — NO_SECURE_ALTERNATIVE_FOUND`**. الحاصرات **B1/B2** من Plan 05
+أُعيد التحقق منها مقابل المصادر الحالية ولم تُحَلّ. البديل **E** (نطاق مُخفَّض: staging محلي + حالة
+محجوبة/يدوية قابلة للتنفيذ) هو الوحيد **`FEASIBLE`** — وهو السلوك الحالي بالفعل.
+
+**أدلّة أولية (2026-11-15، بلا اعتماد/بلا استدعاء إنتاجي):**
+- **Cloud V1** v1.92.0 (257 مسارًا): لا رفع/`multipart`/`binary`/`FileContent`؛ مسارات الملفات قراءة فقط؛ `send-message` = نص/صورة فقط.
+- **Agent Server** v0.1.0 (40 مسارًا): `POST /api/file/upload/{path}` فقط؛ بلا حصر/حجم/تحقق/ملكية؛ `securitySchemes` فارغ.
+- **الكود المصدري** (`software-agent-sdk` @ `2aae48b6…`): `_upload_file` = `is_absolute()`+`mkdir` فقط؛ راوتر واحد بمفتاح واحد `X-Session-API-Key` يشمل `execute_bash_command`+`secrets`؛ الـWebSocket `session` يقبل نص/صورة فقط.
+- **الأصل** (`enterprise` @ `7e8551f7…`): `exposed_urls[AGENT_SERVER].url = runtime['url']`؛ `_build_service_url` path/subdomain. **SDK cloud workspace** (`2aae48b6…`): لا allowlist ولا تحقق URL.
+- **كوكبوكس رسمية جديدة:** `start-sandbox`, `clone-and-attach`, `warm-sandbox-pool`, `custom-agent-with-tool`, `upload-skills` — توثّق `POST /api/file/upload` بمفتاح كامل الصلاحية على `<sandbox>.prod-runtime.all-hands.dev`.
+
+**البدائل:** A (Cloud upload) = `NOT_FEASIBLE` (لا يوجد). B (Agent Server) = `NOT_FEASIBLE` (B1+B2). C (سطح آخر) = `NOT_FEASIBLE` (نص/صورة فقط). D (وسيط/مزوّد) = `NOT_FEASIBLE` للآلي (لا workflow للمزوّد؛ UI المستخدم ليس آليًا). E = `FEASIBLE`.
+
+**ما لم يُفعَل:** لا تنفيذ، لا كود/مخطّط/جدول/قرار معتمَد تغيّر، لا اعتماد مستخدَم، لا استدعاء إنتاجي. `MINI_APP_ENABLED` وAutopush كما هما.
+
+**الأثر:** `docs/reviews/OHB2-REPAIR-PLAN-06-ATTACHMENT-DELIVERY-ALTERNATIVE-ARCHITECTURE.md` (جديد) + هذا القسم.
+**التحقّق:** `git status --short` = الملفان فقط (+ ملف Plan 05 السابق غير المُتتبَّع + تعديل PROGRESS السابق)؛ staged فارغ؛ `.openhands/` لم يُمَس. **لا** commit/push/PR/merge/نشر. **`IMPLEMENTATION NOT AUTHORIZED`.**
+
+## OHB2-PLAN06-INDEPENDENT-REVIEW-FINDINGS-DOCUMENTATION-REMEDIATION (2026-11-14، محلي غير مُودَع)
+
+**الهدف:** معالجة نتائج المراجعة المستقلة العدائية `OHB2-REVIEW-PLAN-06-ATTACHMENT-DELIVERY-ALTERNATIVE-ARCHITECTURE`
+(الحُكم `NEEDS_REMEDIATION`) — **تصحيح توثيقي فقط**، بلا أي تغيير في الكود/المخطّط/آلة الحالات/قرارات المالك.
+
+**نتائج المراجعة المُعالَجة:** M-1 (MEDIUM)، L-1 (LOW)، L-2 (LOW)، L-3 (LOW)، I-1 (INFO)، I-2 (INFO).
+
+**التصحيحات (توثيقية فقط):**
+- **M-1:** البديل E — إزالة الادّعاء غير المدعوم «البوت يخبر المستخدم كيف يرفع الملف من واجهة OpenHands»
+  و«(وهو السلوك الحالي)». الآن مُفصَّل بوضوح: **التخزين المحلي staging مُنفَّذ؛ إرشادات النقل اليدوي غير مُنفَّذة**
+  (قرار منتج/UX مستقبلي محتمل). شملت التصحيحات §1، §5، §9، §10، §11.11، §13 P-0، وملخّص قرار المالك.
+- **L-1:** §3/§4.2/§14 تُميّز الآن صراحةً بين شكل OpenAPI (`POST /api/file/upload/{path}` → `Success`)،
+  وشكل المصدر المُثبَّت (`POST /api/file/upload` بمعامل استعلام `path` → `FileUploadResult`)، وشكل طلب SDK
+  (نموذج الاستعلام). الفرق مُبلَّغ كواقع ملاحَظ **بلا تفسير مُختلَق**، وذُكر **عدم تأثيره على B1/B2**.
+- **L-2:** §4.3/§14 — **خمس** كوكبوكس؛ **ثلاث** تُظهر الرفع فعليًّا؛ **اثنتان** تُظهران عمليات أخرى.
+- **L-3:** §8 تُصنّف **كل** حالة: **3 مُنتَجة** (`pending`, `intent_recorded`, `expired`) و**5 معرَّفة غير مُنتَجة**
+  (`rejected` مُشار إليها في مجموعات الحالات النهائية للقراءة لكن لا تُكتب؛ `dispatching`/`uncertain`/`delivered`/`failed` عناصر نائبة).
+- **I-1:** §3/§6/§8 — الردّ هو **عدد بايتات** (`FileUploadResult.file_size`) لا «Success only»؛ وحجم مُرجَع **ليس**
+  دليلًا على ملكية مساحة العمل أو هوية المحادثة أو التسليم.
+- **I-2:** ادّعاء MCP `call-tool` في §5 أصبح **مسنودًا بالمصدر** (`enterprise` @ `7e8551f7…`، `mcp_tool_call_router.py`):
+  الخادم يُحمَّل من إعدادات المستدعي المخزَّنة لا من الطلب. §14 يسجّل المصدر.
+
+**ما لم يتغيّر:** نتائج B1/B2، تصنيفات البدائل الخمسة، قرارات D-10/D-11/D-14/D-15/D-16/D-22 المفتوحة، وحالة
+`IMPLEMENTATION NOT AUTHORIZED`. **لا** تنفيذ، **لا** إرشادات نقل يدوي في البوت، **لا** تغيير رسائل تيليجرام،
+**لا** رفع بعيد، **لا** تغيير `MINI_APP_ENABLED`/Autopush، **لا** commit/push/PR/merge/نشر.
+
+**الأثر:** `docs/reviews/OHB2-REPAIR-PLAN-06-ATTACHMENT-DELIVERY-ALTERNATIVE-ARCHITECTURE.md` (تصحيحات + قسم §17)
++ هذا القسم (إضافة فقط). تقرير Plan 05 لم يُمَس؛ `.openhands/` لم يُمَس.
+
+**الحالة:** **DONE — READY FOR INDEPENDENT REVIEW** (توثيق فقط). **مطلوب مراجعة مستقلة جديدة** تفحص الـdiff الناتج.
+
+## OHB2-PLAN07-A-SECURE-PULL-FEASIBILITY-INVESTIGATION (2026-11-14، محلي غير مُودَع)
+
+**الهدف:** تحقيق جدوى أمني مُسنَد للمستودع لـ **Plan 07-A — Secure Pull** (تسليم مرفقات بالسحب:
+البوت يخزّن الملف محليًّا ← يعرض رابط HTTPS مؤقّت ضيّق النطاق ← يرسل تعليمة للمحادثة القائمة ←
+الوكيل ينزّل الملف في مساحة العمل الصحيحة ← تحقّق بالحجم وSHA-256). **تحقيق فقط — لا تنفيذ.**
+
+**الحُكم:** **`FEASIBLE WITH BLOCKERS — DESIGN ONLY AFTER SPECIFIED BLOCKERS`**. النصف «الخدْمي»
+ممكن بإعادة استخدام مكوّنات قائمة، لكن النصف «إثبات التسليم» **محجوب** بقرارات مالك غير محسومة.
+
+**حقائق مُتحقَّقة (من الكود/المصدر المُثبَّت/الإعداد هذه الجلسة):**
+- سيرفر ASGI يعمل داخل **نفس العملية** (Uvicorn task) — `bot/web/runner.py` + `bot/app.py::_wire_mini_app`؛
+  نفس مالك SQLite ونفس `OpenHandsClient` (`docs/MINI_APP.md` §1). **مفيش** worker/عملية/مالك جديد.
+- staging: جذر `0700` fail-closed + كتابة `O_CREAT|O_EXCL|O_NOFOLLOW` + حصر بالجذر + توكنات عشوائية
+  غير شفّافة (`bot/attachments.py:200–265,587,1323`). حالات الدفعة: 3 مُنتَجة فقط
+  (`pending`/`intent_recorded`/`expired`)؛ `dispatching`/`uncertain`/`delivered`/`failed`/`rejected`
+  **معرَّفة ولا تُكتب** ⇒ آلة التسليم البعيد **غير مُنفَّذة**.
+- تسليم لِلمحادثة القائمة عبر `POST /app-conversations/{id}/send-message` بمفتاح `OPENHANDS_API_KEY`
+  الموجود (`bot/openhands_client.py:337`). البوت **لا يملك** `session_api_key` ولا ينفّذ أوامر في الساندبوكس.
+- الأصل العام HTTPS حقيقي على **هذا الـ runtime** (Traefik + Let's Encrypt، من `docs/OHB2_HOSTING_DECISION.md` §1.2–1.3)؛
+  لكن مستضيف الإنتاج الموثّق (Katabump) = **long polling بلا منفذ وارد** ⇒ لا يستضيف نقطة السحب.
+- أنماط قابلة لإعادة الاستخدام: توكن عشوائي + SHA-256 عند التخزين (`bot/web/sessions.py`)،
+  محدّد معدّل (`bot/web/ratelimit.py`)، رد مرفق آمن (`_attachment`, `bot/web/app.py:95–108`).
+
+**حاصرات/غير مُتحقَّق:** **D-06** (جذر مساحة العمل الموثوق) و**D-02/D-03** (دليل تسليم موثوق غير
+صادر عن الوكيل) **حاجزان ومفتوحان**؛ **قدرة الساندبوكس على الاتصال الخارجي HTTPS** و**توفّر أداة
+Terminal** غير مُتحقَّقتين ([U]) — لا نستنتج الاتصال من مجرّد وجود Terminal؛ **الأصل العام مستقر؟**
+غير مُتحقَّق (ephemeral)؛ **تجزئة التوكن عند التخزين** تتطلّب تغيير مخطّط (خارج النطاق).
+
+**آلة الجدوى:** PASS (F1–F3,F5,F6,F11,F14,F17) · FAIL (F4,F8,F15) · BLOCKED (F12,F13) · UNVERIFIED (F7,F9,F10,F16).
+**تجربة مضبوطة:** **لم تُجرَ** — لا يوجد بيئة معزولة آمنة قائمة؛ خطة اختبار قابلة للتكرار موصوفة
+في التقرير §9 وتبقى UNVERIFIED.
+
+**البديل لا يضعف استنتاجات Plan 05/06:** يتحاشى B1/B2 **بقلب اتجاه الشبكة** (الوكيل يسحب)، لكنه
+**يرث** حاصرات الإثبات/الهوية (D-06/D-02/D-03) ويُضيف سطحًا جديدًا (تسرّب توكن عبر URL/proxy/referer).
+
+**ما لم يُفعَل:** لا تنفيذ، لا نقطة تنزيل عامة، لا كشف لمجلد الـ staging، لا تغيير كود/مخطّط/قرار معتمَد،
+لا تغيير آلة الحالات/outbox/worker/polling، لا استدعاء إنتاجي/اعتماد/ملف مستخدم حقيقي، لا نشر/DNS/TLS.
+Plan 07-B (تصميم) وPlan 07-C (تنفيذ) **لم يُنفَّذا وليسا مُصرَّحًا بهما**. `MINI_APP_ENABLED`/Autopush كما هما.
+**لا** commit/push/PR/merge/نشر.
+
+**الأثر:** `docs/reviews/OHB2-PLAN-07-A-SECURE-PULL-FEASIBILITY-INVESTIGATION.md` (جديد) + هذا القسم (إضافة فقط).
+تقريرا Plan 05 (`sha256 4944714a…`) وPlan 06 (`sha256 4450b77c…`) **لم يُمَسّا**. `.openhands/` لم يُمَس.
+
+**الحالة:** **DONE — INVESTIGATION COMPLETE** (جدوى فقط). **مطلوب مراجعة مستقلة** + قرار مالك على D-06/D-02/D-03.
+
+## OHB2-PLAN07-A2-DELIVERY-IDENTITY-AND-EVIDENCE-RESOLUTION (2026-11-14، محلي غير مُودَع)
+
+**الهدف:** تحقيق مُسنَد للمستودع لحسم حاصرات Plan 07-A: **D-06** (جذر مساحة العمل الموثوق)،
+**D-02/D-03** (دليل تسليم مستقل وموثوق)، **F4** (تخزين توكن آمن). **تحقيق فقط — لا تنفيذ.**
+
+**الحُكم النهائي:** **`BLOCKED — OWNER ARCHITECTURAL DECISION REQUIRED`**. لا يجوز بدء تصميم Plan 07-B
+الكامل؛ قد يُسمح بتصميم **محدود best-effort** فقط بموافقة مالك صريحة تفيد بأن التسليم **غير مُتحقَّق**.
+
+**D-06 — قراءة جذر مساحة العمل موجودة وتشحن، لكن الربط ناقص:**
+- **[F]** `GET /api/v1/app-conversations[/search]` يرجّع `AppConversation.repositories[]` →
+  `ConversationRepository.path` = «Absolute path of the folder in the sandbox» (كاش Cloud spec v1.92.0،
+  257 مسارًا؛ `readOnly`، تحت `APIKeyHeader`). المصدر: وسم `archiveworkspacepath` **مكتوب من الخادم**
+  (مفتاح محجوز) — لا يستطيع العميل ضبطه.
+- **[F]** agent-server يحسب جذره على المسار المقيَّد: `bind_local_conversation_runtime` →
+  `resolve().is_relative_to(workspace_root)` (وإلا 422) — لكن يتطلّب مفتاحًا كامل الصلاحية
+  (`X-Session-API-Key`) ⇒ حاجز B1 من Plan 05.
+- **[F]** الناقص: **ربط U-12** بالثلاثي `(principal, conversation_id, operation_id)` + تفويض الكتابة
+  (جديد/UNVERIFIED). تحت التجميع، الشقيق يتشارك القاعدة (`grouped_workspace_dir`، `oh_remote.py:1021`).
+- **[F]** البوت **لا يخزّن** جذر مساحة عمل/`sandbox_id`/runtime URL (يقرأ `sandbox_id` عابرًا للاستئناف فقط).
+- **مصفوفة:** قراءة Cloud = RESOLVABLE WITH EXISTING PROVIDER EVIDENCE؛ الربط U-12 = NEW PROVIDER
+  CAPABILITY؛ best-effort = OWNER-APPROVED ARCHITECTURAL CHANGE؛ fail-closed = NOT RESOLVABLE.
+
+**D-02/D-03 — لا يوجد دليل تسليم مستقل اليوم:**
+- **[F]** لا بدائية تُثبت قراءة محتوى **كاملة** (F6b)؛ `delivered` غير قابل للوصول؛ يلزم U-3 من مُصدِر
+  **غير وكيلي** (D-03) من مصدر **مُهدَّأ** (D-04) — كلها غير موجودة.
+- **[F] أقوى بدائية قائمة:** `GET /api/v1/app-conversations/{id}/file` (قراءة ملف بمسار مساحة العمل،
+  user-scoped، يمرّ بترحيل runtime من جانب الخادم) — والبوت **يستخدمها بالفعل** (`bot/openhands_client.py`).
+  لكنها **ليست دليلًا**: ترجّع محتوى لا حجمًا/هاشًا، وكيل، ولا تربط النتيجة بالعملية ⇒ تُضيّق الفجوة ولا
+  تُغلقها.
+- **الحُكم:** D-02/D-03 غير قابلين للتحقّق المستقل اليوم ⇒ BLOCKED.
+
+**F4 — لا يوجد حقل متوافق ولا سرّ ثابت:**
+- **[F]** `attachment_items.staging_token` = اسم ملف خام (ليس هاش)؛ `web_sessions.token_hash` جدول منفصل
+  لجلسات الـ Mini App. لا يوجد app/signing/HMAC secret في `bot/config.py`.
+- **التوصية (least-invasive):** **الخيار C** — جدول جديد يخزّن **هاش SHA-256** لتوكن `secrets.token_urlsafe`
+  256-بت (نمط `bot/web/sessions.py`)، TTL ≤ 15 دقيقة، حذف=إبطال. بديل مفضّل إن قُبِل: **E** (بلا bearer URL).
+  **يتطلّب تغيير مخطّط + موافقة مالك** (غير مُصرَّح به هنا).
+
+**البدائل:** (1) best-effort فقط · (2) مُتحقَّق عبر U-12/U-3 (يشترط قدرة جديدة) · (3) مساحة عمل مشتركة
+معتمَدة · (4) بلا ادّعاء تحقّق (تخفيض صريح، ليس مكافئًا) · (5) التخلّي.
+
+**قرارات المالك المفتوحة (لم تُحسم):** D-02, D-03, D-04, D-06, D-10, D-11, D-14, D-22 (حاجزة)؛
+D-12, D-15, D-16, D-24 (تأكيد). جديدة: قبول best-effort مقابل إلزام U-12/U-3؛ اعتماد تغيير مخطّط F4؛
+اعتماد أصل عام مستقر.
+
+**الحد الأدنى من قدرات المزوّد:** U-12 (ربط الجذر) + U-3 (إقرار قراءة موثوق) + D-04 (مصدر مُهدَّأ) +
+اعتماد مقيَّد النطاق (أو مسار Cloud مفوَّض) + أصل عام مستقر.
+
+**ما لم يُفعَل:** لا تغيير كود/مخطّط/ترحيل/إعداد/مسار؛ لا جدول/عمود/فهرس/مخزن توكن/انتقال حالة؛
+لا عامل/مجدول/عملية/خدمة/مالك SQLite جديد؛ لا نقطة تنزيل/رابط عام؛ لا استدعاء إنتاجي/اعتماد/ملف مستخدم؛
+لا تغيير محادثة/مساحة عمل/ساندبوكس. Plan 07-B/07-C **لم يُنفَّذا وليسا مُصرَّحًا بهما**.
+**لا** commit/push/PR/merge/نشر/Autopush. `MINI_APP_ENABLED` كما هو.
+
+**الأثر:** `docs/reviews/OHB2-PLAN-07-A2-DELIVERY-IDENTITY-AND-EVIDENCE-RESOLUTION.md` (جديد) + هذا القسم
+(إضافة فقط). تقارير Plan 05 (`4944714a…`) وPlan 06 (`4450b77c…`) وPlan 07-A (`8faec96b…`) **لم تُمَس**.
+`.openhands/` لم يُمَس. **تسليم المرفقات يبقى NOT IMPLEMENTED.** **مطلوب مراجعة مستقلة.**
+
+## OHB2-PLAN08-MANUAL-ATTACHMENT-TRANSFER-UX-DESIGN (2026-11-14، محلي غير مُودَع)
+
+**النوع:** تحقيق + تصميم UX/منتج/تقني فقط — **بلا تنفيذ**.
+**الحُكم النهائي:** **`DESIGN READY WITH IMPLEMENTATION PREREQUISITES`**.
+يوجد مسار تنفيذ يدوي **آمن ومحدود** (بلا نقطة/رابط عام/توكن/مخطّط/عامل جديد)، لكن **لا يوجد مسار
+استرجاع قائم للمستخدم اليوم** ⇒ يلزم تنفيذ محدود + قرار مالك على النطاق.
+
+**Baseline:** branch `main`؛ HEAD=`main`=`origin/main`=`facf1f4…`؛ divergence `0 0`. staged: لا شيء.
+`MINI_APP_ENABLED=False` (افتراضي)؛ Autopush غير مُشغَّل؛ `concurrent_updates(True)` كما هو.
+حِفظ الأصول القائمة: 4 تقارير untracked + `.agent/PROGRESS.md` (إضافة فقط).
+
+**تقرير Plan 05/06/07-A/07-A2 (تحقّق بايت-بايت قبل الكتابة):**
+Plan 05 `4944714a…` (428) · Plan 06 `4450b77c…` (617) · Plan 07-A `8faec96b…` (509) ·
+Plan 07-A2 `8aa583d2…` (451) — **كلها لم تُمَس**.
+
+**Investigation A — دورة حياة المرفق (مُتحقَّق من المصدر):**
+- البايتات: `<db_dir>/attachment_staging/` (0700/0600)، اسم = توكن عشوائي `secrets.token_hex(16)`
+  (`attachments.py:108–111,199–201,204–210,585–594`). المالك الوحيد = SQLite واحد
+  (`attachment_batches/items/message_identity`, `db.py:770–815`).
+- الهوية: `attachment_message_identity(telegram_id,chat_id,message_id,batch_id,conversation_id)`
+  PK مركّب + FK RESTRICT (`db.py:804`). **`file_id` غير مخزَّن** (البايتات هي النسخة الوحيدة).
+- الحالات **المكتوبة فعلًا:** `pending` (`attachments.py:704`)، `intent_recorded` (`db.py:1630`)،
+  `expired` (`attachments.py:869,1128`). **غير مكتوبة:** `dispatching/uncertain/delivered/rejected/
+  failed` ⇒ **`delivered` غير قابل للوصول** (لا تسليم بعيد).
+- حالات العنصر: `pending→stored` (CAS ذرّي `db.py:1224`) `→reaped` (`db.py:1463`).
+- الانتهاء/الكنس: مهلة ثابتة **15 دقيقة**؛ المراقب القائم يشغّل `OpportunisticSweeper` (≥60 ث)
+  (`attachments.py:1376–1432`، `bot/app.py:227–241`)؛ الكنس DB-أولًا مع حُرّاس صارمة
+  (توكن مقطع آمن + `_is_within` + `lstat` + ملف عادي؛ symlink⇒`unsafe` بلا حذف).
+- الاسم/النوع: `display_name` **وصفي فقط** (لا يُستخدم كمسار)؛ **MIME غير مخزَّن**.
+- **لا يوجد أي مسار قراءة للبايتات المخزّنة إلى المستخدم** (grep على `bot/` بلا نتيجة) ⇒ لا استرجاع،
+  ولا تغيير حالة بالاسترجاع، ولا استرجاع متكرّر اليوم.
+
+**Investigation B — خيارات الاسترجاع اليدوي:**
+- **B1 (البوت يعيد إرسال الملف): `REQUIRES IMPLEMENTATION`.** `send_document` موجود
+  (`handlers.py:1460,1559`؛ `sender.py:31,71`) وسقف Bot API = 50 MiB (`sender.py:19`) > سقف الوارد
+  20 MB ⇒ لا تعارض. لكن outbox **نصّي فقط** (`db.py:179–180`) ⇒ يلزم نوع عنصر مستند ⇒ **D-22**.
+  **بلا عامل جديد** (يركب على tick الـ outbox القائم).
+- **B2 (تنزيل من الـ Mini App): `REQUIRES IMPLEMENTATION`.** يوجد مسار مصادَق `_attachment`
+  (`app.py:95–108`) وتنزيل Blob نفس-الأصل (`app.js:1046–1055`)، لكن **لا مسار يخدم البايتات
+  المخزّنة**؛ ويجب مسار كوكي جديد يعيد استخدام `_guarded`+الملكية. **بلا رابط bearer عام.**
+  سلوك تنزيل Blob في WebView أندرويد تيليجرام **UNVERIFIED** (مُختبَر في DOM stub فقط).
+- **B3 (أي مسار قائم آخر): `NOT FEASIBLE`** (لا مسار يُرجع البايتات المخزّنة).
+- **التوصية:** B1 أولًا (أكثر موثوقية داخل تيليجرام)، وB2 لاحقًا اختياريًّا.
+
+**Investigation C/D/E:**
+- رحلة يدوية 7 خطوات تفصل صراحةً: تخزين محلي ≠ استرجاع ≠ رفع يدوي ≠ تسليم بعيد مُتحقَّق.
+- نصوص عربية مقترحة (§6): استلام/جاهز للتنزيل/منتهي/فشل تنزيل/تعليمات نقل/تنبيه «مايقدرش يتأكّد».
+- تحليل أمني: معظم المخاطر **مُخفَّفة فعلًا** (ملكية، توكن-فقط، `O_NOFOLLOW`, `_is_within`,
+  allowlist امتداد/magic)؛ **غير مُخفَّف:** سباق استرجاع↔كنس (لا استرجاع بعد)، ازدواج إرسال B1،
+  والالتباس «محلي مقابل بعيد» (فجوة الـ UX الأساسية). **لا تخفيض أمني.**
+- الحدود المعمارية محفوظة: عملية واحدة، مالك SQLite واحد، بلا عامل/مجدول/خدمة جديدة، بلا تغيير
+  polling/إقرار/`concurrent_updates`، `MINI_APP_ENABLED` معطّل، Autopush معطّل.
+
+**قرارات المالك المفتوحة:** D-22 (نوع outbox مستند)، D-12 (ثلاثي الأحجام)، D-15 (نافذة 15 دقيقة)،
+D-16 (idempotency)، النطاق (B1 فقط مقابل B1+B2)، صياغة §6. **U-12/U-3/D-04/D-06/D-02/D-03 تبقى
+الهدف بعيد المدى ولا تُستبدَل.**
+
+**ما لم يُفعَل:** لا كود/واجهة/مخطّط/ترحيل/إعداد/تبعيات/نشر؛ لا نقطة/رابط/توكن جديد؛ لا تنفيذ Plan 08؛
+لا Plan 07-B/07-C. **لا** commit/push/PR/merge/نشر/Autopush. الأثر:
+`docs/reviews/OHB2-PLAN-08-MANUAL-ATTACHMENT-TRANSFER-UX-DESIGN.md` (جديد) + هذا القسم (إضافة فقط).
+**مطلوب مراجعة مستقلة.**
+
+## OHB2-REVIEW-PLAN08-MANUAL-ATTACHMENT-TRANSFER-UX-DESIGN (2026-11-15، مراجعة مستقلة عدائية، قراءة فقط)
+
+**النوع:** مراجعة مستقلة عدائية، قراءة فقط. **الحُكم: `NEEDS_REMEDIATION`** (لا يُصرّح بالتنفيذ).
+**التقرير المستهدف:** `docs/reviews/OHB2-PLAN-08-MANUAL-ATTACHMENT-TRANSFER-UX-DESIGN.md`
+(sha256 `18b29203…`، 419 سطر) — **لم يُمَس**.
+
+**Baseline (مُتحقَّق مستقلًّا، لا من التقرير):** branch `main`؛ HEAD=`main`=`origin/main`=
+`facf1f42…`؛ divergence `0 0`؛ staged: لا شيء؛ unstaged: `.agent/PROGRESS.md`؛ untracked: 5 تقارير
+(05/06/07-A/07-A2/08)؛ ignored: `.openhands/` (لم يُمَس). `MINI_APP_ENABLED=False`؛ Autopush غير
+مُشغَّل؛ `concurrent_updates(True)` كما هو. إعادة حساب الهاشات طابقت: 05 `4944714a…` (428) ·
+06 `4450b77c…` (617) · 07-A `8faec96b…` (509) · 07-A2 `8aa583d2…` (451).
+
+**تحقّق دورة الحياة (كله صحيح):** الجذر `attachment_staging` 0700/0600 (`attachments.py:204–210`)،
+توكن `token_hex(16)` (`:199–201`)، مالك SQLite واحد + `foreign_keys=ON` fail-closed
+(`db.py:560–565`)، `attachment_message_identity` PK مركّب + FK RESTRICT (`db.py:804–813`)،
+`file_id` غير مخزَّن، الحالات المكتوبة فعلًا `pending`/`intent_recorded`/`expired` فقط
+(`attachments.py:704`، `db.py:1630`، `attachments.py:869,1128`) و`delivered` غير قابل للوصول،
+`pending→stored→reaped`، TTL 15 دقيقة، الكنس DB-أولًا مع حُرّاس صارمة، **لا مسار قراءة للبايتات
+المخزّنة إلى المستخدم** (grep شامل بلا نتيجة).
+
+**تحليل B1/outbox:** الـ outbox **نصّي فقط** — المخطّط `(id, conversation_id, chat_id, text,
+status, …)` بلا عمود payload/kind (`db.py:608–621`) والإرسال `client.send_message(...)` لـ
+**OpenHands** (`openhands_client.py:337`) لا لتيليجرام. B1 يحتاج **نوع عملية متين جديد** و/أو حالة
+دورة حياة جديدة ⇒ **D-22 (حاجز مالك)**. أدوات at-most-once موجودة (`pending→claimed→sending→
+sent|unknown`، `outbox.py:298–470`) لكن **لا تُطبَّق تلقائيًّا** على إرسال مستند جديد. الفصل السُّبعي
+للأحداث (تخزين محلي ≠ تسجيل outbox ≠ قبول Telegram ≠ تسليم للمستخدم ≠ تنزيل المستخدم ≠ رفع المستخدم
+≠ تسليم بعيد مُتحقَّق) صحيح.
+
+**B2:** لا مسار قائم يخدم البايتات المخزّنة؛ ممكن مسار كوكي يعيد استخدام `_guarded`+`_attachment`
+بلا رابط عام؛ `_attachment` يقرأ كاملًا في الذاكرة وبلا `Range`؛ **تنزيل WebView الحقيقي غير
+مُتحقَّق** (اختبار DOM stub فقط).
+
+**النتائج:** HIGH — **F-01** حدّ «20 MB» غير مُتحقَّق ويُقدَّم كحقيقة (الحدّ المفروض فعلًا هو
+`MAX_ATTACHMENT_BYTES=3 MiB`؛ لا ثابت 20 MB في المستودع)؛ **F-04** تعارض تسمية غير مُفصَّح بين
+B1/B2/B3 في Plan 08 و**Stage B1/B2/B3** في السجل/الخطة المرحلية (`NOT AUTHORIZED TO START`)؛
+**S-13** لا رسالة حالية تفرّق بين «محلي» و«بعيد» (`ATTACHMENT_ACCEPTED_TEXT`، `handlers.py:1601`).
+MEDIUM — **F-02** التقرير يقلّل من شرط B1 المعماري (D-22)؛ **F-03** توصية B1 مُدّعاة لا مُستنتَجة
+(مقايضة B1/B2 غير مُنمذَجة). LOW/INFO — F-05 دقّة اقتباسات، F-06 دمج الشدّة/الحالة، F-07 زر غير موجود.
+
+**الاختبارات (مُعاد تشغيلها مستقلًّا):** 245 passed (مرفقات)؛ 301 passed (outbox+repair02)؛
+**3060 passed / 0 failed** (كامل، بعد تثبيت التبعيات نظاميًّا كما يفعل CI)؛ pyflakes **0**؛
+Node **250 pass / 0 fail**. الفشل الوحيد الأول (`test_deploy_manifest`) كان **بيئيًّا** (تثبيت في
+user-site + `HOME` مؤقّت في الاختبار) لا انحدارًا — زال بعد التثبيت النظامي. لا نداءات إنتاج/أسرار/
+مرفقات حقيقية.
+
+**ما لم يُفعَل:** لا كود/واجهة/اختبار/مخطّط/ترحيل/إعداد/تبعيات عُدِّلت؛ لا تنفيذ B1/B2؛ لا Plan 07-B/C.
+الأثر: `docs/reviews/OHB2-REVIEW-PLAN08-MANUAL-ATTACHMENT-TRANSFER-UX-DESIGN.md` (جديد) + هذا القسم
+(إضافة فقط). **لا** commit/push/PR/merge/نشر/Autopush. تقارير 05/06/07-A/07-A2/08 بايت-بايت دون تغيير.
+**المطلوب من المالك:** حسم **D-22** + اعتماد النطاق (B1/B2) + اعتماد صياغة §6، وإصلاح بنود §12.
+
+## OHB2-REMEDIATE-PLAN08-MANUAL-ATTACHMENT-TRANSFER-DESIGN (2026-11-15، إصلاح تصميم فقط — لا تنفيذ)
+
+**النوع:** إصلاح وثيقة تصميم (توثيق فقط). **الحُكم: `REMEDIATION COMPLETE WITH OPEN OWNER DECISIONS`.**
+**الهدف:** `docs/reviews/OHB2-PLAN-08-MANUAL-ATTACHMENT-TRANSFER-UX-DESIGN.md` (أُصلِح في مكانه،
+419→812 سطر). **المراجعة المستقلة** `docs/reviews/OHB2-REVIEW-PLAN08-…md` **لم تُمَس** (sha256
+`71cc88c8…`).
+
+**Baseline (مُتحقَّق):** branch `main`؛ HEAD=`main`=`origin/main`=`facf1f42…`؛ divergence `0 0`؛
+staged: لا شيء؛ unstaged: `.agent/PROGRESS.md`؛ untracked: 6 تقارير؛ ignored: `.openhands/`،
+`.pytest_cache/` (لم تُمَس). `MINI_APP_ENABLED=False`؛ Autopush غير مُشغَّل؛ `concurrent_updates(True)`
+كما هو. هاشات 05/06/07-A/07-A2 دون تغيير؛ Plan 08 قبل الإصلاح `18b29203…`.
+
+**إعادة التحقق من كل نتيجة قبل التعديل (كلها مؤكَّدة):**
+- **F-01:** لا ثابت 20 MB في `bot/`؛ السقف المفروض `MAX_ATTACHMENT_BYTES=3 MiB` (`attachments.py:99`)
+  مطبَّق على كل مرفق (`handlers.py:1878`). الحصص الإضافية (`MAX_ITEMS_PER_BATCH=10`،
+  `MAX_STAGING_TOTAL_BYTES=64 MiB`) **معطّلة افتراضيًّا** (D-12). سقف الرفع الصادر 50 MiB (`sender.py:19`).
+- **F-02:** outbox **نصّي فقط** — المخطّط بلا عمود payload/kind (`db.py:608–621`)؛ يرسل لـ OpenHands
+  (`openhands_client.py:337`). MT-1 يحتاج عملية مستند متينة جديدة ⇒ **D-22 (حاجز مالك)**.
+- **F-03:** لا مقارنة سابقة؛ بُنيت مصفوفة MT-1/MT-2/MT-3 + جدول مقايضة؛ **سُحِبت توصية B1-first**.
+- **F-04:** تعارض تسمية مؤكَّد (register `:710`/`:1236` + staged plan `:739`/`:756`/`:768` = مراحل
+  بعيدة `NOT AUTHORIZED`)؛ استُبدِلت بـ **MT-1/MT-2/MT-3** + قاموس مصطلحات (§9).
+- **S-7:** لا مسار استرجاع؛ الكنس DB-أولًا (`attachments.py:1020`/`:1316`/`:1334`) ⇒ §13 تحليل 9 حالات
+  (مستقبلية، مقترحات فقط).
+- **S-8:** CAS/`unknown` at-most-once (`outbox.py:447–470`)؛ لا مفتاح idempotency لتيليجرام ⇒ §14 مصفوفة
+  12 حالة؛ **لا ادّعاء exactly-once**.
+- **S-13:** `ATTACHMENT_ACCEPTED_TEXT` (`handlers.py:1601`) بلا تمييز محلي/بعيد ⇒ §10 صياغة عربية كاملة
+  + تسميات حالة مفاهيمية.
+- **LOW/INFO:** F-05 اقتباسات مضبوطة (`db.py:804–813`)؛ F-06 فصل الشدّة/الحالة (§11)؛ F-07 الأزرار
+  المقترحة موسومة PROPOSED (§10.2/§19)؛ §18 مصفوفة تتبّع لكل النتائج.
+
+**بنية الوثيقة المُصلَحة:** 22 قسمًا مطابقًا للمطلوب (Task ID/verdict → حدّ التفويض → Baseline →
+دورة الحياة → حدود الحجم → عقد outbox → مقارنة MT → توصية → قاموس → صياغة عربية → نموذج حالة → تهديدات
+→ سباق التنظيف → ازدواج الإرسال → مراحل مقترحة → معايير قبول → قرارات المالك → مصفوفة الإصلاح →
+الواجهة الحالية/المقترحة → الاختبارات → تغييرات/Git → القرار التالي).
+
+**التحقّق (قراءة فقط، توثيقي):** لا تشغيل لاختبارات وقت تشغيل (غير مطلوب/غير مُدّعى). فحوص: عدد الأسوار
+متوازن (22)؛ لا ادّعاء «20 MB» إلا في نص السحب؛ لا تسميات B1/B2/B3 كخيارات يدوية (فقط مراحل بعيدة
+مُفصَّلة)؛ الاستشهادات مضبوطة ضد المصدر؛ 0 ملفات كود/واجهة/اختبار/مخطّط/إعداد/تبعيات معدَّلة.
+
+**الملفات:** `docs/reviews/OHB2-PLAN-08-MANUAL-ATTACHMENT-TRANSFER-UX-DESIGN.md` (إصلاح في مكانه) +
+هذا القسم (إضافة فقط). **لم يتغيّر:** تقرير المراجعة المستقلة + 05/06/07-A/07-A2 (هاشات §3.2) +
+`.openhands/`. **لا** commit/push/PR/merge/نشر/Autopush؛ لا شيء staged.
+**القرار المطلوب من المالك:** حسم **D-22** + اختيار النطاق (MT-1/MT-2/لا شيء) + اعتماد صياغة §10.
+**لا تنفيذ لأي خيار قبل ذلك.** Plan 07-B/07-C لا يزالان غير مُصرَّح بهما.
+
+## OHB2-REVIEW-PLAN08-DESIGN-REMEDIATION (2026-11-15، مراجعة مستقلة ثانية، قراءة فقط)
+
+**النوع:** مراجعة عدائية مستقلة ثانية (قراءة فقط). **الحُكم: `PASS_WITH_NOTES`.** لا تُصرّح بأي تنفيذ
+ولا تحسم أي قرار مالك. **الهدف:** `docs/reviews/OHB2-PLAN-08-MANUAL-ATTACHMENT-TRANSFER-UX-DESIGN.md`
+(sha256 `0914609f…`، 812 سطر) مقابل المراجعة المستقلة الأصلية `71cc88c8…` (406 سطر، لم تُمَس).
+
+**Baseline (مُتحقَّق مستقلًّا):** branch `main`؛ HEAD=`main`=`origin/main`=`facf1f42…`؛ divergence `0 0`؛
+staged: لا شيء؛ unstaged: `.agent/PROGRESS.md`؛ untracked: **6** تقارير؛ ignored: `.openhands/`
+(mtime `2026-11-14 16:27`، لم تُمَس)، `.pytest_cache/`. `MINI_APP_ENABLED=False`؛ `concurrent_updates(True)`
+كما هو؛ Autopush غير مُشغَّل. هاشات 05 `4944714a…` · 06 `4450b77c…` · 07-A `8faec96b…` · 07-A2 `8aa583d2…`
+(دون تغيير).
+
+**النتائج:** كل نتائج المراجعة الأولى **مُغلَقة** مقابل المصدر الحالي:
+- **F-01 CLOSED:** سُحِب ادّعاء «20 MB»؛ السقف المفروض 3 MiB (`attachments.py:99`)؛ لا `20 MB` في `bot/`؛
+  حد تيليجرام للتنزيل مُوسَم `[U]`؛ 50 MiB سقف رفع صادر (`sender.py:19`).
+- **F-02 CLOSED:** عقد outbox نصّي بلا payload/kind (`db.py:608–621`)؛ يرسل لـ OpenHands
+  (`openhands_client.py:337`)؛ MT-1 محجوب بـ D-22 (غير محسوم، حاجز).
+- **F-03 CLOSED:** مصفوفة §7.4 مصدرية؛ جدول مقايضة §8؛ سُحِبت توصية B1-first؛ لا فائز مُعلَن.
+- **F-04 CLOSED:** تسميات MT-1/MT-2/MT-3 + قاموس §9؛ مراحل Stage B1/B2/B3 البعيدة منفصلة و`NOT AUTHORIZED`.
+- **F-05/F-06/F-07 CLOSED:** اقتباسات مضبوطة (`db.py:804–813`)؛ فصل الشدّة/الحالة (§11)؛ الأزرار
+  المقترحة موسومة PROPOSED (§10.2/§19).
+- **S-7 CLOSED** (§13، 9 حالات، كلها مستقبلية غير قابلة للوصول اليوم، «الأذونات لا تحلّ السباق»)؛
+  **S-8 CLOSED** (§14، 12 حالة، لا exactly-once، لا مفتاح idempotency مُفترَض)؛ **S-13 CLOSED**
+  (§10، 8 مقاطع + تسميات مفاهيمية ليست حالات قاعدة بيانات).
+
+**ملاحظات متبقّية (غير حاجزة):** **R-1 LOW** §3.1 «five untracked reports» قديم (6 الآن)؛
+**R-2 LOW** §20 «3 call sites» عدّ ناقص (4 نداءات `send_document`)؛ **R-3 INFO** مدى `outbox.py:447–470`
+لـ CancelledError (الفعل `472–478`)؛ **R-4 INFO** وسم «F-08» بلا نظير في المراجعة الأولى.
+
+**الاختبارات (نُفِّذت هنا):** attachment subset **245 passed** (exit 0)؛ `-k "outbox or repair_plan_02"`
+**301 passed/2759 deselected**؛ **full suite 3060 passed**؛ `pyflakes` **0**؛ `node --test` **250 pass/0 fail**.
+
+**الملفات:** أُنشئ `docs/reviews/OHB2-REVIEW-PLAN08-DESIGN-REMEDIATION.md` + هذا القسم (إضافة فقط).
+**لم يتغيّر:** Plan 08 المُصحَّح + المراجعة الأصلية + 05/06/07-A/07-A2 (هاشات §3) + `.openhands/`.
+**لا** commit/push/PR/merge/نشر/Autopush؛ لا شيء staged؛ **لا تنفيذ لأي خيار.**
+**القرار المطلوب من المالك:** حسم **D-22** + اختيار النطاق (MT-1/MT-2/لا شيء) + اعتماد صياغة §10؛
+MT-2 ليس خاليًا من القرارات (نطاق + تحقّق WebView).
+
+## OHB2-OWNER-DECISION-PLAN08-MANUAL-ATTACHMENT-TRANSFER (2026-11-15، تحضير قرار مالك — توثيق فقط)
+
+**النوع:** تحضير قرار مالك (توثيق فقط). **لم يُتَّخذ أي قرار، ولم يُعتمَد أي خيار، ولا تنفيذ.**
+**الملف الجديد:** `docs/decisions/OHB2-OWNER-DECISION-PLAN08-MANUAL-ATTACHMENT-TRANSFER.md`
+(18 قسمًا، إنجليزي، الحالة `PROPOSED — OWNER DECISION REQUIRED`).
+
+**Baseline (مُتحقَّق):** branch `main`؛ HEAD=`main`=`origin/main`=`facf1f42…`؛ divergence `0 0`؛
+staged: لا شيء؛ unstaged: `.agent/PROGRESS.md`؛ untracked: 7 تقارير؛ ignored: `.openhands/`
+(mtime `2026-11-14 16:27`، لم تُمَس)، `.pytest_cache/`. `MINI_APP_ENABLED=False`؛ Autopush غير مُشغَّل.
+
+**محتوى القرار:** يعرض MT-1 (إرجاع عبر تيليجرام) وMT-2 (تنزيل من الـ Mini App) والتأجيل بأدلّة من
+المصدر الحالي، ويرفع قرارات المالك (خصوصًا D-22) دون حسمها. مصفوفة §8 متوافقة مع §4/§5/§7؛ لا فائز
+مُعلَن («NO OPTION IS SELECTED…»). §14 ورقة قرار مستقلة A–F بلا أي انحياز.
+
+**تحقّق المصدر (مُعاد):** `MAX_ATTACHMENT_BYTES=3 MiB` (`attachments.py:99`)؛ staging `0700`/`0600`
+وتوكن شفّاف (`:108–111`,`:199`)؛ TTL 15 دقيقة (`db.py:261`)؛ outbox نصّي بلا payload/kind
+(`db.py:608–621`) ويرسل لـ OpenHands (`openhands_client.py:337`)؛ `send_document` 4 نداءات داخل الذاكرة
+(`handlers.py:1460`,`:1559`؛ `sender.py:31`,`:76`)؛ لا مسار يقرأ `attachment_staging`؛ لا `Range/206`؛
+حالات الدفعة المكتوبة فعليًّا `pending`/`intent_recorded`/`expired` فقط. D-22/D-12/D-15/D-16 منقولة من
+السجل بدقّة (`:1042–1060`، `:158`، `:161`، `:162`).
+
+**التحقّق (توثيقي):** كل المراجع داخل المدى؛ لا آثار heredoc؛ أسوار/جداول متوازنة (0 مشاكل)؛ لا روابط
+داخلية؛ لا درجات رقمية/تقديرات؛ الصياغة العربية §11 محفوظة كـ PROPOSED.
+
+**الملفات:** أُنشئ ملف القرار + هذا القسم (إضافة فقط). **لم يتغيّر:** Plan 08 المُصحَّح `0914609f…`،
+المراجعتان `71cc88c8…`/`af943437…`، 05/06/07-A/07-A2، أي سجل قرارات قائم، أي كود/اختبار/مخطّط/إعداد،
+`.openhands/`. **لا** commit/push/PR/merge/نشر/Autopush؛ لا شيء staged؛ **لا اختيار لأي خيار ولا تنفيذ.**
+
+## OHB2-PLAN09-MT2-AUTHENTICATED-MINI-APP-ATTACHMENT-DOWNLOAD-DESIGN (2026-11-15، تصميم/جدوى فقط)
+
+**النوع:** استقصاء معماري + تحليل أمني + تصميم مقترح فقط. **لا تنفيذ، ولا تغيير سلوك وقت تشغيل.**
+**الملف الجديد:** `docs/reviews/OHB2-PLAN09-MT2-AUTHENTICATED-MINI-APP-ATTACHMENT-DOWNLOAD-DESIGN.md`
+(25 قسمًا). **الحُكم:** `FEASIBLE WITH BLOCKERS — OWNER DECISIONS REQUIRED`.
+**الاتجاه المُختار من المالك:** MT-2 (تنزيل من الـ Mini App) — **للتصميم فقط** (ورقة القرار A2)،
+**ليس تصريح تنفيذ**.
+
+**Baseline (مُتحقَّق):** branch `main`؛ HEAD=`main`=`origin/main`=`facf1f42…`؛ divergence `0 0`؛
+staged: لا شيء؛ unstaged: `.agent/PROGRESS.md`؛ untracked: 8 ملفات (منها ملف القرار)؛ ignored:
+`.openhands/` (mtime `2026-11-14 16:27`، لم تُمَس)، `.pytest_cache/`. `MINI_APP_ENABLED=False`؛
+`concurrent_updates(True)` كما هو؛ Autopush غير مُشغَّل.
+
+**النتائج الأساسية (مُتحقَّقة من المصدر):** يمكن تصميم MT-2 بأمان فوق المعمارية الحالية بلا مالك
+SQLite ثانٍ/عملية/عامل/مجدول/مخطط/تغيير تخزين توكن: إعادة استخدام `_guarded`
+(`web/app.py:432`)، جلسات `web_sessions` (هاش فقط، كوكي `HttpOnly/Secure/SameSite=Strict`)،
+تفويض الملكية (`files.py:220`)، هوية المرفق (عنصر→دفعة→`telegram_id`+`conversation_id`،
+`db.py:769–792`)، و`StreamingResponse` (starlette 1.3.1، متاح). لا مسار يقرأ `attachment_staging`
+اليوم؛ لا `Range/206`. **الحواجز:** تحقّق WebView على أندرويد 12 حقيقي `UNVERIFIED` (خطة §13)؛
+سباق الكنس/الاسترجاع يحتاج ثابتًا أدنى (§11)؛ قرارات النطاق والصياغة مفتوحة. **D-22 و D-16 غير
+منطبقين على MT-2** (D-22 خاص بالـ outbox؛ MT-2 GET idempotent)؛ **D-15** يجب تأكيده؛ **D-12** يخص
+الصياغة/الحدود.
+
+**الاختبارات (بلا تغيير ملفات):** `pytest` (6 ملفات miniapp/export/session/initdata/authz)
+**119 passed**؛ `node --test tests/frontend/*.test.js` **fail 0**؛ فحوص grep لغياب
+`StreamingResponse`/قراءة الـ staging/`Range`. لم يُنفَّذ أي اختبار جهاز حقيقي.
+
+**التحقّق (توثيقي):** كل المراجع (62) داخل المدى؛ جداول Markdown **0 مشاكل** (أُصلحت خليتان
+بأنبوب غير مهروب)؛ لا روابط داخلية؛ لا صياغة انحيازية؛ كل سلوك مقترح موسوم PROPOSED.
+
+**الملفات:** أُنشئ تقرير التصميم + هذا القسم (إضافة فقط). **لم يتغيّر:** ملف القرار، Plan 05/06/07-A/
+07-A2، Plan 08 المُصحَّح، المراجعتان، السجل، أي كود/واجهة/اختبار/مخطط/إعداد/تبعيات/نشر، `.openhands/`.
+**لا** commit/push/PR/merge/نشر/Autopush؛ لا شيء staged؛ **لا تنفيذ ولا تفعيل ولا اختيار خيار.**
+
+## OHB2-PLAN09-FINAL-CLOSURE-DOCUMENTATION — إغلاق توثيقي لموضوع Plan 09 MT-2 (2026-11-15، توثيق فقط)
+
+**النوع:** توثيق فقط (closure record). **لا تنفيذ، ولا تفعيل، ولا أي تغيير في السلوك/الكود/المخطّط.**
+**الهدف:** تسجيل نتيجة دراسة تصميم Plan 09 المُقبَلة مع ملاحظات (`PASS_WITH_NOTES`) وبوّابات التنفيذ المتبقّية.
+**تقرير التصميم (غير مُعدَّل):** `docs/reviews/OHB2-PLAN09-MT2-AUTHENTICATED-MINI-APP-ATTACHMENT-DOWNLOAD-DESIGN.md`
+(638 سطرًا، 25 قسمًا، sha256 `008e90c87fc24ae1de51b92caa74292e0dfa868226a596574d8fc485c7e6fec8`).
+
+**سجل القرار (closure record):**
+- **دراسة تصميم Plan 09: `ACCEPTED WITH NOTES`** (مقبولة كدراسة تصميم مكتملة، مع ملاحظات غير حرجة).
+- **المراجعة المستقلة: `PASS_WITH_NOTES`.** (المراجعة المستقلّة `OHB2-REVIEW-PLAN09-MT2-DESIGN` كانت مُخرَجًا
+  **داخل الجلسة فقط** (قراءة فقط)؛ مهمّتها منعت إنشاء ملف داخل المستودع ⇒ **لا يوجد ملف مراجعة منفصل**،
+  والحُكم مُسجَّل هنا نصًّا. الحُكم الأصلي للوثيقة `FEASIBLE WITH BLOCKERS — OWNER DECISIONS REQUIRED`،
+  والمراجعة المستقلة أقرّته/رفعته إلى `PASS_WITH_NOTES` كدراسة.)
+- **MT-2: `FEASIBLE IN PRINCIPLE, NOT IMPLEMENTATION-READY`.**
+- **تفويض التنفيذ: `NOT GRANTED`** (غير ممنوح).
+- **`MINI_APP_ENABLED` يبقى `False`** (`bot/config.py:262`). **Autopush يبقى معطّلًا/غير نشط.**
+- **لا** يُصرّح هذا الإغلاق بأي عمل تنفيذ/واجهة/خلفية/اختبار/مخطّط/إعداد/تبعيات/نشر.
+
+**نتائج المراجعة المستقلة المُسجَّلة (كما وردت):**
+- الحُكم: `PASS_WITH_NOTES`؛ دراسة التصميم مقبولة؛ **تنفيذ MT-2 غير مُصرَّح**.
+- **تحقّق WebView على أندرويد 12 حقيقي لا يزال `UNVERIFIED`** (الـDOM stub/المحاكاة لا تكفي).
+- **F-01 (MEDIUM):** يلزم تحديد استراتيجية قراءة ملفات/بثّ **غير حاجبة لحلقة الأحداث** المشتركة (bot+ASGI)
+  قبل التنفيذ؛ (ملاحظات إضافية منخفضة: F-02 symlink/TOCTOU للمكوّن الأب، F-03 استبدال بنفس الحجم،
+  F-04 فرق التنزيل navigation مقابل fetch/blob، F-05 عدّ تقارير §3 (خطأ توثيقي)، F-06 الـfd المفتوح على POSIX).
+- **D-15 يتطلّب تأكيد المالك.**
+
+**بوّابات التنفيذ المتبقّية (تُحفظ لأي مقترح تنفيذ مستقبلي):**
+1. حلّ **F-01** بتحديد ومراجعة استراتيجية قراءة/بثّ **غير حاجبة** لا تُجمِّد حلقة أحداث البوت/ASGI المشتركة.
+2. إجراء **تحقّق حقيقي على جهاز أندرويد 12** داخل تطبيق Telegram (الـDOM stubs/الاختبارات المحاكية غير كافية).
+3. الحصول على **تأكيد صريح من المالك لـ D-15**.
+4. الحصول على **تفويض مالك صريح منفصل** قبل بدء أي تنفيذ.
+
+**القيود الموثّقة (تُحفظ):**
+- **لا يوجد مسار استرجاع/تنزيل مرفقات اليوم** (لا route/handler يقرأ `attachment_staging`).
+- **لا ادّعاء** بنجاح تسليم إلى OpenHands ولا بنجاح حفظ المستخدم للملف.
+- **لا يُصرَّح** بأي جدول/عمود/حالة دورة حياة/توكن/سرّ جديد في قاعدة البيانات.
+- **MT-1 وMT-3 وSecure Pull والرفع البعيد والتسليم التلقائي للمرفقات خارج هذا الإغلاق.**
+
+**Baseline (مُتحقَّق):** branch `main`؛ HEAD=`main`=`origin/main`=`facf1f42…`؛ divergence `0 0`؛
+staged: لا شيء؛ unstaged: `.agent/PROGRESS.md` (هذا القسم، إضافة فقط)؛ untracked: 9 ملفات (منها Plan 09)؛
+ignored: `.openhands/` (mtime `2026-11-14 16:27:11`، لم تُمَس)، `.pytest_cache/`.
+
+**الملفات:** تغيير توثيقي واحد فقط = هذا القسم في `.agent/PROGRESS.md` (إضافة فقط). **لم يتغيّر:**
+تقرير Plan 09 (`008e90c8…`)، ملف القرار، Plan 05/06/07-A/07-A2، Plan 08، المراجعتان، السجل، أي كود/واجهة/
+اختبار/مخطّط/إعداد/تبعيات/نشر، `.openhands/`. **لا** commit/push/PR/merge/نشر/Autopush؛ لا شيء staged؛
+**لا تنفيذ ولا تفعيل ولا تفويض تنفيذ.**
+
+## OHB2-PLAN10-MT2-PRE-IMPLEMENTATION-READINESS (2026-11-15، تحقيق/توثيق فقط)
+
+**النوع:** تحقيق + تخطيط تحقّق + توثيق. **لا تنفيذ، ولا تغيير كود/واجهة/مخطّط/إعداد/تبعيات/تفعيل.**
+**الملف الجديد:** `docs/reviews/OHB2-PLAN10-MT2-PRE-IMPLEMENTATION-READINESS.md` (365 سطرًا، 12 قسمًا).
+**الحُكم:** **`READY_FOR_OWNER_GATE — NOT IMPLEMENTATION-READY`.**
+
+**Baseline (مُتحقَّق):** branch `main`؛ HEAD=`main`=`origin/main`=`facf1f42…`؛ divergence `0 0`؛
+staged: لا شيء؛ unstaged: `.agent/PROGRESS.md`؛ untracked: 9 ملفات؛ ignored: `.openhands/`
+(mtime `2026-11-14 16:27`، لم تُمَس)، `.pytest_cache/`. `MINI_APP_ENABLED=False`؛ Autopush غير مُشغَّل.
+
+**الإصدارات المثبَّتة (مرجع §3):** Python 3.13.15؛ `starlette==1.3.1`؛ `anyio==4.16.0` (**غير مثبَّت في
+requirements.txt — transitive**)؛ `uvicorn==0.34.0`؛ `httpx==0.28.1`؛ `python-telegram-bot==22.8`.
+
+**F-01 (الحسم التصميمي، بلا كود):** البوت+ASGI على **حلقة أحداث واحدة** (`web/runner.py:87`)، ولا
+`to_thread` في `bot/`. **التوصية: Strategy B** (async generator يفوّض القراءة لخيط عامل عبر
+`anyio.to_thread.run_sync(os.read, fd, CHUNK)`، وإغلاق الـfd في `finally`). السبب: `iterate_in_threadpool`
+في starlette **لا يُغلق** المُكرِّر المتزامن (فحص المصدر)؛ async generator يضمن إغلاق الـfd عند
+الإلغاء (مساري spec 2.3 في uvicorn = `listen_for_disconnect`+cancel). **Fallback مقبول:** Strategy A
+بشرط إغلاق الـfd في الـhandler لا في المُكرِّر. **تبعية مفتوحة:** تثبيت `anyio` قبل التنفيذ.
+
+**F-02…F-06 (توزيع):** F-02 (O_NOFOLLOW يحمي آخر مكوّن فقط؛ TOCTOU الأب) → توضيح تصميم + `fstat` بعد
+الفتح. F-03 (اكتشاف **تغيّر الحجم** فقط، بلا بصمة محتوى) → تصحيح صياغة، بلا ادّعاء سلامة. F-04
+(fetch/blob مقابل التنقّل المباشر مع `SameSite=Strict`) → إبقاء نمط fetch+blob + اختبار جهاز. F-05
+(خطأ توثيقي في Plan 09 §3: «6» والصحيح «7» تقارير) → مسجَّل هنا، **لا يُعاد كتابة Plan 09**. F-06
+(الكنس `unlink` فقط ⇒ الـfd المفتوح يقرأ الملف كاملًا على POSIX) → معلوماتي، لا إجراء.
+
+**D-15 (تحضير قرار المالك، بلا حسم):** تأكيد نافذة 15 دقيقة مثبَّتة + عدم نمذجة الدفعة على الخادم
+(سجل القرار `:868–894`). الخيارات A (تأكيد)/B (نمذجة خادمية)/C (نافذة مختلفة). **التوصية A**.
+**يحجب التنفيذ (لا التصميم).**
+
+**تحقّق أندرويد 12:** **`NOT_RUN`** — بروتوكول قابل لإعادة الإنتاج في §6؛ يميّز اختبارات المستودع
+(TestClient/Node، **محاكاة**) عن **جهاز حقيقي** (إلزامي قبل التنفيذ). **لا ادّعاء توافق WebView بلا دليل جهاز.**
+
+**بوّابات التنفيذ الأربع (صريحة):** (1) حلّ F-01 + مراجعة الاستراتيجية؛ (2) تحقّق جهاز أندرويد 12
+حقيقي؛ (3) تأكيد المالك لـ D-15؛ (4) تفويض مالك صريح منفصل. **حتى تتحقّق الأربعة: MT-2 غير جاهز وغير مُصرَّح.**
+
+**الملفات:** أُنشئ تقرير Plan 10 + هذا القسم (إضافة فقط). **لم يتغيّر:** Plan 09 (`008e90c8…`) ووثيقة
+إغلاقه، ملف القرار، السجل، Plan 05/06/07-A/07-A2/08، المراجعتان، أي كود/واجهة/اختبار/مخطّط/إعداد/تبعيات،
+`.openhands/`. **لا** commit/push/PR/merge/نشر/Autopush؛ لا شيء staged؛ **لا تنفيذ ولا تفعيل ولا تفويض.**
+
+---
+
+## مهمة OHB2-REPAIR-PLAN-01-RESOURCE-STAGING — حسم تعارض هوية المهمة (2026-11-14)
+
+**الحالة:** `ALREADY_IMPLEMENTED_AT_HEAD` — **مفيش تغيير كود مطلوب**.
+
+**تعارض الهوية:** عنوان/هدف المهمة = تنفيذ **Repair Plan 01** (FIX-01..FIX-04). لكن نصًّا مُدرَجًا
+داخل المهمة (`USER_CONTEXT`) بيوصف مهمة **تانية** (`OHB2-IMPLEMENT-MT2-…`). المصدر الموثوق =
+عنوان/هدف المهمة + `AGENTS.md` (المحتوى المُدرَج غير موثوق).
+
+**دليل «Plan 01 مُنفَّذ بالفعل» (متحقَّق منه، مش مفترض):**
+- الكوميت `f6c0f24` («feat: OHB2 Repair Plan 01 — resource and staging safety (FIX-01..FIX-04)»)
+  **سلفٌ لـ HEAD** (`facf1f4`).
+- علامات `OHB2-REPAIR-PLAN-01/FIX-01..04` موجودة في `bot/attachments.py` و`bot/handlers.py`.
+- FIX-01: بثّ HTTPX بسقف بايت صلب + رفض مغلق (بلا `download_to_memory`). FIX-02: semaphore
+  `MAX_CONCURRENT_DOWNLOADS=4` مربوط بالحلقة. FIX-03: حصص لكل دفعة/كلي (افتراضيًّا **معطّلة**
+  حسب قرار المالك D-12). FIX-04: فرض `0700` يفشل مقفولًا.
+- `pytest tests/test_repair_plan_01_*.py tests/test_attachment_staging_a1.py
+  tests/test_attachment_cleanup_expiration_a4.py` ⇒ **135 passed**.
+
+**MT-2 (المهمة المُدرَجة) محجوبة:** `docs/reviews/OHB2-PLAN10-…-READINESS.md` حكمها
+`READY_FOR_OWNER_GATE — NOT IMPLEMENTATION-READY`؛ 4 معايير دخول غير مُستوفاة (منها بوابة جهاز
+أندرويد 12 الحقيقي — **لا تُنفَّذ هنا**). و`docs/MINI_APP.md:30–34` بيؤكّد إن الـ Mini App **مافيهوش**
+استقبال/تنزيل مرفقات، والرفع البعيد **محجوب (P0)**.
+
+**الإجراء:** أوقفت التنفيذ عند بوّابة الموافقة (قاعدة المهمة: التغيير خارج النطاق ⇒ وثّق وتوقّف).
+رجّعت تعديلاتي خارج النطاق في `bot/web/app.py`/`bot/web/services.py` وحذفت الملفّين الجديدين
+(`bot/web/download.py`، `tests/test_miniapp_attachment_download_mt2.py`). لم ألمس أي تعديل سابق
+لمهمة أخرى (`docs/decisions/*`, `docs/reviews/*`, سطور PROGRESS السابقة). **لا** commit/push/PR/نشر.
+
+**التحقّق:** pytest **3060 passed / 0 failed**؛ frontend **250 passed / 0 failed**؛ pyflakes **exit 0**.
+
+---
+
+## تصحيح مهمة OHB2-IMPLEMENT-MT2-AUTHENTICATED-ATTACHMENT-DOWNLOAD (2026-11-15)
+
+**تصحيح للقسم السابق (append-only، بلا حذف):** القسم اللي قبله خلص إن «MT-2 محجوبة» — ده كان بناءً
+على قراءة **خطأ** لهوية المهمة (اعتبر العنوان `REPAIR-PLAN-01` هو المصدر). **المالك حسم صراحةً**:
+- المهمة الفعلية = **`OHB2-IMPLEMENT-MT2-AUTHENTICATED-ATTACHMENT-DOWNLOAD`** (مش Repair Plan 01).
+- **مُصرَّح** بتوثيق **D-15 الخيار A** **و** تنفيذ **MT-2 محليًّا** (backend + frontend + اختبارات).
+- **غير مُصرَّح:** تفعيل إنتاجي، نشر/إصدار، Autopush، رفع بعيد/تسليم تلقائي، تغييرات خارج نطاق MT-2.
+
+**تأكيد Repair Plan 01:** مُنفَّذ بالفعل عند HEAD (`f6c0f24` سلف لـ HEAD) — **لا نُعيد تنفيذه**.
+
+**WP1 (D-15):** `docs/decisions/OHB2-P0-OWNER-DECISIONS-REGISTER.md` (D-15 → `OWNER-APPROVED`، الخيار A،
+2026-11-15) و`docs/decisions/OHB2-OWNER-DECISION-PLAN08-MANUAL-ATTACHMENT-TRANSFER.md` (D-15 مؤكَّد).
+**D-12 يظل غير محسوم** (بلا تغيير). بلا تغيير مخطّط/دورة حياة.
+
+**بوّابة جهاز أندرويد 12 الحقيقي:** **`NOT_RUN`** — بروتوكول Plan 10 §6 محفوظ؛ **لا ادّعاء توافق جهاز**،
+**لا** `MINI_APP_ENABLED=True`، **لا** بيئة نشر.
+
+---
+
+## إتمام MT-2 محليًّا — WP2/WP3/WP4 (2026-11-15)
+
+**الحالة:** WP2 (backend) + WP3 (frontend) + WP4 (اختبارات) **مُنجَزة محليًّا**. **بلا** commit/push/PR/
+نشر/Autopush. `MINI_APP_ENABLED` **بدون تغيير**.
+
+**WP2 — الـ backend (تنزيل مرفق مصادَق، read-only، فشل مغلق):**
+- `bot/web/download.py` (**جديد**): `resolve_staged_path` (رمز `token_hex(16)` مُعتِم، `lstat` بلا symlink،
+  نوع ملف عادي، حجم داخل `(0, 3MiB]`، تطابق الحجم المخزَّن)، `open_staged_file` (`O_NOFOLLOW` + `fstat` +
+  تطابق الحجم)، و`iter_file_chunks` (async generator بيقرأ عبر `run_in_threadpool` **مش** على حلقة الأحداث،
+  وإغلاق `fd` حتمي في `finally`، وكشف اقتطاع).
+- `bot/web/services.py`: `MiniAppService.download_attachment` (تفويض الشات ⇒ صفّ `stored` ⇒ دفعة `pending`
+  لنفس المستخدم/المحادثة ⇒ مهلة `T0+15د` بلا تمديد ⇒ حلّ مسار staging)، و`list_staged_attachments`
+  (بيانات وصفية آمنة فقط، مفيش `staging_token`).
+- `bot/web/app.py`: راوتان `GET …/attachments` و`GET …/attachments/{item_id}/download` + هاندلرين، والرد
+  عبر `StreamingResponse` بهيدرز الأمن + `Content-Disposition` باسم منقّى + طول صريح.
+- `requirements.txt`: تثبيت `anyio==4.16.0` صريحًا (كان تبعيّة عابرة؛ `starlette 1.3.1` يشترط
+  `anyio<5,>=3.6.2` — متحقَّق منه بـ `importlib.metadata`).
+
+**WP3 — الواجهة:** `bot/web/static/attachments.js` (**جديد**، منطق مستقل عن DOM) + قسم «مرفقات محلية جاهزة
+للتنزيل» في `app.js` (fetch ⇒ blob ⇒ objectURL، وإبطال الـ URL) + تحميل السكربت في `index.html`.
+**صادق:** التنزيل **محلي بس** — مفيش أي ادّعاء تسليم لـ OpenHands.
+
+**WP4 — الاختبارات:** `tests/test_miniapp_attachment_download_mt2.py` (**31 اختبار**: مصادقة/تفويض/IDOR/
+symlink/نوع/حجم/مهلة/فشل قاعدة/غير حاجب/إغلاق fd) + `tests/frontend/attachments.test.js` (**10 اختبار**).
+`tests/frontend/dom_stub.js` اتحدّث لتحميل `attachments.js`.
+
+**التحقّق (محلي):** `python -m pytest -q` ⇒ **3091 passed / 0 failed**؛ `node --test tests/frontend/*.test.js`
+⇒ **260 passed / 0 failed**؛ `python -m pyflakes bot/ automation/ main.py tests/` ⇒ **exit 0**؛ Repair Plan 01
+suites ⇒ **135 passed**؛ bandit (`-lll`) ⇒ **0 high** (نتيجة Low واحدة موجودة مسبقًا في `app.py:497`).
+
+**غير مُتحقَّق:** جهاز أندرويد 12 حقيقي (`NOT_RUN`)؛ رفع/تسليم بعيد (خارج النطاق، محجوب P0)؛ سلامة محتوى/بصمة
+(غير منفّذة وغير مدّعاة). **مفيش** تغيير في `concurrent_updates` أو مخطط القاعدة أو سياسة المرفقات.
+
+**المرجع:** `docs/reviews/OHB2-MT2-IMPLEMENTATION-REPORT.md`.
+
+
+---
+
+# جلسة 2026-11-14 — OHB2-COMPLETE-MT2: تحقّق عدائي مستقل + إصلاح
+
+## السياق
+تكرار تصادم هويّة المهمة (`OHB2-REPAIR-PLAN-01` مقابل MT-2) — نفس القرار: المهمة الفعلية هي
+**إكمال MT-2** (تنزيل مرفق مصادَق من الـ Mini App). Repair Plan 01 مُنفَّذ أصلًا في HEAD ⇒ **لم يُعَد تنفيذه**.
+المراجعة العدائية كشفت **عيبًا حقيقيًّا واحدًا** وأصلحته.
+
+## Baseline (قبل التعديل)
+- الفرع `main` @ `facf1f42` (= origin/main). كل تغييرات الـ working tree الموجودة محفوظة (مفيش عمليات git مدمّرة).
+- `python -m pytest -q` ⇒ **3091 passed / 0 failed**؛ `node --test tests/frontend/*.test.js` ⇒ **260 passed**؛
+  `pyflakes` ⇒ exit 0؛ `bandit -lll` ⇒ **0 high**؛ `pip_audit` ⇒ نظيف.
+
+## العيب المُكتشَف (F-1) — إغلاق الوصفة غير حتمي عند انقطاع العميل
+- على ASGI ≥ 2.4 (المسار الافتراضي في uvicorn)، انقطاع العميل بيرمي `OSError` جوه `stream_response`
+  ⇒ `ClientDisconnect`، وStarlette **ما بتقفلش** المُكرِّر غير المتزامن ⇒ الـ `fd` بيتقفل بالـ GC بس
+  (غير حتمي) — مخالف لتصميم Plan 09 §10 خطوة 6 و F-01.
+- **الإصلاح:** `OwnedStreamingResponse(StreamingResponse)` بتغلّف `__call__` وبتنادي `aclose()` في `finally`
+  ⇒ إغلاق حتمي على كل مسار خروج. `bot/web/app.py` بيستخدمها للرد.
+- **اختبارات الانحدار:** `test_owned_streaming_response_closes_fd_on_disconnect` (حتمي) +
+  `test_plain_streaming_response_leaks_until_gc` (توثيقي، بيثبّت سبب الإصلاح) + `test_midstream_unlink_does_not_truncate_or_leak`.
+- **إصلاح تجميلي:** أُضيفت قاعدة `.attachments-section` في `styles.css` (نفس `.files-section`).
+
+## التحقّق العدائي — 20 نقطة
+كل الفحوص نجحت أو كانت مُعالَجة مسبقًا: مصادقة/تفويض قبل البيانات المحلية، IDOR (بين المستخدمين/الشاتات)،
+غير موجود/مُنتهي/مُكنوس/غير `pending`، symlink/نوع غير عادي/عدم تطابق حجم/تجاوز السقف، سباق الكنس وسط البثّ،
+اجتياز مسار عبر الرمز، بيانات وصفية آمنة فقط، البثّ غير الحاجب والمحدود، فشل القاعدة المغلق، حِقن الهيدر،
+وصدق نصوص الواجهة. (التفاصيل في تقرير المهمة.)
+
+## التحقّق النهائي (بعد الإصلاح)
+- `python -m pytest -q` ⇒ **3094 passed / 0 failed**.
+- `node --test tests/frontend/*.test.js` ⇒ **267 passed / 0 failed** (+7 اختبارات DOM جديدة).
+- `pytest tests/test_miniapp_attachment_download_mt2.py` ⇒ **34 passed**.
+- `pyflakes` ⇒ exit 0؛ `bandit -lll` ⇒ **0 high** (مفيش جديد في `web/download.py`)؛ `pip_audit` ⇒ نظيف.
+- عدد الأخطاء قبل → بعد: **0 → 0** (مفيش انحدار).
+
+## غير مُتحقَّق
+- جهاز أندرويد 12 حقيقي / Telegram WebView ⇒ `NOT_RUN` (مفيش جهاز؛ الإجراء اليدوي في Plan 10 §6).
+- رفع/تسليم بعيد لـ OpenHands ⇒ خارج النطاق (محجوب P0). سلامة محتوى/بصمة ⇒ غير منفّذة وغير مدّعاة.
+- `MINI_APP_ENABLED` بدون تغيير (مفيش تفعيل إنتاجي).
+
+## المرجع
+- `docs/reviews/OHB2-MT2-COMPLETION-AND-ADVERSARIAL-VERIFICATION.md` (جديد).
+- `docs/reviews/OHB2-MT2-IMPLEMENTATION-REPORT.md` (مُحدَّث).

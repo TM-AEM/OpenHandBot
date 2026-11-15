@@ -27,12 +27,14 @@ Telegram WebView ──HTTPS──▶ ingress (TLS) ──HTTP──▶ الحا
 
 ## 2. التبعيات
 
-> **ملاحظة نطاق المرفقات (مهم):** الـ Mini App **مافيهوش** استقبال مرفقات ولا رفع ملفات
-> لـ OpenHands. مسارات `…/files` و`…/file` (تحت) هي **قراءة فقط** لقايمة ملفات **موجودة
-> أصلًا** في محادثة (بمعاينة نصية)، مش رفع. استقبال **المستندات** الوارد من تيليجرام بيحصل
-> في **البوت** (`handle_attachment`) وبيخزّن الملف **محليًّا** فقط (staging تحت دورة حياة
-> A4) — **مفيش تسليم/رفع بعيد**، ومفيش وعد بيه في أي رد. رفع المرفقات البعيد **محجوب** (P0
-> `BLOCKED`؛ انظر `docs/proposals/OHB2-AGENT-SERVER-FILE-UPLOAD-ARCHITECTURE.md` §§26–27
+> **ملاحظة نطاق المرفقات (مهم):** الـ Mini App **مافيهوش** رفع ملفات لـ OpenHands.
+> مسارات `…/files` و`…/file` (تحت) هي **قراءة فقط** لقايمة ملفات **موجودة أصلًا** في
+> محادثة (بمعاينة نصية)، مش رفع. استقبال **المستندات** الوارد من تيليجرام بيحصل في
+> **البوت** (`handle_attachment`) وبيخزّن الملف **محليًّا** فقط (staging تحت دورة حياة
+> A4). مسارات `…/attachments` و`…/attachments/{item_id}/download` (MT-2) بتنزّل
+> **نسخة محلية** من الـ staging للجهاز — تنزيل محلي **بس**، **مفيش** تسليم/رفع بعيد،
+> ومفيش وعد بيه في أي رد. رفع المرفقات البعيد **محجوب** (P0 `BLOCKED`؛ انظر
+> `docs/proposals/OHB2-AGENT-SERVER-FILE-UPLOAD-ARCHITECTURE.md` §§26–27
 > و`README.md` «حالة P0»).
 
 | الحزمة | الإصدار | ليه |
@@ -79,6 +81,8 @@ Telegram WebView ──HTTPS──▶ ingress (TLS) ──HTTP──▶ الحا
 | `/api/v1/conversations/{id}/cost` | GET | كوكي | لأ | تكلفة/استهلاك شات (من نفس نداء التفاصيل) |
 | `/api/v1/conversations/{id}/reply` | GET | كوكي | لأ | الرد الكامل للـ assistant (`reply` + `reply_truncated`) — مصدر زر «نسخ الرد الكامل» |
 | `/api/v1/conversations/{id}/export` | GET | كوكي | لأ | تنزيل تصدير الشات (zip، نفس صيغة البوت، حد صلب) |
+| `/api/v1/conversations/{id}/attachments` | GET | كوكي | لأ | قايمة **المرفقات المحلية المخزَّنة** القابلة للتنزيل (بيانات وصفية آمنة فقط: `item_id`، اسم منقّى، حجم، ثوانٍ متبقّية) — MT-2 |
+| `/api/v1/conversations/{id}/attachments/{item_id}/download` | GET | كوكي | لأ | تنزيل مرفق مصادَق من الـ staging المحلي (بثّ محدود غير حاجب) — MT-2 |
 | `/api/v1/conversations/{id}/files` | GET | كوكي | لأ | قايمة ملفات الشات (allowlist + تصريح) |
 | `/api/v1/conversations/{id}/file` | GET | كوكي | لأ | معاينة نصية محدودة لملف (`?path=`) |
 | `/api/v1/conversations/{id}/prompt` | POST | كوكي | ✔ | `{"text": "...", "client_ref": "..."}` ⇒ يسجّل البرومت في الصندوق |

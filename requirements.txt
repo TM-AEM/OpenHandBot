@@ -3,3 +3,7 @@ httpx==0.28.1
 python-dotenv==1.2.4
 starlette==1.3.1
 uvicorn==0.34.0
+# OHB2-MT-2 (Plan 10 §3.1): `anyio` كان تبعيّة عابرة غير مثبَّتة، ومسار بثّ التنزيل
+# بيعتمد على `anyio.to_thread.run_sync` (عبر `starlette.concurrency.run_in_threadpool`).
+# نثبّته صريحًا عند النسخة المُختبَرة لتثبيت العقد (starlette 1.3.1 يشترط anyio >=3.6.2,<5).
+anyio==4.16.0

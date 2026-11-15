@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from datetime import datetime, timezone
 
 from ..errors import ApiError, ResponseTooLargeError
 from ..messages import get_status, pr_url, state_label, truncate
@@ -22,7 +23,10 @@ from .. import features
 from .. import outbox
 from .. import deletion
 from .. import db as db_module
+from ..attachments import MAX_ATTACHMENT_BYTES, batch_deadline, staging_root_for
 from ..db import (
+    ATTACHMENT_BATCH_PENDING,
+    ATTACHMENT_ITEM_STORED,
     INBOX_DELETE_DELETED,
     INBOX_DELETE_MISSING,
     INBOX_PAGE_SIZE,
@@ -40,6 +44,12 @@ from ..files import (
     file_status_message,
     is_safe_workspace_path,
     is_valid_conversation_id,
+)
+from .download import (
+    AttachmentDownload,
+    AttachmentDownloadError,
+    resolve_staged_path,
+    safe_download_filename,
 )
 
 log = logging.getLogger(__name__)
@@ -744,6 +754,120 @@ class MiniAppService:
                 "too_large", "التصدير كبير أوي للتنزيل الآمن. جرّب شات أصغر.", 413
             )
         return data, export_filename(cid)
+
+    async def download_attachment(
+        self, conversation_id: str, item_id: str, telegram_id: int
+    ) -> AttachmentDownload:
+        """OHB2-MT-2: حلّ تنزيل مرفق مصادَق من الـ staging المحلي (read-only).
+
+        `telegram_id` هو معرّف المستخدم **من الجلسة المصادَقة** (سيرفر-موثوق)، مش من
+        العميل. الترتيب الإلزامي (كل خطوة فشل مغلق، بلا تفاصيل داخلية):
+
+        1. تفويض ملكية الشات (نفس عقد كل مسارات الشات) **قبل** أي بيانات محلية.
+        2. حلّ العنصر: `item_id` المُعتِم ⇒ صفّ عنصر `stored`، ودفعته `pending` لنفس
+           المستخدم والمحادثة، و`T0 + 15د > now` (D-15: بلا تمديد). أي عدم تطابق ⇒ 404
+           (ما نكشفش الفرق بين «مش بتاعك» و«مش موجود»).
+        3. حلّ مسار الـ staging من الرمز المُعتِم داخل الجذر، `lstat` بلا symlink، ملف
+           عادي بحجم داخل الحد. **مفيش** مسار من العميل.
+
+        البثّ الفعلي (قراءة على خيط عامل + إغلاق حتمي) في `bot.web.download`.
+        """
+        cid = _require_id(conversation_id)
+        if not isinstance(item_id, str) or not (1 <= len(item_id) <= 64):
+            raise CodedApiError("not_found", "المرفق مش موجود.", 404)
+        db = self._db
+        if db is None:
+            # بدون قاعدة (وضع مستقل) مفيش مرفقات محلية ⇒ فشل مغلق.
+            raise ApiError("المرفقات مش متاحة دلوقتي.", 503)
+        # (1) تفويض الشات أولًا (ملكية + شاهد الحذف المحلي).
+        await self._authorize_conversation(cid)
+        # (2) حلّ العنصر ودفعته + فرض المستخدم/المحادثة/الحالة/المهلة.
+        try:
+            item = db.get_attachment_item(item_id)
+        except Exception as exc:  # noqa: BLE001 — أي فشل قاعدة ⇒ فشل مغلق (مفيش تفاصيل)
+            log.warning("تعذّر قراءة عنصر المرفق؛ بنرفض (فشل مغلق).")
+            raise ApiError("المرفقات مش متاحة دلوقتي.", 503) from exc
+        if item is None or item.status != ATTACHMENT_ITEM_STORED:
+            raise CodedApiError("not_found", "المرفق مش موجود.", 404)
+        try:
+            batch = db.get_attachment_batch(item.batch_id, telegram_id=int(telegram_id))
+        except Exception as exc:  # noqa: BLE001 — فشل قاعدة ⇒ فشل مغلق
+            log.warning("تعذّر قراءة دفعة المرفق؛ بنرفض (فشل مغلق).")
+            raise ApiError("المرفقات مش متاحة دلوقتي.", 503) from exc
+        if (
+            batch is None
+            or batch.conversation_id != cid
+            or batch.status != ATTACHMENT_BATCH_PENDING
+        ):
+            # دفعة مش بتاعة المستخدم/الشات، أو مش `pending` ⇒ 404 (بلا كشف فرق).
+            raise CodedApiError("not_found", "المرفق مش موجود.", 404)
+        deadline = batch_deadline(batch.t0)
+        if deadline is None or datetime.now(timezone.utc) > deadline:
+            # مهلة 15 دقيقة منتهية (أو `t0` غير صالح) ⇒ 410 (فشل مغلق، بلا تمديد).
+            raise CodedApiError(
+                "expired", "الملف المحلي مش متاح (انتهت الـ 15 دقيقة).", 410
+            )
+        # (3) حلّ مسار الـ staging الآمن من الرمز المُعتِم (مفيش مسار من العميل).
+        try:
+            path, size = resolve_staged_path(
+                staging_root_for(self._config.db_path),
+                item.staging_token,
+                expected_size=item.size_bytes,
+                max_bytes=MAX_ATTACHMENT_BYTES,
+            )
+        except AttachmentDownloadError as exc:
+            raise CodedApiError(exc.code, exc.message, exc.status_code) from exc
+        return AttachmentDownload(
+            path=path,
+            filename=safe_download_filename(item.display_name),
+            size_bytes=size,
+        )
+
+    async def list_staged_attachments(
+        self, conversation_id: str, telegram_id: int
+    ) -> dict:
+        """OHB2-MT-2: قايمة المرفقات **المخزَّنة محليًّا** القابلة للتنزيل لشات مصرّح به.
+
+        read-only، مصادَقة، وتفشل مقفولة. بترجّع بيانات وصفية آمنة فقط (`item_id` المُعتِم،
+        اسم عرض منقّى، الحجم، والثواني المتبقّية) — **مفيش** `staging_token` ولا مسار ولا
+        محتوى. القايمة فاضية لو مفيش دفعة `pending` حيّة أو فاتت مهلة الـ 15 دقيقة (D-15،
+        بلا تمديد). أي فشل قاعدة ⇒ فشل مغلق (قايمة فاضية، بلا كشف تفاصيل).
+        """
+        cid = _require_id(conversation_id)
+        db = self._db
+        if db is None:
+            return {"items": []}
+        await self._authorize_conversation(cid)
+        try:
+            batch = db.latest_pending_attachment_batch(int(telegram_id), cid)
+        except Exception:  # noqa: BLE001 — فشل قاعدة ⇒ فشل مغلق (قايمة فاضية)
+            log.warning("تعذّر قراءة دفعة المرفقات؛ بنرجّع قايمة فاضية (فشل مغلق).")
+            return {"items": []}
+        if batch is None:
+            return {"items": []}
+        deadline = batch_deadline(batch.t0)
+        now = datetime.now(timezone.utc)
+        if deadline is None or now > deadline:
+            return {"items": []}
+        remaining = max(0, int((deadline - now).total_seconds()))
+        try:
+            items = db.list_attachment_items(batch.batch_id)
+        except Exception:  # noqa: BLE001 — فشل قاعدة ⇒ فشل مغلق
+            log.warning("تعذّر قراءة عناصر المرفقات؛ بنرجّع قايمة فاضية (فشل مغلق).")
+            return {"items": []}
+        out = []
+        for it in items:
+            if it.status != ATTACHMENT_ITEM_STORED:
+                continue
+            out.append(
+                {
+                    "item_id": it.item_id,
+                    "display_name": safe_download_filename(it.display_name),
+                    "size_bytes": int(it.size_bytes or 0),
+                    "expires_in": remaining,
+                }
+            )
+        return {"items": out, "expires_in": remaining}
 
     async def associate_repository(self, conversation_id: str, repository: str) -> dict:
         """يربط مستودع بشات موجود (OHB2: إدارة الشاتات).
