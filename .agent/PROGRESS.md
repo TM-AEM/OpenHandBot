@@ -3916,3 +3916,102 @@ suites ⇒ **135 passed**؛ bandit (`-lll`) ⇒ **0 high** (نتيجة Low وا�
 ## المرجع
 - `docs/reviews/OHB2-MT2-COMPLETION-AND-ADVERSARIAL-VERIFICATION.md` (جديد).
 - `docs/reviews/OHB2-MT2-IMPLEMENTATION-REPORT.md` (مُحدَّث).
+
+---
+
+# جلسة 2026-11-15 — OHB2-PLAN01-REMAINING-AND-PLAN02-REMOTE-ATTACHMENT-DELIVERY
+
+## خط الأساس وحالة البيئة
+- مجلد `.git` غير موجود في لقطة مساحة العمل (`git` غير متاح محليًّا)؛ خط الأساس التاريخي الموثَّق: `facf1f42578a20a4a37e220eca016ce3d534e750` وإكمال Plan 01 المبلَّغ عند `f6c0f24`.
+- بيئة بايثون المحلية: `Python 3.10.12` (stdlib فقط — `pytest`, `pyflakes`, `bandit`, `pip_audit`, `httpx`, `telegram`, `starlette`, `dotenv` غير مثبّتة محليًّا). اختبارات الواجهة `node --test tests/frontend/*.test.js` متاحة.
+
+## Plan 01 (`OHB2-REPAIR-PLAN-01-RESOURCE-STAGING`) — التحقّق والإصلاح والإغلاق (`PASS_WITH_NOTES`)
+- تحقّقنا من الكود الفعلي لـ `FIX-01..FIX-04` و`LIFE-01..LIFE-02` (`bot/attachments.py`, `bot/handlers.py`, `bot/db.py`, `bot/app.py`, `bot/watcher.py`, `bot/config.py`) مع حفظ ثوابت `D-12` (معطّلة افتراضيًّا)، `D-15` (15 دقيقة ثابتة)، `D-33..D-35`، وملكية `OutboxWorker`/`Database` الوحيدة.
+- أُصلح عيبان مؤكّدان في `bot/attachments.py` وتطبيع هيدر في `bot/handlers.py`:
+  1. `StagingStore._write_to_path`: إغلاق `fd` حتميًّا عند فشل `os.fdopen(fd, "wb")` قبل `_safe_unlink(path)`.
+  2. `StagingStore.store`: التقاط أخطاء قاعدة البيانات غير `OSError` داخل `_effective_cap(batch_id)` وإرجاع `StageStatus.DB_FAILED` (فشل مغلق).
+  3. `bot/handlers.py:_download_attachment_chunks`: تطبيع مسافات `Content-Encoding` (`strip().lower()`) بتناسق مع `openhands_client._content_encoding`.
+- أُضيفت 3 اختبارات انحدار في `tests/test_repair_plan_01_review_findings.py`.
+
+## Plan 02 (`OHB2-PLAN-12-P0-REMOTE-ATTACHMENT-UPLOAD`) — التصميم والأمان والمصالحة (`BLOCKED`)
+- حُدّث `docs/decisions/OHB2-P0-OWNER-DECISIONS-REGISTER.md` (ملحق `§13`, append-only): تسوية الحصيلة (**35** قرارًا = **13** محسومًا + **22** مفتوحًا) مع بطاقات الحقول العشرة لكل القرارات الحاجزة.
+- حُدّث `docs/proposals/OHB2-AGENT-SERVER-FILE-UPLOAD-ARCHITECTURE.md` (ملحق `§28`, append-only): جدول الهوية، حدود Cloud V1 (`1.92.0`) مقابل Agent Server (`0.1.0`)، دفاع SSRF/IP-pinning/TLS/Secret isolation، حصر المسار والسلامة (`fstat` + `SHA-256`)، التصنيف الصادق (`TRANSPORT_ACCEPTED_UNVERIFIED` مقابل `REMOTELY_VERIFIED`)، ونموذج المصالحة داخل `OutboxWorker` وتقييم فجوات المخطط بدون تعديل القاعدة.
+- أُنشئ `docs/reviews/OHB2-PLAN12-P0-REMOTE-UPLOAD-DESIGN-AND-SECURITY-REVIEW.md`.
+- **لم يُنفَّذ** أي رفع بعيد أو تعديل مخطّط أو تفعيل `MINI_APP_ENABLED` أو `Autopush` أو استدعاء إنتاجي أو commit/push.
+- **مراجعة مستقلة (Phase J):** `INDEPENDENT_REVIEW_NOT_RUN` (مراجعة ذاتية فقط).
+
+---
+
+# جلسة 2026-11-15 — OHB2-PLAN01-PLAN02-REMAINING-CODE-REPAIR-AND-COMPLETION
+
+## خط الأساس وحالة Git
+- مجلد `.git` غائب في مساحة العمل؛ حالة Git (الفرع/HEAD/remote) **UNVERIFIED**.
+- تحقّقنا بالفحص الساكن المباشر من وجود تعديلات الجلسة السابقة على القرص في `bot/attachments.py`، `bot/handlers.py`، `tests/test_repair_plan_01_review_findings.py`، `docs/decisions/OHB2-P0-OWNER-DECISIONS-REGISTER.md` (الحصيلة الفعلية: **35** قرارًا = **13** محسومًا `OWNER-APPROVED` + **22** مفتوحًا)، `docs/proposals/OHB2-AGENT-SERVER-FILE-UPLOAD-ARCHITECTURE.md`، `docs/reviews/OHB2-PLAN12-P0-REMOTE-UPLOAD-DESIGN-AND-SECURITY-REVIEW.md`.
+
+## إصلاحات Plan 01 الإضافية المُنفَّذة في هذه المهمة
+1. `bot/attachments.py:extension_of`: تطبيع محارف التحكّم (`ch >= " " and ch != "\x7f"`) والنقاط/المسافات الطرفية (`strip().rstrip(" .")`) قبل استخراج الامتداد دون قصّ الطول إلى 200 حرف، لإغلاق ثغرة تجاوز `_DENIED_EXTENSIONS` بأسماء مثل `evil.exe.` أو `run.sh.. ` أو `payload.py\x07` بينما كان `sanitize_display_name` يزيل النقاط الطرفية ومحارف التحكّم.
+2. `bot/attachments.py:AttachmentReaper.sweep` / `_sweep_orphan_items` / `_scan_root_untracked`:
+   - حفظ أعداد `errors`/`skipped` السابقة عند الفشل المبكّر لـ `list_expired_pending_attachment_batches` (`report["errors"] += 1; return SweepReport(**report)` بدل `SweepReport(errors=1)`).
+   - تمرير `report` إلى `_sweep_orphan_items` و`_scan_root_untracked` وتسجيل `report["errors"] += 1` عند فشل `list_all_attachment_batches` أو `list_attachment_items_by_status` أو `root.iterdir()`، لمنع `OpportunisticSweeper` من تقديم `last_success_at` كنجاح كاذب مع `errors=0`.
+3. `bot/handlers.py:_download_attachment_chunks`: استبدال `file_path[:7] in ("http://", "https:/")` بـ `file_path.startswith(("http://", "https://"))` لمنع تصنيف مسار غير صالح مثل `https:/...` كرابط HTTP.
+
+## الاختبارات المُضافة (`NOT RUN`)
+- أُضيفت 4 اختبارات انحدار في `tests/test_repair_plan_01_review_findings.py` (جميعها **`NOT RUN`**؛ لم يُشغَّل أي اختبار أو linter أو مترجم أو بناء في هذه المهمة التزامًا بقيود المهمة):
+  - `test_extension_of_blocks_trailing_dot_and_control_char_bypass` (`NOT RUN`)
+  - `test_reaper_sweep_records_error_when_orphan_item_query_fails` (`NOT RUN`)
+  - `test_reaper_sweep_preserves_prior_errors_when_expired_query_fails` (`NOT RUN`)
+  - `test_download_chunks_does_not_treat_single_slash_https_as_url` (`NOT RUN`)
+
+## حالة Plan 02 (`OHB2-PLAN-12-P0-REMOTE-ATTACHMENT-UPLOAD`)
+- لم يُنفَّذ أي كود رفع بعيد أو عميل افتراضي أو تعديل مخطّط SQLite أو عامل جديد أو تفعيل `MINI_APP_ENABLED` أو `D-12` quotas؛ كل بنود التنفيذ الفعلي للرفع البعيد والمصالحة والتحقق البعيد تظل محجوبة بـ `B1`/`B2` والقرارات المفتوحة (`22` قرارًا) والمراجعة الأمنية المستقلة (`D-19`).
+
+---
+
+# جلسة 2026-11-15 — OHB2-FINAL-CLOSURE-PLAN01-PLAN02
+
+## خط الأساس وحالة Git والقيود
+- مجلد `.git` غائب في مساحة العمل -> حالة Git **UNVERIFIED** (بلا تهيئة Git أو commit/push/PR/نشر).
+- سياسة التنفيذ: **لم يُنفَّذ أي اختبار أو lint أو أمن أو بناء أو تشغيل** (`NOT RUN` بالكامل).
+- **`INDEPENDENT_REVIEW_NOT_RUN`** (مراجعة ذاتية وتدقيق كود ساكن فقط؛ بوّابة `D-19` مفتوحة).
+
+## إصلاحات Plan 01 النهائية على القرص (`bot/attachments.py`, `bot/handlers.py`)
+1. **`bot/handlers.py` (`_classify_telegram_file_path` + `_download_attachment_chunks`):** تصنيف حتمي مغلق عبر `urllib.parse.urlsplit` + تعبير مخطّط URI؛ يرفض المسارات الفارغة/بايت NUL، والمخطّطات غير `http(s)` (`ftp://`, `file://`, `data:`, `javascript:`)، والروابط المشوّهة (`https://`, بلا host، بورت غير صالح، مسافات/تحكّم، `https:/...`) بـ `StagingError` قبل `os.path.isfile` أو `client.stream`.
+2. **`bot/attachments.py` (`sanitize_display_name`, `extension_of`):** تطبيع `unicodedata.normalize("NFKC", ...)` وإزالة محارف الفئة `C*` (`Cc` بما فيها C1 و`Cf` الخفيّة/bidi مثل `\u200b`, `\u202e`) قبل استخراج الامتداد لإغلاق تفاوت حظر الامتداد مع `bot/web/download.py:safe_download_filename`.
+3. **`bot/attachments.py` (`AttachmentReaper.sweep`, `_sweep_orphan_items`, `_count_unsafe_entries`):** تمرير `report` إلى `_count_unsafe_entries` ورصد `report["errors"] += 1` + تسجيل تحذير عند فشل `root.iterdir()` أو عند رمي استثناء من `mark_attachment_item_reaped` داخل `_sweep_orphan_items`.
+
+## الاختبارات المضافة (`NOT RUN`)
+- `tests/test_repair_plan_01_review_findings.py`:
+  - `test_extension_of_blocks_unicode_format_c1_and_fullwidth_bypass` (`NOT RUN`)
+  - `test_download_chunks_rejects_malformed_urls_and_non_http_schemes` (`NOT RUN`)
+  - `test_reaper_sweep_records_errors_on_unsafe_scan_and_orphan_mark_failure` (`NOT RUN`)
+
+## الإغلاق الوثائقي لـ Plan 02 (`docs/decisions/OHB2-P0-OWNER-DECISIONS-REGISTER.md` §13.3–§13.4, `docs/proposals/OHB2-AGENT-SERVER-FILE-UPLOAD-ARCHITECTURE.md` §28.6, `docs/reviews/OHB2-PLAN12-P0-REMOTE-UPLOAD-DESIGN-AND-SECURITY-REVIEW.md` §11)
+- تثبيت تسوية نطاقي `D-12` مع بقاء `### D-12` تاريخيًا `غير محسوم`.
+- تثبيت التصنيف الرباعي للحواجز: `BLOCKED_BY_PROVIDER`، `BLOCKED_BY_OWNER_DECISION` (22 قرارًا تشمل إضافات مخطّط SQLite)، `BLOCKED_BY_ARCHITECTURE`، و`BLOCKED_BY_RELEASE_GATE` (`D-19`).
+- النتيجة الرسمية: **`PLAN01_IMPLEMENTATION_COMPLETE_PENDING_VERIFICATION`** و**`PLAN02_INVESTIGATION_AND_DESIGN_CLOSED_REMOTE_DELIVERY_BLOCKED`** و**`ZERO_REMOTE_UPLOAD_ITEMS_IMPLEMENTABLE_UNDER_CURRENT_PROVIDER_CONTRACT_AND_OWNER_APPROVALS`**.
+
+---
+
+# جلسة 2026-11-15 — OHB2-FINAL-EXECUTION-AND-CLOSURE-PLAN01-PLAN02
+
+## خط الأساس وحالة Git والبيئة
+- مجلد `.git` غائب في مساحة العمل -> حالة Git **UNVERIFIED** (بلا تهيئة Git أو commit/push/PR/deploy).
+- بيئة التشغيل: Python `3.10.12` (stdlib فقط؛ حزم `pytest`/`pyflakes`/`bandit`/`pip_audit`/`telegram`/`httpx`/`starlette`/`dotenv` و`pip` غير موجودة، وتثبيت التبعيات محظور). `node` `v22.23.2` متاح (لم تُمس ملفات الواجهة).
+- **المراجعة المستقلة:** **`INDEPENDENT_REVIEW_NOT_AVAILABLE`** (لا توجد أداة وكيل/جلسة مراجعة منفصلة في هذه البيئة؛ لم تُصطنع أو تُحاكَ).
+
+## الإصلاحات النهائية لـ Plan 01 (`bot/handlers.py`, `bot/attachments.py`, `tests/test_repair_plan_01_review_findings.py`)
+1. `bot/handlers.py:_classify_telegram_file_path`: تغليف `urlsplit(file_path)` و`parts.hostname` و`parts.port` داخل `try ... except ValueError` لرفض عناوين IPv6 المشوّهة مثل `https://[::1/a` و`http://[` بـ `StagingError` مغلق بدل `ValueError` غير مُلتقَط، ورفض مسارات `//...` النسبية للبروتوكول بـ `StagingError`.
+2. `bot/attachments.py:_is_denied_extension`: توسيع الفحص ليشمل `extension_of(sanitize_display_name(name))` (منع كشف الامتداد بعد القصّ إلى 200 حرف مثل `("a"*196)+".sh.txt"`) وإسقاط `[A-Za-z0-9-_.]` المطابق لـ `safe_download_filename` عبر `raw`/`NFKC`/`NFKD`/`sanitized` (منع تجاوزات علامات التشكيل والترقيم مثل `evil.e\u0301xe`, `evil.e\u0327xe`, `evil.exe!`, `evil.e!xe`, `bad.\uff45\uff58\uff45\u0301` مع حفظ قبول الأسماء الصالحة مثل `تقرير_نهائي.txt`).
+3. `tests/test_repair_plan_01_review_findings.py`: إصلاح خطأ `FileNotFoundError` في اختباري الامتداد عند فحص `store.root.iterdir()` قبل إنشاء الجذر (`not store.root.exists() or ...`) وإضافة حالات IPv6/protocol-relative وعلامات التشكيل/القصّ.
+
+## التحقّق الفعلي المُنفَّذ
+- `python3 -m compileall -q bot automation tools main.py tests` -> **`PASS`** (exit `0`) + `AST_PARSE_ALL_OK` لكل ملفات `.py`.
+- اختبارات stdlib موجّهة (معزولة في `TemporaryDirectory`) -> **`PASS`** (`7/7` مجموعات شملت `D-12` `None` defaults، `3 MiB`، `D-15` `15m`، كل حالات الامتدادات والترميم والإسقاط، إغلاق `fd` عند فشل `fdopen`، `DB_FAILED` عند فشل `_effective_cap`، فرض `FIX-03` الصريح، فشل `chmod` المقفول `FIX-04`، `AttachmentReaper`/`OpportunisticSweeper`، والتحقّق المقتبس AST لـ `_classify_telegram_file_path`).
+- `pytest` / `pyflakes` / `bandit` -> **`NOT RUN` / `BLOCKED`** (غياب الحزم في الحاوية)؛ `pip_audit` -> **`NOT RUN`** (غياب الأداة + وصول خارجي)؛ `node --test tests/frontend/*.test.js` -> **`SKIPPED`** (لا تغييرات واجهة).
+
+## تسوية Plan 02 والحالة النهائية
+- تسوية التعداد في `docs/decisions/OHB2-P0-OWNER-DECISIONS-REGISTER.md §13.5`: **`13` `OWNER-APPROVED` + `21` قرارًا غير محسوم خارج البوّابة + `1` قرار بوّابة مراجعة/إصدار غير محسوم (`D-19`) = `35` سجلًا** (مع حزمة القرار الموجزة وتطابق `§28.7` في `docs/proposals/OHB2-AGENT-SERVER-FILE-UPLOAD-ARCHITECTURE.md` و`§12` في `docs/reviews/OHB2-PLAN12-P0-REMOTE-UPLOAD-DESIGN-AND-SECURITY-REVIEW.md`).
+- التحقّق من بقاء الثوابت محفوظة: `bot/db.py` غير ممسوس، `MINI_APP_ENABLED = False`، Autopush غير نشط، لا اعتماديات مضافة، لا رفع بعيد.
+- **حالة Plan 01:** **`PLAN01_IMPLEMENTATION_COMPLETE_PENDING_VERIFICATION`**.
+- **حالة Plan 02:** **`PLAN02_INVESTIGATION_AND_DESIGN_CLOSED_REMOTE_DELIVERY_BLOCKED`**.
+

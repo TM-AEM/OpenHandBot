@@ -834,5 +834,104 @@ Attachment handling stays **fail-closed**. **P0 is NOT DONE / PASS / IMPLEMENTED
 `OTHER_PLAN_PHASES_AUTHORIZED = NO`; `COMMIT_PUSH = NONE`. **No runtime change. No schema change.
 Self-review only; no independent review performed.**
 
+---
 
+## 28) r6 — Plan 02 Reconciled Design & Readiness Addendum (`OHB2-PLAN-12-P0-REMOTE-ATTACHMENT-UPLOAD`, 2026-11-15)
+
+**Preservation note:** Sections `§1–§27` above remain intact. This addendum records the reconciled
+architecture, security, integrity, verification, and outbox-reconciliation design produced under
+`OHB2-PLAN01-REMAINING-AND-PLAN02-REMOTE-ATTACHMENT-DELIVERY` **without** modifying database
+tables/columns/lifecycle states, **without** adding workers/schedulers/SQLite owners, and
+**without** implementing remote attachment upload while `B1/B2` and owner decisions remain open.
+
+### 28.1 Authoritative Identity & Provenance Mapping (Phase C1)
+
+| Layer / Field | Authoritative Source | Mutability & Scope | Trust & Verification Rule |
+| --- | --- | --- | --- |
+| `telegram_id`, `chat_id`, `message_id` | Telegram `Update` / `attachment_message_identity` (`bot/db.py:804`) | Immutable canonical message identity (`D-33/D-35`); `ON DELETE RESTRICT` | Never conflate `update_id` (delivery seq) with `message_id` |
+| `conversation_id` | `db.awaiting_state` (`kind="route"`) + `attachment_batches.conversation_id` | Bound at batch creation (`A2`), re-validated at `A3` (`D-26`) and dispatch (`D-17`) | Strict `^[A-Za-z0-9_-]{1,64}$`; fail-closed if `db.is_deleted(cid)` |
+| `created_by_user_id` vs `/users/me.id` | Cloud V1 `GET /api/v1/app-conversations` + `IdentityCache` (`bot/files.py`) | Owner-scoped (`ALLOWED_TELEGRAM_ID` single-user policy) | Fail-closed (`UNAUTHORIZED`) if missing or mismatched |
+| `batch_id`, `item_id` | `secrets.token_hex(16)` (`bot/attachments.py:351-358`) | Immutable opaque IDs generated locally on `A2` accept | Primary keys for `attachment_batches` / `attachment_items` |
+| `staging_token` | `secrets.token_hex(16)` (`bot/attachments.py`) | Immutable opaque 32-hex filename inside `0700` staging root | Never derived from `display_name`; `O_NOFOLLOW` + `lstat`/`fstat` |
+| `display_name` | Sanitized metadata (`bot/attachments.py`) | Display-only; sanitized (`[A-Za-z0-9._-]`) for final leaf | **Never** trusted as path or component alone |
+| `client_operation_id` (Design) | Deterministic hash/key of `(batch_id, item_id, staging_token)` | Stable across retries & process restarts (`D-21`) | Required for idempotent remote reconciliation (`D-16`) |
+| `sandbox_id`, `conversation_url`, `workspace_root` | Cloud V1 `AppConversation` runtime metadata | Ephemeral/provider-controlled per sandbox lifecycle | Requires grouping/isolation check (`D-06`) + origin allowlist (`B2`) |
+| `remote_relpath` (Design) | Server-derived under verified `workspace_root`: `.openhandbot_attachments/<batch_id>/<item_id>_<safe_name>` | Fixed once assigned to item; single-use per batch (`D-13`) | Must satisfy `PurePosixPath` normalization + confinement (`D-05`) |
+
+### 28.2 Verified Upstream API Boundaries (Phase C2)
+
+- **Cloud V1 (`https://app.all-hands.dev/openapi.json` v1.92.0, 257 paths):**
+  - **Upload:** **NONE** (`0` upload/multipart/binary write routes).
+  - **File read/list:** `GET /api/v1/app-conversations/{id}/file` (currently bounded to 256 KiB in `OpenHandsClient.read_file_text_bounded`), `GET /api/v1/app-conversations/{id}/files`, `GET /api/v1/app-conversations/{id}/download` (trajectory export zip).
+  - **Message dispatch:** `POST /api/v1/app-conversations/{id}/send-message` accepts `TextContent | ImageContent` only. `ImageContent.image_urls` on Cloud V1 for `data:` URLs is **UNVERIFIED** and image-only (cannot carry PDFs/docs/archives/code).
+  - **Conversation metadata:** `AppConversation` returns `conversation_url`, `session_api_key` (ephemeral/full-privilege runtime credential), `sandbox_id`, and `repositories[].path` (`readOnly: true`, from `archiveworkspacepath`).
+- **Agent Server (`agent-sdk.json` v0.1.0, 40 paths):**
+  - **Only upload endpoint:** `POST /api/file/upload/{path}` (`multipart/form-data`, `file`, `format: binary`).
+  - **Verified security gaps in `software-agent-sdk`:**
+    1. **Blocker B1 (`D-10/D-11`):** `dependencies.py::check_session_api_key` protects `/api/*` uniformly with a single `X-Session-API-Key` granting bash execution (`POST /api/bash/execute_bash_command`) and secrets management (`POST /api/conversations/{id}/secrets`).
+    2. **No path confinement (`D-05/D-06`):** `file_router.py::_upload_file` checks only `target_path.is_absolute()` and executes `target_path.parent.mkdir(parents=True, exist_ok=True)` before writing; no workspace confinement and no size limit.
+    3. **No verification/idempotency (`D-02/D-16`):** Returns only `Success{success}` (or `file_size` in some SDK variants) — no SHA-256, no `stat`, no idempotency key.
+  - **Blocker B2 (`D-14`):** `conversation_url` origin varies across path-mode and subdomain-mode (`remote_sandbox_service.py`) without a provider-committed allowlist.
+
+### 28.3 SSRF, Origin Allowlist, TLS, IP Pinning & Credential Isolation Design (Phase D)
+
+Until **B1** and **B2** are resolved (either via a Cloud V1 delegated upload proxy or explicit owner approval + committed origin pattern), no upload HTTP client may connect to `conversation_url`. If an Agent Server upload path is later authorized under `D-10/D-11/D-14`, the following controls are mandatory:
+1. **Strict Origin Allowlist (No arbitrary HTTPS):** Parse `conversation_url` (`urlsplit`), require `scheme == "https"`, reject `userinfo`, query, fragment, and non-standard ports, and enforce exact match against an owner/provider-configured `AGENT_SERVER_ALLOWED_ORIGINS` (exact `host` or strict anchored subdomain pattern, never wildcard `*`).
+2. **DNS Resolution & IP Pinning (Anti-Rebinding):** Resolve host via `socket.getaddrinfo` once per request/connection, reject **all** non-global IPs (`is_private`, `is_loopback`, `is_link_local`, `is_multicast`, `is_reserved`, `is_unspecified`, IPv4-mapped IPv6), and connect directly to the validated IP while preserving TLS SNI + certificate hostname verification (`ssl` context / pinned transport).
+3. **No Redirects & No Proxy Leakage:** `follow_redirects=False`; any `3xx` response fails closed (`StagingError` / retry-safe pre-upload abort). Strip all Cloud Bearer tokens when talking to Agent Server origins, and never send `X-Session-API-Key` to Cloud V1 or any unpinned host.
+4. **Volatile Secret Handling (`X-Session-API-Key`):** Fetch `session_api_key` only in memory at dispatch time from `GET /api/v1/app-conversations`; **never** persist `session_api_key` in SQLite (`attachment_batches`, `outbox`, `settings`), logs, exceptions, or Mini App responses; redact headers unconditionally.
+
+### 28.4 Workspace Proof, Path Confinement, Local Source Integrity & Honest Remote Verification (Phase E)
+
+1. **Workspace Identity Proof (`D-06`):** Before generating a destination path, re-verify conversation ownership (`created_by_user_id == owner_uuid`), verify `not db.is_deleted(conversation_id)`, verify sandbox state is live/compatible, obtain authoritative `workspace_root` from `AppConversation`, and reject shared/ambiguous `grouped_workspace_dir` layouts unless unambiguous conversation isolation is proven.
+2. **Deterministic Safe Remote Path (`D-05`):**
+   - Never pass user-supplied `display_name` as a path.
+   - Normalize leaf (`[A-Za-z0-9._-]`, bounded length, no `.`/`..`/control chars/NUL/backslash, fallback `attachment`).
+   - Construct relative path `.openhandbot_attachments/<batch_id>/<item_id>_<safe_leaf>` and validate via `PurePosixPath` + `bot/files.py:is_safe_workspace_path`; join only to verified `workspace_root` after confirming `PurePosixPath(full_path).is_relative_to(workspace_root)`.
+3. **Local Source Integrity Guard (TOCTOU & Corruption Prevention):**
+   - Open staged file with `os.O_RDONLY | os.O_NOFOLLOW` inside verified `0700` staging root.
+   - Verify `os.fstat(fd)`: `S_ISREG`, `0 < st_size <= MAX_ATTACHMENT_BYTES`, and `st_size == item.size_bytes`.
+   - Record `(st_dev, st_ino, st_size)` and compute `SHA-256` prior to upload; stream chunks from `fd` while recomputing `SHA-256` on the exact uploaded byte stream; fail closed (`INTEGRITY_MISMATCH`) if bytes read != `st_size` or digest differs.
+4. **Honest Remote Verification Taxonomy (`D-02/D-03/D-04`):**
+   - **HTTP 2xx / `Success` response alone:** Classified strictly as **`TRANSPORT_ACCEPTED_UNVERIFIED`** — **NEVER** transitions batch to `delivered`.
+   - **`REMOTELY_VERIFIED` (required for `delivered`):** Requires independent confirmation over an authenticated read channel: (a) path presence in `GET /api/v1/app-conversations/{id}/files`, AND (b) full-content re-read via `GET /api/v1/app-conversations/{id}/file` (or future upstream `stat+sha256` endpoint) proving exact byte length and `SHA-256` match against the local staged file. Note: current `OpenHandsClient.read_file_text_bounded` enforces `256 KiB` and rejects binary/non-UTF-8 (`bot/files.py`), so full binary re-read verification up to `3 MiB` requires an explicit binary-safe verification helper (pending `D-02/D-03/D-12`).
+   - **User-Facing Truthfulness:** Only state "تم تسليم المرفق والتحقق منه في مساحة العمل" after **`REMOTELY_VERIFIED`** + prompt dispatch completion; otherwise report `uncertain` / `failed` honestly.
+
+### 28.5 Durable Outbox-Compatible Reconciliation & Schema Impact Analysis (Phase F)
+
+- **Single Ownership Invariant (`I2/I3`):** Remote attachment delivery MUST run inside the existing `OutboxWorker` loop (`bot/outbox.py`) on the single `Database` SQLite owner. No new worker, scheduler, background daemon, or second DB is permitted.
+- **Bounded Pre-Upload Retries vs Ambiguous Post-Upload:**
+  - Failures **strictly before** sending upload request bytes (auth check failed, sandbox starting, DNS/allowlist/pre-connect failure, `429`/`5xx` before body upload if confirmed unstarted) use bounded `attempts < MAX_OUTBOX_ATTEMPTS` backoff.
+  - Once upload HTTP write begins and ends ambiguously (timeout, EOF, `5xx`, process crash while `dispatching`), **NO blind re-POST** (`I11`): transition/hold in **`uncertain`** (`dispatching` -> `uncertain` on startup recovery) and execute **read-only reconciliation** first (`GET .../files` + `GET .../file` SHA-256 check).
+    - If remote file exists with **exact matching `SHA-256` & `size_bytes`**: mark item verified without re-uploading!
+    - If remote file exists with **mismatching hash/size** (partial/corrupted): fail closed (`failed` / `uncertain` — never silently overwrite or claim `delivered` unless owner-approved idempotent replace contract `D-16` exists).
+    - If remote file is **absent** and upload window (`expires_at` = `T0 + 15m` or bounded op TTL per `D-15`) has **not** expired and local staged file passes `fstat`+`SHA-256`: bounded retry to the **exact same deterministic `remote_relpath`** (`client_operation_id`).
+    - Once **all** batch items are verified remotely, dispatch the accompanying `intent_text` via existing `at-most-once` `send-message` outbox CAS (`pending -> claimed -> sending -> sent/unknown`).
+- **Schema Gap Evaluation (Design Only — NO DB Changes Applied Today):**
+  Existing `attachment_batches` (`batch_id, telegram_id, conversation_id, t0, status, created_at, updated_at, intent_text`) and `attachment_items` (`item_id, batch_id, staging_token, display_name, size_bytes, status, created_at, updated_at`) are **insufficient** for crash-safe remote upload reconciliation without a future owner-approved migration adding:
+  - On `attachment_items`: `sha256 TEXT`, `source_dev INTEGER`, `source_ino INTEGER`, `remote_relpath TEXT`, `remote_status TEXT` (`staged|uploading|uploaded_unverified|verified|failed|reaped`), `remote_op_id TEXT`, `remote_attempts INTEGER DEFAULT 0`, `remote_error TEXT`, `remote_verified_at TEXT`.
+  - On `attachment_batches`: `outbox_id INTEGER` (or `dispatch_op_id TEXT`, `dispatch_attempts INTEGER DEFAULT 0`, `last_error TEXT`, `dispatched_at TEXT`) to coordinate batch delivery + accompanying `intent_text` under `OutboxWorker` without double-sending.
+  - Under the current task constraints, **none** of these schema additions are applied.
+
+### 28.6 Final Closure Blocker Taxonomy & Scope Status (`OHB2-FINAL-CLOSURE-PLAN01-PLAN02`)
+
+- **Implementability verdict:** **`ZERO_REMOTE_UPLOAD_ITEMS_IMPLEMENTABLE_UNDER_CURRENT_PROVIDER_CONTRACT_AND_OWNER_APPROVALS`**. Neither a remote upload HTTP client nor a DB schema migration nor an `OutboxWorker` upload adapter can be implemented safely without inventing unapproved provider trust rules or silently overriding unresolved owner decisions.
+- **`D-12` Two-Scope Reconciliation:**
+  - *Scope 1 (Plan 01 local resource guard):* `MAX_ATTACHMENT_BYTES = 3 MiB` stays active as a local memory/resource safety bound under the temporary Option A baseline, while batch/total quotas remain disabled (`None` default, zero config toggles).
+  - *Scope 2 (Plan 02 / permanent product quota policy):* `### D-12` remains **`UNRESOLVED`** (`غير محسوم`) until explicit owner approval defines permanent limits for remote delivery.
+- **Four-Way Blocker Separation:**
+  1. **`BLOCKED_BY_PROVIDER`:** Missing Cloud V1 upload endpoint (`1.92.0`), full-privilege `X-Session-API-Key` protecting Agent Server `POST /api/file/upload/{path}` (`B1`), absent provider-committed `conversation_url` origin allowlist (`B2`), absent `stat + sha256` & server-side workspace confinement, unverified/image-only `ImageContent`, shared `grouped_workspace_dir` risk, and missing `runtime-api` C2 teardown guarantee.
+  2. **`BLOCKED_BY_OWNER_DECISION`:** All 22 open decisions (`D-01..D-08`, `D-10..D-14`, `D-16..D-18`, `D-20..D-24`, plus **`attachment_items` / `attachment_batches` schema additions** classified cleanly as awaiting owner approval rather than architecturally forbidden).
+  3. **`BLOCKED_BY_ARCHITECTURE`:** Second SQLite owner (`I3`), second worker/scheduler/process (`I2`), blind re-POST after ambiguous failure (`I11`), cross-conversation fallback (`I1`), upload delivery without accompanying prompt (`I7/I8`), or claiming `exactly-once`.
+  4. **`BLOCKED_BY_RELEASE_GATE`:** **`D-19`** (mandatory independent adversarial security review prior to any Plan 02 enablement/release).
+
+### 28.7 Final Decision Tally & Investigation Closure Addendum (`OHB2-FINAL-EXECUTION-AND-CLOSURE-PLAN01-PLAN02`)
+
+- **Official Plan 02 Status:** **`PLAN02_INVESTIGATION_AND_DESIGN_CLOSED_REMOTE_DELIVERY_BLOCKED`**.
+- **Reconciled Register Tally (`35` total records `D-01..D-35`):**
+  - **`13` `OWNER-APPROVED`** (`D-09` [`D-09-R1` + narrow local `D-09-R2`], `D-15` [Option A in MT-2 scope], and `D-25..D-35` local A3/identity/retention policy decisions + `D-34/J`).
+  - **`21` unresolved non-gate owner decisions (`UNRESOLVED`)**: `D-01..D-08`, `D-10..D-14`, `D-16..D-18` (`D-18` outside P0), `D-20..D-24` (with `D-12` Plan 01 Option A local resource-guard `None` quota defaults preserved separately from Plan 02's unresolved permanent product-policy scope).
+  - **`1` unresolved governance/release-gate decision (`BLOCKED_BY_RELEASE_GATE`)**: **`D-19`**.
+  - **Total:** `13 + 21 + 1 = 35` (`22` unresolved total records in the register = `21` non-gate + `1` `D-19`).
+- **Authorized Schema/Runtime Boundary:** Zero remote upload implementation, zero `bot/db.py` schema edits, zero new workers/schedulers/SQLite owners, `MINI_APP_ENABLED=False`, Autopush inactive. See `docs/decisions/OHB2-P0-OWNER-DECISIONS-REGISTER.md §13.5` for the owner decision package (`RECOMMENDATION — NOT OWNER-APPROVED`).
 

@@ -703,3 +703,271 @@ def test_documented_limits_table_exists():
     src = pathlib.Path(attachments_mod.__file__).read_text(encoding="utf-8")
     assert "جدول الحدود" in src
     assert "معطّل" in src and "مفعّل" in src
+
+
+def test_staging_write_fdopen_failure_closes_opened_fd(tmp_path, monkeypatch):
+    """فشل os.fdopen بعد نجاح os.open لازم يقفل الـ fd فورًا (بلا تسريب وصفة)."""
+    db, store = make_store(tmp_path)
+    add_batch(db)
+    opened: list[int] = []
+    closed: list[int] = []
+    real_open = os.open
+    real_close = os.close
+
+    def track_open(path, flags, mode=0o777):
+        fd = real_open(path, flags, mode)
+        opened.append(fd)
+        return fd
+
+    def boom_fdopen(*a, **k):
+        raise OSError("fdopen failed")
+
+    def track_close(fd):
+        closed.append(fd)
+        return real_close(fd)
+
+    monkeypatch.setattr(os, "open", track_open)
+    monkeypatch.setattr(os, "fdopen", boom_fdopen)
+    monkeypatch.setattr(os, "close", track_close)
+    res = store.store(
+        telegram_id=OWNER_ID, batch_id="b1", item_id="i1",
+        display_name="a.txt", chunks=[b"data"],
+    )
+    assert res.status is StageStatus.WRITE_FAILED
+    assert len(opened) == 1 and opened[0] in closed
+    assert list(store.root.iterdir()) == []
+
+
+def test_store_effective_cap_db_failure_returns_db_failed(tmp_path, monkeypatch):
+    """فشل SQLite جوه _effective_cap (مع تفعيل max_bytes_per_batch) ⇒ DB_FAILED (مغلق)."""
+    db, store = make_store(tmp_path, max_bytes_per_batch=1024)
+    add_batch(db)
+    calls = {"n": 0}
+    real_list = db.list_attachment_items
+
+    def flaky_list(batch_id):
+        calls["n"] += 1
+        if calls["n"] >= 2:  # ينجح في byte_quota_block ويفشل في _effective_cap
+            raise RuntimeError("sqlite failure")
+        return real_list(batch_id)
+
+    monkeypatch.setattr(db, "list_attachment_items", flaky_list)
+    res = store.store(
+        telegram_id=OWNER_ID, batch_id="b1", item_id="i1",
+        display_name="a.txt", chunks=[b"data"],
+    )
+    assert res.status is StageStatus.DB_FAILED
+    assert list(store.root.iterdir()) == []
+
+
+def test_stream_download_content_encoding_whitespace_handling():
+    """Content-Encoding بمسافات (` gzip `) يُرفض، والفارغ/identity المُحاط بمسافات يُقبل."""
+    srv_bad = RealHTTPServer(lambda _r: http_response(
+        200, headers={"Content-Encoding": " gzip "}, body=b"abc"
+    ))
+    srv_ok = RealHTTPServer(lambda _r: http_response(
+        200, headers={"Content-Encoding": " identity "}, body=b"abc"
+    ))
+    try:
+        client = httpx.AsyncClient()
+        with pytest.raises(StagingError):
+            _run(handlers._download_attachment_chunks(
+                _FakeCtx(_FakeBot(client, _tg_file(f"{srv_bad.url}/file"))), "f1", 1000
+            ))
+        chunks = _run(handlers._download_attachment_chunks(
+            _FakeCtx(_FakeBot(client, _tg_file(f"{srv_ok.url}/file"))), "f1", 1000
+        ))
+        assert b"".join(chunks) == b"abc"
+        _run(client.aclose())
+    finally:
+        srv_bad.shutdown()
+        srv_ok.shutdown()
+
+
+def test_extension_of_blocks_trailing_dot_and_control_char_bypass(tmp_path):
+    """النقاط الطرفية ومحارف التحكّم لا تتجاوز حظر الامتدادات التنفيذية/السكربتية."""
+    assert attachments_mod.extension_of("evil.exe.") == "exe"
+    assert attachments_mod.extension_of("run.sh.. ") == "sh"
+    assert attachments_mod.extension_of("script.py . .") == "py"
+    assert attachments_mod.extension_of("payload.bat\x00") == "bat"
+    assert attachments_mod.extension_of("script.ps1\x07") == "ps1"
+    assert attachments_mod.extension_of("a" * 250 + ".sh") == "sh"
+
+    db, store = make_store(tmp_path)
+    add_batch(db)
+    for hostile_name in ("evil.sh.", "run.bat.. ", "payload.py\x07"):
+        res = store.store(
+            telegram_id=OWNER_ID, batch_id="b1", item_id=f"i_{hostile_name}",
+            display_name=hostile_name, chunks=[b"echo harmless"],
+        )
+        assert res.status is StageStatus.REJECTED_TYPE
+    assert not store.root.exists() or list(store.root.iterdir()) == []
+
+
+def test_reaper_sweep_records_error_when_orphan_item_query_fails(tmp_path, monkeypatch):
+    """فشل الاستعلام داخل _sweep_orphan_items يجب أن يرفع errors>=1 ولا يقدّم last_success_at."""
+    db, store = make_store(tmp_path)
+
+    def boom_items(status):
+        raise RuntimeError("sqlite items failure")
+
+    monkeypatch.setattr(db, "list_attachment_items_by_status", boom_items)
+    reaper = AttachmentReaper(db, store=store)
+    sweeper = attachments_mod.OpportunisticSweeper(reaper, clock=lambda: 1000.0)
+    rep = sweeper.maybe_sweep(now=T0_DT + timedelta(minutes=20))
+    assert rep is not None and rep.errors >= 1
+    assert sweeper.last_success_at is None
+
+
+def test_reaper_sweep_preserves_prior_errors_when_expired_query_fails(tmp_path, monkeypatch):
+    """فشل list_expired_pending_attachment_batches يحفظ أخطاء الخطوات السابقة ولا يصفّرها."""
+    db, store = make_store(tmp_path)
+
+    def boom_all_items():
+        raise RuntimeError("items table failure")
+
+    def boom_expired(*, now_iso):
+        raise RuntimeError("expired query failure")
+
+    monkeypatch.setattr(db, "list_all_attachment_items", boom_all_items)
+    monkeypatch.setattr(db, "list_expired_pending_attachment_batches", boom_expired)
+    reaper = AttachmentReaper(db, store=store)
+    rep = reaper.sweep(now=T0_DT + timedelta(minutes=20))
+    assert rep.errors >= 2
+
+
+def test_download_chunks_does_not_treat_single_slash_https_as_url():
+    """مسار غير صحيح بصيغة `https:/...` لا يُعامل كرابط HTTP ويفشل مقفولًا بـ StagingError."""
+    client = httpx.AsyncClient()
+    try:
+        bot = _FakeBot(client, _tg_file("https:/not-a-valid-url"))
+        ctx = _FakeCtx(bot)
+        with pytest.raises(StagingError):
+            _run(handlers._download_attachment_chunks(ctx, "f1", 1000))
+    finally:
+        _run(client.aclose())
+
+
+def test_extension_of_blocks_unicode_format_c1_and_fullwidth_bypass(tmp_path):
+    """محارف التنسيق الخفيّة وC1 وNFKC الكاملة العرض وعلامات التشكيل لا تتجاوز حظر الامتدادات."""
+    assert attachments_mod.extension_of("evil.e\u200bxe") == "exe"
+    assert attachments_mod.extension_of("run.s\u202eh") == "sh"
+    assert attachments_mod.extension_of("bad.\uff45\uff58\uff45") == "exe"
+    assert attachments_mod.extension_of("bad.sh\u0085") == "sh"
+    assert attachments_mod.extension_of("bad.\uff25\uff38\uff25\u200b.") == "exe"
+    assert attachments_mod.extension_of("تقرير.txt") == "txt"
+    assert attachments_mod.sanitize_display_name("a\u202eb\u200bc.txt") == "abc.txt"
+
+    db, store = make_store(tmp_path)
+    add_batch(db)
+    hostile_names = (
+        "evil.e\u200bxe",
+        "run.s\u202eh",
+        "bad.\uff45\uff58\uff45",
+        "bad.sh\u0085",
+        "evil.e\u0301xe",
+        "evil.e\u0327xe",
+        "evil.exe!",
+        "evil.e!xe",
+        "bad.\uff45\uff58\uff45\u0301",
+        ("a" * 196) + ".sh.txt",
+    )
+    for idx, hostile_name in enumerate(hostile_names):
+        res = store.store(
+            telegram_id=OWNER_ID,
+            batch_id="b1",
+            item_id=f"u_{idx}",
+            display_name=hostile_name,
+            chunks=[b"harmless"],
+        )
+        assert res.status is StageStatus.REJECTED_TYPE
+    assert not store.root.exists() or list(store.root.iterdir()) == []
+
+    # أسماء بريئة (بما فيها غير ASCII وامتدادات مسموحة) تستمر بالقبول.
+    ok_res = store.store(
+        telegram_id=OWNER_ID,
+        batch_id="b1",
+        item_id="u_ok",
+        display_name="تقرير_نهائي.txt",
+        chunks=[b"harmless"],
+    )
+    assert ok_res.status is StageStatus.STORED
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    [
+        "https://",
+        "https://[::1/a",
+        "http://[",
+        "//evil.example/file",
+        "http://host with spaces/a",
+        "http://host:99999/a",
+        "ftp://example.com/a",
+        "file:///etc/passwd",
+        "data:text/plain,abc",
+        "javascript:alert(1)",
+        "/tmp/bad\x00file",
+    ],
+)
+def test_download_chunks_rejects_malformed_urls_and_non_http_schemes(bad_path):
+    """الروابط المشوّهة أو ذات المخطّطات غير http(s) تُرفض مقفولة بـ StagingError."""
+    client = httpx.AsyncClient()
+    try:
+        bot = _FakeBot(client, _tg_file(bad_path))
+        ctx = _FakeCtx(bot)
+        with pytest.raises(StagingError):
+            _run(handlers._download_attachment_chunks(ctx, "f1", 1000))
+    finally:
+        _run(client.aclose())
+
+
+def test_reaper_sweep_records_errors_on_unsafe_scan_and_orphan_mark_failure(
+    tmp_path, monkeypatch
+):
+    """فشل _sweep_orphan_items في الوسم أو فشل _count_unsafe_entries يرفع errors>=1."""
+    db, store = make_store(tmp_path)
+    db._conn.execute("PRAGMA foreign_keys=OFF")
+    db.add_attachment_item(
+        "i_orphan",
+        "missing-batch",
+        staging_token="a" * 32,
+        display_name="n.txt",
+        size_bytes=1,
+        status=ATTACHMENT_ITEM_STORED,
+    )
+    db._conn.execute("PRAGMA foreign_keys=ON")
+
+    def boom_mark(_item_id):
+        raise RuntimeError("mark reaped failed")
+
+    monkeypatch.setattr(db, "mark_attachment_item_reaped", boom_mark)
+    reaper = AttachmentReaper(db, store=store)
+    sweeper = attachments_mod.OpportunisticSweeper(reaper, clock=lambda: 1000.0)
+    rep = sweeper.maybe_sweep(now=T0_DT + timedelta(minutes=20))
+    assert rep is not None and rep.errors >= 1 and rep.orphans_left >= 1
+    assert sweeper.last_success_at is None
+
+    monkeypatch.undo()
+    case2_dir = tmp_path / "case2"
+    case2_dir.mkdir()
+    db2, store2 = make_store(case2_dir)
+    root2 = store2.ensure_root()
+    reaper2 = AttachmentReaper(db2, store=store2)
+    monkeypatch.setattr(reaper2, "_scan_root_untracked", lambda *_a, **_k: 0)
+    real_iterdir = pathlib.Path.iterdir
+
+    def boom_iterdir(self):
+        if self == root2:
+            raise OSError("iterdir failed")
+        return real_iterdir(self)
+
+    monkeypatch.setattr(pathlib.Path, "iterdir", boom_iterdir)
+    sweeper2 = attachments_mod.OpportunisticSweeper(reaper2, clock=lambda: 2000.0)
+    rep2 = sweeper2.maybe_sweep(now=T0_DT + timedelta(minutes=20))
+    assert rep2 is not None and rep2.errors >= 1
+    assert sweeper2.last_success_at is None
+
+
+
+

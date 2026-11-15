@@ -5,9 +5,11 @@ import asyncio
 import io
 import logging
 import os
+import re
 import sqlite3
 import time
 from datetime import datetime, timezone
+from urllib.parse import urlsplit
 
 from telegram import InputFile, Update
 from telegram.constants import ParseMode
@@ -1737,6 +1739,47 @@ def _read_local_capped(path: str, max_bytes: int) -> bytes:
     return bytes(buf)
 
 
+_URI_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]{1,}:")
+
+
+def _classify_telegram_file_path(file_path: object) -> str:
+    """يصنّف `tg_file.file_path` بشكل حتمي مغلق إلى `'url'` أو `'local'`.
+
+    أي URI بمخطط غير `http`/`https` أو `http(s)` مشوّه (مثل `https:/...`، بلا host،
+    IPv6 غير مكتمل، بورت غير صالح، مسافات/تحكّم، `//...`، أو بايت NUL) يرفع
+    `StagingError` فورًا بلا سقوط لمسار محلي.
+    """
+    from .attachments import StagingError
+
+    if not isinstance(file_path, str) or not file_path:
+        raise StagingError(
+            "تنزيل مرفق تيليجرام غير محدود غير متاح (مفيش URL ولا ملف محلي مقيّد)"
+        )
+    if "\x00" in file_path:
+        raise StagingError("مسار ملف تيليجرام غير صالح")
+    if file_path.startswith("//"):
+        raise StagingError("رابط تنزيل تيليجرام غير صالح")
+
+    lowered = file_path.lower()
+    has_http_prefix = lowered.startswith(("http://", "https://"))
+    if has_http_prefix or _URI_SCHEME_RE.match(file_path):
+        if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in file_path):
+            raise StagingError("رابط تنزيل تيليجرام غير صالح")
+        try:
+            parts = urlsplit(file_path)
+            hostname = parts.hostname
+            _ = parts.port
+        except ValueError as exc:
+            raise StagingError("رابط تنزيل تيليجرام غير صالح") from exc
+        if parts.scheme.lower() not in ("http", "https") or not has_http_prefix:
+            raise StagingError("رابط تنزيل تيليجرام غير صالح أو مخطّط غير مدعوم")
+        if not parts.netloc or not hostname:
+            raise StagingError("رابط تنزيل تيليجرام غير صالح")
+        return "url"
+
+    return "local"
+
+
 async def _download_attachment_chunks(context, file_id: str, max_bytes: int):
     """مُكرِّر بايتات الملف من تيليجرام بسقف بايت صلب فعلي (FIX-01 / FIX-R04).
 
@@ -1746,11 +1789,10 @@ async def _download_attachment_chunks(context, file_id: str, max_bytes: int):
     2) **قراءة ملف محلي مقيّدة** (سيرفر Bot API محلي/اختبار): على قطع بسقف صلب.
 
     **مرفوض (fail closed):** أي حالة تانية (بلا URL مع عميل بثّ متاح، أو بلا ملف محلي
-    قابل للقراءة) ⇒ `StagingError`. **مابنستخدمش `File.download_to_memory` كمسار
-    بديل**: في `python-telegram-bot==22.8` بتلمّ **الرد كامل** في الذاكرة وتنادي
-    `out.write(buf)` **مرّة واحدة** (`telegram/_files/file.py::download_to_memory`
-    + `telegram/request/_httpxrequest.py::do_request` ⇒ `res.content`) ⇒ مش مسار
-    محدود، ومايصحّش نعتبره سقفًا صلبًا.
+    قابل للقراءة، أو URL مشوّه/مخطّط غير http/https) ⇒ `StagingError`. **مابنستخدمش
+    `File.download_to_memory` كمسار بديل**: في `python-telegram-bot==22.8` بتلمّ
+    **الرد كامل** في الذاكرة وتنادي `out.write(buf)` **مرّة واحدة** ⇒ مش مسار محدود،
+    ومايصحّش نعتبره سقفًا صلبًا.
     """
     from .attachments import AttachmentTooLargeError, StagingError
 
@@ -1758,11 +1800,11 @@ async def _download_attachment_chunks(context, file_id: str, max_bytes: int):
     async with _get_download_semaphore():
         tg_file = await context.bot.get_file(file_id)
         file_path = getattr(tg_file, "file_path", None)
-        is_url = isinstance(file_path, str) and file_path[:7] in ("http://", "https:/")
+        kind = _classify_telegram_file_path(file_path)
 
-        if not is_url:
+        if kind == "local":
             # مسار محلي (سيرفر Bot API محلي/اختبار): ملف على القرص ⇒ قراءة مقيّدة.
-            if isinstance(file_path, str) and os.path.isfile(file_path):
+            if os.path.isfile(file_path):
                 try:
                     return iter([_read_local_capped(file_path, max_bytes)])
                 except AttachmentTooLargeError:
@@ -1797,9 +1839,10 @@ async def _download_attachment_chunks(context, file_id: str, max_bytes: int):
                     raise StagingError(f"تنزيل تيليجرام فشل (HTTP {resp.status_code})")
                 # ترميز محتوى غير `identity` ⇒ رفض آمن بدل تخزين بايتات مضغوطة (المجموع
                 # التراكمي على البايتات الخام هو الضمان).
-                encoding = resp.headers.get("content-encoding")
-                if encoding is not None and encoding.lower() != "identity":
-                    raise StagingError(f"ترميز محتوى غير متوقّع من تيليجرام ({encoding})")
+                raw_encoding = resp.headers.get("content-encoding")
+                encoding = raw_encoding.strip().lower() if raw_encoding is not None else ""
+                if encoding and encoding != "identity":
+                    raise StagingError(f"ترميز محتوى غير متوقّع من تيليجرام ({raw_encoding})")
                 async for chunk in resp.aiter_raw():
                     if not chunk:
                         continue

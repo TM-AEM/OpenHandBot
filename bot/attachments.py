@@ -76,6 +76,7 @@ import secrets
 import stat as _stat
 import logging
 import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -212,22 +213,27 @@ def staging_root_for(db_path) -> Path:
 def sanitize_display_name(name: str | None) -> str | None:
     """اسم عرض آمن **للبيانات الوصفية فقط** (عمره ما يُستخدم كمسار).
 
-    بيشيل أي مكوّن مسار (نأخذ آخر مقطع)، ومحارف التحكّم/NUL، والنقاط الطرفية، ويقصّ الطول.
+    بيشيل أي مكوّن مسار (نأخذ آخر مقطع)، ومحارف التحكّم/التنسيق الخفيّة (`Cc`/`Cf`)،
+    والنقاط الطرفية، ويطبّع Unicode (`NFKC`)، ويقصّ الطول.
     """
     if not isinstance(name, str):
         return None
     base = name.replace("\\", "/").rsplit("/", 1)[-1]
-    base = "".join(ch for ch in base if ch >= " " and ch != "\x7f")
+    base = unicodedata.normalize("NFKC", base).replace("\\", "/").rsplit("/", 1)[-1]
+    base = "".join(ch for ch in base if unicodedata.category(ch)[0] != "C")
     base = base.strip().strip(".")
     base = base[:_MAX_DISPLAY_NAME]
     return base or None
 
 
 def extension_of(name: str | None) -> str:
-    """الامتداد (حروف/أرقام) لآخر مقطع من الاسم، أو '' لو مفيش."""
+    """الامتداد (حروف/أرقام) لآخر مقطع من الاسم بعد تطبيع Unicode وإزالة التحكّم/الخفي."""
     if not isinstance(name, str):
         return ""
-    base = name.replace("\\", "/").rsplit("/", 1)[-1].strip().lower()
+    base = name.replace("\\", "/").rsplit("/", 1)[-1]
+    base = unicodedata.normalize("NFKC", base).replace("\\", "/").rsplit("/", 1)[-1]
+    base = "".join(ch for ch in base if unicodedata.category(ch)[0] != "C")
+    base = base.strip().rstrip(" .").lower()
     if "." not in base:
         return ""
     ext = base.rsplit(".", 1)[-1]
@@ -312,8 +318,31 @@ def staging_total_bytes(root: Path) -> int:
     return total
 
 
+_ASCII_LEAF_SAFE = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
+)
+
+
+def _ascii_leaf_projection(leaf: str) -> str:
+    return "".join(ch for ch in leaf if ch in _ASCII_LEAF_SAFE).strip(".")
+
+
 def _is_denied_extension(name: str | None) -> bool:
-    return extension_of(name) in _DENIED_EXTENSIONS
+    if extension_of(name) in _DENIED_EXTENSIONS:
+        return True
+    if not isinstance(name, str):
+        return False
+    sanitized = sanitize_display_name(name)
+    if sanitized and extension_of(sanitized) in _DENIED_EXTENSIONS:
+        return True
+    raw_leaf = name.replace("\\", "/").rsplit("/", 1)[-1]
+    nfkc_leaf = unicodedata.normalize("NFKC", raw_leaf).replace("\\", "/").rsplit("/", 1)[-1]
+    nfkd_leaf = unicodedata.normalize("NFKD", raw_leaf).replace("\\", "/").rsplit("/", 1)[-1]
+    for candidate in (raw_leaf, nfkc_leaf, nfkd_leaf, sanitized or ""):
+        projected = _ascii_leaf_projection(candidate)
+        if projected and extension_of(projected) in _DENIED_EXTENSIONS:
+            return True
+    return False
 
 
 def _is_denied_magic(head: bytes) -> bool:
@@ -591,7 +620,15 @@ class StagingStore:
             raise _CollisionError() from exc
         written = 0
         try:
-            with os.fdopen(fd, "wb") as handle:
+            try:
+                handle = os.fdopen(fd, "wb")
+            except BaseException:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise
+            with handle:
                 for chunk in chunks:
                     if not chunk:
                         continue
@@ -685,6 +722,11 @@ class StagingStore:
         except OSError as exc:
             return StageResult(
                 StageStatus.WRITE_FAILED, item_id=item_id, staging_token=token,
+                error=type(exc).__name__,
+            )
+        except Exception as exc:  # noqa: BLE001 — فشل قاعدة أثناء حساب السقف ⇒ رفض مغلق
+            return StageResult(
+                StageStatus.DB_FAILED, item_id=item_id, staging_token=token,
                 error=type(exc).__name__,
             )
         if cap <= 0:
@@ -1066,7 +1108,8 @@ class AttachmentReaper:
             expired = self._db.list_expired_pending_attachment_batches(now_iso=now_iso)
         except Exception as exc:  # noqa: BLE001 — فشل قاعدة ⇒ كنسة فاشلة (تُرصد)
             log.warning("A4 sweep: تعذّر جلب الدفعات المنتهية (%s)", type(exc).__name__)
-            return SweepReport(errors=1)
+            report["errors"] += 1
+            return SweepReport(**report)
         for batch in expired:
             self._mark_expired(batch, now_iso, report)
 
@@ -1083,7 +1126,7 @@ class AttachmentReaper:
 
         # (3) دلاء يتيمة (عناصر بلا دفعة) — تُكنس بالتوكن، وتُرصد لو أثرت.
         try:
-            orphans = self._sweep_orphan_items(known_tokens)
+            orphans = self._sweep_orphan_items(known_tokens, report=report)
         except Exception as exc:  # noqa: BLE001
             log.warning("A4 sweep: تعذّر كنس العناصر اليتيمة (%s)", type(exc).__name__)
             orphans = 0
@@ -1092,13 +1135,13 @@ class AttachmentReaper:
 
         # (4) مسح الجذر: بايتات بلا عنصر مطابق ⇒ تُرصد (بلا حذف عمياء/تبنّي).
         try:
-            report["untracked_left"] = self._scan_root_untracked(known_tokens)
+            report["untracked_left"] = self._scan_root_untracked(known_tokens, report=report)
         except Exception as exc:  # noqa: BLE001
             log.warning("A4 sweep: تعذّر مسح جذر الـ staging (%s)", type(exc).__name__)
             report["errors"] += 1
 
         # (5) مخارج آمنة (symlink/مسار غير آمن) — تُرصد كحالة تحتاج تحقيق.
-        report["unsafe_left"] = self._count_unsafe_entries()
+        report["unsafe_left"] = self._count_unsafe_entries(report=report)
         self._log_report(report)
         return SweepReport(**report)
 
@@ -1207,13 +1250,18 @@ class AttachmentReaper:
         return BatchSweepResult(batch.batch_id, SweepOutcome.NOTHING, batch.status,
                                 items=len(items))
 
-    def _sweep_orphan_items(self, known_tokens: set[str]) -> int:
+    def _sweep_orphan_items(
+        self, known_tokens: set[str], *, report: dict | None = None
+    ) -> int:
         """عناصر بلا دفعة أب (دبوس مفقود): وسم `reaped` + حذف بايتاتها. ترجّع المتبقّي."""
         try:
             all_batches = {b.batch_id for b in self._db.list_all_attachment_batches()}
         except Exception as exc:  # noqa: BLE001
             log.warning("A4 sweep: تعذّر جلب كل الدفعات (%s)", type(exc).__name__)
-            return 0
+            if report is not None:
+                report["errors"] += 1
+                return 0
+            raise
         left = 0
         for status in (
             ATTACHMENT_BATCH_PENDING,
@@ -1225,6 +1273,8 @@ class AttachmentReaper:
             except Exception as exc:  # noqa: BLE001
                 log.warning("A4 sweep: تعذّر جلب عناصر بحالة %s (%s)",
                             status, type(exc).__name__)
+                if report is not None:
+                    report["errors"] += 1
                 continue
             for item in items:
                 if item.batch_id in all_batches:
@@ -1246,14 +1296,20 @@ class AttachmentReaper:
                     if not self._db.mark_attachment_item_reaped(item.item_id):
                         left += 1
                         continue
-                except Exception:  # noqa: BLE001
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("A4 sweep: تعذّر وسم العنصر اليتيم %s كمكنوس (%s)",
+                                item.item_id, type(exc).__name__)
+                    if report is not None:
+                        report["errors"] += 1
                     left += 1
                     continue
                 if self._remove_file(token) == "retry":
                     left += 1
         return left
 
-    def _scan_root_untracked(self, known_tokens: set[str]) -> int:
+    def _scan_root_untracked(
+        self, known_tokens: set[str], *, report: dict | None = None
+    ) -> int:
         """يعدّ البايتات في الجذر بلا عنصر مطابق (تُرصد، ما تُحذفش — بلا تبنّي/تخمين)."""
         root = self._validated_root()
         if root is None:
@@ -1263,6 +1319,8 @@ class AttachmentReaper:
             entries = list(root.iterdir())
         except OSError as exc:
             log.warning("A4 sweep: تعذّر قراءة جذر الـ staging (%s)", type(exc).__name__)
+            if report is not None:
+                report["errors"] += 1
             return 0
         for entry in entries:
             name = entry.name
@@ -1275,7 +1333,7 @@ class AttachmentReaper:
             log.info("A4 sweep: %s بايت غير مرتبط بعنصر في جذر الـ staging ⇒ تُركت للتحقيق", left)
         return left
 
-    def _count_unsafe_entries(self) -> int:
+    def _count_unsafe_entries(self, *, report: dict | None = None) -> int:
         """يعدّ مدخلات الجذر غير الآمنة (symlink/غير ملف عادي) — تُرصد بلا متابعة."""
         root = self._validated_root()
         if root is None:
@@ -1283,7 +1341,10 @@ class AttachmentReaper:
         count = 0
         try:
             entries = list(root.iterdir())
-        except OSError:
+        except OSError as exc:
+            log.warning("A4 sweep: تعذّر فحص المدخلات غير الآمنة في الجذر (%s)", type(exc).__name__)
+            if report is not None:
+                report["errors"] += 1
             return 0
         for entry in entries:
             if self._is_unsafe_entry(entry):
