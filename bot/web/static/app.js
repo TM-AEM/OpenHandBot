@@ -5,7 +5,7 @@
   var API = "/api/v1";
   var tg = (window.Telegram && window.Telegram.WebApp) || null;
   var REQUEST_TIMEOUT = 12000;
-  var state = { chatsPage: 0, currentChat: null, selectedRepo: null, inboxPage: 0, inboxLoading: false, inboxIds: {}, inboxHasMore: false, inboxVisible: false, inboxLastRefreshAt: 0, inboxFilter: "all", detailSeq: 0, chatsSeq: 0, reposSeq: 0, watchesSeq: 0, jobsPage: 0, jobsLoading: false, jobsHasMore: false };
+  var state = { chatsPage: 0, currentChat: null, selectedRepo: null, inboxPage: 0, inboxLoading: false, inboxIds: {}, inboxHasMore: false, inboxVisible: false, inboxLastRefreshAt: 0, inboxFilter: "all", detailSeq: 0, chatsSeq: 0, chatsHasMore: false, reposSeq: 0, watchesSeq: 0, jobsPage: 0, jobsLoading: false, jobsHasMore: false };
   // OHB2-08-07: مؤقّت التحديث الدوري (مرئي فقط) + آخر وقت تحديث (للتهدئة).
   var inboxPollTimer = null;
 
@@ -15,6 +15,34 @@
     if (cls) { n.className = cls; }
     if (text !== undefined && text !== null) { n.textContent = text; }
     return n;
+  }
+
+  // OHB2-PLAN04-LOW1: صف تفاعلي قابل للوصول بالكيبورد (للصفوف **البسيطة** اللي مفيهاش
+  // عناصر تفاعلية جوّاها: الشاتات/الملفات/المتابعات/المستودعات). بيحوّل عنصر `<li>` لدور
+  // زر (role=button + tabindex=0) عشان الكيبورد يوصله، ويربط Enter/Space بنفس فعل الماوس
+  // **مرّة واحدة بالظبط**: `activate()` هي المسار الوحيد للفعل، و`click()` الافتراضي
+  // (من الماوس أو Enter) بينده عليها. Space بيمنع التمرير الافتراضي (preventDefault)
+  // وبينده `activate()` مباشرةً من غير ما يطلق `click()` (عشان مايتفعّلش مرتين لو
+  // المتصفح بيولّد click لاحقًا).
+  //
+  // صف الإشعارات **مش** بيستعمل الدالة دي: فيه أزرار إجراء (أرشفة/حذف) جوّاه، فبنستخدم
+  // زر `<button>` حقيقي للفعل الرئيسي (OHB2-PLAN04-F1) بدل role=button على الحاوية.
+  function makeRowInteractive(li, activate) {
+    li.setAttribute("role", "button");
+    li.setAttribute("tabindex", "0");
+    li.addEventListener("click", function () { activate(); });
+    li.addEventListener("keydown", function (e) {
+      var key = e && e.key;
+      if (key === "Enter") {
+        // Enter غالبًا بيولّد click افتراضي ⇒ نمنعه ونفعّل مرّة واحدة من هنا.
+        if (e.preventDefault) { e.preventDefault(); }
+        activate();
+      } else if (key === " " || key === "Spacebar") {
+        // Space بيمرّر الصفحة افتراضيًا ⇒ نمنعه ونفعّل مباشرةً.
+        if (e.preventDefault) { e.preventDefault(); }
+        activate();
+      }
+    });
   }
 
   function show(name) {
@@ -428,46 +456,67 @@
 
   // OHB2-PHASE1C: صف إشعار واحد + أزرار الأرشفة/الاسترجاع/الحذف. الحذف النهائي بيتطلب
   // تأكيد صريح (خطوتين) في الواجهة، والسيرفر بيفرض الأهلية تاني بشكل مستقل.
+  //
+  // OHB2-PLAN04-F1: الحاوية `<li>` **عنصر قايمة بنيوي** (مفيهاش role=button ولا tabindex)،
+  // والفعل الرئيسي (تعليم مقروء + فتح الشات) بقى زر `<button>` حقيقي **شقيق** لأزرار
+  // الأرشفة/الحذف — مش حاوية بتلفّهم. كده ما فيش تداخل عناصر تفاعلية (nested interactive)،
+  // وكل زر بيتفعّل بالكيبورد لوحده (Enter/Space من العنصر المركَّز بس)، ومافيش فقاعة
+  // `keydown` من زر داخلي تفعّل فعل الصف (السبب الجذري لـ F-1). الماوس/اللمس محفوظين:
+  // الضغط على أي مكان فاضي في الصف بيفتح الشات، والضغط على زر إجراء بيعمل فعله بس.
   function renderInboxRow(it) {
     var unread = INBOX.isUnread(it);
     var archived = INBOX.isArchived(it);
     var li = el("li", "row" + (unread ? " unread" : "") + (archived ? " archived" : ""));
-    var main = el("div", "row-main");
-    main.appendChild(el("span", "row-title", it.title || it.conversation_id || ""));
-    main.appendChild(el("span", "row-sub", kindLabel(it.kind)));
-    li.appendChild(main);
-    var pills = el("div", "row-pills");
+
+    // الفعل الرئيسي: زر حقيقي بيغطّي العنوان/الوصف/الشارات. الاسم المتاح بيُشتق من نصّه
+    // (العنوان + النوع + حالة القراءة)، فقارئ الشاشة بيعلن فعلًا مفهومًا.
+    var openBtn = el("button", "row-main row-open");
+    openBtn.setAttribute("type", "button");
+    openBtn.appendChild(el("span", "row-title", it.title || it.conversation_id || ""));
+    openBtn.appendChild(el("span", "row-sub", kindLabel(it.kind)));
+    var pills = el("span", "row-pills");
     // OHB2-08-05 (Batch 3R): شارة حالة التسليم (مفيش شارة لو اتسلّم).
     var delivery = INBOX.deliveryLabel(it.delivery_status);
     if (delivery) { pills.appendChild(el("span", "pill delivery", delivery)); }
     pills.appendChild(el("span", "pill", unread ? "جديد" : "مقروء"));
-    li.appendChild(pills);
+    openBtn.appendChild(pills);
+    function activateMain() {
+      if (unread) {
+        post("/notifications/" + encodeURIComponent(it.id) + "/read", {}).then(function (r2) {
+          if (r2.ok) { renderInboxBadge(r2.data && r2.data.unread_count); }
+        }).catch(function () { /* نتجاهل: العرض لسه شغال */ });
+      }
+      if (it.conversation_id) { openDetail(it.conversation_id); }
+    }
+    openBtn.addEventListener("click", activateMain);
+    li.appendChild(openBtn);
+
     var actions = el("div", "row-actions");
     // أرشفة/استرجاع (قابل للعكس دائمًا).
     var archiveBtn = el("button", "btn ghost small", archived ? "استرجاع" : "أرشفة");
-    archiveBtn.addEventListener("click", function (e) {
-      if (e && e.stopPropagation) { e.stopPropagation(); }
+    archiveBtn.setAttribute("type", "button");
+    archiveBtn.addEventListener("click", function () {
       setInboxArchived(it, !archived, archiveBtn);
     });
     actions.appendChild(archiveBtn);
     // حذف نهائي — بس لو السيرفر قال إنه مؤهّل، ومع تأكيد صريح.
     if (INBOX.canDelete(it)) {
       var delBtn = el("button", "btn danger small", "🗑 حذف");
+      delBtn.setAttribute("type", "button");
       var confirmBtn = el("button", "btn danger small", "أكّد الحذف");
+      confirmBtn.setAttribute("type", "button");
       confirmBtn.hidden = true;
       var cancelBtn = el("button", "btn ghost small", "إلغاء");
+      cancelBtn.setAttribute("type", "button");
       cancelBtn.hidden = true;
       var deleting = false;
-      delBtn.addEventListener("click", function (e) {
-        if (e && e.stopPropagation) { e.stopPropagation(); }
+      delBtn.addEventListener("click", function () {
         delBtn.hidden = true; confirmBtn.hidden = false; cancelBtn.hidden = false;
       });
-      cancelBtn.addEventListener("click", function (e) {
-        if (e && e.stopPropagation) { e.stopPropagation(); }
+      cancelBtn.addEventListener("click", function () {
         delBtn.hidden = false; confirmBtn.hidden = true; cancelBtn.hidden = true;
       });
-      confirmBtn.addEventListener("click", function (e) {
-        if (e && e.stopPropagation) { e.stopPropagation(); }
+      confirmBtn.addEventListener("click", function () {
         if (deleting) { return; }
         deleting = true;
         confirmBtn.disabled = true; cancelBtn.disabled = true;
@@ -491,13 +540,16 @@
       actions.appendChild(cancelBtn);
     }
     li.appendChild(actions);
-    li.addEventListener("click", function () {
-      if (unread) {
-        post("/notifications/" + encodeURIComponent(it.id) + "/read", {}).then(function (r2) {
-          if (r2.ok) { renderInboxBadge(r2.data && r2.data.unread_count); }
-        }).catch(function () { /* نتجاهل: العرض لسه شغال */ });
-      }
-      if (it.conversation_id) { openDetail(it.conversation_id); }
+
+    // ماوس/لمس: الضغط على أي مكان فاضي في الصف يفتح الإشعار (نفس سلوك ما قبل الإصلاح).
+    // بنعالج بس النقر اللي هدفه الحاوية نفسها (padding) — أي نقر جوه زر (الفعل الرئيسي أو
+    // أزرار الإجراءات) بيتعالج بمعالج الزر نفسه. كده مفيش ازدواج، والضغط على زر إجراء
+    // مايفعّلش الفعل الرئيسي. مسار الكيبورد منفصل تمامًا: الأزرار الحقيقية بتتعامل مع
+    // Enter/Space بنفسها، ومفيش أي `keydown` على الحاوية.
+    li.addEventListener("click", function (e) {
+      var t = e && e.target;
+      if (t && t !== li) { return; }
+      activateMain();
     });
     return li;
   }
@@ -816,7 +868,7 @@
     return pill;
   }
 
-  function loadChats(refresh) {
+  function loadChats(refresh, page) {
     var list = $("chats-list");
     // OHB2-MINIAPP-STALE-FIX: حرس الردود القديمة بنفس نمط `detailSeq`. كل طلب جديد
     // بيلغي الطلبات الأقدم؛ الرد (نجاح/فشل/رفض شبكة) مايلمسش الـ DOM غير لو لسه
@@ -825,11 +877,19 @@
     function current() { return state.chatsSeq === seq; }
     list.innerHTML = "";
     list.appendChild(el("li", "loading-row", "بيتم التحميل…"));
-    var q = "?page=" + state.chatsPage + (refresh ? "&refresh=1" : "");
+    // OHB2-PLAN04-UI03: رقم الصفحة المطلوب بيتحدّد قبل النداء، و`state.chatsPage` مايتقدّمش
+    // إلا بعد نجاح الرد (من `data.page` تحت). كده ضغط مزدوج على «المزيد» مايتخطّاش صفحة،
+    // ونفس نمط الترقيم المستقر في صندوق الإشعارات (R5-01).
+    var targetPage = (typeof page === "number" && page >= 0) ? page : state.chatsPage;
+    var q = "?page=" + targetPage + (refresh ? "&refresh=1" : "");
     return get("/conversations" + q).then(function (res) {
       if (!current()) { return; }
       if (!res.ok) { list.innerHTML = ""; list.appendChild(el("li", "empty-row", friendlyMessage(res.status, res.data))); return; }
       var data = res.data || {};
+      // OHB2-PLAN04-UI03: نزامن رقم الصفحة مع رد السيرفر **بعد النجاح بس** (نفس نمط
+      // صندوق الإشعارات/طلبات البدء). كده فشل الطلب مايقدّمش الصفحة، وضغط «المزيد»
+      // التاني بيعيد نفس الصفحة الفاشلة بدل ما يتخطاها.
+      if (typeof data.page === "number" && data.page >= 0) { state.chatsPage = data.page; }
       list.innerHTML = "";
       var items = data.items || [];
       if (!items.length) { list.appendChild(el("li", "empty-row", "مفيش شاتات.")); }
@@ -840,11 +900,12 @@
         main.appendChild(el("span", "row-sub", item.repository || "بدون مستودع"));
         li.appendChild(main);
         li.appendChild(statusPill(item));
-        li.addEventListener("click", function () { openDetail(item.id); });
+        makeRowInteractive(li, function () { openDetail(item.id); });
         list.appendChild(li);
       });
       var more = $("chats-more");
       if (more) { more.hidden = !data.has_more; }
+      state.chatsHasMore = !!data.has_more;
     }).catch(function () {
       // OHB2-MINIAPP-STALE-FIX: رفض الشبكة كان بيسيب صف «بيتم التحميل…» للأبد وبيرمي
       // unhandled rejection. دلوقتي بنستبدله برسالة قابلة للاسترجاع — لكن برضه بحرس
@@ -1050,7 +1111,8 @@
           if (res.ok) {
             toast("اتحذف من OpenHands نهائيًا ✅");
             showView("view-chats");
-            loadChats(true);
+            state.chatsPage = 0;
+            loadChats(true, 0);
           } else {
             deleting = false;
             confirmBtn.disabled = false;
@@ -1155,7 +1217,7 @@
         files.forEach(function (path) {
           var li = el("li", "row");
           li.appendChild(el("span", "row-title", path));
-          li.addEventListener("click", function () { loadPreview(path); });
+          makeRowInteractive(li, function () { loadPreview(path); });
           list.appendChild(li);
         });
       }).catch(function () {
@@ -1210,7 +1272,7 @@
         main.appendChild(el("span", "row-title", w.title || w.id));
         main.appendChild(el("span", "row-sub", w.last_state || ""));
         li.appendChild(main);
-        li.addEventListener("click", function () { openDetail(w.id); });
+        makeRowInteractive(li, function () { openDetail(w.id); });
         list.appendChild(li);
       });
     }).catch(function () {
@@ -1237,7 +1299,7 @@
       items.forEach(function (r) {
         var li = el("li", "row");
         li.appendChild(el("span", "row-title", r.full_name + (r.private ? " 🔒" : "")));
-        li.addEventListener("click", function () { pickRepo(r.full_name); });
+        makeRowInteractive(li, function () { pickRepo(r.full_name); });
         list.appendChild(li);
       });
     }).catch(function () {
@@ -1295,7 +1357,8 @@
       } else {
         toast("اتبدأ الشات ✅ — حدّث القايمة.");
         showView("view-chats");
-        loadChats(true);
+        state.chatsPage = 0;
+        loadChats(true, 0);
       }
     }
     resendCreate(ref).then(function (res) {
@@ -1333,7 +1396,7 @@
         tab.addEventListener("click", function () {
           var view = tab.getAttribute("data-view");
           showView("view-" + view);
-          if (view === "chats") { state.chatsPage = 0; loadChats(false); }
+          if (view === "chats") { state.chatsPage = 0; loadChats(false, 0); }
           if (view === "watches") { loadWatches(); }
           if (view === "inbox") { state.inboxLastRefreshAt = Date.now(); loadInbox(0); }
           if (view === "jobs") { state.jobsPage = 0; loadJobs(0, false); loadDeletions(false); }
@@ -1341,8 +1404,13 @@
         });
       })(tabs[i]);
     }
-    $("chats-refresh").addEventListener("click", function () { state.chatsPage = 0; loadChats(true); });
-    $("chats-next").addEventListener("click", function () { state.chatsPage += 1; loadChats(false); });
+    $("chats-refresh").addEventListener("click", function () { state.chatsPage = 0; loadChats(true, 0); });
+    $("chats-next").addEventListener("click", function () {
+      // OHB2-PLAN04-UI03: ما نتقدّمش الصفحة هنا — بنطلب الصفحة الجاية صراحةً،
+      // و`state.chatsPage` بيتزامن مع رد السيرفر بعد النجاح بس (نفس نمط الصندوق).
+      if (!state.chatsHasMore) { return; }
+      loadChats(false, state.chatsPage + 1);
+    });
     $("watches-refresh").addEventListener("click", loadWatches);
     $("inbox-refresh").addEventListener("click", function () { state.inboxLastRefreshAt = Date.now(); loadInbox(0); });
     ["inbox-filter-all", "inbox-filter-unread", "inbox-filter-archived"].forEach(function (id) {
@@ -1388,7 +1456,8 @@
       renderBootstrap(boot.data);
       show("state-ready");
       showView("view-chats");
-      loadChats(false);
+      state.chatsPage = 0;
+      loadChats(false, 0);
     }).catch(function () {
       setError("مش قادر أوصل للسيرفر. اتأكد من الاتصال وجرّب تاني.");
     });

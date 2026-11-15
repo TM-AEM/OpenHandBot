@@ -82,8 +82,31 @@ class El {
     const i = arr.indexOf(fn);
     if (i !== -1) { arr.splice(i, 1); }
   }
+  // OHB2-PLAN04-F2: نموذج أحداث بيفقّس (bubbles) من العنصر الهدف لأسلافه، زي المتصفح.
+  // بيحترم `bubbles` و`stopPropagation()` و`preventDefault()`، وبيضبط `target`/`currentTarget`
+  // و`defaultPrevented`. ده اللي بيخلّي اختبارات الفقاعة (زر داخلي → حاوية الصف) ليها معنى.
   dispatch(type, event) {
-    (this._listeners[type] || []).slice().forEach((fn) => fn.call(this, event || {}));
+    const e = event || {};
+    if (e.type === undefined) { e.type = type; }
+    if (e.bubbles === undefined) { e.bubbles = true; }
+    if (e.defaultPrevented === undefined) { e.defaultPrevented = false; }
+    if (typeof e.preventDefault !== "function") {
+      e.preventDefault = function () { e.defaultPrevented = true; };
+    }
+    if (typeof e.stopPropagation !== "function") {
+      e.stopPropagation = function () { e._stop = true; };
+    }
+    if (e.target === undefined) { e.target = this; }
+    let node = this;
+    while (node) {
+      e.currentTarget = node;
+      // ننسخ القايمة عشان تعديلها أثناء البث (add/removeEventListener) ما يأثّرش على الجولة دي.
+      (node._listeners[type] || []).slice().forEach((fn) => fn.call(node, e));
+      if (e._stop) { break; }          // stopPropagation: اوقف الطلوع للأسلاف.
+      if (!e.bubbles) { break; }       // حدث غير فقّاس: الهدف بس.
+      node = node.parentNode;
+    }
+    return e;
   }
   // زرّ: click() بيطلق الحدث (والأزرار المعطّلة ما بتطلقهاش زي المتصفح).
   click() { if (this.disabled) { return undefined; } return this.dispatch("click", { type: "click" }); }

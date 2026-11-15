@@ -664,3 +664,89 @@ DOM ومُختبر بـ Node). الأزرار بتظهر **بس** حسب أعل�
   لاحقًا. **مفيش cleanup worker**: التقليم جوه نفس معاملة الإدراج.
 - تفعيل `MINI_APP_ENABLED` في الإنتاج + تحديث `/app` يشاور على الواجهة الفعلية.
 - معالجة الرابط الثابت (القسم 13).
+
+## 15. مصفوفة تكافؤ الميزات والجاهزية (OHB2-PLAN04-UI04)
+
+> مُشتقّة من تتبّع **route → service → db** الفعلي، مش من وجود زر/راوت. لكل ميزة **حالة
+> واحدة** بالضبط. مفردات الحالة: `IMPLEMENTED_AND_TESTED` · `IMPLEMENTED_NOT_E2E_VERIFIED`
+> · `HIDDEN_BY_POLICY` · `BLOCKED` · `NOT_IMPLEMENTED`.
+
+| # | الميزة | الحالة | الراوت | الخدمة | قاعدة البيانات | مدخل الواجهة | بوابة | تفويض/ملكية | tombstone | حدود/تحقّق | حالة عملية متينة | اختبارات |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | الشاتات | `IMPLEMENTED_AND_TESTED` | `GET /conversations` | `list_conversations` | `list_watched`/`is_deleted_with_retry` (كاش 45s) | تبويب الشاتات (`app.js::loadChats`) | — | كاش+search (قراءة) | `_without_deleted` | `page∈[0,MAX_PAGE]` | — | `test_miniapp_features`, `stale_guards.test.js`, `chats_pagination.test.js` |
+| 2 | إرسال برومت | `IMPLEMENTED_AND_TESTED` | `POST /conversations/{id}/prompt` | `send_prompt` | `add_or_group_outbox` (idempotent بـ`client_ref`) | `app.js` (textarea+إرسال) | — | `_authorize_conversation` | 409 `conversation_deleted` | `_require_text`/`_require_ref` | outbox pending→accepted | `test_miniapp_operations`, `http_journeys`, `ops.test.js` |
+| 3 | شات جديد | `IMPLEMENTED_AND_TESTED` | `POST /chats` | `create_chat` | `add_creation_job` | تبويب «شات جديد» | — | owner-scoped | استبعاد المتشاهد | `_require_repo` (اختياري) | creation pending→done/unknown | `test_miniapp_creation_jobs`, `jobs*.test.js` |
+| 4 | اختيار المستودع | `IMPLEMENTED_AND_TESTED` | `GET /repositories` · `PATCH /conversations/{id}/repository` | `list_repositories` · `associate_repository` | — | تبويب «شات جديد» + تفاصيل | — | `_authorize_conversation` على PATCH | 404 متشاهد | `_require_repo` owner/repo | — | `test_miniapp_features`, `http_journeys`, `stale_guards.test.js` |
+| 5 | تصفّح الملفات | `IMPLEMENTED_AND_TESTED` | `GET /conversations/{id}/files` | `list_files` | `is_deleted` | قسم «ملفات الشات» | `features.files` (مفعّلة) | `_authorize_conversation` | 404 متشاهد | allowlist `is_safe_workspace_path` | — | `test_miniapp_files`, `files_watch.test.js` |
+| 6 | معاينة الملف | `IMPLEMENTED_AND_TESTED` | `GET /conversations/{id}/file?path=` | `read_preview` | — | ضغط مسار الملف | `features.files` | `_authorize_conversation` | 404 متشاهد | allowlist + سقف قراءة | — | `test_miniapp_files`, `test_real_http_miniapp_download` |
+| 7 | تصدير الشات | `IMPLEMENTED_AND_TESTED` | `GET /conversations/{id}/export` | `export_conversation` | `is_deleted` | زر «تصدير الشات» | `features.export` | `_authorize_conversation` | 404 متشاهد | سقف `MAX_EXPORT_BYTES` | — | `test_miniapp_export_reply`, `test_real_http_miniapp_download`, `export.test.js` |
+| 8 | التكلفة/الاستهلاك | `IMPLEMENTED_AND_TESTED` | `GET /conversations/{id}/cost` | `get_cost` | — | قسم «التكلفة والاستهلاك» | `features.cost` | `_authorize_conversation` | 404 متشاهد | فشل القسم مايكسّر التفاصيل | — | `test_miniapp_cost`, `cost.test.js` |
+| 9 | المتابعات | `IMPLEMENTED_AND_TESTED` | `GET /watches` · `POST/DELETE /conversations/{id}/watch` | `list_watches`/`add_watch`/`remove_watch` | `add_watched`/`remove_watched`/`list_watched` | تبويب المتابعات | `features.is_hidden("followups")` (مفعّلة) | `_authorize_conversation` | استبعاد المتشاهد | — | — | `test_miniapp_features`, `inbox_watch.test.js` |
+| 10 | الإشعارات/الصندوق | `IMPLEMENTED_AND_TESTED` | `GET /notifications` · `POST …/read`,`/read-all`,`/archive`,`/unarchive` · `DELETE /notifications/{id}` | `list_inbox`/`mark_*`/`delete_inbox_item` | `list_inbox`/`count_inbox`/`mark_inbox_*` | تبويب الإشعارات | — | owner-scoped | استبعاد المتشاهد | `page∈[0,MAX_PAGE]` | eligibility CAS للحذف | `test_miniapp_inbox*`, `inbox*.test.js` |
+| 11 | العمليات والتسوية | `IMPLEMENTED_AND_TESTED` | `GET /operations/outbox`·`/operations/creation`·`/operations/deletions/list` · `POST …/reconcile` | `*_operation`/`reconcile_*` | `get_outbox`/`get_creation_job`/CAS | تبويب «طلبات البدء» + صناديق العمليات | — | owner-scoped (404) | استبعاد المتشاهد | `id`/`client_ref` | CAS ذرّي (`set_*_status_if_in`) | `test_miniapp_operations`, `test_miniapp_reconcile`, `reconcile_watch.test.js` |
+| 12 | حذف الشات البعيد | `IMPLEMENTED_AND_TESTED` | `DELETE /conversations/{id}` | `delete_conversation` | `remote_deletion_*` + tombstone | زر «حذف الشات» (تأكيد خطوتين) | — | `_authorize_conversation` | tombstone مؤكّد | معرّف صالح | deleting→confirmed/uncertain | `test_conversation_deletion`, `test_remote_deletion*`, `delete.test.js` |
+
+**ملاحظات على المصفوفة:**
+- كل الصفوف `IMPLEMENTED_AND_TESTED`: كل ميزة ليها تغطية اختبار فعليّة على مستوى السلوك
+  (routes عبر `TestClient` + وحدات الواجهة عبر Node)، مش مجرد وجود راوت.
+- **مفيش** ميزة `HIDDEN_BY_POLICY` حاليًا: `bot/features.py::DEFERRED_FEATURES_HIDDEN=False`
+  (الميزات مفعّلة). مفيش `BLOCKED` ولا `NOT_IMPLEMENTED` ضمن الـ12 المطلوبة.
+- **قيود معروفة (غير مانعة):** (أ) تنقّل مجلدات هرمي/تنزيل ملف منفرد غير مُنفَّذ (القسم 13هـ)؛
+  (ب) `MINI_APP_ENABLED` لسه **مطفأ** في الإنتاج (نشر، مش كود)؛ (ج) عرض «الرد الكامل» في
+  البوت = عرض للنسخ اليدوي (قيود Bot API على الحافظة).
+
+### 15.1 التحقّق من الأمان والثوابت (state-changing)
+
+كل نقطة نهائية تغيّر الحالة بتتحقّق من: **جلسة صالحة + مستخدم مسموح + Origin مطابق**
+(`_guarded(state_changing=True)`)، وتفويض **ملكية الشات server-side** (`_authorize_conversation`)
+قبل أي كتابة. حالات سلبية مغطّاة: 401 (بلا جلسة)، 403 (مستخدم مش مسموح / أصل غلط)،
+403/404 (مالك تاني)، 409 (متشاهد/حالة نهائية). الشات المتشاهد (tombstone) بيُرفض على
+كل مسارات القراءة والكتابة (F-1) باستثناء عمليتين صريحتين (`watch` reengage، وإعادة محاولة الحذف).
+
+## 16. تحقّق HTTP والمتصفّح (OHB2-PLAN04-UI02)
+
+| الفئة | الحالة | الدليل |
+| --- | --- | --- |
+| **تحقّق HTTP حقيقي** | ✔ مُتحقَّق | `tests/test_miniapp_*.py` (~370 اختبار عبر `TestClient`) + `tests/test_miniapp_http_journeys.py` (جديد: مصادقة/كوكي/أصل/برومت idempotent/PATCH مستودع/status) |
+| **تحقّق عبر سوكيت TCP حقيقي** | ✔ مُتحقَّق | `tests/test_real_http_miniapp_download.py` (معاينة/تصدير عبر خادم upstream على 127.0.0.1) |
+| **تحقّق بمتصفّح حقيقي** | ✖ **غير مُتحقَّق** | مفيش مشغّل متصفّح (Playwright/Selenium) في البيئة أو CI |
+| **تحقّق Node DOM-stub** | ✔ مُتحقَّق (بديل جزئي) | `tests/frontend/*.test.js` (250) — بيشغّل **نفس** `app.js` في DOM مصغّر |
+| **تحقّق Telegram WebView** | ✖ **غير مُتحقَّق** | يحتاج عميل تيليجرام حقيقي (خارج CI) |
+
+**قرار بشأن المتصفّح:** ما تمّش إضافة مشغّل متصفّح. المبرّر: المتصفّح الحقيقي في سياق
+Telegram WebView فقط (المصادقة عبر `initData`)، والمسارات الحرجة (مصادقة/كوكي/أصل/idempotency/
+ملكية/تنزيل) مغطّاة عبر **حدود HTTP حقيقية**، وسلوك الـ DOM مغطّى عبر Node. سلوك WebView-only
+يُترك **غير مُتحقَّق صراحةً** بدل ادّعاء تغطية مضلّلة. أي إضافة مشغّل متصفّح تبقى قرارًا
+منفصلًا (تبعيات + CI) لو المالك طلبها.
+
+## 17. مرونة الحالات + الإتاحة (OHB2-PLAN04-UI03)
+
+**إصلاح (UI-03):** ترقيم قايمة الشاتات كان بيعتمد على `state.chatsPage += 1` **قبل** الطلب
+(نمط مشترك في `inbox`/`jobs` كان أصلًا مصحّحًا). النتيجة: ضغط مزدوج على «المزيد» كان
+بيقدّم الرقم مرتين ⇒ تخطّي صفحة (سباق). اتّصلح بجعل `loadChats(refresh, page)`:
+- الرقم المطلوب بيتحدّد قبل النداء، و`state.chatsPage` بيتزامن مع رد السيرفر **بعد النجاح بس**
+  (`data.page`)، و«المزيد» بيقف لما `has_more=false` (نفس نمط R5-01 في الصندوق).
+- **اختبار انحدار:** `tests/frontend/chats_pagination.test.js` (مُثبَت إنه بيفشل على السلوك
+  القديم: 3/3 fail قبل الإصلاح، 3/3 pass بعده).
+
+**إتاحة (a11y):** RTL عربي (`<html lang="ar" dir="rtl">`)، حالة تحميل معلنة (`role=status`+
+`aria-live`)، حالة خطأ (`role=alert`)، هدف لمس ≥44px، و**حلقة تركيز مرئية** للكيبورد
+(`:focus-visible` في `styles.css`). فحوص مصدرية في `tests/frontend/a11y.test.js`
+(**مش** تحقّق متصفّح حقيقي).
+
+**إصلاح F-1 (OHB2-PLAN04-F1):** صفوف الإشعارات كانت `<li role="button" tabindex="0">` **وفيها**
+أزرار أرشفة/حذف جوّاها ⇒ تداخل عناصر تفاعلية، و`Enter`/`Space` على زر داخلي كانت بتفقّس
+للصف وبتفعّل فعل الصف كمان (فتح شات/تعليم مقروء غير مقصود). الحل: الحاوية `<li>` بقت عنصر
+قايمة بنيوي، والفعل الرئيسي زر `<button type="button" class="row-open">` حقيقي **شقيق**
+لأزرار الأرشفة/الحذف، فكل زر بيتفعّل لوحده بالكيبورد. الصفوف البسيطة (chats/files/watches/
+repos) لسه بتستعمل `makeRowInteractive` زي ما هي. **اختبار انحدار:** `tests/frontend/keyboard_rows.test.js`
+(اختبارات F-1 بتفشل على البنية القديمة).
+
+**إصلاح F-2 (OHB2-PLAN04-F2):** `tests/frontend/dom_stub.js` بقى **يفقّس** الأحداث للعنصر الأب
+(`bubbles`/`target`/`currentTarget`/`stopPropagation`/`preventDefault`/`defaultPrevented`)،
+عشان اختبارات الفقاعة (زر داخلي → حاوية الصف) يكون ليها معنى حقيقي.
+
+**حالات مراجَعة وأُكِّدت سليمة (بلا تغيير):** حرس الردود القديمة (chats/detail/watches/repos/
+preview عبر `*Seq` + `currentChat`)، منع الطلبات المتداخلة (inbox/jobs)، منع الضغط المزدوج
+على العمليات المدمِّرة (delete/cancel/archive — `busy`/`deleting`)، وعدم ادّعاء نجاح كاذب
+عند الغموض (`مش قادر أوصل للسيرفر — جرّب تاني`).

@@ -137,25 +137,20 @@ ATTACHMENT_BATCH_STATUSES = (
     ATTACHMENT_BATCH_FAILED,
 )
 
-# OHB2-P0-A3/D-32 (F1-1a/F1-1b): تصنيف **صريح** لحالات الدفعة عند حدّ توجيه النصّ في A3.
+# OHB2-P0-A3/D-32 (F1-1a/F1-1b)، محدَّث بـD-34: تصنيف **صريح** لحالات الدفعة عند حدّ توجيه النصّ في A3.
 # القاعدة الحاكمة: حالات **غير محسومة** (لسه فيها نيّة/إرسال معلّق) بتحجب البرومت العادي؛
-# حالات **نهائية** ما بتحجبش برومتًا جديدًا بذاتها (لكن ما بتصرّحش بتحويل/إعادة نصّ قديم).
+# وحالات **نهائية** بتحجب كذلك (D-34: غياب دليل الهوية **مش** دليل على رسالة جديدة) — مش بتسقط
+# لمسار البرومت/`_send_prompt`/`outbox`، ولا بتصرّح بتحويل/إعادة نصّ قديم.
 #   - unresolved: النيّة/الإرسال لسه معلّق ⇒ **تحجب** (فشل مغلق). `intent_recorded` = نيّة
 #     محلية متينة (D-27)؛ `dispatching`/`uncertain` = مراحل B (لسه بلا منطق انتقال).
-#   - terminal: نتيجة نهائية ⇒ **لا تحجب** برومتًا جديدًا (بلا غموض).
+#   - terminal: نتيجة نهائية ⇒ **تحجب** (fail-closed — D-34، ألغى سلوك D-32 بند 2 القديم
+#     «terminal لا تحجب»): المرتبط بدفعة نهائية `TERMINAL_ASSOCIATED`، وبلا دليل هوية
+#     `TERMINAL_UNPROVEN` — الاتنين بيمنعوا مسار البرومت العادي.
 ATTACHMENT_BATCH_UNRESOLVED_STATUSES = frozenset(
     {
         ATTACHMENT_BATCH_INTENT_RECORDED,
         ATTACHMENT_BATCH_DISPATCHING,
         ATTACHMENT_BATCH_UNCERTAIN,
-    }
-)
-ATTACHMENT_BATCH_TERMINAL_STATUSES = frozenset(
-    {
-        ATTACHMENT_BATCH_DELIVERED,
-        ATTACHMENT_BATCH_EXPIRED,
-        ATTACHMENT_BATCH_REJECTED,
-        ATTACHMENT_BATCH_FAILED,
     }
 )
 

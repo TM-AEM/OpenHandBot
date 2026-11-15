@@ -114,6 +114,15 @@ html, body {
 .btn:active { transform: scale(.98); }
 .btn[disabled] { opacity: .6; cursor: default; }
 
+/* OHB2-PLAN04-UI03: حلقة تركيز مرئية واضحة للتنقّل بالكيبورد على كل العناصر التفاعلية.
+   بنستخدم `:focus-visible` (بتظهر للمستخدم اللي بيتنقّل بالكيبورد، مش لكل ضغطة ماوس) —
+   من غير ما نلغي الحلقة الافتراضية للمتصفحات القديمة اللي مابتدعمهاش. */
+.btn:focus-visible, .tab:focus-visible, .chip:focus-visible,
+.input:focus-visible, .textarea:focus-visible, .row:focus-visible, .link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 /* OHB2-06: عناصر الواجهة الوظيفية */
 .topbar .user { font-size: 13px; opacity: .8; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tabs { display: flex; gap: 6px; overflow-x: auto; padding: 4px 0 8px; }
@@ -126,6 +135,15 @@ html, body {
 .list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
 .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 12px; border: 1px solid #334155; border-radius: 12px; cursor: pointer; }
 .row-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 auto; }
+/* OHB2-PLAN04-F1: الفعل الرئيسي في صف الإشعار بقى زر `<button>` حقيقي — نصفّر تنسيق الزر
+   الافتراضي عشان يفضل شكله زي ما كان (نص + شارات)، مع حلقة تركيز واضحة للكيبورد. */
+.row-open {
+  appearance: none; -webkit-appearance: none;
+  background: transparent; border: 0; padding: 0;
+  font: inherit; color: inherit; text-align: start;
+  align-items: stretch;
+}
+.row-open:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .row-pills { display: flex; gap: 4px; align-items: center; flex: 0 0 auto; }
 .row-actions { display: flex; gap: 4px; align-items: center; flex: 0 0 auto; }
 .row.archived { opacity: .7; }

@@ -3058,3 +3058,195 @@ P0، مفيش تغيير سلوك، مفيش كود/اختبارات/مخطط.**
 `SUPPORTED_ATTACHMENT_FILTER`/`UNSUPPORTED_ATTACHMENT_FILTER`).
 
 > ملاحظة: ده **توثيق فقط**؛ مفيش تغيير كود ولا قرار جديد ولا تصريح تنفيذ جديد.
+
+---
+
+## OHB2-EXECUTE-PLAN-04-MINIAPP-FRONTEND (2026-11-14)
+
+### توضيح تعارض العنوان (مهم — مقروء من الأدلّة)
+عنوان المهمة المرسل كان «OHB2-REPAIR-PLAN-01-RESOURCE-STAGING» (FIX-01..04)، لكن
+**USER_CONTEXT** المرفق وصف المهمة الحالية بأنها «OHB2-EXECUTE-PLAN-04-MINIAPP-FRONTEND».
+اتّضح إن **Plan 01 مُنفَّذ ومُودَع فعلًا عند HEAD** (`f6c0f24`، جدّ `9c8cf2e`) مع اختباراته
+(`tests/test_repair_plan_01_*.py` = **57 passed**) ومسار تصحيح نتائج المراجعة (R-1..R-5).
+سجل الذاكرة `.openhands/memory/2026-11-14.md` بيوثّق **نفس** نمط دمج العنوان/الـ USER_CONTEXT
+في الجلسة السابقة (عنوان Plan 01 لكن USER_CONTEXT = Plan 03 ⇒ اتنفّذ Plan 03 = `9c8cf2e`).
+⇒ القرار: تنفيذ **Plan 04** (الـ USER_CONTEXT الحيّ)، مع الإبلاغ الصريح عن حالة Plan 01.
+
+### خط الأساس (متحقَّق منه فعليًّا)
+- الفرع `main`، HEAD `9c8cf2e`، `origin/main` == local main، الشجرة **نظيفة** قبل تعديلاتي.
+- البوابة قبل: pytest **1 failed / 3051 passed** (الفشل = `test_deploy_manifest.py::
+  test_documented_manifest_is_import_sufficient` — **قائم سابقًا/بيئي**: `import main` في
+  subprocess معزول بيفشل `ModuleNotFoundError: telegram`)، node **223 pass**، pyflakes exit 0.
+
+### معايير القبول
+1. UI-01: سلطة الواجهة الأمامية موثّقة بالأدلّة + اقتراح إزالة السقالة (بلا تنفيذ حذف).
+2. UI-02: تحقّق HTTP حقيقي للرحلات الحرجة (مصادقة/كوكي/أصل/idempotency/ملكية).
+3. UI-03: إصلاح سباق ترقيم الشاتات + إتاحة، مع اختبار انحدار مُثبَت.
+4. UI-04: مصفوفة تكافؤ ميزات (route→service→db) بحالة واحدة لكل ميزة.
+5. بلا كسر: كل الاختبارات القائمة تفضل خضراء ما عدا الفشل القائم سابقًا. بلا commit/push/PR.
+
+### ما اتعمل (UI-01 → UI-04)
+- **UI-01** — `docs/decisions/owner-briefs/OHB2-PLAN04-UI01-FRONTEND-AUTHORITY.md`: الواجهة
+  الفعلية = `bot/web/static/` (vanilla، Starlette بنفس عملية البوت)؛ سقالة React/Vite الجذرية
+  **غير مستخدمة** (صفر مراجع في كود/CI/`start.sh`؛ `src/App.tsx` فاضي؛ `package.json` = "react-example")
+  و**تخالف** `docs/plan-openhandBot-2.md` §4.2. **اقتراح إزالة** موثّق — **لم يُنفَّذ** (خارج النطاق).
+- **UI-02** — `tests/test_miniapp_http_journeys.py` (8 اختبارات، `Database` حقيقي + `OpenHandsClient`
+  حقيقي فوق `httpx.MockTransport`): فشل مصادقة بلا كوكي، دورة حياة الكوكي (إنشاء/إبطال)، رحلة
+  قراءة كاملة، `GET /status` إيجابي/سلبي، برومت idempotent عبر HTTP + polling، رفض الأصل،
+  ربط المستودع (نجاح/أصل/مشوّه/مالك تاني)، 401 لغير المسجّل. **مفيش** مشغّل متصفّح (قرار موثّق).
+- **UI-03** — `bot/web/static/app.js`: `loadChats(refresh, page)` بقى بيتزامن `state.chatsPage`
+  مع رد السيرفر **بعد النجاح بس** (`data.page`)، و«المزيد» بيتقدّم للصفحة الجاية صراحةً مع
+  وقف عند `has_more=false` (نمط R5-01 في الصندوق) ⇒ شيل سباق تخطّي الصفحة عند الضغط المزدوج.
+  `bot/web/static/styles.css`: حلقة تركيز مرئية (`:focus-visible`).
+  اختبارات: `tests/frontend/chats_pagination.test.js` (3) + `tests/frontend/a11y.test.js` (5).
+- **UI-04** — `docs/MINI_APP.md` §15 (مصفوفة 12 ميزة بحالة واحدة + بوابة + تفويض + tombstone +
+  حدود + حالة عملية + اختبارات)، §16 (مستويات تحقّق UI-02)، §17 (تغييرات UI-03).
+
+### التحقّق (أوامر ونتائج فعلية)
+- `python -m pytest -q` ⇒ **1 failed / 3059 passed** (150s). الفشل الوحيد **نفس** الفشل البيئي
+  القائم سابقًا (`test_deploy_manifest`) ⇒ **مش انحدار**. (الأساس 3051 ⇒ +8 اختبار جديد، صفر انحدار.)
+- `node --test tests/frontend/*.test.js` ⇒ **231 pass / 0 fail** (الأساس 223 ⇒ +8).
+- `python -m pyflakes bot/ automation/ main.py tests/` ⇒ exit **0**.
+- `python -m bandit -r bot/ automation/ main.py -lll -s B613` ⇒ High **0**.
+- إثبات انحدار UI-03: على السلوك القديم `chats_pagination.test.js` = **3/3 fail**، بعده **3/3 pass**.
+- `tests/test_repair_plan_01_*.py` ⇒ **57 passed** (تأكيد أن Plan 01 سليم ومُنفَّذ عند HEAD).
+
+### Assumptions / decisions
+- **تفسير تعارض العنوان:** نُفِّذ الـ USER_CONTEXT (Plan 04) — متّسق مع نمط الجلسة السابقة
+  الموثّق في الذاكرة، ومع كون Plan 01 مُنفَّذًا فعلًا (إعادة تنفيذه = مخاطرة انحدار بلا فائدة).
+- **مفيش مشغّل متصفّح:** المتصفّح الحقيقي = Telegram WebView فقط؛ المسارات الحرجة مغطّاة عبر
+  حدود HTTP حقيقية + Node DOM-stub؛ سلوك WebView-only = **UNVERIFIED** صراحةً.
+- **إزالة السقالة:** قرار مالك منفصل — موثّق فقط.
+- لم أُعدّل `concurrent_updates(True)`، ولا المعمارية، ولا سياسة المرفقات، ولا أي سلوك fail-closed.
+
+### الحالة
+- **DONE محليًّا** (Plan 04). **لا** commit/push/PR/merge/نشر/تفعيل Autopush (تعليمة صريحة).
+- **الخطوة التالية:** قرار مالك على إزالة سقالة React/Vite (بند UI-01 §4).
+
+---
+
+## OHB2-PLAN04-FINAL-LOW-FINDINGS-REMEDIATION (2026-11-14, محلي غير مُودَع)
+
+**الهدف:** معالجة الـ3 نتائج LOW المؤكّدة من المراجعة المستقلة لـ Plan 04.
+
+**ما تمّ (بلا commit):**
+- **LOW-1 (كيبورد):** helper جديد `makeRowInteractive(li, activate)` في `app.js` (role=button +
+  tabindex=0 + click→activate + keydown Enter/Space→activate مع `preventDefault`).
+  طُبِّق على الصفوف التفاعلية الـ5: الإشعارات (`renderInboxRow`)، الشاتات، الملفات،
+  المتابعات، المستودعات. صفوف «طلبات البدء»/الحذف غير التفاعلية **مااتغيّرتش**.
+  اختبارات انحدار جديدة `tests/frontend/keyboard_rows.test.js` (9 اختبارات، سلوكية عبر
+  أحداث حقيقية). مُثبَت إنه بيفشل على السلوك القديم (6/9 fail).
+- **LOW-2 (أرقام قديمة):** `docs/MINI_APP.md` §16 و`docs/decisions/owner-briefs/OHB2-PLAN04-UI01-FRONTEND-AUTHORITY.md`
+  — صُحّحت لأحدث قيم مقيسة بعد LOW-1: اختبارات Node **240**، `app.js` **1445** سطر.
+- **LOW-3 (راوت):** `docs/MINI_APP.md` §15 صف 11 — `GET /operations/outbox|creation|deletions`
+  → `GET /operations/outbox`·`/operations/creation`·`/operations/deletions/list` (مطابق `bot/web/app.py`).
+
+**خارج النطاق (لم يُلمس):** INFO-1/INFO-2، متصفّح/WebView، سقالة React/Vite، المصادقة/التفويض/CSRF/الجلسة/tombstone،
+`MINI_APP_ENABLED`، أي نشر/نشر إنتاجي، أي إعادة هيكلة.
+
+**الحالة:** **DONE محليًّا — جاهز لمراجعة مستقلة** (قراءة فقط) في جلسة منفصلة. **لا** commit/push/PR/merge/نشر.
+
+## OHB2-PLAN04-F1-NOTIFICATION-KEYBOARD-ACCESSIBILITY-REMEDIATION (2026-11-15, محلي غير مُودَع)
+
+**الهدف:** معالجة F-1 (MEDIUM: صف الإشعار الكيبوردي بيتعارض مع أزرار الأرشفة/الحذف الجوّاه) و F-2 (LOW: dom-stub ما بيفقّسش الأحداث).
+
+**خط الأساس:** `main` @ `9c8cf2eac7d5e7fe35ca5c6830341db91dd08fe2` (== origin/main)، 4 ملفات معدّلة + 5 غير متتبّعة، لا staged.
+
+**ما تمّ (بلا commit):**
+- **F-1:** `renderInboxRow` — الحاوية `<li>` بقت **بنيوية** (مفيش `role=button`/`tabindex`)، والفعل الرئيسي زر
+  `<button type="button" class="row-main row-open">` **شقيق** لأزرار الأرشفة/الحذف (مش حاوية بتلفّهم). الاسم المتاح من
+  نص الزر (عنوان + نوع + حالة قراءة). ما فيش `keydown` على الحاوية. ماوس/لمس: نقر الحاوية (target===li) بيفتح الإشعار،
+  ونقر أي زر بيتعالج بمعالج الزر نفسه. `stopPropagation` اتشالت (ما بقتش لازمة — مفيش تداخل).
+  `styles.css`: `.row-open` (تصفير تنسيق الزر) + حلقة تركيز.
+- **F-2:** `tests/frontend/dom_stub.js` — `El.dispatch` بقى **يفقّس** (`bubbles`/`target`/`currentTarget`/`stopPropagation`/
+  `preventDefault`/`defaultPrevented`)، و`click()` بيطلق حدث فقّاس.
+- **اختبارات:** `keyboard_rows.test.js` — 12 اختبار F-1 جديد (دلالات + سلوك Enter/Space لكل زر + ماوس + no nested interactives).
+- **LOW-2 صِيانة:** القيم المقيسة اتغيّرت بعد التعديل ⇒ حُدِّثت المراجع: اختبارات Node **240→250**، `app.js` **1450→1472**،
+  الإجمالي **~2440** (`docs/MINI_APP.md` §17، owner brief).
+
+**التحقّق:**
+- `node --test tests/frontend/keyboard_rows.test.js` → **19/19 pass**.
+- `node --test tests/frontend/*.test.js` → **250/250 pass**.
+- `pytest tests/test_miniapp_http_journeys.py` → 8 passed؛ `pyflakes` → نظيف.
+- `pytest -q` → **1 failed / 3059 passed** (الفشل الوحيد `test_deploy_manifest.py::test_documented_manifest_is_import_sufficient`
+  — **خط أساس/بيئة مؤكَّد**: أُعيد على أرشيف `9c8cf2e` نظيف ⇒ يفشل بنفس السبب `ModuleNotFoundError: No module named 'telegram'`).
+- `pip_audit` → No known vulnerabilities؛ `bandit -lll` → 0 High.
+- **حساسية الاختبار (خارج المستودع):** إعادة البنية القديمة ⇒ **10/19 fail**؛ الـstub القديم (بلا فقاعة) + البنية القديمة
+  ⇒ اختبار «Enter على الأرشفة مايفعّلش الصف» **ينجح زورًا** (يثبت الحاجة لـ F-2).
+- **متصفّح حقيقي (chromium + CDP):** الصف `<li>` بلا role/tabindex، الفعل الرئيسي `<button>` قابل للتركيز بـ 0 عناصر
+  تفاعلية متداخلة؛ Enter/Space على الفعل الرئيسي → read=1 detail=1؛ على الأرشفة → archive=1 فقط؛ على الحذف/التأكيد/الإلغاء
+  → كل فعل مرّة واحدة، والفعل الرئيسي مااتفعّلش.
+
+**خارج النطاق (لم يُلمس):** LOW-2 (راوت/أرقام — صِيانة فقط)، LOW-3، سقالة React/Vite، المصادقة/التفويض/CSRF/الجلسة/tombstone،
+`MINI_APP_ENABLED`، أي نشر/نشر إنتاجي، أي إعادة هيكلة.
+
+**الحالة:** **DONE — READY FOR INDEPENDENT REVIEW** (قراءة فقط) في جلسة منفصلة. **لا** commit/push/PR/merge/نشر.
+
+## OHB2-REPAIR-PLANS-01-04-REMAINING-NOTES-REMEDIATION (2026-11-14, محلي غير مُودَع)
+
+**الهدف:** معالجة الملاحظات الأربع الباقية من التدقيق التكاملي
+`docs/reviews/OHB2-REPAIR-PLANS-01-04-FINAL-INTEGRATION-AUDIT.md` (N-1..N-4).
+
+**خط الأساس:** `main` @ `9c8cf2e` (== origin/main)؛ 5 معدّلة + 6 غير متتبّعة (Plan 04 + تقرير التدقيق)؛ لا staged.
+
+**ما تمّ (ملف واحد فقط: `bot/db.py`):**
+- **N-1 (مُصلَح):** صُحّح التعليق القديم عند رأس مجموعة ثوابت الحالات (كان يقول «الحالات النهائية
+  ما بتحجبش» — مناقض لـ D-34). أصبح يصف السلوك الفعلي: الحالات النهائية **بتحجب** (fail-closed،
+  `TERMINAL_ASSOCIATED`/`TERMINAL_UNPROVEN`). تعليق فقط — صفر تغيير سلوك.
+- **N-2 (أُزيل):** حُذف `ATTACHMENT_BATCH_TERMINAL_STATUSES` — مُثبَت أنه غير مُستخدَم (لا مرجع في
+  أي ملف، لا `__all__`، لا حزمة/واجهة عامة، لا وصول ديناميكي، لا اختبار/توثيق). الكنس يستخدم
+  `_TERMINAL` الخاصة به (قيم حرفية) بمعزل. الثوابت الأربعة المنفردة ما زالت مُستخدَمة.
+- **N-3 (مؤكَّد بلا تغيير):** العضو `AttachmentRoutingState.TERMINAL` باقٍ كما هو (value=`terminal`)
+  «للاستقرار فقط»، ولا يُنتجه التصنيف. لم يُعدَّل/يُحذف/يُعاد استخدامه.
+- **N-4 (OWNER_DECISION_REQUIRED):** بوّابة مراجعة **سياسة D-34** نفسها (سجل القرارات §5 → D-34،
+  البند I: «مراجعة عدائية مستقلة لـ D-34 قبل بدء التنفيذ»). الموجود هو مراجعة **التنفيذ**
+  (`...CONSOLIDATED-IMPLEMENTATION...`, PASS_WITH_NOTES). السجل ما زال يسجّل «التنفيذ مستحقّ بعد
+  مراجعة D-34» رغم أن D-34 مُنفَّذ على `main`. تحديث/إغلاق بوّابة قرار مالك **غير مُصرَّح به** ⇒
+  لم أُعدّل أي مستند قرار؛ وثّقت الحاجة لقرار مالك.
+
+**التحقّق (أوامر ونتائج فعلية، venv معزول `/tmp/ohb2_venv`):**
+- `pytest tests/test_attachment_terminal_routing_remediation.py tests/test_attachment_batch_state_routing_f1_1a.py tests/test_attachment_cleanup_expiration_a4.py tests/test_attachment_message_identity_a3.py tests/test_attachment_intent_a3.py` ⇒ **171 passed**.
+- Plan 01–04 + A2/A3/A4 + CI guards ⇒ **304 passed**.
+- `pytest -q` (كامل) ⇒ **3060 passed / 0 failed** (مطابق للأساس).
+- `pyflakes bot/ automation/ tools/ main.py tests/` ⇒ exit **0**.
+- `pip_audit -r requirements-dev.txt` ⇒ «No known vulnerabilities».
+- `bandit -r bot/ automation/ tools/ main.py -lll -s B613` ⇒ High severity **0**، exit 0.
+- `node --test tests/frontend/*.test.js` ⇒ **250 pass / 0 fail**.
+- فحص استيراد: `TERMINAL.value == "terminal"`، الثابت المحذوف غائب، `UNRESOLVED_STATUSES` سليم،
+  والتصنيف ما زال يُنتج `TERMINAL_ASSOCIATED`/`TERMINAL_UNPROVEN`.
+
+**خارج النطاق (لم يُلمس):** أي ملف آخر (Plan 04 العامل محفوظ)، أي سلوك D-34 وقت التشغيل، دلالات
+المعاملات/الإقرار، `concurrent_updates(True)`، المعمارية، سياسة المرفقات، `MINI_APP_ENABLED`، سقالة React/Vite.
+
+**الحالة:** **DONE_WITH_NOTES** — الإصلاح الكودي مكتمل؛ N-4 يبقى **OWNER_DECISION_REQUIRED**.
+**لا** commit/push/PR/merge/نشر. جاهز لمراجعة مستقلة (قراءة فقط) في جلسة منفصلة.
+
+## OHB2-D34-OWNER-DECISION-A-RECORD-AND-GATE-CLOSURE (2026-11-15, محلي غير مُودَع)
+
+**الهدف:** تسجيل قرار المالك الصريح (**الخيار A**) على N-4 من التدقيق التكاملي ومراجعة الإصلاح، وإغلاق
+بوّابة مراجعة D-34 وفقًا لذلك، وتحديث التوثيق الأدنى اللازم.
+
+**قرار المالك (مسجَّل):** المالك **يقبل** مراجعة **تنفيذ D-34** المستقلة القائمة كـ**بديل كافٍ** عن
+**مراجعة عدائية منفصلة لـسياسة D-34**، لغرض **استيفاء وإغلاق** بوّابة المراجعة المسجّلة. **إحلال/إعفاء
+صريح** من إجراء المراجعة المنفصلة — **وليس** ادّعاءً بأن مراجعة سياسة منفصلة قد أُجريت.
+
+**الملف المُعدَّل (وثيقة قرارات فقط):** `docs/decisions/OHB2-P0-OWNER-DECISIONS-REGISTER.md`
+- **§5 → D-34/J (جديد):** سجل كامل لقرار الإحلال (الحالة/الإفصاح/المراجعة المُعتمَد عليها/حدود ما لا يغيّره).
+- **§5 → D-34/I:** عُنوِن «تاريخي — استُوفي بـ`J`» (حُفِظ النصّ الأصلي؛ لم يُمحَ).
+- **§7 (صف D-34 في مصفوفة الجاهزية):** أُضيفت حالة إغلاق البوّابة (مع إبقاء «التنفيذ مستحقّ» — سياسة فقط).
+- **§1 (سجل حالة الوثيقة) + §9 (تذييل D-34) + §12 + التذييل الختامي:** إشارات مختصرة متّسقة للإغلاق.
+
+**التمايز الحاسم:** **N-4 مُغلَق بإحلال صريح من المالك** — **لا** بإجراء مراجعة عدائية منفصلة للسياسة
+(**لم تُجرَ**، ولا يجوز تمثيلها كمكتملة). المراجعة المُعتمَد عليها: `docs/reviews/OHB2-P0-A3-F1-CONSOLIDATED-IMPLEMENTATION-INDEPENDENT-REVIEW.md`
+— الحُكم `PASS_WITH_NOTES`، النطاق = العمل **المُنفَّذ** لـ A3/F1، والجاهزية A3/F1 → A4 `SAFE TO PROCEED`.
+
+**لم يُلمس (حدود محمية):** سياسة D-34 ومتطلّباتها؛ سلوك التنفيذ؛ توجيه D-32/D-34 والحالات النهائية/
+fail-closed/المعاملات/الإقرار؛ المخطّط/القيم المُسلسَلة/انتقالات دورة الحياة؛ أي ADR؛ Plan 01–04؛ سقالة
+React/Vite؛ `MINI_APP_ENABLED`؛ Autopush. **صفر تغيير في كود/اختبارات/مخطّط.**
+
+**التحقّق (توثيقي):** مراجعة الـdiff الكامل؛ تأكيد دقّة سجل الخيار A؛ فحص اتّساق حالة البوّابة؛ بحث عن أي
+صياغة فعّالة متبقّية تقول إن بوّابة مراجعة D-34 ما زالت معلّقة؛ تمييز التاريخي عن الحالي؛ تأكيد وجود
+المراجعة المُعتمَد عليها؛ تأكيد عدم تغيّر أي كود/مخطّط (`git diff` يخصّ ملفات `.md` فقط).
+
+**الحالة:** **DONE — READY FOR INDEPENDENT REVIEW** (توثيق فقط). **لا** commit/push/PR/merge/نشر.
+الخطوة التالية: مراجعة مستقلة (قراءة فقط) تفحص الـdiff الفعلي وتتحقّق من اتّساق سجل القرارات.
