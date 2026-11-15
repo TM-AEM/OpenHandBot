@@ -22,7 +22,7 @@
 
 The current `main` source has the following relevant characteristics. Re-check the exact HEAD and working tree before implementation; do not assume these observations are still unchanged.
 
-- `main.py` starts the Telegram bot with long polling using `run_polling(drop_pending_updates=True)`.
+- `main.py` starts the Telegram bot with long polling using a custom `getUpdates` loop (`bot.polling.run_bot`), not PTB's `run_polling`.
 - `bot/app.py` registers these seven slash commands:
   - `/start`
   - `/cancel`
@@ -139,7 +139,7 @@ Acceptance criteria:
 
 ### 1.4 Review pending Telegram updates
 
-- Explicitly decide whether `drop_pending_updates=True` is intentional for this product.
+- Explicitly decide whether `drop_pending_updates=True` is intentional for this product. **(Resolved in Stage 2: the custom loop uses `deleteWebhook(drop_pending_updates=False)` and preserves pending updates.)**
 - Document the operational consequence: pending updates may be discarded on restart.
 - Change the policy only with tests for stale update handling and duplicate-command safety. Do not change it merely as cleanup.
 

@@ -81,7 +81,7 @@ X-Real-Ip: 10.1.1.26
 
 - `ss -tlnp` showed **no listening sockets** at investigation time; the Telegram bot is **not
   running in this sandbox** (only the tmux agent session and the autopush daemon are).
-- The bot uses long polling (`main.py` → `run_polling(drop_pending_updates=True)`), so it needs
+- The bot uses long polling (custom `getUpdates` loop: `main.py` → `bot.polling.run_bot`), so it needs
   **no inbound port**. Ports 12000/12001 are free for the Mini App HTTP server.
 - Therefore running the bot's polling loop and a small ASGI server in **one asyncio process**
   (§4.1 of the plan) is possible without port conflict.
@@ -211,7 +211,7 @@ Concrete shape for OHB2-05 (not implemented here):
 - Bind the ASGI app to the host-assigned port (the published work-host port, e.g. 12000) on
   `0.0.0.0`; keep the public URL HTTPS at the ingress.
 - Start both the Telegram polling lifecycle and the ASGI server from the same process/event loop
-  (Uvicorn `Server.serve()` as a task alongside `Application.run_polling`), so there is exactly one
+  (Uvicorn `Server.serve()` as a task alongside the custom Telegram `getUpdates` loop), so there is exactly one
   `Database`, one outbox worker set, one watcher/notifier.
 - `MINI_APP_URL` (already added in OHB2-03) is set to the work-host HTTPS URL, e.g.
   `https://work-1-kivosuogpgofjcub.prod-runtime.all-hands.dev/mini/`.
@@ -262,7 +262,7 @@ CORS).
 
 1. **Dependency**: add `starlette` and `uvicorn` (smallest stable ASGI pair) to `requirements.txt`.
 2. **Single-process wiring**: start the ASGI server as an asyncio task inside the same process as
-   `run_polling`; bind to the host-assigned port on `0.0.0.0`; never start a second bot/worker.
+   the custom Telegram polling loop; bind to the host-assigned port on `0.0.0.0`; never start a second bot/worker.
 3. **URL**: set `MINI_APP_URL` to the work-host HTTPS URL of the Mini App (`…/mini/`).
 4. **Auth**: implement the `initData` HMAC validation endpoint and the short-lived session cookie.
 5. **Static**: serve versioned assets under `/mini/` from the same app.

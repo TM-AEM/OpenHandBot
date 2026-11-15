@@ -33,7 +33,7 @@ cp .env.example .env                  # واملأ القيم
 قبل أي تشغيل حقيقي، شغّل بوابة الانحدار مرة عشان تتأكد إن البيئة سليمة:
 
 ```bash
-python -m pyflakes bot/ automation/ main.py tests/
+python -m pyflakes bot/ automation/ tools/ main.py tests/
 python -m pytest -q
 ```
 
@@ -117,8 +117,14 @@ python main.py
   المحلي بتحفّظ، بدون أي POST خارجي) → 3) بدء **worker واحد مالك** لصندوق البرومتات،
   و**worker واحد مالك** لطلبات الشات الجديد، و**worker واحد مالك** للإكمال المحلي،
   و**المراقب**، و**المُبلّغ**. فيه حرس يمنع إنشاء worker مكرّر لو `post_init` اتنادت تاني.
-- **الاستقبال:** long polling على تيليجرام (`app.run_polling(drop_pending_updates=True)`)
-  مع `concurrent_updates(True)` عشان تأكيد «وصل ✅» مايتأخّرش بسبب أمر بطيء.
+- **الاستقبال:** حلقة استطلاع **مخصّصة** (`bot/polling.py::TelegramPoller`؛ التطبيق مبني
+  بـ `updater(None)` ⇒ مفيش Updater) بتعمل `deleteWebhook(drop_pending_updates=False)`
+  عند الإقلاع ثم `getUpdates` بنفسها. **`concurrent_updates(True)`** إعداد على `Application`
+  (`bot/app.py`) بس — **مش** دليل إن الحلقة المخصّصة بتوزّع الدفعة بالتوازي: الحلقة بتوزّع
+  التحديثات **تسلسليًّا** (تحطّ التحديث في الطابور وتستنّى `update_queue.join()` قبل اللي
+  بعده — `bot/polling.py::dispatch_and_wait`) ⇒ تحديث بطيء/غير محسوم **بيأخّر** اللي بعده
+  في الدفعة. الحكم على الإقرار **من البادئة المؤهّلة/النتيجة الدائمة** مش من الإعداد ده.
+  **مفيش** `run_polling` بتاع PTB ومفيش poller تاني.
 - **الحالة المستقرة:** الـ workers بيعالجوا من الطوابير؛ المراقب بيسأل كل
   `WATCHER_INTERVAL` ثانية في طلب واحد لكل الشاتات المتابَعة.
 - **الإغلاق:** `Ctrl+C` (SIGINT) أو SIGTERM ⇒ `post_shutdown` بيوقف كل حاجة بأمان
@@ -135,9 +141,9 @@ python main.py
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pyflakes bot/ automation/ main.py tests/  # لازم يخرج من غير أي تحذير
+python -m pyflakes bot/ automation/ tools/ main.py tests/  # لازم يخرج من غير أي تحذير
 python -m pip_audit -r requirements-dev.txt                # SCA: لازم «No known vulnerabilities found»
-python -m bandit -r bot/ automation/ main.py -lll -s B613  # SAST: مفيش نتائج عالية الخطورة
+python -m bandit -r bot/ automation/ tools/ main.py -lll -s B613  # SAST: مفيش نتائج عالية الخطورة
 python -m pytest -q                                        # كل الاختبارات لازم تعدّي
 ```
 
@@ -235,19 +241,31 @@ python -m pytest -q tests/test_watcher.py tests/test_u01_watcher.py
   للتكرار عمدًا). ده **مختلف** عن مسار الحماية العادي اللي بيسجّل `update_id`.
 
 **دلالات polling في تيليجرام وPTB (مُتحقَّق منها في PTB v22.8):**
-- PTB بيقدّم `_last_update_id` **بعد** ما يحط التحديثات المجلوبة في طابور التحديثات،
-  **وقبل** ما الـ handler يخلّص (`.venv/.../telegram/ext/_updater.py`: `update_queue.put`
-  ثم `_last_update_id = updates[-1].update_id + 1`).
 - تيليجرام بيعدّ التحديث **مؤكَّدًا (confirmed)** لما نداء `getUpdates` لاحق يستخدم
   `offset` أكبر من `update_id` بتاعه (توثيق Bot API الرسمي).
-- البوت بيشتغل بـ `run_polling(drop_pending_updates=True)` (`main.py`) ⇒ عند كل إقلاع
-  التحديثات المعلّقة على خادم تيليجرام **بتترمى**.
-- السلوكيات دي **بتقلّل** أو **بتلغي عمدًا** بعض فرص إعادة التسليم، لكنها **ماتحوّلش**
-  آلية الاحتفاظ في القاعدة لضمان exactly-once.
+- **PTB الافتراضي (`run_polling`) — تاريخي، مش مسار البوت الحالي:** PTB بيقدّم
+  `_last_update_id` **بعد** ما يحط التحديثات المجلوبة في طابور التحديثات و**قبل** ما
+  الـ handler يخلّص (`.venv/.../telegram/ext/_updater.py`: `update_queue.put` ثم
+  `_last_update_id = updates[-1].update_id + 1`) ⇒ الإقرار كان بيسبق التنفيذ. ده السلوك
+  اللي **اتغيّر** في Stage 2.
+- **البوت الحالي (حلقة مخصّصة، `bot/polling.py::TelegramPoller`):** التطبيق مبني بـ
+  `updater(None)` ⇒ **مفيش Updater**. الحلقة بتعمل `deleteWebhook(drop_pending_updates=False)`
+  عند الإقلاع (⇒ التحديثات المعلّقة **مابتترميش**)، وبتسحب `getUpdates` بنفسها، وبتقدّم
+  الـ `offset` **بس بعد** ما نتيجة التحديث الدائمة تتثبّت في القاعدة. الحكم **من القاعدة**
+  (`processed_updates.outcome`) مش من رجوع الـ handler (PTB بيبتلع الاستثناءات).
+- الحلقة بتقدّم **أطول بادئة مؤهّلة** بترتيب الاستقبال (مش `max(update_id)+1`)؛ أول تحديث
+  **غير مؤهّل** (فشل عابر/نتيجة غامضة/مفيش نتيجة مُسجَّلة) بيحجز كل اللي بعده (head-of-line
+  blocking) ⇒ إعادة تسليم لاحقة (fail-closed). الاستئناف بعد إعادة التشغيل من الحدّ الدائم
+  `B+1`، أو `None` لو مفيش حدّ (من أقدم غير مؤكَّد).
+- `allowed_updates = ("message", "callback_query")` (`bot/polling.py::ALLOWED_UPDATES`):
+  الأنواع التانية **مابتُسحَبش** أصلًا من تيليجرام.
+- **الإقرار ≠ تسليم:** إقرار تيليجرام **مش** إثبات وصول لـ OpenHands ولا إشعار للمستخدم.
+- كل ده **بيقلّل** فرص إعادة التسليم، لكنه **مايحوّلش** آلية الاحتفاظ في القاعدة لضمان
+  exactly-once.
 
 **تمييز لازم (4 طبقات منفصلة):**
 1. تأكيد تيليجرام من جهة الخادم (عند `offset` أعلى).
-2. تقدّم `offset` في PTB (عند وضع التحديثات في الطابور).
+2. تقدّم `offset` في البوت (**بعد** تثبيت النتيجة الدائمة في القاعدة).
 3. الكشف الدائم في التطبيق (`processed_updates`).
 4. اكتمال معاملة العملية (`commit`).
 مفيش طبقة فيهم بتوفّر ضمان «مرة واحدة بالظبط» بشكل مستقل.
@@ -257,7 +275,7 @@ python -m pytest -q tests/test_watcher.py tests/test_u01_watcher.py
   الحاجز الحالي وينفّذ عملية دائمة تاني. التجربة بتثبت **الميكانيزم على مستوى التطبيق**،
   **مش** إعادة تسليم فعلية من تيليجرام.
 - **إعادة التسليم الفعلية في الإنتاج لسه غير مُثبَتة**، والاحتمالية العملية **منخفضة جدًا**
-  في الإعداد الحالي (التقليم عند الإقلاع فقط + `drop_pending_updates=True`).
+  في الإعداد الحالي (التقليم عند الإقلاع فقط + استئناف الحدّ الدائم بدل رمي المعلّق).
 - ده **قيد احتفاظ محدود (bounded-retention limitation)**، **مش** دليل على فساد بيانات
   حالي ولا حادثة إنتاج مؤكّدة.
 
@@ -269,7 +287,7 @@ python -m pytest -q tests/test_watcher.py tests/test_u01_watcher.py
 **مراجع المصدر:** `bot/handlers.py` (`PROCESSED_UPDATES_KEEP`، `dedupe_update`)،
 `bot/db.py` (`processed_updates`، `update_is_processed`، `_mark_processed_nocommit`،
 `prune_processed_updates`، دوال الكتابة الذرّية)، `bot/app.py` (استدعاء التقليم في
-`_post_init`)، `main.py` (`run_polling(drop_pending_updates=True)`)،
+`_post_init`)، `main.py` (`asyncio.run(run_bot(app))` — حلقة مخصّصة بدل `run_polling`)،
 `.venv/.../telegram/ext/_updater.py` (تقدّم `offset`).
 
 ## 8) الفحص والتسوية اليدوية

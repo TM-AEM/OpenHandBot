@@ -195,7 +195,7 @@ Optional (leave at defaults unless needed):
 
 - **Exactly one process** must own Telegram `getUpdates`. The app never spawns children
   (no `subprocess`/`multiprocessing`/`os.exec` in the startup path). `main.py` runs one
-  `run_polling(drop_pending_updates=True)` loop; the Mini App backend, if enabled, runs inside the
+  custom `getUpdates` loop (`bot/polling.py::TelegramPoller`; `deleteWebhook(drop_pending_updates=False)`); the Mini App backend, if enabled, runs inside the
   **same** process (no second worker). Do not run two instances against the same token/DB.
 
 ### 4.7 ASGI and Telegram polling startup behavior
@@ -203,8 +203,10 @@ Optional (leave at defaults unless needed):
 - Telegram long polling starts immediately after `_post_init` (recovery → workers → polling).
 - Mini App backend (ASGI/uvicorn) starts **only** when `MINI_APP_ENABLED=1`; it shares the same DB
   and process. Off by default.
-- `drop_pending_updates=True` is intentional: updates accumulated while the bot was down are
-  dropped (accepted for single-user use; prevents stale-command floods and duplicate orders).
+- Polling start uses `deleteWebhook(drop_pending_updates=False)` (Stage 2 custom loop): pending
+  updates are **preserved**, not dropped. After restart the loop resumes from the durable boundary
+  `B+1`, or `None` (oldest unacknowledged) if there is no boundary. (This supersedes the earlier
+  OHB2-02 `drop_pending_updates=True` policy, which intentionally dropped pending updates.)
 
 ### 4.8 Graceful shutdown
 

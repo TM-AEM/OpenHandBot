@@ -68,7 +68,7 @@ Auto-follow after prompt (`bot/watcher.py`) remains active regardless.
 - `bot/watcher.py` — `Watcher` (watched conversations; `watch_seq` CAS).
 - `bot/notifier.py` — `Notifier` (global proactive notifications).
 - `bot/app.py` — `build_application`, `_post_init`, `_post_shutdown`.
-- `main.py` — `run_polling(drop_pending_updates=True)` (long polling; no inbound port).
+- `main.py` — custom `getUpdates` polling loop (`bot.polling.run_bot`; long polling; no inbound port).
 
 ## 6. Hosting feasibility (decision gate — NOT yet resolved)
 

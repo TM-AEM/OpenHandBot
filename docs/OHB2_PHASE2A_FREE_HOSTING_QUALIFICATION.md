@@ -62,8 +62,8 @@ qualification research + the blockers.
 
 | Fact | Evidence |
 |---|---|
-| Entry point / single process | `main.py` → `bot.app.build_application` → `app.run_polling(drop_pending_updates=True)`; docstring: "مفيش عملية تانية ومفيش exec". `start.sh` uses `exec "$PY" main.py` (same process). |
-| Long polling (no inbound port needed for the bot) | `run_polling`; documented in `docs/OHB2_HOSTING_DECISION.md` §1.5. |
+| Entry point / single process | `main.py` → `bot.app.build_application` → `bot.polling.run_bot` (custom `getUpdates` loop; `updater(None)`); docstring: "مفيش عملية تانية ومفيش exec". `start.sh` uses `exec "$PY" main.py` (same process). |
+| Long polling (no inbound port needed for the bot) | custom `getUpdates` loop (`bot/polling.py`); documented in `docs/OHB2_HOSTING_DECISION.md` §1.5. |
 | Mini App ASGI | Starlette `bot/web/app.py` + `uvicorn` (both pinned in `requirements.txt`). |
 | DB path | `bot/config.py:235` `db_path = DB_PATH or "bot_state.sqlite3"`; relative path is resolved against CWD (`start.sh` cd's to the script dir). |
 | DB parent auto-create | `bot/bootstrap.py::_check_db_path` → `parent.mkdir(parents=True, exist_ok=True)`; raises `BootstrapError` if the parent is a file or not writable. |

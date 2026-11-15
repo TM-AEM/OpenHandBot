@@ -109,7 +109,7 @@ Every item below cites the exact source that defines it.
 | Install | `pip install -r requirements-dev.txt` (pulls `requirements.txt`) | `AGENTS.md` §1; `requirements-dev.txt` |
 | Runtime deps | `python-telegram-bot[all]==22.8`, `httpx==0.28.1`, `python-dotenv==1.2.4`, `starlette==0.41.3`, `uvicorn==0.34.0` | `requirements.txt` |
 | Start command | `python main.py` (or `sh start.sh`) | `main.py`; `start.sh` |
-| Bot lifecycle | Telegram **long polling** (`run_polling(drop_pending_updates=True)`) | `main.py` |
+| Bot lifecycle | Telegram **long polling** (custom `getUpdates` loop; `bot/polling.py`; `deleteWebhook(drop_pending_updates=False)`) | `main.py` |
 | Mini App lifecycle | Starlette + Uvicorn started as an **asyncio task in the same process**, gated by `MINI_APP_ENABLED` | `bot/app.py` (`web_server_lifespan`), `bot/web/runner.py` |
 | Process count | **exactly one** (one poller, in-process workers). Multi-replica **not supported** | `bot/app.py` (worker guards), `docs/ZERO_TOUCH_STARTUP.md` §3.3 |
 | Host bind | `0.0.0.0` (all interfaces) | `bot/app.py`: `web_server_lifespan(web_app, "0.0.0.0", config.mini_app_port)` |

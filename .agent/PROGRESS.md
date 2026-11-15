@@ -3026,3 +3026,35 @@ P0، مفيش تغيير سلوك، مفيش كود/اختبارات/مخطط.**
 لا دفع/PR/دمج/نشر في هذه المهمة. الخطوة التالية **مراجعة عدائية مستقلة للقراءة فقط** على
 الفرع `agent/ohb2-plan02-life01-race-retry-fix` (نفس أسلوب LIFE-01). البرومبت الجاهز في
 `docs/reviews/OHB2-REPAIR-PLAN-02-LIFE01-F1-F2-ADVERSARIAL-REVIEW-PROMPT.md`.
+
+---
+
+## OHB2-REPAIR-PLAN-03-DOCS-CI — تسوية واقعية لحالة P0 (إضافة مؤرَّخة، append-only)
+
+**التاريخ:** 2026-11-14. **النوع:** إضافة واقعية فقط (factual append) — **مفيش إعادة كتابة
+لتاريخ**، ومفيش تغيير لأي قرار مالك أو متطلّب محمي. المصادر: سجل قرارات المالك
+(`docs/decisions/OHB2-P0-OWNER-DECISIONS-REGISTER.md`، D-09/D-09-R1/D-09-R2)، مقترح P0
+(`docs/proposals/OHB2-AGENT-SERVER-FILE-UPLOAD-ARCHITECTURE.md` §§26–27)، وسجلات هذه المهمة.
+
+**التسوية (تمييز لازم):**
+1. **P0 اتفتح للتحقيق/إعادة الفتح** (`OHB2-P0-ATTACHMENT-WORKFLOW-REOPEN-AND-SECURE-COMPLETION`،
+   2026-11-12؛ §27) — **قرار مالك صريح**.
+2. **تصريح التحقيق/إعادة الفتح ≠ تصريح تنفيذ.** و**تصريح التنفيذ (D-09-R1، 2026-11-13) ≠ إتمام P0.**
+   D-09-R2 (2026-11-13) صرّح **بتنفيذ محلي محدود لـ A0–A4** فقط.
+3. **التسليم/الرفع البعيد للمرفقات لـ OpenHands لسه محجوب** — **مفيش مسار رفع آمن معتمد**
+   (حاجز B1: مفيش اعتماد رفع محدود الصلاحية؛ B2: مفيش أصل agent-server ثابت موثوق؛ §27.2).
+4. **P0 (الميزة الكاملة) لسه مش DONE/PASS/IMPLEMENTED/CLOSED.** اللي اتنفّذ **محليًّا** هو
+   القبول المحلي/الـ staging/دورة الحياة **A0–A4** (بلا أي تسليم بعيد) + إصلاحات Plan 01/02.
+   مرحلة **B** (التسليم البعيد) **غير مُصرَّح بها**.
+5. **قرار Option D التاريخي والمتطلّبات الأصلية محفوظين كما هم** (بلا حذف/تضعيف). النصّ أعلاه
+   «`BLOCKED / DEFERRED BY EXPLICIT PRODUCT DECISION`» يفضل **صحيحًا للتسليم البعيد**،
+   ويُقرأ الآن مع هذه الإضافة: التنفيذ **المحلي** A0–A4 مُصرَّح به ومُنجَز محليًّا، والتسليم
+   البعيد **لسه محجوب**.
+6. **SW-02 يفضل `UNKNOWN / NEEDS SOURCE`** (انظر «Stage 5 / SW-02» أعلاه) — بلا تغيير.
+
+**مرجع كود:** `bot/attachments.py` (`AttachmentService`/`StagingStore`/`AttachmentReaper`)،
+`bot/db.py` (دفعات/عناصر المرفقات + `classify_attachment_routing`)، `bot/handlers.py`
+(`handle_attachment`/`handle_unsupported_attachment`)، `bot/app.py` (فلاتر
+`SUPPORTED_ATTACHMENT_FILTER`/`UNSUPPORTED_ATTACHMENT_FILTER`).
+
+> ملاحظة: ده **توثيق فقط**؛ مفيش تغيير كود ولا قرار جديد ولا تصريح تنفيذ جديد.

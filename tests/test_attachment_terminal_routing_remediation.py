@@ -437,7 +437,8 @@ def test_race_classification_to_intent_fails_closed(tmp_path, monkeypatch):
 
 
 def test_race_classification_to_ordinary_prompt_is_fail_closed(tmp_path, monkeypatch):
-    # لو الحالة اتحوّلت «منتهية» بين التصنيف والمسار العادي: F1 قائم (مُعطَّل) ⇒ نوثّقه.
+    # لو الحالة اتحوّلت «منتهية» بين التصنيف والمسار العادي: النصّ لازم يرفض نهائيًّا
+    # (fail-closed — D-34). الاختبار يثبت الإصلاح (مش توثيق عيب قديم).
     a = _harness(tmp_path, monkeypatch, _client())
     a.route(CID_A)
     a.mkbatch(t0=_live_t0(), batch_id="b1")

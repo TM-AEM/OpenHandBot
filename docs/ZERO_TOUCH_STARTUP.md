@@ -46,7 +46,7 @@ Entry point: `main.py::main()` (run as `python main.py`).
 | 5 | **Runtime dir + DB path preparation** (idempotent) | `bot.bootstrap._check_db_path()` | `BootstrapError` → exit 1 |
 | 6 | **Application build** (one `Application`, DB open, Mini App wire) | `bot.app.build_application()` | `ConfigError` on Mini App misconfig; else fatal only on real programming errors |
 | 7 | **Worker lifecycle start** (outbox, creation, watcher, notifier) | `bot.app._post_init()` | isolated per-worker guards; failures logged |
-| 8 | **Telegram polling start** (single owner) | `main.main()` → `app.run_polling(drop_pending_updates=True)` | platform-supervised |
+| 8 | **Telegram polling start** (single owner) | `main.main()` → `bot.polling.run_bot` (custom `getUpdates` loop; `updater(None)`; `deleteWebhook(drop_pending_updates=False)`) | platform-supervised |
 | 9 | **Graceful shutdown** | `bot.app._post_shutdown()` | closes workers, HTTP client, checkpoints + closes DB |
 
 Health/readiness reporting today is the **bootstrap status log line** (`bootstrap status: ...`, INFO,
@@ -117,7 +117,7 @@ Verified: `tests/test_zero_touch_lifecycle.py::test_database_new_init_and_restar
 `tests/test_security_invariants.py::test_db_wal_and_busy_timeout_intact`.
 
 ### 3.3 Single application process / single polling owner
-`main.py` builds exactly one `telegram.ext.Application` and calls `run_polling` once. All background
+`main.py` builds exactly one `telegram.ext.Application` (`updater(None)`) and runs one custom `getUpdates` loop (`bot.polling.run_bot` → `TelegramPoller`) — **not** PTB's `run_polling`. All background
 workers (outbox, creation, watcher, notifier) are **in-process `asyncio` tasks** with `bot_data`
 "create-once" guards — no `subprocess`, `os.exec*`, `multiprocessing`, or thread spawning anywhere in
 `main.py`, `bot/` (verified by

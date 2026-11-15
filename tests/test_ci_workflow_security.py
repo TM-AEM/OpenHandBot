@@ -1,6 +1,7 @@
 """OHB2-PHASE1E: تأكيدات على سير عمل CI وسياسة الفحص الثابت/الأمني.
 
-الغرض: منع أي تراجع صامت في تغطية الفحص (كان pyflakes بيسقط `automation/`)،
+الغرض: منع أي تراجع صامت في تغطية الفحص (كان pyflakes بيسقط `automation/`؛
+وOHB2-REPAIR-PLAN-03/F-07 ضاف `tools/` بعد ما بقى متتبَّعًا في git)،
 أو في أدوات SCA/SAST، أو في شروط تشغيل CI. مفيش شبكة: قراءة ملفات المستودع بس.
 """
 
@@ -55,20 +56,22 @@ def test_ci_never_runs_production_side_effects():
 
 
 def test_ci_static_check_covers_all_first_party_modules():
-    # الثغرة اللي كانت: pyflakes على bot/ main.py tests/ بس. لازم يغطّي automation/ كمان.
-    assert "pyflakes bot/ automation/ main.py tests/" in CI
+    # الثغرة اللي كانت: pyflakes على bot/ main.py tests/ بس. لازم يغطّي automation/ و tools/
+    # (tools/ كان متتبَّعًا في git من 1b201ba؛ الفحص الثابت AST بس ⇒ مفيش تشغيل).
+    assert "pyflakes bot/ automation/ tools/ main.py tests/" in CI
 
 
 def test_ci_runs_dependency_and_sast_checks():
     assert "pip_audit -r requirements-dev.txt" in CI
-    assert "bandit -r bot/ automation/ main.py -lll -s B613" in CI
+    assert "bandit -r bot/ automation/ tools/ main.py -lll -s B613" in CI
 
 
-def test_ci_sast_scope_includes_automation():
-    # AUD-07: كان bandit على bot/ main.py بس. لازم يغطّي automation/ كمان.
-    assert "bandit -r bot/ automation/ main.py -lll -s B613" in CI
+def test_ci_sast_scope_includes_automation_and_tools():
+    # AUD-07: كان bandit على bot/ main.py بس. لازم يغطّي automation/ و tools/ كمان.
+    assert "bandit -r bot/ automation/ tools/ main.py -lll -s B613" in CI
     # ومفيش استدعاء bandit بنطاق أضيق سايب في السير عمل.
     assert "bandit -r bot/ main.py" not in CI
+    assert "bandit -r bot/ automation/ main.py" not in CI
 
 
 def test_bandit_flags_high_severity_in_automation(tmp_path):
@@ -121,8 +124,9 @@ def test_runtime_dependencies_are_exactly_pinned():
 
 
 def test_docs_document_bandit_scope_with_automation():
-    """AUD-08: أي توثيق بيذكر أمر bandit لازم يطابق نطاق CI (`bot/ automation/ main.py`).
-    كان README.md لسه على النطاق القديم (bot/ main.py) — ده بيمنع التراجع الصامت."""
+    """AUD-08 + OHB2-REPAIR-PLAN-03/F-07: أي توثيق بيذكر أمر bandit لازم يطابق نطاق CI
+    (`bot/ automation/ tools/ main.py`). كان README.md لسه على النطاق القديم
+    (bot/ main.py) — ده بيمنع التراجع الصامت."""
     docs = {
         "README.md": (ROOT / "README.md").read_text(encoding="utf-8"),
         "docs/OPERATIONS_RUNBOOK.md": (ROOT / "docs/OPERATIONS_RUNBOOK.md").read_text(encoding="utf-8"),
@@ -131,5 +135,6 @@ def test_docs_document_bandit_scope_with_automation():
     }
     for name, text in docs.items():
         if "bandit -r" in text:
-            assert "bandit -r bot/ automation/ main.py" in text, f"{name}: نطاق bandit قديم"
+            assert "bandit -r bot/ automation/ tools/ main.py" in text, f"{name}: نطاق bandit قديم"
+            assert "bandit -r bot/ automation/ main.py" not in text, f"{name}: لسه فيه نطاق بدون tools/"
             assert "bandit -r bot/ main.py" not in text, f"{name}: لسه فيه النطاق الضيّق"
