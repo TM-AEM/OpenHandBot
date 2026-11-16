@@ -4158,3 +4158,32 @@ pyflakes **0**؛ bandit **High 0**؛ مجموعة مركّزة (config/miniapp/b
   - ما زالت محجوبة بيئيًّا (`exit 1`؛ لا يوجد `pip`/`ensurepip`): `pytest` و`pyflakes` و`bandit` و`pip_audit`؛ و`INDEPENDENT_REVIEW_NOT_AVAILABLE`؛ و`.git` غائب.
 - **الأحكام النهائية المنفصلة:** `OPS-01: PASS_WITH_NOTES` | `OPS-02: UNTRACEABLE — SOURCE REQUIRED`.
 
+---
+
+## OHB2-PLAN-16-DOCUMENTATION-CONSISTENCY-EXECUTION-01 (2026-11-16)
+
+- **الخطة:** `OHB2-PLAN-16-DOCUMENTATION-CONSISTENCY` (OpenHandBot Plan 06 — توثيق وتحقق فقط، بلا تعديل كود أو تبعيات).
+- **التقرير الكامل:** `docs/reviews/OHB2-PLAN16-DOCUMENTATION-CONSISTENCY-REPORT.md`.
+- **`DOC-01` (تضارب وصف ثبات جلسات الـ Mini App في `docs/MINI_APP.md`) — الحُكم: `RESOLVED`:**
+  - الكود والمخطط (`bot/db.py::web_sessions`، `bot/web/sessions.py::SessionStore`، `bot/web/app.py::MiniApp`) يخزّنان هاش التوكن SHA-256 فقط في SQLite مع انتهاء وإلغاء من السيرفر؛ `_mem` في `SessionStore` احتياطي فقط عند `db=None` للاختبار المستقل، و`SlidingWindowLimiter` في الذاكرة لمعدّل الطلبات فقط.
+  - تم تحديث البند المتقادم في `docs/MINI_APP.md` §14 (سطر 714 حاليًا) ليطابق §7 والواقع التطبيقي (ثبات الجلسات عبر إعادة التشغيل بشرط `DB_PATH` على تخزين دائم).
+  - تحقّق عملي عابر للعمليات (`3` عمليات OS مستقلة `stdlib` فوق `bot/db.py` + `bot/web/sessions.py`): بقاء الجلسة الصالحة، رفض المنتهية، دوام الإلغاء، وعدم تخزين التوكن الخام (**PASS**). اختبار `TestClient` في `tests/test_miniapp_session_persistence.py` محجوب محليًا لنقص `pytest`/`starlette`.
+- **`DOC-02` (تضارب إصدار `starlette` في التوثيق مع `requirements.txt`) — الحُكم: `PARTIALLY RESOLVED`:**
+  - `requirements.txt` يثبّت `starlette==1.3.1` و`uvicorn==0.34.0` و`anyio==4.16.0`؛ `.github/workflows/ci.yml` (`["3.11", "3.13"]`) و`requirements-dev.txt` متوافقان، وتم تحديث `docs/MINI_APP.md` §2 (سطر 42–44) من `0.41.3` إلى `1.3.1` (مع `anyio 4.16.0`) **بلا** تغيير أي تثبيت في `requirements*.txt`.
+  - الوثائق التاريخية (`docs/OHB2_ENZONIC_DEPLOYMENT_PREFLIGHT.md:77` و`docs/OHB2_PHASE6_HOSTING_AND_DEPLOYMENT_PLAN.md:110`) محفوظة دون تعديل كسجلات تاريخية.
+  - إصدار `starlette` المثبّت فعليًا، `pytest`، و`pip_audit` محجوبة محليًا في هذه الحاوية (`Python 3.10.12`، بلا `pip`/`starlette`/`pytest`/`pyflakes`/`bandit`/`pip_audit`).
+- **التحقّق:** `compileall` (`0`)؛ `AST_OK:165`؛ `node --test tests/frontend/*.test.js` (`280 pass / 0 fail`)؛ اختبار إعادة التشغيل بـ 3 عمليات `stdlib` (**PASS**)؛ `pytest`/`pyflakes`/`bandit`/`pip_audit`/`starlette` (`BLOCKED`, exit `1`)؛ `INDEPENDENT_REVIEW_NOT_AVAILABLE`؛ `.git` غائب. لا `commit`/`push`/`PR`/نشر/تفعيل `MINI_APP_ENABLED` أو Autopush.
+
+---
+
+## OHB2-PLAN-17-18-COMBINED-EXECUTION-01 (2026-11-16 — Plan 07 + Plan 08 توثيق وتحقيق ومزامنة فقط)
+
+- **النطاق:** تنفيذ توثيقي وتحقيقي فقط بدون أي تعديل على الكود التطبيقي أو المخطّط أو الحصص أو الاعتماديات أو حالة التشغيل/الاستضافة (`MINI_APP_ENABLED=False`، Autopush معطّل، `.git` غير متاح في الحاوية).
+- **Plan 07 (`OHB2-PLAN-17-DEPLOYMENT-AND-DECISION-RECORD-SYNC`):**
+  - التقرير الكامل: `docs/reviews/OHB2-PLAN17-DEPLOYMENT-AND-DECISION-RECORD-SYNC-REPORT.md`.
+  - **`DOC-03` (`DONE`):** إنشاء `docs/DEPLOY_ENZONIC.md` كوثيقة حالة تأهيل وضوابط سلامة فقط (ليست دليل نشر)، وتحديث الإحالات النشطة في `README.md` و`docs/OPERATIONS_RUNBOOK.md` و`docs/ZERO_TOUCH_STARTUP.md` و`docs/OHB2_ENZONIC_DEPLOYMENT_PREFLIGHT.md` لتعكس `HOST-01: BLOCKED` و`HOST-02: BLOCKED` (تأجيل Plan 04)، وعرض العوائق الثمانية المسجَّلة، وتحذير منع التفاعل/التعديل/اختبار SQLite مع الخادم الحي القائم على Enzonic (`OpenHandBot` / `Brave Grove`)؛ مع الإبقاء على `docs/DEPLOY_KATABUMP.md` سليمًا كمرجع تاريخي وحارس `tests/test_deploy_manifest.py`.
+  - **`DOC-04` (`DONE`):** مزامنة اعتماد المالك الصريح لـ **D-15 الخيار A (2026-11-15)** في `docs/decisions/OHB2-P0-OWNER-DECISIONS-REGISTER.md` (`§7` سطور 1972 و1987، `§8` بند 8، `§9` المقدّمة وقائمة التحقّق `[x] Approve option A`، `§13.5`) مع حفظ صياغته الدقيقة (`15 دقيقة ثابتة`، `staging فقط لا C2`، `لا دفعة على الخادم`، `لا حالة غير نهائية بعد الانتهاء`) وإبقاء بطاقة `### D-12` (`غير محسوم`) سليمة لاختبار `tests/test_repair_plan_01_review_findings.py`؛ وإضافة تنبيهات مزامنة مؤرَّخة غير ماحِية للتاريخ في أعلى `docs/reviews/OHB2-PLAN10-MT2-PRE-IMPLEMENTATION-READINESS.md` و`docs/reviews/OHB2-PLAN-08-MANUAL-ATTACHMENT-TRANSFER-UX-DESIGN.md` و`docs/reviews/OHB2-REPAIR-PLAN-05-SECURE-ATTACHMENT-DELIVERY-INVESTIGATION.md`.
+- **Plan 08 (`OHB2-PLAN-18-ATTACHMENT-POLICY-AND-MEDIA-SCOPE`):**
+  - التقرير الكامل: `docs/reviews/OHB2-PLAN18-ATTACHMENT-POLICY-AND-MEDIA-SCOPE-REPORT.md`.
+  - **`ATT-01` (`COMPLETE — INVESTIGATION_AND_POLICY_SYNC_ONLY`):** تأكيد تفعيل سقف الملف الواحد `MAX_ATTACHMENT_BYTES = 3 MiB` دائمًا في `bot/attachments.py` و`bot/handlers.py`، بينما الحصص التراكمية (`MAX_ITEMS_PER_BATCH=10`, `MAX_STAGING_TOTAL_BYTES=64 MiB`, `max_bytes_per_batch`) معطّلة افتراضيًا (`None`) ولا توجد لها مفاتيح في `bot/config.py`/`.env.example` التزامًا بـ **Plan 01 Option A (`FIX-R01`/`FIX-R05`)** وتظل سياسة `D-12` الدائمة (النطاق 2) `غير محسومة / OWNER_DECISION_REQUIRED`؛ وتوثيق ثغرة التزامن (عدم وجود حجز ذرّي مع `concurrent_updates(True)` و`MAX_CONCURRENT_DOWNLOADS=4` لو فُعِّلت الحصص لاحقًا)، وتقديم خيارات A/B/C + توصية (`Option A` حاليًا؛ موسومة `RECOMMENDATION — NOT OWNER-APPROVED`).
+  - **`ATT-02` (`COMPLETE — INVESTIGATION_AND_DECISION_PREP_ONLY`):** حصر مسار الاستلام الفعلي (`bot/polling.py` `ALLOWED_UPDATES=("message","callback_query")`، `bot/app.py` `SUPPORTED_ATTACHMENT_FILTER=Document.ALL` مقابل 9 فلاتر وسائط مرفوضة بأمان بدون `get_file`/تخزين/نداء OpenHands عبر `handle_unsupported_attachment`، وتجاهل `caption`/`media_group_id` التزامًا بسياسة `D-31` المعتمدة، وتجاهل التحديثات غير المطابقة في `handle_unmatched_update`، وملاحظة الفروع الخاملة في `_attachment_declared_size`/`_attachment_file_id` دون تعديل)، وتقديم خيارات A/B/C + توصية (`Option A` الإبقاء على `Document` فقط؛ موسومة `RECOMMENDATION — NOT OWNER-APPROVED`).

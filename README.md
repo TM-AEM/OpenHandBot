@@ -106,9 +106,13 @@ CI (`.github/workflows/`) بيشتغل على `push`/`pull_request` على `main
 (مصفوفة)، وبيشغّل نفس الفحوص (`pyflakes` على كل وحدات المشروع + `pip-audit` + `bandit` +
 `pytest`)، بالإضافة لوظيفة اختبارات الواجهة على Node.
 
-## النشر على Katabump
+## الاستضافة والنشر — الحالة الراهنة (Enzonic)
 
-اقرأ `docs/DEPLOY_KATABUMP.md`.
+مرجع الاستضافة النشط المُقيَّم حاليًا هو **Enzonic Python Hosting** (عُدِّل في Plan 07 بدلًا من Katabump المجاني)، مع بقاء التأهيل **`BLOCKED` ومؤجَّلًا** (`HOST-01: BLOCKED`، `HOST-02: BLOCKED`، `MINI_APP_ENABLED=False`).
+
+- راجع الحالة الكاملة والعوائق وضوابط السلامة في `docs/DEPLOY_ENZONIC.md` وتقارير الخطة 04 (`docs/reviews/OHB2-PLAN04-HOST01-HOSTING-QUALIFICATION.md`، `docs/reviews/OHB2-PLAN04-ENZONIC-CANARY-EXECUTION-REPORT.md`).
+- **تحذير سلامة:** خادم Enzonic القائم (`OpenHandBot` / `Brave Grove`) خادم حيّ فعلي وليس بيئة اختبار/Canary — ممنوع التفاعل معه أو تعديله أو اختبار SQLite عليه أو النشر إليه.
+- وثيقة `docs/DEPLOY_KATABUMP.md` محفوظة كمادة **تاريخية/خاصة بمزوّد سابق** فقط (وليست توجيه النشر النشط).
 
 ## التشغيل والصيانة
 

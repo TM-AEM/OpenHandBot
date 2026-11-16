@@ -20,6 +20,14 @@
 > Evidence labels used below: **[F] fact** (verified from a primary source this session),
 > **[I] inference**, **[U] unknown/unverified**, **[R] recommendation**. Facts and inferences are
 > kept separate on purpose.
+>
+> **Dated decision sync (2026-11-16, Plan 07 / `DOC-04`):** At the 2026-11-15 retrieval timestamp of
+> this historical investigation, `D-15` was `OPEN`. The owner subsequently approved **D-15 Option A**
+> later on **2026-11-15** (fixed 15-min expiry, staging-only reclaim, no C2 change, server does not
+> model batch, no non-terminal batch state after expiry) — see
+> `docs/decisions/OHB2-P0-OWNER-DECISIONS-REGISTER.md` (§5 → D-15, §9, §13.5). All historical text
+> below is preserved verbatim; `D-10`/`D-11`/`D-14`/`D-16`/`D-22` and remote attachment delivery remain
+> `BLOCKED`.
 
 ---
 

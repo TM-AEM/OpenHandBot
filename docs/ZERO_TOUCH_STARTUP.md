@@ -157,10 +157,18 @@ so the bot and any operator tooling refer to the same file regardless of cwd.
 
 ---
 
-## 5. Hosting compatibility assessment (Katabump Free)
+## 5. Hosting compatibility assessment (Historical: Katabump Free; Amended Target: Enzonic)
 
-The selected target is **Katabump Free**, bot-only, Telegram long-polling, `MINI_APP_ENABLED=0`,
-one process. Distinguish carefully:
+> **Plan 07 Amendment (`OHB2-PLAN-17`):** Active hosting guidance was amended from Katabump Free to
+> **Enzonic Python Hosting** (`docs/DEPLOY_ENZONIC.md`), whose Plan 04 qualification remains
+> **`BLOCKED` and explicitly deferred** (`HOST-01: BLOCKED`, `HOST-02: BLOCKED`; see
+> `docs/reviews/OHB2-PLAN04-HOST01-HOSTING-QUALIFICATION.md` and
+> `docs/reviews/OHB2-PLAN04-ENZONIC-CANARY-EXECUTION-REPORT.md`). The existing live Enzonic
+> `"OpenHandBot"` server (`Brave Grove`) must never be touched, modified, or used for SQLite
+> testing. The subsections below preserve the historical Katabump Free readiness notes verbatim.
+
+Historically, the initial documented target was **Katabump Free**, bot-only, Telegram long-polling,
+`MINI_APP_ENABLED=0`, one process. Distinguish carefully:
 
 ### 5.1 Repository implementation — VERIFIED
 - One process, one poller, in-process workers (§3.3).
@@ -245,8 +253,11 @@ does **not** silently rewrite history — the superseded items are named explici
 - **Verified (repository):** one process, one poller, in-process workers; no inbound port needed for
   long-polling; safe DB init + WAL + `busy_timeout`; core startup has no backup subsystem; a fresh DB
   is initialised if absent.
-- **Documented (operator-facing, not verified here):** Katabump upload list, env vars, and startup
-  command (`docs/DEPLOY_KATABUMP.md`).
+- **Current hosting status (Plan 07 / Plan 04):** Enzonic Python Hosting qualification status and
+  safety constraints are recorded in `docs/DEPLOY_ENZONIC.md` (`HOST-01: BLOCKED`, `HOST-02: BLOCKED`,
+  deferred; live server untouched).
+- **Documented (historical, operator-facing, not verified here):** Katabump upload list, env vars,
+  and startup command (`docs/DEPLOY_KATABUMP.md`, preserved as historical/provider-specific material).
 - **Unverified platform claims (must not be described as production-ready):** that Katabump actually
   installs `requirements.txt` on start; that the free server is auto-restarted after a crash;
   **renewal every 4 days** and that the free server **stops if the renewal is missed**; filesystem
@@ -258,8 +269,9 @@ does **not** silently rewrite history — the superseded items are named explici
 
 ## 6. Required runtime file set
 
-Per `docs/DEPLOY_KATABUMP.md` and enforced by `tests/test_deploy_manifest.py` (AST import closure
-from `main.py` + an isolated `import main` with only these files):
+Per the historical runtime manifest in `docs/DEPLOY_KATABUMP.md` and enforced by
+`tests/test_deploy_manifest.py` (AST import closure from `main.py` + an isolated `import main`
+with only these files):
 
 ```
 main.py

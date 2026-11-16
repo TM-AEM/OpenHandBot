@@ -6,7 +6,8 @@
 `bot/watcher.py`، `docs/REGRESSION_GATE.md`، `.github/workflows/ci.yml`).
 
 > نطاق الدليل: التشغيل والصيانة والاسترجاع فقط. تفاصيل الـ API في `docs/API_NOTES.md`،
-> والخطة الأصلية في `docs/PLAN.md`، والنشر على استضافة مجانية في `docs/DEPLOY_KATABUMP.md`.
+> والخطة الأصلية في `docs/PLAN.md`، وحالة استضافة Enzonic وضوابط السلامة في `docs/DEPLOY_ENZONIC.md`
+> (التأهيل `BLOCKED` ومؤجَّل؛ و`docs/DEPLOY_KATABUMP.md` محفوظ كمرجع تاريخي لمزوّد سابق).
 
 ---
 
@@ -384,4 +385,4 @@ python -m pytest -q tests/test_watcher.py tests/test_u01_watcher.py
 - المراقب وإشعارات الانتهاء: `bot/watcher.py`
 - أوامر التشغيل: `bot/handlers.py` (`/outbox*`)
 - بوابة الانحدار: `docs/REGRESSION_GATE.md` · CI: `.github/workflows/ci.yml`
-- الـ API: `docs/API_NOTES.md` · النشر: `docs/DEPLOY_KATABUMP.md`
+- الـ API: `docs/API_NOTES.md` · حالة الاستضافة (Enzonic): `docs/DEPLOY_ENZONIC.md` *(تاريخيًا: `docs/DEPLOY_KATABUMP.md`)*

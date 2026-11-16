@@ -1,10 +1,19 @@
 # OHB2 — Enzonic Deployment Preflight (Personal Single-User)
 
-> **Update 2026-11-16 (Plan 04 / HOST-01):** Enzonic is re-assessed first-class in
-> `docs/reviews/OHB2-PLAN04-HOST01-HOSTING-QUALIFICATION.md` (Python panel vs Web Hosting vs Deploy
-> vs Game Hosting). The 2026-11-16 official `/python` page advertises a **custom startup command**, so
-> the historical `python3 app.py` entry-point blocker (B1 below) is resolved by configuration
-> (`sh start.sh`); the unresolved item is **persistence + SQLite locking (`UNKNOWN`)**.
+> **Update 2026-11-16 (Plan 04 + Plan 07 Status Sync):** Enzonic was re-assessed under Plan 04
+> (`docs/reviews/OHB2-PLAN04-HOST01-HOSTING-QUALIFICATION.md`,
+> `docs/reviews/OHB2-PLAN04-HOST02-ACTIVATION-READINESS.md`,
+> `docs/reviews/OHB2-PLAN04-ENZONIC-CANARY-EXECUTION-REPORT.md`), and **both `HOST-01` and `HOST-02`
+> remain `BLOCKED` and explicitly deferred** (see `docs/DEPLOY_ENZONIC.md`). Persistence, SQLite
+> locking, HTTPS ingress, continuous runtime, and resource constraints remain **unqualified / `UNKNOWN`**.
+> This historical Phase 8 preflight document does **not** qualify Enzonic and does **not** authorize
+> deployment. **Strict safety rule:** the existing live Enzonic `"OpenHandBot"` (`Brave Grove`) server
+> is a real live project server — **NOT** a canary. Never restart/stop/start it, upload/edit/delete
+> files, run console commands, open its terminal, change env/config, test SQLite on it, or deploy.
+>
+> *(Historical note kept verbatim: the 2026-11-16 `/python` page advertised a custom startup command
+> resolving the historical `python3 app.py` mismatch by config `sh start.sh`; persistence + SQLite
+> locking remained `UNKNOWN`.)*
 
 **Type:** documentation only (preflight + procedure). **Nothing was deployed, uploaded, or executed
 against Enzonic.** No file was uploaded, no production secret was configured, no production process
@@ -355,10 +364,17 @@ No P0 blocker. B1 is resolved by configuration, not by code.
 
 ---
 
-## 10. Ordered manual deployment procedure (for the user, later)
+## 10. Ordered manual deployment procedure (historical preflight draft — **NOT AUTHORIZED / BLOCKED**)
 
-> Prerequisite: separate explicit approval to deploy. Do not use Reinstall, Delete, or egg-switch.
-> Never enter secrets anywhere except the panel's Environment Variables UI.
+> **Plan 04 / Plan 07 Safety & Block Notice:** **Do NOT execute this procedure.** `HOST-01` and
+> `HOST-02` are **`BLOCKED` and deferred** (`docs/DEPLOY_ENZONIC.md`). The existing Enzonic
+> `"OpenHandBot"` (`Brave Grove`) server is a **live project server, NOT a canary** — do **not**
+> touch, modify, restart, upload/delete files, open a console/terminal, change env vars, test SQLite,
+> or deploy to it.
+>
+> *(Historical prerequisite note preserved:)* Prerequisite: separate explicit approval to deploy.
+> Do not use Reinstall, Delete, or egg-switch. Never enter secrets anywhere except the panel's
+> Environment Variables UI.
 
 1. In the Enzonic panel, open server **Brave Grove** and confirm the runtime is Python (3.14).
 2. Upload the **runtime set** from §4.1 (ZIP or SFTP): `main.py`, the full `bot/` tree including
@@ -394,7 +410,12 @@ No P0 blocker. B1 is resolved by configuration, not by code.
 
 ---
 
-## 12. Final recommendation
+## 12. Final recommendation (Historical Phase 8 Preflight; Superseded by Plan 04 `BLOCKED`)
+
+> **Current authoritative status (Plan 04 / Plan 07 — `docs/DEPLOY_ENZONIC.md`):** **`HOST-01: BLOCKED`**,
+> **`HOST-02: BLOCKED`** (deferred). The historical `PREFLIGHT_READY_WITH_RISKS` note below records only
+> the earlier local Phase 8 config/Python-3.14 check and does **not** authorize any interaction with or
+> deployment to the live Enzonic `"OpenHandBot"` (`Brave Grove`) server.
 
 **PREFLIGHT_READY_WITH_RISKS** — configuration is fully specified and locally validated (including
 Python 3.14), and the only true configuration blocker (B1, the `app.py` entry point) is resolved by

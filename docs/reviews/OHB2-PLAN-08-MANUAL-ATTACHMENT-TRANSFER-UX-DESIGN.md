@@ -20,6 +20,14 @@
 > `71cc88c8…`, immutable) is treated as **evidence to investigate**, not as authority. Every
 > review finding was **re-verified against current source** before this document was corrected;
 > results are in §18.
+>
+> **Dated decision sync (2026-11-16, Plan 07 / `DOC-04`):** This historical design document
+> (2026-11-14 / remediated 2026-11-15) recorded `D-15` as `OPEN` at the time of writing. The owner
+> subsequently approved **D-15 Option A on 2026-11-15** (fixed 15-min expiry, staging-only reclaim, no
+> C2 change, server does not model batch, no non-terminal batch state after expiry) — see
+> `docs/decisions/OHB2-P0-OWNER-DECISIONS-REGISTER.md` (§5 → D-15, §9, §13.5) and
+> `docs/decisions/OHB2-OWNER-DECISION-PLAN08-MANUAL-ATTACHMENT-TRANSFER.md` (§10). Historical text
+> below is preserved verbatim; D-12, D-16, D-22 and runtime/MT-2 activation remain unapproved.
 
 ---
 

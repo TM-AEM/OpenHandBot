@@ -9,6 +9,14 @@
 > Evidence labels: **[F]** verified this session from source/installed packages · **[I]** inference ·
 > **[U]** unverified · **[R]** recommendation · **[OWNER]** owner decision.
 > This report does **not** authorize implementation. It does not modify Plan 09 or its closure record.
+>
+> **Dated decision sync (2026-11-16, Plan 07 / `DOC-04`):** Historical sections below (`Date: 2026-11-15`)
+> were written *before* the owner's subsequent **2026-11-15 approval of D-15 Option A** (fixed 15-minute
+> expiry, staging-only reclaim, no C2 change, server does not model batch, no non-terminal batch state
+> after expiry). See `docs/decisions/OHB2-P0-OWNER-DECISIONS-REGISTER.md` (§5 → D-15, §9, §13.5) and
+> `docs/reviews/OHB2-MT2-COMPLETION-AND-ADVERSARIAL-VERIFICATION.md`. This note is a dated sync only;
+> historical investigation text below is preserved verbatim, and D-15 confirmation alone does **not**
+> authorize MT-2 activation or deployment (`HOST-02` remains `BLOCKED`).
 
 ---
 
