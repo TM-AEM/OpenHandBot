@@ -1,5 +1,11 @@
 # OHB2 — Enzonic Deployment Preflight (Personal Single-User)
 
+> **Update 2026-11-16 (Plan 04 / HOST-01):** Enzonic is re-assessed first-class in
+> `docs/reviews/OHB2-PLAN04-HOST01-HOSTING-QUALIFICATION.md` (Python panel vs Web Hosting vs Deploy
+> vs Game Hosting). The 2026-11-16 official `/python` page advertises a **custom startup command**, so
+> the historical `python3 app.py` entry-point blocker (B1 below) is resolved by configuration
+> (`sh start.sh`); the unresolved item is **persistence + SQLite locking (`UNKNOWN`)**.
+
 **Type:** documentation only (preflight + procedure). **Nothing was deployed, uploaded, or executed
 against Enzonic.** No file was uploaded, no production secret was configured, no production process
 was started, and no Enzonic server/panel control was used (no Back up now, Backups, Reinstall,

@@ -4073,3 +4073,61 @@ suites ⇒ **135 passed**؛ bandit (`-lll`) ⇒ **0 high** (نتيجة Low وا�
 ## الحالة النهائية
 - **WS-01: DONE.** **WS-02: BLOCKED_BY_PROVIDER** (موثّق، fail-closed).
 - مفيش commit/push/PR/deploy (حسب التعليمات). الفشل الوحيد المتبقّي **سابق** وغير متعلّق.
+
+---
+
+## OHB2-PLAN04-HOSTING-QUALIFICATION-AND-MINIAPP-GATES-EXECUTION-02 (2026-11-16، تحقيق/توثيق فقط)
+
+**Baseline:** `main` @ `56a58124f5cd677ca39e1dad19b5e3fa94b0fbc1` (== origin/main)؛ شجرة نظيفة قبل البدء.
+**النوع:** استقصاء + توثيق فقط. لا حساب/لا تزويد/لا نشر/لا تفعيل Mini App/لا دفع أو كارت/لا سر/لا Git publication.
+
+**HOST-01 — الحُكم: `BLOCKED`.** مفيش مرشّح عنده **دليل استمرارية/تشغيل فعلي**؛ كل اختبارات الاستمرارية
+البعيدة `NOT_RUN`. Enzonic Python panel أفضل ملاءمة مجانية/بلا كارت نظريًّا، بس الاستمرارية + قفل SQLite
+`UNKNOWN`. التقرير: `docs/reviews/OHB2-PLAN04-HOST01-HOSTING-QUALIFICATION.md` (مصفوفة كاملة + أدلّة 2026-11-16).
+
+**Enzonic — أربع مسارات منفصلة:** (2A) Python Hosting panel: مجاني 512 MB/50% CPU/10 GB/24/7، بلا كارت،
+Python 3.10–3.12 + `requirements.txt` + أمر تشغيل مخصّص ⇒ **استمرارية UNKNOWN**. (2B) Web Hosting =
+**نفس المنتج** (مش استحقاق تاني). (2C) Deploy/Cloud = **FAIL** (serverless/scale-to-zero؛ Hobby بينام 15 دقيقة).
+(2D) Game Hosting = **FAIL** (بينام؛ مش بيئة Python مدعومة).
+
+**أدلّة محلية (مُتحقَّقة):** RSS عند الاستيراد الكامل = **58.4 MiB** (≪ 512 MB)؛ إثبات SQLite محلي
+(`/tmp/ohb2_host01_proof/proof.py`): `journal_mode=wal`، `busy_timeout=5000`، ملفات `-wal/-shm`،
+الصف بيفضل بعد **إعادة تشغيل العملية**، والقفل أحادي المالك مُطبَّق.
+
+**HOST-02 — الحُكم: `BLOCKED`.** البوّابات 1/2/7/8/10/12 فاشلة/معلّقة؛ مفيش موافقة مالك على التفعيل.
+التقرير: `docs/reviews/OHB2-PLAN04-HOST02-ACTIVATION-READINESS.md` (قائمة البوّابات + إجراء التفعيل/التراجع).
+`MINI_APP_ENABLED` افتراضيًا **False**؛ قيمة غير معروفة ⇒ `ConfigError`؛ تفعيل بلا URL ⇒ fail-closed؛
+مفيش مسار تفعيل بديل؛ البناء المقفول مابيكشفش أي واجهة HTTP. **مفيش عيب أمان in-scope ⇒ مفيش تغيير كود.**
+
+**MT-2:** محجوب عند المزوّد (P0) — لم يُدَّعَ اكتماله. **WS-02:** `BLOCKED_BY_PROVIDER_CAPABILITY`.
+**Android 12 Telegram WebView:** `NOT_RUN` (مفيش جهاز/عميل حقيقي؛ Chromium ≠ Telegram).
+
+**التحقّق:** pytest **1 فشل سابق / 3117 ناجح** (الفشل الوحيد `test_deploy_manifest::test_documented_manifest_is_import_sufficient`
+— `ModuleNotFoundError: telegram` لأن الاختبار يبدّل `HOME` والحزمة في user-site)؛ node **280/0**؛
+pyflakes **0**؛ bandit **High 0**؛ مجموعة مركّزة (config/miniapp/bootstrap/security) **143 ناجح**.
+
+**الملفات الجديدة:** 3 تقارير تحت `docs/reviews/` + هذا القسم. **لم يتغيّر أي كود/إعداد/مخطّط/تبعية.**
+**لا** commit/push/PR/merge/نشر/تفعيل Autopush.
+
+---
+
+## OHB2-PLAN04-ENZONIC-PYTHON-HOSTING-CANARY-EXECUTION-01 (2026-11-16، تحقيق/توثيق فقط — الحُكم BLOCKED)
+
+**Baseline:** `main` @ `56a58124f5cd677ca39e1dad19b5e3fa94b0fbc1`؛ شجرة العمل قبل البدء = docs/ + `.agent/` فقط.
+**النوع:** محاولة تنفيذ canary معزول على Enzonic Python Hosting. **لم يُزوَّد أي canary. مفيش C1–C9 اتنفّذ. مفيش حساب/دفع/رفع/حذف/نشر/تفعيل.**
+
+**سبب الإيقاف (بوّابة preflight فاشلة):** **مفيش حساب Enzonic مُصادَق** في البيئة، وتسجيل الدخول/التسجيل **خارج النطاق**.
+- `panel.enzonic.com/` و`/dashboard`: قشرة JS بلا أي واجهة حساب؛ كوكي Clerk `__client_uat=0` (مسجّل خروج) وJWT مجهول فقط.
+- `accounts.enzonic.com/sign-in`: تحقّق Cloudflare Turnstile ("Just a moment…"). تسجيل حساب جديد غير مُصرَّح.
+- فحص الاعتمادات: مفيش أي اعتماد/جلسة Enzonic في البيئة (`~/.openhands/` فيه بس github.token + profiles؛ الريبو فيه `.env.example` فقط).
+- ⇒ حسب §2: **ما يُزوَّدش**؛ الاختبارات `NOT_RUN`؛ Blocker موثّق.
+
+**نتيجة C1–C9:** C1–C8 = `NOT_RUN` (نفس السبب)؛ C9 = `PASS` (لا شيء اتخلق أصلًا فمفيش حاجة تتنضّف).
+
+**حُكم HOST-01 (الـ canary):** **`BLOCKED`** — الاختبار **لم يُنفَّذ**، فمش `NOT_QUALIFIED` (مفيش فشل تقني مُلاحَظ). كل المتطلبات الإلزامية **UNVERIFIED** (ادّعاءات مزوّد فقط، بتاريخ 2026-11-16 13:15:49Z).
+
+**HOST-02:** **`BLOCKED` ومستقل** — النجاح في canary مش تفويض للتفعيل. `MINI_APP_ENABLED=False` (بلا تغيير)؛ Autopush غير مُشغَّل؛ مفيش نشر؛ Plan 03 مُغلق بحاجزه القائم.
+
+**الملف الجديد:** `docs/reviews/OHB2-PLAN04-ENZONIC-CANARY-EXECUTION-REPORT.md` + قسم متابعة مؤرَّخ في `docs/reviews/OHB2-PLAN04-HOST01-HOSTING-QUALIFICATION.md` (§8). **لم يُعَد كتابة أي تقرير تاريخي.**
+
+**الخطوة التالية (قرار المالك، واحد):** (أ) يسجّل المالك الدخول لحساب Enzonic القائم ويثبت استحقاق مجاني/بلا كارت ⇒ إعادة تشغيل نفس المهمة؛ (ب) لو مفيش حساب: ينشئه المالك شخصيًّا أو يفوّض مضيفًا آخر بلا كارت؛ (ج) قبول الوضع الحالي (محلي فقط).

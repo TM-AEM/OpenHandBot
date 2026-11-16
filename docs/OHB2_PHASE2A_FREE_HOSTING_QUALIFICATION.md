@@ -7,6 +7,12 @@ deployed, no DNS/Telegram change, no production call, no commit/push by hand.
 **Research date:** 2026-11-08 (all provider facts below were re-checked on this date from the
 provider's own official pages; the "checked" date is stated per claim).
 
+> **Update 2026-11-16 (Plan 04 / HOST-01):** a refreshed qualification study with a **first-class,
+> separate Enzonic assessment** (Python panel vs Web Hosting vs Deploy vs Game Hosting) and a full
+> candidate matrix is at `docs/reviews/OHB2-PLAN04-HOST01-HOSTING-QUALIFICATION.md`. Verdict there:
+> **`BLOCKED`** (no candidate has actual persistence proof). This 2026-11-08 study is kept as the
+> historical record.
+
 ---
 
 ## 0. Phase 1 readiness gate (checked FIRST, per the task)
