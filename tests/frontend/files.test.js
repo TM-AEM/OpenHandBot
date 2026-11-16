@@ -82,3 +82,84 @@ test("createDeduper: different keys run independently", async () => {
   assert.equal(await b, 2);
   assert.equal(calls, 2);
 });
+
+// =============================================== تنقّل المجلدات (OHB2-PLAN-13-WS-01)
+const PATHS = ["src/main.py", "src/util/helper.js", "notes.txt", ".github/workflows/ci.yml"];
+
+test("buildTree: يبني هرمية من مسارات نسبية (مجلدات/ملفات)", () => {
+  const t = FILES.buildTree(PATHS);
+  const root = FILES.entryRows(t).map((r) => r.type + ":" + r.name);
+  assert.deepEqual(root, ["folder:.github", "folder:src", "file:notes.txt"]);
+  const src = FILES.entryRows(FILES.resolveNode(t, "src")).map((r) => r.type + ":" + r.name);
+  assert.deepEqual(src, ["folder:util", "file:main.py"]);
+});
+
+test("buildTree: يتجاهل المقاطع الفارغة/النقطية (fail-closed)", () => {
+  const t = FILES.buildTree(["a//b.py", "a/../x.py", "", "good.txt", "a/./y.py"]);
+  const root = FILES.entryRows(t).map((r) => r.type + ":" + r.name);
+  assert.deepEqual(root, ["file:good.txt"]);
+});
+
+test("resolveNode: الجذر للمسار الفاضي، null لمسار مش مجلد", () => {
+  const t = FILES.buildTree(PATHS);
+  assert.ok(FILES.resolveNode(t, ""));
+  assert.ok(FILES.resolveNode(t, "src/util"));
+  assert.equal(FILES.resolveNode(t, "src/main.py"), null, "الملف مش مجلد");
+  assert.equal(FILES.resolveNode(t, "nope"), null);
+});
+
+test("hasFiles: false للعقدة الفاضية/غير الموجودة", () => {
+  const t = FILES.buildTree(PATHS);
+  assert.equal(FILES.hasFiles(FILES.resolveNode(t, "src")), true);
+  assert.equal(FILES.hasFiles(FILES.resolveNode(t, "nope")), false);
+  assert.equal(FILES.hasFiles(null), false);
+});
+
+test("parentPath: لأعلى أو null في الجذر", () => {
+  assert.equal(FILES.parentPath("src/util"), "src");
+  assert.equal(FILES.parentPath("src"), "");
+  assert.equal(FILES.parentPath(""), null);
+});
+
+test("childPath: يبني مسار فرعي نسبةً للمجلد الحالي", () => {
+  assert.equal(FILES.childPath("", "src"), "src");
+  assert.equal(FILES.childPath("src", "util"), "src/util");
+});
+
+test("breadcrumbs: من الرئيسية لآخر مقطع، وكل عنصر فيه مساره", () => {
+  assert.deepEqual(FILES.breadcrumbs("").map((c) => c.label), ["الرئيسية"]);
+  assert.deepEqual(FILES.breadcrumbs("src/util").map((c) => c.label), ["الرئيسية", "src", "util"]);
+  assert.deepEqual(FILES.breadcrumbs("src/util").map((c) => c.path), ["", "src", "src/util"]);
+});
+
+test("safeDir: يقبل مجلد معروف فقط ويرفض الملف/غير الموجود (fail-closed)", () => {
+  const t = FILES.buildTree(PATHS);
+  assert.equal(FILES.safeDir("", t), "");
+  assert.equal(FILES.safeDir("src", t), "src");
+  assert.equal(FILES.safeDir("src/util", t), "src/util");
+  assert.equal(FILES.safeDir("src/main.py", t), null, "ملف مرفوض كمجلد");
+  assert.equal(FILES.safeDir("nope", t), null);
+  assert.equal(FILES.safeDir("../../etc", t), null);
+  assert.equal(FILES.safeDir(null, t), "");
+  assert.equal(FILES.safeDir(123, t), null);
+});
+
+test("readDir/writeDir: حفظ/استرجاع/مسح لكل شات (fail-safe لو التخزين راح)", () => {
+  const m = new Map();
+  const store = {
+    getItem: (k) => (m.has(k) ? m.get(k) : null),
+    setItem: (k, v) => m.set(k, String(v)),
+    removeItem: (k) => m.delete(k),
+  };
+  assert.equal(FILES.readDir(store, "c1"), "");
+  FILES.writeDir(store, "c1", "src/util");
+  assert.equal(FILES.readDir(store, "c1"), "src/util");
+  assert.equal(FILES.readDir(store, "c2"), "", "كل شات ليه مفتاح مستقل");
+  FILES.writeDir(store, "c1", "");
+  assert.equal(FILES.readDir(store, "c1"), "", "المسح يرجّع الجذر");
+  // تخزين بيرمي (مثلاً وضع خاص/مقفول) ⇒ مايكسرش (fail-open للعرض فقط).
+  const bad = { getItem() { throw new Error("blocked"); }, setItem() { throw new Error("blocked"); }, removeItem() { throw new Error("blocked"); } };
+  assert.equal(FILES.readDir(bad, "c1"), "");
+  FILES.writeDir(bad, "c1", "src");
+  assert.equal(FILES.readDir(null, "c1"), "");
+});

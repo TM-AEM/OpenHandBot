@@ -1263,21 +1263,84 @@
     var wrap = el("div", "files-section");
     var head = el("div", "toolbar");
     head.appendChild(el("span", "card-label", "ملفات الشات"));
+    // OHB2-PLAN-13-WS-01: زر «لأعلى» (مخفي في الجذر) + تحديث.
+    var upBtn = el("button", "btn ghost small", "⬆️ لأعلى");
+    upBtn.hidden = true;
     var refresh = el("button", "btn ghost small", "تحديث");
+    head.appendChild(upBtn);
     head.appendChild(refresh);
     wrap.appendChild(head);
+
+    // OHB2-PLAN-13-WS-01: فتات تنقّل (breadcrumbs) قابلة للضغط — من الجذر للمجلد الحالي.
+    var crumbs = el("nav", "breadcrumbs");
+    crumbs.setAttribute("aria-label", "مسار المجلد");
+    wrap.appendChild(crumbs);
 
     var list = el("ul", "list");
     var previewBox = el("div", "file-preview");
     // OHB2-MINIAPP-STALE-FIX: جيل المعاينة الحالي (بيتزوّد في كل طلب معاينة، وفي `load`
     // كمان عشان تحديث قايمة الملفات يلغي أي معاينة معلّقة قبل ما ترسم).
     var previewSeq = 0;
+    // OHB2-PLAN-13-WS-01: شجرة المجلدات (محلية) + المجلد الحالي.
+    var tree = null;
+    var dir = "";
     wrap.appendChild(list);
     wrap.appendChild(previewBox);
+
+    function store() {
+      // الوصول للـ localStorage نفسه ممكن يرمي (وضع خاص/سياسة) ⇒ نرجّع null بأمان.
+      try {
+        return (typeof window !== "undefined" && window.localStorage) || null;
+      } catch (e) { return null; }
+    }
 
     function showLoading(container, text) {
       container.innerHTML = "";
       container.appendChild(el("li", "loading-row", text || "بيتم التحميل…"));
+    }
+
+    function renderCrumbs() {
+      crumbs.innerHTML = "";
+      var items = FILES.breadcrumbs(dir);
+      items.forEach(function (c, i) {
+        var b = el("button", "crumb", c.label);
+        b.setAttribute("type", "button");
+        if (c.path === dir) { b.classList.add("active"); b.setAttribute("aria-current", "page"); }
+        b.addEventListener("click", function () { go(c.path); });
+        crumbs.appendChild(b);
+        if (i < items.length - 1) { crumbs.appendChild(el("span", "crumb-sep", "›")); }
+      });
+    }
+
+    // تنقّل لمجلد (fail-closed): بنقبل بس مسار مجلد معروف في الشجرة، وبنحفظ الحالة لكل شات.
+    function go(target) {
+      var safe = FILES.safeDir(target, tree);
+      if (safe === null) { return; }
+      dir = safe;
+      FILES.writeDir(store(), id, dir);
+      previewSeq += 1;
+      previewBox.innerHTML = "";
+      renderCrumbs();
+      renderList();
+      upBtn.hidden = (dir === "");
+    }
+
+    function renderList() {
+      list.innerHTML = "";
+      var node = FILES.resolveNode(tree, dir);
+      if (!FILES.hasFiles(node)) { list.appendChild(el("li", "empty-row", "مفيش ملفات هنا.")); return; }
+      FILES.entryRows(node).forEach(function (r) {
+        var li = el("li", "row");
+        li.appendChild(el("span", "row-title", r.type === "folder" ? r.name + "/" : r.name));
+        if (r.type === "folder") {
+          li.classList.add("folder-row");
+          makeRowInteractive(li, function () { go(FILES.childPath(dir, r.name)); });
+        } else {
+          var full = FILES.childPath(dir, r.name);
+          makeRowInteractive(li, function () { loadPreview(full); });
+        }
+        list.appendChild(li);
+      });
     }
 
     function loadPreview(path) {
@@ -1321,19 +1384,24 @@
         list.innerHTML = "";
         if (!res.ok) { list.appendChild(el("li", "empty-row", filesErrorText(res))); return; }
         var files = (res.data && res.data.files) || [];
-        if (!files.length) { list.appendChild(el("li", "empty-row", "مفيش ملفات.")); return; }
-        files.forEach(function (path) {
-          var li = el("li", "row");
-          li.appendChild(el("span", "row-title", path));
-          makeRowInteractive(li, function () { loadPreview(path); });
-          list.appendChild(li);
-        });
+        tree = FILES.buildTree(files);
+        // استرجاع المجلد المحفوظ لهذا الشات، مع تصحيح آمن لو المجلد اختفى من الشجرة.
+        var saved = FILES.safeDir(FILES.readDir(store(), id), tree);
+        dir = saved === null ? "" : saved;
+        FILES.writeDir(store(), id, dir);
+        renderCrumbs();
+        renderList();
+        upBtn.hidden = (dir === "");
       }).catch(function () {
         list.innerHTML = "";
         list.appendChild(el("li", "empty-row", "مش قادر أوصل للسيرفر."));
       });
     }
 
+    upBtn.addEventListener("click", function () {
+      var parent = FILES.parentPath(dir);
+      if (parent !== null) { go(parent); }
+    });
     refresh.addEventListener("click", load);
     load();
     return wrap;

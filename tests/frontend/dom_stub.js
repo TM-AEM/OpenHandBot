@@ -305,6 +305,15 @@ function toResponse(result) {
   };
 }
 
+// OHB2-PLAN-13-WS-01: تخزين محلي مصغّر (Map-backed) لمحاكاة حفظ حالة التنقّل لكل شات.
+class LocalStorage {
+  constructor() { this._m = new Map(); }
+  getItem(k) { return this._m.has(String(k)) ? this._m.get(String(k)) : null; }
+  setItem(k, v) { this._m.set(String(k), String(v)); }
+  removeItem(k) { this._m.delete(String(k)); }
+  clear() { this._m.clear(); }
+}
+
 // ------------------------------------------------------------------ تحميل app.js
 function loadApp(opts) {
   opts = opts || {};
@@ -318,6 +327,7 @@ function loadApp(opts) {
     console,
     document: doc,
     fetch: fetchImpl,
+    localStorage: opts.localStorage || new LocalStorage(),
     AbortController: class { constructor() { this.signal = {}; } abort() {} },
     setTimeout: (fn, ms) => { timers.push({ fn, ms: ms || 0 }); return timers.length; },
     clearTimeout: () => {},
@@ -368,4 +378,4 @@ function loadApp(opts) {
   return { sandbox, doc, fetch: fake, timers, telegram: tg, runTimers, runIntervals, intervalCount };
 }
 
-module.exports = { El, Document, buildDocument, FakeFetch, loadApp, descendants, IDS };
+module.exports = { El, Document, buildDocument, FakeFetch, loadApp, descendants, IDS, LocalStorage };

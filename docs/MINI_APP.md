@@ -633,28 +633,80 @@ DOM ومُختبر بـ Node). الأزرار بتظهر **بس** حسب أعل�
 — fail-closed: لو العلم مش `true` صراحةً، مفيش إجراء. الإلغاء/الحسم بيتطلبوا **تأكيد
 صريح (خطوتين)**، وأي 409/فشل شبكة مايعرضوش نجاح كاذب.
 
-## 13هـ. قايمة ملفات الشات (عرض مسطّح + معاينة للقراءة فقط)
+## 13هـ. قايمة ملفات الشات (تنقّل هرمي + معاينة للقراءة فقط) — OHB2-PLAN-13-WS-01
 
-الملفات بتتعرَض من تفاصيل الشات (قسم «ملفات الشات» في `bot/web/static/app.js`) كـ **قايمة
-مسطّحة للقراءة فقط** من المسارات النسبية الآمنة — مفيش أي تسلسل مجلدات في الواجهة:
+الملفات بتتعرَض من تفاصيل الشات (قسم «ملفات الشات» في `bot/web/static/app.js`) كـ **متصفّح
+مجلدات هرمي للقراءة فقط** فوق نفس قايمة المسارات النسبية الآمنة:
 
 - **`GET /api/v1/conversations/{id}/files`** ⇒ `{"conversation_id": …, "files": [ … ]}`:
   قايمة نصية **مسطّحة** بالمسارات النسبية (allowlist عبر `is_safe_workspace_path` + تفويض
-  ملكية الشات، نفس مسار `FileService.list_files` بتاع البوت). بادئة شبيهة بمجلد جوه المسار
-  (زي `src/main.py`) **مجرد جزء من اسم المسار** ومابتوفّرش أي تنقّل بين المجلدات.
-- **الضغط على أي مسار** بيفتح **معاينة نصية محدودة** عبر
-  **`GET /api/v1/conversations/{id}/file?path=<المسار>`** (نفس مسار `FileService.read_preview`:
-  تفويض ⇒ فحص مسار ⇒ allowlist ⇒ قراءة محدودة). المعاينة بتعرض النص أو حالة واضحة
-  (`binary`/`not_utf8`/`too_large`)، وبتوضّح لو النص **مقصوص** (`truncated`).
-- **زر «تحديث»** بيعيد تحميل **قايمة الملفات بس** (`/files`) — مش بيعمل أي تنقّل ولا تغيير مجلد.
+  ملكية الشات، نفس مسار `FileService.list_files` بتاع البوت). **الرد نفسه ماتغيّرش**: لسه
+  قايمة مسطّحة بمسارات كاملة زي `src/util/helper.js`.
+- **الهرمية بتتبني محليًا في الواجهة** من نص المسار (تقسيم على `/`) — مفيش راوت جديد ولا
+  قراءة إضافية. المنطق الخالص في `bot/web/static/files.js`
+  (`buildTree`/`resolveNode`/`entryRows`/`breadcrumbs`/`parentPath`/`childPath`/`safeDir`)
+  ومُختبر بـ Node. القايمة المسطّحة بتتحوّل شجرة: **المجلدات الأول (مرتّبة)** وبعدها
+  **الملفات (مرتّبة)**، واسم المجلد بياخد لاحقة `/`.
+- **التنقّل:** الضغط على مجلد **ينزل جواه** (بس لو المجلد **موجود فعلًا في الشجرة** —
+  فشل مغلق: مفيش اجتياز لمسار مش مصرّح به)، وفتات تنقّل (breadcrumbs) بيوضّح المسار الحالي
+  وبيسمح بالرجوع لأي مستوى، وزر **«⬆️ لأعلى»** بيرجّع للمجلد الأب (مخفي في الجذر).
+- **حالة التنقّل محفوظة لكل شات** عبر إعادة تحميل الصفحة في `localStorage` (مفتاح
+  `ohb2.files.dir.<conversation_id>`)، والاسترجاع **آمن**: لو المجلد المحفوظ اختفى من الشجرة
+  بنرجع للجذر (fail-safe). لو `localStorage` مش متاح، التنقّل يفضل شغّال من غير حفظ.
+- **الضغط على أي ملف** بيفتح **معاينة نصية محدودة** عبر
+  **`GET /api/v1/conversations/{id}/file?path=<المسار الكامل>`** (نفس مسار
+  `FileService.read_preview`: تفويض ⇒ فحص مسار ⇒ allowlist ⇒ قراءة محدودة). المعاينة بتعرض
+  النص أو حالة واضحة (`binary`/`not_utf8`/`too_large`)، وبتوضّح لو النص **مقصوص**
+  (`truncated`). المسار المطلوب هو المسار الكامل المبني من الشجرة (`src/util/helper.js`).
+- **زر «تحديث»** بيعيد تحميل **قايمة الملفات بس** (`/files`) ويعيد بناء الشجرة (مع استرجاع
+  المجلد المحفوظ).
 
-**الحدود الحالية (غير مُنفَّذة):** الواجهة **مافيهاش** تنقّل مجلدات هرمي، ولا رجوع للمجلد
-الأعلى، ولا فتات تنقّل (breadcrumbs)، ولا رجوع/تقدّم داخل المجلدات، ولا حالة تنقّل محفوظة
-عبر إعادة تحميل الصفحة، ولا **تنزيل ملف منفرد** (المعاينة عرض نصي بس).
+**الحدود الحالية (غير مُنفَّذة):** **تنزيل ملف منفرد (بايتات)** غير متاح (المعاينة عرض نصي
+محدود بس) — شوف القسم 13و للأسباب. مفيش بحث/فرز داخل المجلد.
 
 **الفرق عن التصدير:** المعاينة أعلاه لكل **ملف منفرد**؛ أما
 **`GET /api/v1/conversations/{id}/export`** فهو **تصدير الشات** كـ ZIP (`event_*.json` +
 `meta.json`) — ميزة منفصلة تمامًا (القسم 13ج)، مش عرض/تنزيل ملفات الـ workspace.
+
+## 13و. تنزيل ملف مساحة عمل منفرد — OHB2-PLAN-13-WS-02 (BLOCKED_BY_PROVIDER_CAPABILITY)
+
+**الحالة: `BLOCKED_BY_PROVIDER_CAPABILITY`** (نفس التصنيف القائم `BLOCKED_BY_PROVIDER`، بس بصيغة الإغلاق الإداري الأدقّ) — **غير مُنفَّذ، عن قصد، ومفيش راوت مُختَرَع ولا بديل.** الإغلاق الإداري الكامل في `docs/reviews/OHB2-PLAN03-ADMINISTRATIVE-CLOSURE-REPORT.md`.
+
+الأدلة (مصدر رسمي، اتُّحقّق منها وقت التنفيذ):
+
+- **Cloud V1 (`https://app.all-hands.dev/openapi.json`, v1.92.0, 257 مسارًا):**
+  - `GET /api/v1/app-conversations/{id}/file` — **"Read Conversation File"**: الرد
+    `application/json` نصّي (`type: string`)، وهو **نص** (مابيرجّعش بايتات أصلية). المسار
+    المحلي (`read_file_text_bounded`) **محدود بـ 256 KiB** و**بيرفض** المحتوى الثنائي/غير
+    UTF-8 (`binary`/`not_utf8`). يعني ده **عرض نصي**، مش تنزيل بايتات.
+  - `GET /api/v1/app-conversations/{id}/files` — **"List Conversation Files"**: `array of
+    string` (مسارات نسبية).
+  - `GET /api/v1/app-conversations/{id}/download` — **"Export Conversation"**: تصدير
+    **trajectory** المحادثة كـ ZIP، **مش** ملف مساحة عمل منفرد.
+  - **مفيش** أي راوت راجع `application/octet-stream`/`format: binary`، ومفيش `multipart`،
+    ومفيش أي راوت "تنزيل ملف مساحة عمل" في Cloud V1 (فحص كامل للـ spec: `octet-stream=0`،
+    `format: binary=0`، `multipart=0`، وكل ردود 2xx كلها `application/json`).
+- **Agent Server (`https://docs.openhands.dev/openapi/agent-sdk.json`, v0.1.0, 40 مسارًا):**
+  - `GET /api/file/download/{path}` — **"Download File"**: ده **الراوت الوحيد** اللي بينزّل
+    بايتات ملف من مساحة العمل.
+  - **بس** ده بيتطلّب هيدر `X-Session-API-Key` (مفتاح جلسة الـ Agent Server)، وهو **مفتاح
+    كامل الصلاحية على مستوى السيرفر** (نفس المفتاح بيوصل `POST /api/bash/execute_bash_command`
+    — تنفيذ أوامر عشوائية — و`/api/conversations/{id}/secrets`). ده **الخطر B1** الموثّق في
+    `docs/proposals/OHB2-AGENT-SERVER-FILE-UPLOAD-ARCHITECTURE.md` §17/§22 (لا مُصدِر موثوق
+    ولا اعتماد محدود الصلاحية، والراوت القديم `GET /api/file/download/{path}` **مش محصور**
+    في مساحة العمل: أي مسار مطلق).
+  - كمان `session_api_key` **مش مخزّن** في البوت (سياسة موثّقة)، والحصول عليه من Cloud
+    يتطلّب قراءة `session_api_key` من كائن المحادثة.
+
+**القرار (fail-closed):** التنزيل الفعلي (بايتات) **مستحيل بأمان** بالمزود الحالي من غير
+اعتماد كامل الصلاحية مرفوض. فالتنزيل **محجوب عمدًا**: مفيش راوت تنزيل بايتات محلي، ومفيش
+استبدال بـ shell/write API، ومفيش ادّعاء تنزيل كاذب. أي طلب لمسار تنزيل مزعوم يرجّع
+**404**. المعاينة النصية المحدودة (القسم 13هـ) هي البديل الآمن الوحيد المتاح.
+
+**لو اتفتح مستقبلًا:** لازم مزوّد يوفّر راوت قراءة بايتات **محصور في مساحة العمل** باعتماد
+**محدود الصلاحية** (مش مفتاح الجلسة الكامل). ساعتها ينفع نضيف راوت تنزيل محلي بالبثّ
+المحدود (نفس نمط `bot/web/download.py` بتاع المرفقات) — بشرط اتّباع allowlist المسارات
+وحدّ الحجم. ده **خارج نطاق Plan 13** حاليًا.
 
 ## 14. اللي فاضل لمهام OHB2 اللاحقة
 
@@ -681,7 +733,7 @@ DOM ومُختبر بـ Node). الأزرار بتظهر **بس** حسب أعل�
 | 2 | إرسال برومت | `IMPLEMENTED_AND_TESTED` | `POST /conversations/{id}/prompt` | `send_prompt` | `add_or_group_outbox` (idempotent بـ`client_ref`) | `app.js` (textarea+إرسال) | — | `_authorize_conversation` | 409 `conversation_deleted` | `_require_text`/`_require_ref` | outbox pending→accepted | `test_miniapp_operations`, `http_journeys`, `ops.test.js` |
 | 3 | شات جديد | `IMPLEMENTED_AND_TESTED` | `POST /chats` | `create_chat` | `add_creation_job` | تبويب «شات جديد» | — | owner-scoped | استبعاد المتشاهد | `_require_repo` (اختياري) | creation pending→done/unknown | `test_miniapp_creation_jobs`, `jobs*.test.js` |
 | 4 | اختيار المستودع | `IMPLEMENTED_AND_TESTED` | `GET /repositories` · `PATCH /conversations/{id}/repository` | `list_repositories` · `associate_repository` | — | تبويب «شات جديد» + تفاصيل | — | `_authorize_conversation` على PATCH | 404 متشاهد | `_require_repo` owner/repo | — | `test_miniapp_features`, `http_journeys`, `stale_guards.test.js` |
-| 5 | تصفّح الملفات | `IMPLEMENTED_AND_TESTED` | `GET /conversations/{id}/files` | `list_files` | `is_deleted` | قسم «ملفات الشات» | `features.files` (مفعّلة) | `_authorize_conversation` | 404 متشاهد | allowlist `is_safe_workspace_path` | — | `test_miniapp_files`, `files_watch.test.js` |
+| 5 | تصفّح الملفات (هرمي) | `IMPLEMENTED_AND_TESTED` | `GET /conversations/{id}/files` | `list_files` | `is_deleted` | قسم «ملفات الشات» (شجرة + فتات + لأعلى) | `features.files` (مفعّلة) | `_authorize_conversation` | 404 متشاهد | allowlist `is_safe_workspace_path` + شجرة محلية fail-closed | — | `test_miniapp_files`, `files_watch.test.js`, `files.test.js` |
 | 6 | معاينة الملف | `IMPLEMENTED_AND_TESTED` | `GET /conversations/{id}/file?path=` | `read_preview` | — | ضغط مسار الملف | `features.files` | `_authorize_conversation` | 404 متشاهد | allowlist + سقف قراءة | — | `test_miniapp_files`, `test_real_http_miniapp_download` |
 | 7 | تصدير الشات | `IMPLEMENTED_AND_TESTED` | `GET /conversations/{id}/export` | `export_conversation` | `is_deleted` | زر «تصدير الشات» | `features.export` | `_authorize_conversation` | 404 متشاهد | سقف `MAX_EXPORT_BYTES` | — | `test_miniapp_export_reply`, `test_real_http_miniapp_download`, `export.test.js` |
 | 8 | التكلفة/الاستهلاك | `IMPLEMENTED_AND_TESTED` | `GET /conversations/{id}/cost` | `get_cost` | — | قسم «التكلفة والاستهلاك» | `features.cost` | `_authorize_conversation` | 404 متشاهد | فشل القسم مايكسّر التفاصيل | — | `test_miniapp_cost`, `cost.test.js` |
@@ -695,9 +747,11 @@ DOM ومُختبر بـ Node). الأزرار بتظهر **بس** حسب أعل�
   (routes عبر `TestClient` + وحدات الواجهة عبر Node)، مش مجرد وجود راوت.
 - **مفيش** ميزة `HIDDEN_BY_POLICY` حاليًا: `bot/features.py::DEFERRED_FEATURES_HIDDEN=False`
   (الميزات مفعّلة). مفيش `BLOCKED` ولا `NOT_IMPLEMENTED` ضمن الـ12 المطلوبة.
-- **قيود معروفة (غير مانعة):** (أ) تنقّل مجلدات هرمي/تنزيل ملف منفرد غير مُنفَّذ (القسم 13هـ)؛
-  (ب) `MINI_APP_ENABLED` لسه **مطفأ** في الإنتاج (نشر، مش كود)؛ (ج) عرض «الرد الكامل» في
-  البوت = عرض للنسخ اليدوي (قيود Bot API على الحافظة).
+- **قيود معروفة (غير مانعة):** (أ) **تنزيل ملف منفرد (بايتات) غير مُنفَّذ** — محجوب عند
+  المزود (`BLOCKED_BY_PROVIDER_CAPABILITY`، القسم 13و): مفيش راوت قراءة بايتات في Cloud V1،
+  وراوت Agent Server الوحيد بيتطلّب مفتاح جلسة كامل الصلاحية (B1، مرفوض)؛ التنقّل الهرمي
+  مُنفَّذ (القسم 13هـ)؛ (ب) `MINI_APP_ENABLED` لسه **مطفأ** في الإنتاج (نشر، مش كود)؛ (ج) عرض
+  «الرد الكامل» في البوت = عرض للنسخ اليدوي (قيود Bot API على الحافظة).
 
 ### 15.1 التحقّق من الأمان والثوابت (state-changing)
 

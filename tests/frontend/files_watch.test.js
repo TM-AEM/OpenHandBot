@@ -45,6 +45,9 @@ function filesList(doc) {
   return sec ? descendants(sec).find((n) => n.tagName === "UL") : null;
 }
 function fileRows(list) { return list.children.filter((c) => c.className.split(" ").includes("row")); }
+function rowByText(list, text) {
+  return fileRows(list).find((r) => r.textContent === text) || null;
+}
 function findButtonByText(root, text) {
   return descendants(root).find((n) => n.tagName === "BUTTON" && n.textContent === text) || null;
 }
@@ -70,24 +73,94 @@ async function openFiles(env, { files, preview } = {}) {
   return env;
 }
 
-test("يفتح التفاصيل ⇒ قسم الملفات يجيب القايمة من المسار المصادَق", async () => {
+test("يفتح التفاصيل ⇒ قسم الملفات يجيب القايمة ويعرض جذر هرمي (مجلدات أولاً)", async () => {
   const env = await mkEnv();
   await openFiles(env);
   const call = env.fetch.last((c) => c.path === "/conversations/c1/files");
   assert.ok(call, "لازم يكون فيه نداء لقايمة الملفات");
   const list = filesList(env.doc);
   assert.ok(list, "قسم الملفات لازم يظهر");
-  assert.deepEqual(fileRows(list).map(textOf), ["src/main.py", "notes.txt"]);
+  // WS-01: القايمة المسطّحة بتتحوّل لهرمية — المجلد `src` الأول، وبعده الملف `notes.txt`.
+  assert.deepEqual(fileRows(list).map(textOf), ["src/", "notes.txt"]);
+});
+
+test("WS-01: الدخول لمجلد يعرض محتواه وفتح ملف جواه يطلب مساره الكامل", async () => {
+  const env = await mkEnv();
+  await openFiles(env);
+  const list = filesList(env.doc);
+  // ندخل مجلد src.
+  rowByText(list, "src/").click();
+  await flush();
+  assert.deepEqual(fileRows(list).map(textOf), ["main.py"], "محتوى المجلد يظهر");
+  // نفتح الملف جوه المجلد ⇒ المسار الكامل src/main.py.
+  rowByText(list, "main.py").click();
+  await flush();
+  const call = env.fetch.last(FILE_PREVIEW_MATCH);
+  assert.ok(call && call.url.indexOf("path=src%2Fmain.py") !== -1, "المسار الكامل للملف مطلوب");
+  const pre = descendants(env.doc.getElementById("view-detail")).find((n) => n.className === "file-text");
+  assert.equal(textOf(pre), "print('hi')\n");
+});
+
+test("WS-01: فتات التنقّل تظهر وترجّع للجذر، وزر «لأعلى» يرجّع مجلد", async () => {
+  const env = await mkEnv();
+  await openFiles(env);
+  const section = filesSection(env.doc);
+  const list = filesList(env.doc);
+  const crumbs = descendants(section).find((n) => n.className === "breadcrumbs");
+  assert.ok(crumbs, "فتات التنقّل لازم يظهر");
+  // في الجذر: عنصر واحد بس «الرئيسية».
+  assert.deepEqual(descendants(crumbs).filter((n) => n.className.split(" ").includes("crumb")).map(textOf), ["الرئيسية"]);
+  // ندخل مجلد src ⇒ الفتات يعرض الرئيسية › src.
+  rowByText(list, "src/").click();
+  await flush();
+  const crumbTexts = descendants(crumbs).filter((n) => n.className.split(" ").includes("crumb")).map(textOf);
+  assert.deepEqual(crumbTexts, ["الرئيسية", "src"]);
+  // زر «لأعلى» يرجع للجذر.
+  const up = findButtonByText(section, "⬆️ لأعلى");
+  assert.equal(up.hidden, false, "زر لأعلى ظاهر جوه مجلد");
+  up.click();
+  await flush();
+  assert.deepEqual(fileRows(list).map(textOf), ["src/", "notes.txt"], "رجعنا للجذر");
+});
+
+test("WS-01: الضغط على فتات الجذر يرجّع من مجلد فرعي مباشرةً", async () => {
+  const env = await mkEnv();
+  await openFiles(env);
+  const section = filesSection(env.doc);
+  const list = filesList(env.doc);
+  rowByText(list, "src/").click();
+  await flush();
+  const crumbs = descendants(section).find((n) => n.className === "breadcrumbs");
+  const home = descendants(crumbs).find((n) => n.className.split(" ").includes("crumb") && n.textContent === "الرئيسية");
+  home.click();
+  await flush();
+  assert.deepEqual(fileRows(list).map(textOf), ["src/", "notes.txt"]);
+});
+
+test("WS-01: حالة التنقّل محفوظة لكل شات عبر إعادة الفتح", async () => {
+  const env = await mkEnv();
+  await openFiles(env);
+  const list = filesList(env.doc);
+  rowByText(list, "src/").click();
+  await flush();
+  assert.deepEqual(fileRows(list).map(textOf), ["main.py"]);
+  // نرجع للشاتات ونفتح التفاصيل تاني ⇒ نفس المجلد يسترجع.
+  env.doc.getElementById("chats-refresh").click();
+  await flush();
+  const chatRow = env.doc.getElementById("chats-list").children.find((c) => c.className.split(" ").includes("row"));
+  chatRow.click();
+  await flush();
+  assert.deepEqual(fileRows(filesList(env.doc)).map(textOf), ["main.py"], "المجلد المحفوظ استرجع");
 });
 
 test("الضغط على ملف يجيب المعاينة ويعرض النص", async () => {
   const env = await mkEnv();
   await openFiles(env);
   const list = filesList(env.doc);
-  fileRows(list)[0].click();
+  rowByText(list, "notes.txt").click();
   await flush();
   const call = env.fetch.last(FILE_PREVIEW_MATCH);
-  assert.ok(call && call.url.indexOf("path=src%2Fmain.py") !== -1, "لازم يطلب المسار الصح");
+  assert.ok(call && call.url.indexOf("path=notes.txt") !== -1, "لازم يطلب المسار الصح");
   const pre = descendants(env.doc.getElementById("view-detail")).find((n) => n.className === "file-text");
   assert.equal(textOf(pre), "print('hi')\n");
 });
@@ -95,7 +168,7 @@ test("الضغط على ملف يجيب المعاينة ويعرض النص", a
 test("المعاينة المقصوصة تعرض تنبيه", async () => {
   const env = await mkEnv();
   await openFiles(env, { preview: { status: 200, data: { status: "ok", text: "abc", truncated: true } } });
-  fileRows(filesList(env.doc))[0].click();
+  rowByText(filesList(env.doc), "notes.txt").click();
   await flush();
   const hint = descendants(env.doc.getElementById("view-detail")).find((n) => n.className === "hint");
   assert.ok(hint && hint.textContent.indexOf("مقصوصة") !== -1, "لازم يبان تنبيه القصّ");
@@ -119,7 +192,7 @@ test("خطأ التفويض في القايمة يعرض نص عربي مش تف
 test("خطأ 'كبير أوي' في المعاينة يعرض نص عربي", async () => {
   const env = await mkEnv();
   await openFiles(env, { preview: { status: 413, data: { error: "too_large", message: "x" } } });
-  fileRows(filesList(env.doc))[0].click();
+  rowByText(filesList(env.doc), "notes.txt").click();
   await flush();
   const box = descendants(env.doc.getElementById("view-detail")).find((n) => n.className === "file-preview");
   assert.ok(textOf(box).indexOf("كبير أوي") !== -1);
@@ -132,7 +205,7 @@ test("الضغط المتكرّر على نفس الملف مايكرّرش ال
   // نخلي المعاينة معلّقة (وعد لسه ما اتحلّش) عشان نضغط مرتين بسرعة.
   let resolvePreview;
   fetch.route(FILE_PREVIEW_MATCH, () => new Promise((r) => { resolvePreview = r; }));
-  const target = fileRows(filesList(env.doc))[0];
+  const target = rowByText(filesList(env.doc), "notes.txt");
   target.click();
   target.click(); // ضغط تاني بسرعة قبل ما الأول يخلص
   const previewCalls = fetch.all(FILE_PREVIEW_MATCH);

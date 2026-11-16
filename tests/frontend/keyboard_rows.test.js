@@ -147,8 +147,16 @@ test("LOW1: صف الملف قابل للتركيز وEnter يحمّل المع�
   await flush(10);
   const filesSection = findByClass(doc.getElementById("view-detail"), "files-section");
   assert.ok(filesSection, "لازم قسم الملفات يظهر في التفاصيل");
+  // WS-01: في الجذر بيظهر مجلد `src` — لازم يكون قابل للتركيز بالكيبورد.
+  const folderRow = rowsOf(filesSection)[0];
+  assert.ok(folderRow, "لازم صف مجلد يظهر");
+  assert.equal(folderRow.getAttribute("role"), "button");
+  assert.equal(folderRow.getAttribute("tabindex"), "0");
+  // ندخل المجلد بالكيبورد.
+  folderRow.dispatch("keydown", kd("Enter"));
+  await flush(6);
   const fileRow = rowsOf(filesSection)[0];
-  assert.ok(fileRow, "لازم صف ملف يظهر");
+  assert.ok(fileRow, "لازم صف ملف يظهر جوه المجلد");
   assert.equal(fileRow.getAttribute("role"), "button");
   assert.equal(fileRow.getAttribute("tabindex"), "0");
   const before = countCalls(fetch, (c) => c.path.startsWith("/conversations/c1/file?"));

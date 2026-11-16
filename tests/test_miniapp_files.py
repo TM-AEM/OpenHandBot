@@ -306,3 +306,74 @@ def test_file_error_response_schema_is_stable():
     r = tc.get(f"/api/v1/conversations/{CID}/files")
     assert set(r.json().keys()) == {"error", "message"}
     assert isinstance(r.json()["error"], str) and isinstance(r.json()["message"], str)
+
+
+# ============================ OHB2-PLAN-13-WS-01 (قايمة هرمية) + WS-02 (حدود التنزيل)
+def test_list_files_returns_nested_relative_paths_intact_for_tree_build():
+    """WS-01: القايمة بترجّع المسارات النسبية الكاملة زي ما هي، عشان الواجهة تبني
+    الشجرة الهرمية محليًا (تقسيم على `/`). مفيش تحويل/قطع من السيرفر."""
+    api = MockAPI()
+    api.files = ["src/main.py", "src/util/helper.js", ".github/workflows/ci.yml", "notes.txt"]
+    tc, _ = make_client(api)
+    login(tc)
+    r = tc.get(f"/api/v1/conversations/{CID}/files")
+    assert r.status_code == 200
+    assert r.json()["files"] == [
+        "src/main.py",
+        "src/util/helper.js",
+        ".github/workflows/ci.yml",
+        "notes.txt",
+    ]
+
+
+def test_list_files_drops_unsafe_paths_so_tree_never_escapes_workspace():
+    """WS-01 (أمان): أي مسار مطلق/اجتياز/خط عكسي لازم يتسقط من القايمة، فالشجرة الهرمية
+    محليًا مستحيل تبني مجلد يهرب بره مساحة العمل المصرّح بها."""
+    api = MockAPI()
+    api.files = [
+        "ok/keep.txt",
+        "/etc/passwd",
+        "../../../../etc/hostname",
+        "a\\b.txt",
+        "a\x00b.txt",
+        "",
+    ]
+    tc, _ = make_client(api)
+    login(tc)
+    r = tc.get(f"/api/v1/conversations/{CID}/files")
+    assert r.status_code == 200
+    assert r.json()["files"] == ["ok/keep.txt"]
+
+
+def test_preview_accepts_nested_relative_path_from_tree():
+    """WS-01: المسار الكامل المبني من الشجرة (مجلد/ملف) مقبول في المعاينة."""
+    api = MockAPI()
+    api.files = ["src/util/helper.js"]
+    api.contents = {"src/util/helper.js": "export const x = 1;\n"}
+    tc, _ = make_client(api)
+    login(tc)
+    r = tc.get(f"/api/v1/conversations/{CID}/file", params={"path": "src/util/helper.js"})
+    assert r.status_code == 200
+    assert r.json()["status"] == "ok"
+    assert r.json()["text"] == "export const x = 1;\n"
+
+
+def test_no_workspace_file_download_route_exists():
+    """WS-02: مفيش راوت تنزيل بايتات لملف مساحة العمل في الـ Mini App (fail-closed).
+
+    مزوّد Cloud V1 مالوش راوت تنزيل بايتات (الـ `/file` بيرجّع نص JSON محدود،
+    و`/download` تصدير محادثة zip مش ملف مساحة عمل). راوت تنزيل بايتات حقيقي
+    موجود بس على Agent Server (`GET /api/file/download/{path}`) وبيتطلّب مفتاح
+    جلسة **كامل الصلاحية** (خطر B1) — مرفوض. عشان كده مفيش راوت محلي، وأي مسار
+    تنزيل مزعوم لازم يرجّع 404 (مفيش اختراع endpoint ولا بديل كتابة/shell)."""
+    api = MockAPI()
+    tc, _ = make_client(api)
+    login(tc)
+    for path in (
+        f"/api/v1/conversations/{CID}/file/download",
+        f"/api/v1/conversations/{CID}/files/download",
+        f"/api/v1/conversations/{CID}/download",
+    ):
+        r = tc.get(path)
+        assert r.status_code == 404, path
+        assert r.headers.get("content-type", "").startswith("application/json")

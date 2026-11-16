@@ -4015,3 +4015,61 @@ suites ⇒ **135 passed**؛ bandit (`-lll`) ⇒ **0 high** (نتيجة Low وا�
 - **حالة Plan 01:** **`PLAN01_IMPLEMENTATION_COMPLETE_PENDING_VERIFICATION`**.
 - **حالة Plan 02:** **`PLAN02_INVESTIGATION_AND_DESIGN_CLOSED_REMOTE_DELIVERY_BLOCKED`**.
 
+
+---
+
+# جلسة 2026-11-16 — OHB2-PLAN03-WS01-WS02-EXECUTION-ONLY-05 (تنفيذ Plan 13)
+
+## الهدف ومعايير القبول
+- **WS-01:** تنقّل مجلدات هرمي في قسم «ملفات الشات» (فتات تنقّل + لأعلى + دخول مجلدات +
+  حالة تنقّل محفوظة لكل شات)، فوق نفس راوت القايمة المصرّح به (مفيش راوت جديد).
+- **WS-02:** تنزيل ملف مساحة عمل منفرد **بأمان** — لازم يفضل **محجوب** لو مفيش قدرة قراءة
+  بايتات آمنة موثّقة عند المزوّد (ممنوع اختراع endpoint أو بديل shell/write).
+- **معيار القبول:** WS-01 شغّال ومُختبَر (node + pytest + Chromium حقيقي)؛ WS-02 موثّق
+  `BLOCKED_BY_PROVIDER` بأدلة رسمية، ومفيش راوت تنزيل مزعوم (404).
+
+## خط الأساس (محفوظ)
+- الفرع `openhands-workspace-kPgFEhoMiLQANCdCk2NGD` @ `0d644e8` (== `origin/main`)، شجرة نظيفة.
+- pytest: **1 فشل سابق / 3113 ناجح** (`test_deploy_manifest` — `ModuleNotFoundError: telegram`،
+  بيئة user-site). node: **267 ناجح / 0 فشل**. pyflakes: 0. bandit High: 0.
+- لم يُمسّ أي عمل جلسة سابقة (WS-01/SSRF من الجلسات السابقة موجودين في `bot/files.py`/`handlers.py`).
+
+## WS-01 — التنفيذ
+- `bot/web/static/files.js`: منطق تنقّل خالص جديد (ES5) — `buildTree`/`resolveNode`/`hasFiles`/
+  `parentPath`/`entryRows`/`breadcrumbs`/`childPath`/`safeDir`/`readDir`/`writeDir`.
+  `buildTree` بيفحص المسار **كله** قبل الإدخال (fail-closed؛ مسار غير صالح مايسيبش مجلد فاضي).
+- `bot/web/static/app.js::renderFilesSection`: إعادة كتابة — شجرة + فتات تنقّل قابلة للضغط +
+  زر «⬆️ لأعلى» + صفوف مجلدات/ملفات (`makeRowInteractive` زي الباقي) + استرجاع المجلد المحفوظ
+  لكل شات من `localStorage` مع تصحيح آمن لو المجلد اختفى.
+- `bot/web/static/styles.css`: أنماط `.breadcrumbs`/`.crumb`/`.folder-row` (+`:focus-visible`).
+- `bot/web/static/index.html`: رفع نسخ cache-bust (`styles.css?v=6`, `files.js?v=7`, `app.js?v=8`).
+- **الرد الخلفي ماتغيّرش** (`/files` لسه قايمة مسطّحة) ⇒ صفر مخاطر رجوع على البوت.
+
+## WS-02 — القرار (BLOCKED_BY_PROVIDER)
+- **Cloud V1** (`app.all-hands.dev/openapi.json`, v1.92.0, 257 مسارًا): `/file` = نص JSON
+  محدود (مش بايتات)، `/download` = تصدير trajectory zip، ومفيش أي راوت `octet-stream`/`binary`/
+  `multipart` (فحص كامل: كل ردود 2xx `application/json`).
+- **Agent Server** (`docs.openhands.dev/openapi/agent-sdk.json`, v0.1.0): `GET /api/file/download/{path}`
+  هو الراوت الوحيد لبايتات — بس بيتطلّب `X-Session-API-Key` **كامل الصلاحية** (الخطر B1: نفس
+  المفتاح بيوصل `execute_bash_command` + `secrets`، والراوت القديم غير محصور بمساحة العمل).
+  مرفوض؛ ولا `session_api_key` مخزّن أصلًا.
+- **القرار:** التنزيل محجوب عمدًا (fail-closed)، مفيش راوت محلي، وأي مسار تنزيل مزعوم = 404.
+
+## التحقّق الفعلي
+- pytest: **1 فشل سابق / 3117 ناجح** (‎+4 اختبارات خلفية جديدة).
+- node: **280 ناجح / 0 فشل** (‎+13 اختبارًا: 9 وحدة تنقّل + 4 DOM/tree).
+- pyflakes: 0. bandit High: 0.
+- **Chromium حقيقي (WebView-equivalent، headless):** فتح تفاصيل شات ⇒ الجذر
+  `[".github/","src/","notes.txt"]` ⇒ دخول `src/` ⇒ `["util/","main.py"]` + فتات `["الرئيسية","src"]`
+  + `savedDir="src"` + زر لأعلى ظاهر ⇒ فتح `main.py` ⇒ المعاينة `"content of src/main.py\n"` ⇒
+  رجوع بفتات الرئيسية ⇒ الجذر + `savedDir=null`.
+
+## الملفات المتغيّرة
+- `bot/web/static/files.js`, `bot/web/static/app.js`, `bot/web/static/styles.css`,
+  `bot/web/static/index.html`, `docs/MINI_APP.md` (§13هـ/§13و + جدول §15 + القيود),
+  `tests/frontend/files.test.js`, `tests/frontend/files_watch.test.js`,
+  `tests/frontend/keyboard_rows.test.js`, `tests/frontend/dom_stub.js`, `tests/test_miniapp_files.py`.
+
+## الحالة النهائية
+- **WS-01: DONE.** **WS-02: BLOCKED_BY_PROVIDER** (موثّق، fail-closed).
+- مفيش commit/push/PR/deploy (حسب التعليمات). الفشل الوحيد المتبقّي **سابق** وغير متعلّق.
