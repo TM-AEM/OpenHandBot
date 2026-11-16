@@ -4131,3 +4131,30 @@ pyflakes **0**؛ bandit **High 0**؛ مجموعة مركّزة (config/miniapp/b
 **الملف الجديد:** `docs/reviews/OHB2-PLAN04-ENZONIC-CANARY-EXECUTION-REPORT.md` + قسم متابعة مؤرَّخ في `docs/reviews/OHB2-PLAN04-HOST01-HOSTING-QUALIFICATION.md` (§8). **لم يُعَد كتابة أي تقرير تاريخي.**
 
 **الخطوة التالية (قرار المالك، واحد):** (أ) يسجّل المالك الدخول لحساب Enzonic القائم ويثبت استحقاق مجاني/بلا كارت ⇒ إعادة تشغيل نفس المهمة؛ (ب) لو مفيش حساب: ينشئه المالك شخصيًّا أو يفوّض مضيفًا آخر بلا كارت؛ (ج) قبول الوضع الحالي (محلي فقط).
+
+---
+
+## OHB2-PLAN-15-OPERATIONAL-FAILURE-VISIBILITY-EXECUTION-01 (2026-11-16)
+
+- **الخطة:** `OHB2-PLAN-15-OPERATIONAL-FAILURE-VISIBILITY` (الأولوية: `Medium` — مفيش دليل على تضليل المستخدم بادّعاء نجاح عملية فاشلة).
+- **التقرير الكامل والمصفوفة:** `docs/reviews/OHB2-PLAN15-OPERATIONAL-FAILURE-VISIBILITY-REPORT.md`.
+- **OPS-01 (`show_status` / `show_cost`) — الحُكم: `PASS_WITH_NOTES`:**
+  - `OPS01-D1` (`bot/handlers.py`): تغليف `await q.answer()` داخل `try/except Exception` (تسجيل `type(exc).__name__` فقط، وبلا ابتلاع `CancelledError`) عشان فشل الكولباك القديم (`BadRequest: Query is too old...`) عند إعادة التسليم أو `TimedOut` ما يوقفش العرض ولا يوقع التعافي في `FAILED_PERMANENT`.
+  - `OPS01-D2` (`bot/messages.py`): حراسة `state_label` ضد القيم غير النصّية/غير القابلة للتجزئة و`format_cost` ضد `metrics`/`accumulated_token_usage` غير `dict` لمنع الانهيار الصامت بعد `q.answer()`.
+  - اختبارات انحدار مضافة: `tests/test_plan05_status_cost_failure_visibility.py`.
+  - بند مؤجّل بقرار مالك (لم يُعدَّل): فشل `_edit_or_send` (`False` عند `conv is not None`) لسه غير مرئي للمستخدم (بلا رسالة نجاح كاذبة، ويسجّل `FAILED_TRANSIENT`).
+- **OPS-02 (`SW-02`) — الحُكم: `UNTRACEABLE — SOURCE REQUIRED`:** 0 إشارة في الكود/الاختبارات/الوثائق خارج الإحالات الذاتية في هذا الملف؛ لم يُعدَّل أي كود لـ `SW-02`.
+- **التحقّق:** `compileall` PASS؛ `AST_OK:165`؛ `node --test tests/frontend/*.test.js` = `280/0`؛ تحقّق معزول `stdlib` (`9/9` مجموعات) PASS؛ `pytest`/`pyflakes`/`bandit`/`pip_audit` = `BLOCKED` في هذه الحاوية (نقص الحزم)؛ `INDEPENDENT_REVIEW_NOT_AVAILABLE`؛ `.git` غائب.
+
+---
+
+## OHB2-PLAN-15-OPERATIONAL-FAILURE-VISIBILITY-CLOSURE-01 (2026-11-16)
+
+- **المهمة:** التحقّق المستقل والإغلاق لخطة `OHB2-PLAN-15-OPERATIONAL-FAILURE-VISIBILITY` (بدون تعديل الكود؛ مراجعة توثيقية والتحقق الشامل للملفات الخمسة المبلَّغ عنها).
+- **تقرير الإغلاق المرتبط:** `docs/reviews/OHB2-PLAN15-OPERATIONAL-FAILURE-VISIBILITY-CLOSURE-REPORT.md` (مع الإبقاء على `docs/reviews/OHB2-PLAN15-OPERATIONAL-FAILURE-VISIBILITY-REPORT.md` سليمًا كدليل تاريخي، وتوثيق 3 فروق طفيفة في أرقام الأسطر فقط).
+- **نتيجة التحقّق المحدّثة:**
+  - `bot/handlers.py` (`show_status` `1347-1350`, `show_cost` `1401-1404`) و`bot/messages.py` (`state_label` `56-61`, `format_cost` `181-185`) و`tests/test_plan05_status_cost_failure_visibility.py` (`1-191`) مُراجَعة بالكامل؛ لا تغيير على العقود المحفوظة (`concurrent_updates(True)`, `polling`, `outbox`, `MINI_APP_ENABLED=False`, تعطيل Autopush, وصمت `_edit_or_send(False)` عند `conv is not None` كبند قرار مالك).
+  - `compileall` (`0`)، `AST_OK:165`، `unused_imports={}`، `node --test tests/frontend/*.test.js` (`280 pass / 0 fail`)، وتحقق سلوكي معزول `stdlib` (`11` مجموعة متضمّنة حساسية الانحدار).
+  - ما زالت محجوبة بيئيًّا (`exit 1`؛ لا يوجد `pip`/`ensurepip`): `pytest` و`pyflakes` و`bandit` و`pip_audit`؛ و`INDEPENDENT_REVIEW_NOT_AVAILABLE`؛ و`.git` غائب.
+- **الأحكام النهائية المنفصلة:** `OPS-01: PASS_WITH_NOTES` | `OPS-02: UNTRACEABLE — SOURCE REQUIRED`.
+

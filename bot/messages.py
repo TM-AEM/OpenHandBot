@@ -54,6 +54,10 @@ def is_terminal(status: str | None) -> bool:
 
 
 def state_label(state: str | None) -> str:
+    if state is None:
+        return STATE_LABELS[None]
+    if not isinstance(state, str):
+        return "غير معروف"
     return STATE_LABELS.get(state, state or "غير معروف")
 
 
@@ -174,10 +178,11 @@ def format_cost(metrics: dict | None) -> str:
     اسم عملة في المخرَج (OHB2-09-A2-03، نفس قرار OHB2-09-04-R1 على الواجهة). القيم
     غير المحدودة (NaN/±Infinity) والـ bool والقيم غير الرقمية بتتجاهل (مفيش تمثيل كاذب).
     """
-    if not metrics:
+    if not isinstance(metrics, dict) or not metrics:
         return "مفيش بيانات تكلفة."
     cost = _finite_number(metrics.get("accumulated_cost"))
-    usage = metrics.get("accumulated_token_usage") or {}
+    raw_usage = metrics.get("accumulated_token_usage")
+    usage = raw_usage if isinstance(raw_usage, dict) else {}
     model = metrics.get("model_name") or usage.get("model") or "غير معروف"
     lines = [f"الموديل: {model}"]
     if cost is not None:

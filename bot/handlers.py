@@ -1344,7 +1344,10 @@ async def delete_conversation_confirm(update: Update, context: ContextTypes.DEFA
 
 async def show_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    await q.answer()
+    try:
+        await q.answer()
+    except Exception as exc:  # noqa: BLE001 — فشل الرد على الكولباك (استعلام قديم/عابر) مايوقفش عرض الحالة ولا يكسر التعافي
+        log.warning("تعذّر الرد على الكولباك (%s)", type(exc).__name__)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
@@ -1395,7 +1398,10 @@ async def show_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def show_cost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    await q.answer()
+    try:
+        await q.answer()
+    except Exception as exc:  # noqa: BLE001 — فشل الرد على الكولباك (استعلام قديم/عابر) مايوقفش عرض التكلفة ولا يكسر التعافي
+        log.warning("تعذّر الرد على الكولباك (%s)", type(exc).__name__)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
