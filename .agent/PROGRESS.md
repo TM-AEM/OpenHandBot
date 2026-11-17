@@ -4187,3 +4187,35 @@ pyflakes **0**؛ bandit **High 0**؛ مجموعة مركّزة (config/miniapp/b
   - التقرير الكامل: `docs/reviews/OHB2-PLAN18-ATTACHMENT-POLICY-AND-MEDIA-SCOPE-REPORT.md`.
   - **`ATT-01` (`COMPLETE — INVESTIGATION_AND_POLICY_SYNC_ONLY`):** تأكيد تفعيل سقف الملف الواحد `MAX_ATTACHMENT_BYTES = 3 MiB` دائمًا في `bot/attachments.py` و`bot/handlers.py`، بينما الحصص التراكمية (`MAX_ITEMS_PER_BATCH=10`, `MAX_STAGING_TOTAL_BYTES=64 MiB`, `max_bytes_per_batch`) معطّلة افتراضيًا (`None`) ولا توجد لها مفاتيح في `bot/config.py`/`.env.example` التزامًا بـ **Plan 01 Option A (`FIX-R01`/`FIX-R05`)** وتظل سياسة `D-12` الدائمة (النطاق 2) `غير محسومة / OWNER_DECISION_REQUIRED`؛ وتوثيق ثغرة التزامن (عدم وجود حجز ذرّي مع `concurrent_updates(True)` و`MAX_CONCURRENT_DOWNLOADS=4` لو فُعِّلت الحصص لاحقًا)، وتقديم خيارات A/B/C + توصية (`Option A` حاليًا؛ موسومة `RECOMMENDATION — NOT OWNER-APPROVED`).
   - **`ATT-02` (`COMPLETE — INVESTIGATION_AND_DECISION_PREP_ONLY`):** حصر مسار الاستلام الفعلي (`bot/polling.py` `ALLOWED_UPDATES=("message","callback_query")`، `bot/app.py` `SUPPORTED_ATTACHMENT_FILTER=Document.ALL` مقابل 9 فلاتر وسائط مرفوضة بأمان بدون `get_file`/تخزين/نداء OpenHands عبر `handle_unsupported_attachment`، وتجاهل `caption`/`media_group_id` التزامًا بسياسة `D-31` المعتمدة، وتجاهل التحديثات غير المطابقة في `handle_unmatched_update`، وملاحظة الفروع الخاملة في `_attachment_declared_size`/`_attachment_file_id` دون تعديل)، وتقديم خيارات A/B/C + توصية (`Option A` الإبقاء على `Document` فقط؛ موسومة `RECOMMENDATION — NOT OWNER-APPROVED`).
+
+---
+
+## OHB2-PLAN-17-18-FINAL-ADMINISTRATIVE-CLOSURE-01 (2026-11-16 — الإغلاق الإداري النهائي للخطتين 07 و08)
+
+- **المرجع والتقرير النهائي المجمَّع:** `docs/reviews/OHB2-PLAN17-18-FINAL-CLOSURE-REPORT.md` (مع الإبقاء على تقريرَي التنفيذ الأصليين `OHB2-PLAN17-DEPLOYMENT-AND-DECISION-RECORD-SYNC-REPORT.md` و`OHB2-PLAN18-ATTACHMENT-POLICY-AND-MEDIA-SCOPE-REPORT.md` سليمَين دون مساس).
+- **أحكام بنود العمل النهائية (منفصلة):**
+  - **`DOC-03`: `RESOLVED`** — مرجع الاستضافة النشط **Enzonic Python Hosting** (`docs/DEPLOY_ENZONIC.md` كوثيقة حالة تأهيل وضوابط سلامة فقط)، وبقاء `HOST-01: BLOCKED` و`HOST-02: BLOCKED` (Plan 04 مؤجَّل)، وحفظ العوائق الثمانية وحماية الخادم الحي القائم (`OpenHandBot` / `Brave Grove`) كاملة، والإبقاء على `docs/DEPLOY_KATABUMP.md` كمادة تاريخية سليمة (`tests/test_deploy_manifest.py`).
+  - **`DOC-04`: `RESOLVED`** — مزامنة اعتماد المالك الصريح لـ **D-15 الخيار A (2026-11-15)** بدلالاته الخمس الدقيقة عبر `docs/decisions/OHB2-P0-OWNER-DECISIONS-REGISTER.md` (بما في ذلك مواءمة هامش تاريخي ضيّق في `§6.3` سطر 1937 ليتطابق مع `§8 #8`) مع حفظ `### D-12` (`غير محسوم`) سليمًا، وتنبيهات المزامنة المؤرّخة على وثائق التصميم/التحقيق التاريخية.
+  - **`ATT-01`: `INVESTIGATION COMPLETE — OWNER POLICY DECISION DEFERRED`** *(تطبيق Outcome B)* — أثبت التتبّع المستقل أن `"Plan 01 Option A"` (`FIX-R01`/`FIX-R05` في `.agent/PROGRESS.md:2758, 2815–2816`) كان **تفسيرًا هندسيًا محافظًا قابلًا للعكس** لا موافقة مالك مسجّلة، وأن `D-12` (النطاق 2) ما زال **غير محسوم** ضمن 22 بندًا مفتوحًا في السجل القانوني (مقابل 13 بندًا معتمدًا). يُحفظ الإعداد الافتراضي (`MAX_ATTACHMENT_BYTES = 3 MiB` مفعّل؛ `MAX_ITEMS_PER_BATCH=10` و`MAX_STAGING_TOTAL_BYTES=64 MiB` و`max_bytes_per_batch` معطّلة `None`) دون أي تغيير أو انتحال موافقة مالك، مع توثيق أثر الموارد وثغرة التزامن (`concurrent_updates(True)` + `MAX_CONCURRENT_DOWNLOADS=4` بلا حجز ذرّي) لو فُعّلت الحصص مستقبلًا.
+  - **`ATT-02`: `CURRENT SCOPE VERIFIED — EXPANSION DEFERRED`** — تأكيد نطاق `Document`-only مع رفض الفلاتر التسعة غير المدعومة بأمان وتجاهل `caption`/`media_group_id` وفق **D-31 (`OWNER-APPROVED` 2026-11-13)** وتجاهل التحديثات غير المطابقة، وإبقاء أي توسعة مستقبلية للوسائط مؤجّلة.
+- **الإغلاق الإداري والقيود المرحّلة:**
+  - **Plan 07 (`OHB2-PLAN-17-DEPLOYMENT-AND-DECISION-RECORD-SYNC`):** **`ADMINISTRATIVELY CLOSED`**.
+  - **Plan 08 (`OHB2-PLAN-18-ATTACHMENT-POLICY-AND-MEDIA-SCOPE`):** **`ADMINISTRATIVELY CLOSED — INVESTIGATION AND DECISION PREPARATION COMPLETE`**.
+  - **الترحيل الصريح:** تأهيل Plan 04 (`HOST-01`/`HOST-02` `BLOCKED`)، وحسم سياسة `ATT-01` / `D-12` الدائمة مستقبلًا، وقرار التوسّع المستقبلي لـ `ATT-02`، والفحوص المحجوبة بيئيًا (`pytest`, `pyflakes`, `bandit`, `pip_audit`, فحص `ptb==22.8` الحي)، و`INDEPENDENT_REVIEW_NOT_AVAILABLE`، وغياب `.git`.
+- **التحقّق النهائي وسلامة الحدود:** `node --test tests/frontend/*.test.js` (`280 pass / 0 fail`)؛ `compileall` (`exit 0`)؛ `AST_OK: 165`؛ ثوابت `StagingStore` و`bot/config.py` (`MINI_APP_ENABLED=False`) و`DEPLOY_KATABUMP.md` و`### D-12` ووجود كل الملفات الـ 14 محقّقة؛ صفر تعديلات على الكود/الاختبارات/المخطّط/التبعيات/الإعدادات؛ Autopush معطّل؛ صفر تفاعل مع خادم Enzonic الحي (`OpenHandBot` / `Brave Grove`)؛ لا عمليات Git كتابية.
+
+---
+
+## OHB2-PLAN04-ENZONIC-PYTHON-HOSTING-CANARY-EXECUTION-02 (2026-11-16 — محاولة الكناري 02 على Enzonic)
+
+- **التقرير الكامل:** `docs/reviews/OHB2-PLAN04-ENZONIC-CANARY-EXECUTION-REPORT-02.md` (مع حفظ تقرير المحاولة 01 `docs/reviews/OHB2-PLAN04-ENZONIC-CANARY-EXECUTION-REPORT.md` سليمًا دون أي تعديل، وتحديث المرجع التنظيمي `docs/DEPLOY_ENZONIC.md`).
+- **فحص التمهيد (Phase 0 — `2026-11-16T23:02:04Z`):** **`BLOCKED_AUTHENTICATED_SESSION_NOT_AVAILABLE`**
+  - لا توجد في الجلسة أي أدوات متصفح تفاعلية (`MCP` متصفح غير متاح)، وفي الحاوية تغيب `chromium`/`google-chrome`/`firefox`/`playwright`/`ssh`/`sftp` ووحدات `playwright`/`selenium` في Python ومتغيّرات `DISPLAY`/`WAYLAND_DISPLAY` وملفات/متغيّرات جلسة Enzonic (`~/.openhands` غائب، `HOME_TMP_ENZONIC_MATCHES: []`). لم تُطلب بيانات دخول ولم تُحاوَل تجاوزات Turnstile/CAPTCHA/MFA، ولم تُفترض إتاحة جلسة الجهاز اللوحي للمالك.
+- **تصنيف المنتج (`UNKNOWN` / التباس غير محسوم):**
+  - معلومات المالك (`CPU: 50%`, `RAM: ~500 MB / 512 MiB`, `Storage: 1 GB`, ورسالة سابقة تشير إلى **سكون الخادم بدون لاعبين**) لا تثبت وحدها أن الاستحقاق هو **Python Hosting** مستمر وتتعرض مع مطالبة `/python` التسويقية (`10 GB` و`Always on`) مقابل **Game Hosting** (`/free` الذي يدخل في سبات دون لاعبين). توقّفت بوابة الإنشاء قبل إنشاء أي مورد.
+- **حالة الاختبارات `C1–C9` و`HOST-01`/`HOST-02`:**
+  - لم يُنشأ أي مورد Canary ولم تُرفع أي ملفات؛ **`C1, C2, C4, C5, C6, C7, C8: NOT_RUN`**؛ **`C3: NOT_RUN — EXPLICITLY EXCLUDED BY OWNER`**؛ **`C9: PASS`** (شكليًا لعدم إنشاء أي مورد).
+  - **`HOST-01`: `BLOCKED`** | **`HOST-02`: `BLOCKED`**.
+- **تأكيدات السلامة والتحقّق النهائي:** الخادم الحي القائم (`OpenHandBot` / `Brave Grove`) لم يُمسّ أو يُفتح أو يُختبَر؛ لا SQLite على Enzonic؛ لا كود/بيانات/أسرار مرفوعة؛ `MINI_APP_ENABLED=False`؛ Autopush معطّل؛ لا بطاقة/دفع/حساب جديد/مورد دائم؛ لا تعديل كود/مخطّط/تبعيات/إعدادات ولا أوامر Git كتابية.
+
+

@@ -13,11 +13,13 @@
 | --- | --- | --- |
 | **HOST-01** — تأهيل مضيف مجاني بلا بطاقة | **`BLOCKED`** (التأهيل مؤجَّل؛ الكناري `NOT_RUN`) | `docs/reviews/OHB2-PLAN04-HOST01-HOSTING-QUALIFICATION.md` |
 | **HOST-02** — جاهزية تفعيل الـ Mini App | **`BLOCKED`** (`MINI_APP_ENABLED=False`؛ بلا موافقة تفعيل) | `docs/reviews/OHB2-PLAN04-HOST02-ACTIVATION-READINESS.md` |
-| محاولة تنفيذ الكناري على Enzonic | **`BLOCKED`** عند بوّابة التمهيد (`C1–C8 NOT_RUN`، `C9 PASS` شكليًّا) | `docs/reviews/OHB2-PLAN04-ENZONIC-CANARY-EXECUTION-REPORT.md` |
+| محاولة تنفيذ الكناري على Enzonic (المحاولة 01) | **`BLOCKED`** عند بوّابة التمهيد (`C1–C8 NOT_RUN`، `C9 PASS` شكليًّا) | `docs/reviews/OHB2-PLAN04-ENZONIC-CANARY-EXECUTION-REPORT.md` |
+| محاولة تنفيذ الكناري على Enzonic (المحاولة 02) | **`BLOCKED`** (`BLOCKED_AUTHENTICATED_SESSION_NOT_AVAILABLE`؛ `C1, C2, C4–C8 NOT_RUN`؛ **`C3 NOT_RUN — EXPLICITLY EXCLUDED BY OWNER`**؛ `C9 PASS` شكليًّا) | `docs/reviews/OHB2-PLAN04-ENZONIC-CANARY-EXECUTION-REPORT-02.md` |
 | ملخص إغلاق الخطة 04 | **`BLOCKED`** (المضيف والتفعيل) | `docs/reviews/OHB2-PLAN04-CLOSURE-SUMMARY.md` |
 | فحص التمهيد التاريخي (`Brave Grove`) | وثيقة تمهيد سابقة — **لا تؤهّل المضيف ولا تُصرّح بالنشر** | `docs/OHB2_ENZONIC_DEPLOYMENT_PREFLIGHT.md` |
 
-- **الدقة التنظيمية للوضع:** Enzonic **لم يُثبَت عدم صلاحيته الدائمة تقنيًّا** (`NOT_QUALIFIED` لم يُطلَق؛ لم يُرصَد فشل تقني على الاستضافة لأن بوّابة التمهيد لم تكتمل). التوصيف الدقيق هو أن Enzonic **غير مؤهَّل بعد**، وأن أعمال التأهيل وتجربة الكناري **`BLOCKED` ومؤجَّلة**.
+- **الدقة التنظيمية للوضع:** Enzonic **لم يُثبَت عدم صلاحيته الدائمة تقنيًّا** (`NOT_QUALIFIED` لم يُطلَق؛ لم يُرصَد فشل تقني على الاستضافة لأن بوّابة التمهيد لم تكتمل). التوصيف الدقيق هو أن Enzonic **غير مؤهَّل بعد**، وأن أعمال التأهيل وتجربة الكناري **`BLOCKED` ومؤجَّلة**. كما أن بيانات الاستحقاق المبلَّغ عنها من المالك (`50% CPU`، `~500 MB / 512 MiB RAM`، `1 GB Storage`، وعبارة السكون دون لاعبين) لا تُثبت وحدها أن المنتج **Python Hosting** مستمرّ وليست كافية لتجاوز بوّابة التصنيف.
+- **استثناء SQLite الصريح (`C3`):** اختبار SQLite على Enzonic **محظور صراحةً بقرار المالك** (`NOT_RUN — EXPLICITLY EXCLUDED BY OWNER`)، ولا يُعدّل هذا الحظر معمارية SQLite المحلية في OpenHandBot.
 - **تطبيق القيود القائمة:** يبقى `MINI_APP_ENABLED=False`، ويبقى Autopush معطّلًا وغير نشط، ولا يُنفَّذ أي نشر أو ترحيل أو تغيير على البنية أحادية العملية وأحادية مالك SQLite (`I2`/`I3`).
 
 ---
@@ -61,6 +63,7 @@
   - `docs/reviews/OHB2-PLAN04-HOST01-HOSTING-QUALIFICATION.md`
   - `docs/reviews/OHB2-PLAN04-HOST02-ACTIVATION-READINESS.md`
   - `docs/reviews/OHB2-PLAN04-ENZONIC-CANARY-EXECUTION-REPORT.md`
+  - `docs/reviews/OHB2-PLAN04-ENZONIC-CANARY-EXECUTION-REPORT-02.md`
   - `docs/reviews/OHB2-PLAN04-CLOSURE-SUMMARY.md`
 - **وثيقة التمهيد التاريخية على Enzonic:** `docs/OHB2_ENZONIC_DEPLOYMENT_PREFLIGHT.md` (تاريخية من Phase 8 — ليست تأهيلاً ولا تفويض نشر).
 - **مادة Katabump التاريخية:** `docs/DEPLOY_KATABUMP.md` محفوظة **كمادة تاريخية/خاصة بمزوّد سابق** (وترتبط بها اختبارات قائمة الملفات التشغيلية في `tests/test_deploy_manifest.py`) — لم تعد هي التوجيه النشط للاستضافة بعد تعديل Plan 07.
