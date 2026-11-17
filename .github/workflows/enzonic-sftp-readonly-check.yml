@@ -1,0 +1,125 @@
+name: Enzonic SFTP Read-Only Connectivity Check
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: enzonic-sftp-readonly-check
+  cancel-in-progress: false
+
+jobs:
+  sftp-readonly-check:
+    name: Read-only SFTP connectivity check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify pinned host key and run read-only SFTP listing
+        timeout-minutes: 3
+        env:
+          ENZONIC_SFTP_HOST: us-four.enzonic.com
+          ENZONIC_SFTP_PORT: "2022"
+          ENZONIC_SFTP_USER: 5s5k7kk.e56cc5c8
+          ENZONIC_PINNED_FINGERPRINT: SHA256:6MPMP1TJ75QuFqne7qrvN4+7vMW4tFvokGhmIE74fls
+          ENZONIC_SSH_PRIVATE_KEY: ${{ secrets.ENZONIC_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+
+          # Fail fast if the encrypted secret is missing or empty without printing any secret data.
+          if [ -z "${ENZONIC_SSH_PRIVATE_KEY:-}" ]; then
+            echo "::error::Secret ENZONIC_SSH_PRIVATE_KEY is missing or empty."
+            exit 1
+          fi
+
+          WORK_DIR="$(mktemp -d)"
+          CANDIDATE_KNOWN_HOSTS="$WORK_DIR/candidate_known_hosts"
+          SINGLE_HOST_KEY="$WORK_DIR/single_host_key"
+          VERIFIED_KNOWN_HOSTS="$WORK_DIR/verified_known_hosts"
+          KEY_FILE="$WORK_DIR/id_ed25519"
+          BATCH_FILE="$WORK_DIR/sftp_batch"
+          SCAN_ERR="$WORK_DIR/keyscan_err"
+
+          cleanup() {
+            rm -rf "$WORK_DIR"
+          }
+          trap cleanup EXIT
+
+          chmod 700 "$WORK_DIR"
+          install -m 600 /dev/null "$VERIFIED_KNOWN_HOSTS"
+          install -m 600 /dev/null "$KEY_FILE"
+          install -m 600 /dev/null "$BATCH_FILE"
+
+          # 1. Fetch candidate host public key(s) without authenticating and verify against the pinned SHA256 fingerprint.
+          if ! ssh-keyscan -T 15 -p "$ENZONIC_SFTP_PORT" "$ENZONIC_SFTP_HOST" > "$CANDIDATE_KNOWN_HOSTS" 2> "$SCAN_ERR"; then
+            echo "::error::ssh-keyscan failed for ${ENZONIC_SFTP_HOST}:${ENZONIC_SFTP_PORT}."
+            cat "$SCAN_ERR" >&2 || true
+            exit 1
+          fi
+
+          if [ ! -s "$CANDIDATE_KNOWN_HOSTS" ]; then
+            echo "::error::No SSH host keys returned by ${ENZONIC_SFTP_HOST}:${ENZONIC_SFTP_PORT}."
+            cat "$SCAN_ERR" >&2 || true
+            exit 1
+          fi
+
+          OBSERVED_FPS=""
+          while IFS= read -r host_line; do
+            [ -z "$host_line" ] && continue
+            case "$host_line" in
+              \#*) continue ;;
+            esac
+            printf '%s\n' "$host_line" > "$SINGLE_HOST_KEY"
+            if fp_out="$(ssh-keygen -lf "$SINGLE_HOST_KEY" -E sha256 2>/dev/null)"; then
+              fp="$(printf '%s\n' "$fp_out" | awk '{print $2}')"
+              OBSERVED_FPS="${OBSERVED_FPS}${fp} "
+              if [ "$fp" = "$ENZONIC_PINNED_FINGERPRINT" ]; then
+                printf '%s\n' "$host_line" >> "$VERIFIED_KNOWN_HOSTS"
+              fi
+            fi
+          done < "$CANDIDATE_KNOWN_HOSTS"
+
+          if [ ! -s "$VERIFIED_KNOWN_HOSTS" ]; then
+            echo "::error::SSH host key fingerprint mismatch for ${ENZONIC_SFTP_HOST}:${ENZONIC_SFTP_PORT}. Expected ${ENZONIC_PINNED_FINGERPRINT}; observed: ${OBSERVED_FPS:-none}."
+            exit 1
+          fi
+
+          echo "SSH host key fingerprint verified: ${ENZONIC_PINNED_FINGERPRINT}"
+
+          # 2. Write the private key to an ephemeral 0600 file and unset the env var immediately.
+          printf '%s\n' "$ENZONIC_SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY_FILE"
+          unset ENZONIC_SSH_PRIVATE_KEY
+          chmod 600 "$KEY_FILE"
+
+          if ! grep -qE '^-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----' "$KEY_FILE"; then
+            echo "::error::Secret ENZONIC_SSH_PRIVATE_KEY does not contain a valid private key header."
+            exit 1
+          fi
+
+          # 3. Prepare strict read-only SFTP batch commands (pwd + root directory listing only).
+          printf 'pwd\nls -la /\n' > "$BATCH_FILE"
+
+          # 4. Connect strictly via SFTP with pinned host key verification (no shell access, no writes).
+          if ! timeout 60 sftp \
+            -P "$ENZONIC_SFTP_PORT" \
+            -i "$KEY_FILE" \
+            -b "$BATCH_FILE" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o IdentityAgent=none \
+            -o PasswordAuthentication=no \
+            -o KbdInteractiveAuthentication=no \
+            -o PreferredAuthentications=publickey \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$VERIFIED_KNOWN_HOSTS" \
+            -o GlobalKnownHostsFile=/dev/null \
+            -o CheckHostIP=no \
+            -o ConnectTimeout=15 \
+            -o ServerAliveInterval=10 \
+            -o ServerAliveCountMax=2 \
+            "${ENZONIC_SFTP_USER}@${ENZONIC_SFTP_HOST}"; then
+            echo "::error::Read-only SFTP connectivity check failed."
+            exit 1
+          fi
+
+          echo "Read-only SFTP connectivity check completed successfully."
