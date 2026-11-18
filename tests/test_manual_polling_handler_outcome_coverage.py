@@ -24,7 +24,7 @@ from telegram.ext import ApplicationHandlerStop
 import bot.handlers as h
 from bot import update_outcomes as uo
 from bot.db import Database
-from bot.errors import ApiError
+from bot.errors import ApiError, OperationalApiFailure
 
 from tests.test_duplicate_update_dispatch import OWNER_ID
 from tests.test_handlers import (
@@ -205,13 +205,15 @@ def test_list_files_upstream_error_records_ambiguous(tmp_path):
     assert db.is_update_acknowledgment_eligible(9401) is False
 
 
-def test_send_reply_txt_transient_upstream_records_ambiguous(tmp_path):
+def test_send_reply_txt_transient_upstream_propagates(tmp_path):
+    """OHB2-WP-03 (DEF-004): فشل قراءة آخر تبادل التشغيلي في `send_reply_txt` بينتشر
+    (`OperationalApiFailure`) زي copy/full — كان بيتسجّل `partial_or_unknown` (أقل دقة)."""
     client = ExchangeClient({"id": "c1", "title": "شات"}, exchange_error=ApiError("timeout"))
     update, ctx = _cb(tmp_path, client, "txt:c1", 9402)
-    asyncio.run(h.send_reply_txt(update, ctx))
-    db = ctx.bot_data["db"]
-    assert db.update_outcome(9402) == uo.PARTIAL_OR_UNKNOWN
-    assert db.is_update_acknowledgment_eligible(9402) is False
+    with pytest.raises(OperationalApiFailure):
+        asyncio.run(h.send_reply_txt(update, ctx))
+    # الفشل التشغيلي مايتسجّلش كـ تجاهل/نجاح (يرفع للمعالج ⇒ failed_transient).
+    assert ctx.bot_data["db"].update_outcome(9402) is None
 
 
 def test_send_reply_txt_permanent_rejection_records_ignored(tmp_path):

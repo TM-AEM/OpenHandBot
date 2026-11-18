@@ -52,6 +52,19 @@ python -m pytest -q
 | `LOG_LEVEL` | لا | `INFO` | واحد من `DEBUG, INFO, WARNING, ERROR, CRITICAL` |
 | `WATCHER_INTERVAL` | لا | `25` | رقم صحيح بين **5** و**3600** ثانية |
 | `DB_PATH` | لا | `bot_state.sqlite3` | مسار ملف SQLite (انظر §4) |
+| `MINI_APP_URL` | لا | — | لو موجود: `https://` عام صالح، بلا userinfo/fragment/query، ومش loopback |
+| `MINI_APP_ENABLED` | لا | `0` | `1` لتشغيل خلفية الـ Mini App (ASGI)؛ لو مفعّل لازم `MINI_APP_URL` يكون مضبوطًا |
+| `MINI_APP_PORT` | لا | `12000` | رقم منفذ صحيح (1..65535) |
+| `MINI_APP_INITDATA_MAX_AGE` | لا | `300` | رقم صحيح موجب (ثواني) |
+| `MINI_APP_SESSION_TTL` | لا | `3600` | رقم صحيح موجب (ثواني) |
+| `MINI_APP_COOKIE_SECURE` | لا | `1` | `1`/`0` (كوكي Secure) |
+| `MINI_APP_ALLOWED_ORIGINS` | لا | — | أصول (scheme://host[:port]) مفصولة بفواصل؛ فاضية ⇒ بتتشتقّ من `MINI_APP_URL` |
+| `MINI_APP_AUTH_RATE_PER_MINUTE` | لا | `10` | رقم صحيح موجب |
+| `MINI_APP_AUTH_RATE_PER_HOUR` | لا | `30` | رقم صحيح موجب |
+| `MINI_APP_API_RATE_PER_MINUTE` | لا | `60` | رقم صحيح موجب |
+| `MINI_APP_RATE_MAX_KEYS` | لا | `4096` | رقم صحيح موجب |
+| `MINI_APP_TRUSTED_PROXIES` | لا | — | IPs/CIDRs مفصولة بفواصل؛ قيمة غير صالحة ⇒ `ConfigError` |
+| `ATTACHMENT_DOCUMENT_INTAKE_ENABLED` | لا | `1` | `1`/`0` (مفتاح إيقاف تخزين المستندات؛ راجع `OD-03`) |
 
 ملاحظات:
 
@@ -70,8 +83,13 @@ python -m pytest -q
   - `PRAGMA journal_mode=WAL` — يسمح بالقراءة أثناء الكتابة (الـ handlers والمراقب
     بيكتبوا في وقت واحد).
   - `PRAGMA busy_timeout=5000` — بدل ما يرمي `database is locked`، بيستنى لحد 5 ثواني.
-  - `CREATE TABLE IF NOT EXISTS` للجداول: `watched`, `user_state`, `outbox`,
-    `creation_jobs` (+ فهارس `idx_outbox_status`, `idx_creation_jobs_status`).
+  - `CREATE TABLE IF NOT EXISTS` للجداول (المصدر: `bot/db.py::_init_schema`؛ **17** جدول):
+    `watched`, `user_state`, `outbox`, `creation_jobs`, `completion_pending`, `settings`,
+    `notification_state`, `notifier_pending`, `notifier_retry_not_before`, `notification_inbox`,
+    `deleted_conversations`, `web_sessions`, `processed_updates`, `update_failures`,
+    `attachment_batches`, `attachment_items`, `attachment_message_identity`
+    (+ فهارس `idx_outbox_status`, `idx_creation_jobs_status`).
+    اختبار تكافؤ (`NEW-DEF-08`) بيقارن العدد ده مع `bot/db.py` تلقائيًا.
 - **الترحيلات (`_migrate`):** إضافية وغير مدمّرة فقط (`ALTER TABLE … ADD COLUMN`) —
   بتضيف أعمدة جديدة للقواعد القديمة من غير فقد بيانات. الأعمدة المُدارة:
   `watched.chat_id`, `user_state.awaiting_at`, `user_state.awaiting_title`,
@@ -371,6 +389,12 @@ python -m pytest -q tests/test_watcher.py tests/test_u01_watcher.py
 - البوت **مابيسجّلش** نص البرومتات كامل، ولا التوكن/المفتاح (فلتر `RedactingFilter`
   بيخفي أي سر مسجَّل من الرسالة والمعاملات والـ traceback).
 - الأخطاء غير المتوقعة في شات واحد **معزولة**: ما توقفش باقي دورة المراقب.
+- **صندوق الإشعارات (`notification_inbox`):** جدول دائم بيخزّن كل إشعار داخل قبل محاولة
+  التسليم (نمط outbox للإشعارات)، فلو البوت اتقفل/اتعاد تشغيله وسط التسليم، الإشعارات
+  المعلّقة بتتعافى وتُعاد من نفس الصف بدل ما تتوه. للفحص اليدوي (قراءة فقط): استعلم
+  `notification_inbox` عبر `sqlite3` (راجع §4 للنسخ الآمن) — الصفوف المعلّقة بتظهر كـ
+  `pending`. مفيش إصلاح تلقائي لصفوف عالقة: راجع الشات/الصلاحيات ثم أعد التشغيل (التعافي
+  في `post_init` بيعالجها)، وما تعدّلش القاعدة أثناء تشغيل البوت.
 - أي `500`/`429` عابر من OpenHands وارد؛ السجلات بتفضل متّسقة والـ worker بيتعافى
   في الدورة الجاية. **ملاحظة (OHB2-N10-05):** `429` تصنيفه فشل **عابر** مش دائم — قبل
   بدء الـ POST بيتعاود تلقائيًا، وبعد بدء الـ POST يبقى `unknown` (غامض، مايتعادش

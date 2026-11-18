@@ -4,7 +4,7 @@ from __future__ import annotations
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from . import features
-from .messages import state_label
+from .messages import get_status, state_label
 
 CALLBACK_DATA_LIMIT = 64  # حد تيليجرام بالبايت
 
@@ -110,7 +110,7 @@ def conversations_menu(items: list[dict], page: int, has_more: bool) -> InlineKe
     rows: list[list[InlineKeyboardButton]] = []
     for conv in items:
         title = (conv.get("title") or "بدون عنوان")[:40]
-        label = f"{title} — {state_label(conv.get('execution_status'))}"
+        label = f"{title} — {state_label(get_status(conv))}"
         rows.append([_btn(label, callback_data=f"open:{conv['id']}")])
     nav: list[InlineKeyboardButton] = []
     if page > 0:

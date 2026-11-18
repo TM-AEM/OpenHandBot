@@ -128,6 +128,18 @@ def safe_error_label(exc: ApiError) -> str:
     return "تعذّر الاتصال (نتيجة غامضة)"
 
 
+def safe_exception_label(exc: BaseException) -> str:
+    """وصف مختصر آمن لأي استثناء (من غير النص الخام، ممكن يحوي أسرار).
+
+    OHB2-WP-05 (DEF-012): فروع الاستطلاع العامة كانت بتستدعي `safe_error_label`
+    المخصّص لـ `ApiError` فقط، فكان أي استثناء غير `ApiError` يرمي `AttributeError`.
+    هنا بنميّز: `ApiError` ⇒ التسمية الموجودة؛ غيره ⇒ نوع الاستثناء فقط.
+    """
+    if isinstance(exc, ApiError):
+        return safe_error_label(exc)
+    return f"خطأ غير متوقع ({type(exc).__name__})"
+
+
 def is_permanent(exc: ApiError) -> bool:
     """رفض نهائي مؤكد؟ (4xx) — غير كده غامض/مؤقت.
 
@@ -208,16 +220,17 @@ async def wait_running(client, conversation_id: str, interval: float, timeout: f
 
 
 async def deliver_outbox(client, db, bot, outbox_id: int) -> None:
-    """مسار مباشر: لو العنصر 'pending' نحاول نحجزه ذرّياً ثم نرسله عبر _post_claimed.
+    """مسار مباشر: نحجز **السجل المطلوب نفسه** ذرّياً ثم نرسله عبر _post_claimed.
 
-    OHB2-N10-28C: بنحجز ذرّياً (`claim_outbox` بحجز أقدم pending) بدل read-then-write،
-    عشان ما نتنافسش مع الـ worker على نفس السجل. لو الحجز رجّع سجل تاني، نكمّل بيه
-    (نفس ترتيب الأقدم-أولاً)، وبكده ما نكرّرش معالجة سجل واحد من مسارين.
+    OHB2-WP-05 (DEF-008): كان بيستدعي `claim_outbox` غير المُقيَّد بالمعرّف، فيمكن أن
+    يحجز ويرسل سجلًا آخر (أقدم) غير المطلوب، ويتخطّى نافذة التجميع (`GROUP_WINDOW`).
+    دلوقتي بنحجز `outbox_id` نفسه ذرّياً (`claim_outbox_by_id`) عشان ما نلمسش سجلًا
+    تاني، ونكمل عبر `_post_claimed` (نفس مسار الـ worker).
     """
     item = db.get_outbox(outbox_id)
     if item is None or item.status != OUTBOX_PENDING:
         return
-    claimed = db.claim_outbox(now_iso())
+    claimed = db.claim_outbox_by_id(outbox_id, now_iso())
     if claimed is None:
         return
     await _post_claimed(client, db, bot, claimed)
@@ -714,7 +727,7 @@ class OutboxWorker(_BaseWorker):
         return delay if fresh is None else fresh
 
 
-async def _start_conversation(client, db, bot, job, base_url: str) -> None:
+async def _start_conversation(client, db, bot, job, base_url: str, on_created=None) -> None:
     """ينشئ شات جديد بأمان at-most-once.
 
     - 'starting' يتسجّل بثبات قبل POST البدء بالظبط (حد الغموض): أي إلغاء/انقطاع قبله
@@ -742,7 +755,26 @@ async def _start_conversation(client, db, bot, job, base_url: str) -> None:
             )
             await safe_send(bot, chat_id, _UNKNOWN_CREATION_NOTICE)
             return
-        await _finish_creation(client, db, bot, job_id, chat_id, repo, conversation_id, base_url)
+        except asyncio.CancelledError:
+            # OHB2-WP-05 (DEF-012): إلغاء أثناء الاستطلاع المستأنَف ⇒ 'unknown' ثم إعادة
+            # الرمي (الإلغاء ينتشر زي ما هو)، عشان الطلب ما يفضلش 'claimed'/'starting'.
+            db.set_creation_status_if_in(
+                job_id, CREATION_UNKNOWN, now_iso(),
+                {CREATION_CLAIMED, CREATION_STARTING}, "اتقطع أثناء استطلاع البدء",
+            )
+            raise
+        except Exception as exc:  # noqa: BLE001 — أي فشل غير متوقّع في الاستطلاع لازم يتسجّل
+            # OHB2-WP-05 (DEF-012): أي خطأ غير `ApiError` كان بيفضّل الطلب
+            # 'claimed'/'starting' للأبد لحد restart. نعامله كغامض: 'unknown' + إشعار.
+            db.set_creation_status_if_in(
+                job_id, CREATION_UNKNOWN, now_iso(),
+                {CREATION_CLAIMED, CREATION_STARTING}, safe_exception_label(exc),
+            )
+            await safe_send(bot, chat_id, _UNKNOWN_CREATION_NOTICE)
+            return
+        await _finish_creation(
+            client, db, bot, job_id, chat_id, repo, conversation_id, base_url, on_created
+        )
         return
 
     # مفيش task_id معروف ⇒ إحنا (بإذن الله) أول من يعمل POST. نسجّل 'starting' أولاً
@@ -804,12 +836,25 @@ async def _start_conversation(client, db, bot, job, base_url: str) -> None:
             {CREATION_CLAIMED, CREATION_STARTING}, "اتقطع أثناء استطلاع البدء",
         )
         raise
+    except Exception as exc:  # noqa: BLE001 — أي فشل غير متوقّع في الاستطلاع لازم يتسجّل
+        # OHB2-WP-05 (DEF-012): فرع POST البدء كان بيلتقط `ApiError`/`CancelledError`/
+        # `ValueError` بس؛ أي خطأ غير متوقّع كان بيسيب الطلب 'claimed'/'starting'.
+        # نعامله كغامض (مفيش إعادة POST تلقائية، مفيش ادّعاء فشل/نجاح).
+        db.set_creation_status_if_in(
+            job_id, CREATION_UNKNOWN, now_iso(),
+            {CREATION_CLAIMED, CREATION_STARTING}, safe_exception_label(exc),
+        )
+        await safe_send(bot, chat_id, _UNKNOWN_CREATION_NOTICE)
+        return
 
-    await _finish_creation(client, db, bot, job_id, chat_id, repo, conversation_id, base_url)
+    await _finish_creation(
+        client, db, bot, job_id, chat_id, repo, conversation_id, base_url, on_created
+    )
 
 
 async def _finish_creation(
-    client, db, bot, job_id: int, chat_id: int, repo, conversation_id: str, base_url: str
+    client, db, bot, job_id: int, chat_id: int, repo, conversation_id: str, base_url: str,
+    on_created=None,
 ) -> None:
     """اتأكد بدء الشات: نسجّل 'done' (CAS) + نتابع الشات + نبلّغ الرابط (قابل للتعافي).
 
@@ -827,6 +872,15 @@ async def _finish_creation(
     ):
         log.info("الطلب %s اتحسم بحالة أحدث قبل تسجيل 'done'", job_id)
         return
+    # OHB2-WP-05 (NEW-DEF-02): الشات الجديد بقى موجود فعلًا (commit ناجح) ⇒ نبلّغ كاش
+    # قايمة الشات بإنه باطل، وإلا الشات الجديد يفضل مختفي من «شاتاتي» لحد انتهاء LIST_TTL.
+    # النداء بعد الـ commit فقط (مفيش إبطال كاذب)، وفشله مايفشّلش الإكمال (الكاش تحسين،
+    # مش صحة) ⇒ نتسجّل النوع بس.
+    if on_created is not None:
+        try:
+            on_created()
+        except Exception as exc:  # noqa: BLE001 — إبطال الكاش تحسين، مش شرط صحة
+            log.warning("تعذّر إبطال كاش القايمة بعد إنشاء شات (%s)", type(exc).__name__)
     await _complete_creation(
         db, bot, db.get_completion_pending(COMPLETION_KIND_CREATION, job_id), base_url
     )
@@ -873,12 +927,19 @@ class CreationWorker(_BaseWorker):
     def _claim(self):
         return self._db.claim_creation_job(now_iso())  # حجز ذرّي: pending ⇒ claimed
 
-    def __init__(self, client, db, bot, base_url: str, poll_interval: float = 2.0, max_idle: float = 30.0) -> None:
+    def __init__(
+        self, client, db, bot, base_url: str, poll_interval: float = 2.0,
+        max_idle: float = 30.0, on_created=None,
+    ) -> None:
         super().__init__(client, db, bot, poll_interval=poll_interval, max_idle=max_idle)
         self._base_url = base_url
+        # OHB2-WP-05 (NEW-DEF-02): اختياري — إبطال كاش قايمة الشات بعد اكتمال إنشاء شات.
+        self._on_created = on_created
 
     async def _process(self, item) -> None:
-        await _start_conversation(self._client, self._db, self._bot, item, self._base_url)
+        await _start_conversation(
+            self._client, self._db, self._bot, item, self._base_url, self._on_created
+        )
 
     def _is_retry_pending(self, item) -> bool:
         after = self._db.get_creation_job(item.id)

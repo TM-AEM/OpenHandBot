@@ -87,6 +87,8 @@ python main.py
 | `MINI_APP_AUTH_RATE_PER_HOUR` | اختياري، حد محاولات `/auth` لكل IP في الساعة، الافتراضي `30` |
 | `MINI_APP_API_RATE_PER_MINUTE` | اختياري، حد طلبات الـ API لكل جلسة في الدقيقة، الافتراضي `60` |
 | `MINI_APP_RATE_MAX_KEYS` | اختياري، أقصى عدد مفاتيح محدّد المعدّل (حد الذاكرة)، الافتراضي `4096` |
+| `MINI_APP_TRUSTED_PROXIES` | اختياري، IPs/CIDRs لمضيفات/وسطاء موثوقين مفصولة بفواصل. فاضي = مفيش وسطاء موثوقين |
+| `ATTACHMENT_DOCUMENT_INTAKE_ENABLED` | اختياري، `1` (افتراضي) لتخزين مستندات تيليجرام مؤقتًا (`pending`)؛ `0` لإيقاف الإدخال (راجع `docs/OPERATIONS_RUNBOOK.md` §3 و`OD-03`) |
 
 ## الاختبار
 

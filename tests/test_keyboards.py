@@ -68,6 +68,21 @@ def test_conversations_menu_no_more_when_last_page():
     assert "open:c1" in cbs
 
 
+def test_conversations_menu_uses_normalized_status_label():
+    """OHB2-WP-06 (DEF-009): وصف الزر يستخدم `get_status(conv)` ⇒ تسمية عربية معيارية."""
+    # execution_status بحروف كبيرة + sandbox ERROR ⇒ "خطأ بيئة" (مش النص الخام).
+    items = [{"id": "c1", "title": "ع", "execution_status": "RUNNING", "sandbox_status": "ERROR"}]
+    labels = [b.text for row in kb.conversations_menu(items, page=0, has_more=False).inline_keyboard
+              for b in row]
+    assert any("خطأ بيئة" in t for t in labels)
+    # execution_status مفقود ⇒ "غير معروف" (مش "unknown").
+    items2 = [{"id": "c2", "title": "ع"}]
+    labels2 = [b.text for row in kb.conversations_menu(items2, page=0, has_more=False).inline_keyboard
+               for b in row]
+    assert any("غير معروف" in t for t in labels2)
+    assert all("unknown" not in t for t in labels2)
+
+
 def test_conversations_menu_second_page_has_previous():
     items = [{"id": "c1", "title": "ع", "execution_status": "running"}]
     cbs = _callbacks(kb.conversations_menu(items, page=2, has_more=True))

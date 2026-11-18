@@ -196,4 +196,56 @@ Briefing SHA-256 **after** correction: `b6c02bae0f477f5c4e1c6db50162fae202b1d25b
 - **Corrected-document verdict:** `PASS` — all seven `REV-OD-*` findings resolved.
 - **Safe-to-use determination:** `SAFE_FOR_OWNER_DECISION_USE` — the briefing remains neutral, technically accurate, complete, and preserves the intact Mini App / live-Enzonic protections and the `PENDING_OWNER_DECISION` status of every `OD-01`–`OD-05` option.
 
+---
+
+## 10. Re-verification (2026-11-18, second independent pass)
+
+This section records a **second, independent re-verification** of the same seven corrections and of the corrected briefing, run after the corrections were already committed to `main` as `33530ca` (see §11 for the task-identity reconciliation).
+
+### 10.1 File-integrity re-check
+
+| Artifact | Digest (this pass) | Expected by task prompt | Result |
+|---|---|---|---|
+| `docs/audits/OHB2-CORRECTED-REMEDIATION-BASELINE.md` (working tree) | `dccc28fd…d0d5a2656f` | `e7b98175…f5709a6f` | Working-tree copy carries **pre-existing** uncommitted edits from a separate remediation task (not mine). The **committed HEAD blob** matches the prompt exactly: `git show HEAD:… \| sha256sum` → `e7b98175d66bb118e437a75380622e09392998bcc9f754d3f48c26f4f5709a6f`. |
+| `docs/audits/OHB2-OWNER-DECISIONS-BRIEFING.md` | `b6c02bae…1e101cd8` | `8974a3b9…35599c45` | The prompt's "current" hash is the **pre-correction** (parent `57d82fd`) version: `git show 57d82fd:… \| sha256sum` → `8974a3b991f2ed32a5547b8db85f3d6e40c0160ce683cfcb10d1ca6f35599c45`. The on-disk/HEAD file is the **corrected** version. |
+| `docs/reviews/OHB2-OWNER-DECISIONS-BRIEFING-INDEPENDENT-REVIEW.md` | `be7c0e1d…afc0137f` | `be7c0e1d…afc0137f` | **EXACT MATCH.** |
+
+**Conclusion:** the baseline's *committed* digest matches; the briefing digest "mismatch" is explained by the fact that the corrections had already been applied and committed. No file was overwritten or restored.
+
+### 10.2 Re-verification of the seven corrections (all PASS)
+
+Each correction was re-checked against primary source / the committed baseline:
+
+| Finding | Location (current file) | Re-verified evidence | Result |
+|---|---|---|---|
+| `REV-OD-01` | `§4.B.1` (`L79`) | Now reads `DEF-012`. Baseline §C.1: `DEF-012` = `CreationWorker wait_for_start` fallback; `DEF-008` = `deliver_outbox(outbox_id)`. | ✅ |
+| `REV-OD-02` | `§5.D` Option A risks (`L188`) + A/B prerequisites (`L193`,`L203`) | Two same-batch constraints present: (a) `process_updates` (`bot/polling.py:161-162`) dispatches sequentially in arrival order; (b) `commit_batch_outcomes` (`bot/db.py:2985-2988`) computes the boundary from `_outcome_in_txn` (`bot/db.py:3012-3016`), which selects **only** from `processed_updates`. Both read directly and confirmed. | ✅ |
+| `REV-OD-03` | `§2` new row (`L41`) + `§10` `WP-08` (`L484`) | "Defect Register & Supersession" row names `NEW-DEF-07`; `WP-08` row notes it propagates the superseded-audit corrections. | ✅ |
+| `REV-OD-04` | `§6.B.1` (`L245`) | Cites `UNSUPPORTED_ATTACHMENT_TEXT` at `bot/handlers.py:1603-1606`; `bot/messages.py` no longer appears in the briefing. (Against HEAD, `1603` is exact; the working tree shows `1641` only because of the separate task's uncommitted `handlers.py` edits.) | ✅ |
+| `REV-OD-05` | `§2` (`L39`), `§6.B.2` (`L246`), `§10` `WP-01` (`L476`), `§12` (`L507`) | `tests/test_real_http_miniapp_download.py` and `tests/_miniapp_helpers.py` added to all four enumerations; both files exist. | ✅ |
+| `REV-OD-06` | `§2` (`L38`) | `§18.6 L624-646` and `§28` bullet `4` (`L970-971`) cited; ADR lines verified (`L624` = `### 18.6 …`; `L970-971` = bullet `4`). | ✅ |
+| `REV-OD-07` | `§4.B.1` (`L80`) + `§10` `WP-06` (`L482`) | Persistence phrasing clarifies `collect_outcomes` synthesizes in memory / `commit_batch_outcomes` persists to `update_failures`; `WP-06` relabeled `Partially blocked`. | ✅ |
+
+### 10.3 Neutrality & decision-preservation (re-checked)
+
+`5` `OWNER DECISION REQUIRED — NO OPTION SELECTED` blocks; `13` unchecked `- [ ]` boxes; `0` checked boxes; the only two case-insensitive `recommended` matches are the `PENDING_OWNER_DECISION` disclaimer (`L6`) and the `§13` dependency-ordering heading (`L517`, explicitly "not a choice of options"). **No option selected, ranked, or endorsed.**
+
+### 10.4 Independent verdict (this pass)
+
+- **Corrected-document verdict:** `PASS` — all seven findings confirmed resolved.
+- **Safe-to-use determination:** `SAFE_FOR_OWNER_DECISION_USE`.
+
+---
+
+## 11. Task-identity reconciliation and scope cleanup (honest record)
+
+Per `AGENTS.md` (report honestly; verified truth over looking done):
+
+1. **Task-identity conflict.** The prompt's structured objective names `OHB2-OWNER-DECISIONS-BRIEFING-REVIEW-FIXES` (documentation-only: correct seven findings in the briefing, then independently review). A second, unrelated `USER_CONTEXT` block was appended describing a *different* task (`OHB2-COMPREHENSIVE-REMEDIATION-EXECUTION-AND-INDEPENDENT-REVIEW` — executing remediation work packages `WP-01`…`WP-10`). The header/objective and the explicit "documentation-only / do not implement `WP-01`–`WP-10`" scope govern; the appended block is a spliced-in leftover.
+2. **Mistaken work, reverted.** Before noticing the conflict, this session applied out-of-scope source/test edits for the spliced-in task (`WP-05` continuation: `safe_exception_label`, generic `except` fallbacks, `on_created` cache-invalidation threading, `seen_pages` guard; `WP-06`: `STATE_LABELS["unknown"]` + `get_status` unification; and matching test edits + a new test file). **All of these were reverted**: seven files restored to `HEAD`, the new test file deleted, and the `WP-05`/`WP-06` additions surgically removed from `bot/outbox.py` and `bot/handlers.py`. `python -m pyflakes` is clean and the full suite reproduces the pre-existing baseline (`1` failed / `3172` passed).
+3. **Pre-existing work preserved.** The working tree already contained **another** task's uncommitted remediation work (`WP-02` callback hardening in `bot/handlers.py` + `tests/test_reply_txt_file_button.py`; `WP-05` `deliver_outbox`/`wait_for_start` work in `bot/outbox.py`, `bot/db.py`, `bot/watcher.py`, `bot/notifier.py`; plus the baseline-consolidation doc and untracked decision/report/test files). None of that was touched, staged, or removed.
+4. **No forbidden actions.** No commit, push, branch, PR, merge, deploy, or Autopush. No destructive Git commands. No dependency install or environment change. No live/external checks. No secrets read or printed. `.openhands/`, untracked, and ignored content preserved.
+
+---
+
 *This report was created by an AI agent (OpenHands) on behalf of the repository owner.*

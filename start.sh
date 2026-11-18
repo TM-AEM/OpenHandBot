@@ -53,7 +53,7 @@ deps_missing() {
     "$PY" - <<'PY'
 import importlib.util as u
 
-mods = ("telegram", "httpx", "dotenv", "starlette", "uvicorn")
+mods = ("telegram", "httpx", "dotenv", "starlette", "uvicorn", "anyio")
 missing = []
 for m in mods:
     try:

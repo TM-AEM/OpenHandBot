@@ -963,11 +963,15 @@ def test_miniapp_list_collects_all_pages(tmp_path):
 
 
 def test_miniapp_list_flags_truncation(tmp_path):
-    """لو فيه صفحات أكتر من الحد ⇒ `truncated=true` (إعلان صريح، مش إخفاء صامت)."""
+    """لو فيه صفحات أكتر من الحد (مؤشّرات مختلفة) ⇒ `truncated=true` (إعلان صريح)."""
 
     class AlwaysMore:
+        def __init__(self):
+            self.calls = 0
+
         async def search_conversations(self, limit=100, page_id=None):
-            return {"items": [_conv("c1")], "next_page_id": "more"}
+            self.calls += 1
+            return {"items": [_conv(f"c{self.calls}")], "next_page_id": f"p{self.calls}"}
 
         async def get_current_user(self):
             return {"id": OWNER_UUID}
@@ -980,6 +984,32 @@ def test_miniapp_list_flags_truncation(tmp_path):
     r = tc.get("/api/v1/conversations?refresh=1")
     assert r.status_code == 200, r.text
     assert r.json()["truncated"] is True
+
+
+def test_miniapp_list_repeated_cursor_no_false_truncation(tmp_path):
+    """OHB2-WP-05 (NEW-DEF-05): مؤشّر مكرّر ⇒ توقّف فورًا بلا `truncated` كاذب (Mini App)."""
+
+    class Repeats:
+        def __init__(self):
+            self.calls = 0
+
+        async def search_conversations(self, limit=100, page_id=None):
+            self.calls += 1
+            return {"items": [_conv("c1")], "next_page_id": "same"}
+
+        async def get_current_user(self):
+            return {"id": OWNER_UUID}
+
+    client = Repeats()
+    tc = TestClient(
+        build_web_app(make_config(), _db(tmp_path), client=client, application=_FakeApp()),
+        raise_server_exceptions=False,
+    )
+    login(tc)
+    r = tc.get("/api/v1/conversations?refresh=1")
+    assert r.status_code == 200, r.text
+    assert client.calls == 2
+    assert r.json()["truncated"] is False
 
 
 # ================================ OHB2-PHASE1E-F1: delete must not 500 after success

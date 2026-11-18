@@ -72,10 +72,13 @@ async def _register_commands(application: Application, owner_id: int) -> None:
 
 
 def build_application(config: Config) -> Application:
-    # U04: بدون concurrent_updates أي أمر بطيء (تصدير/قايمة ملفات) بيأخّر تأكيد
-    # "وصل ✅" لأن التحديثات بتتعالج واحد ورا التاني. التزامن آمن هنا لأن حالة
-    # التوجيه بتتقرأ قراءة فقط (db.awaiting_state)، واستهلاكها المتوقّع النوع مع كتابة
-    # العمل الدائم (صندوق/طلب إنشاء) وعلامة «معالَج» بيحصلوا ذرّياً في معاملة واحدة.
+    # OHB2-WP-07 (DEF-006): `concurrent_updates(True)` إعداد على `Application` بس — **مش**
+    # دليل إن الحلقة المخصّصة بتوزّع الدفعة بالتوازي. حلقة `bot.polling::TelegramPoller`
+    # بتوزّع التحديثات **تسلسليًّا** (`dispatch_and_wait`: تحطّ التحديث في الطابور وتستنّى
+    # `update_queue.join()` قبل اللي بعده) ⇒ تحديث بطيء/غير محسوم بيأخّر اللي بعده في الدفعة.
+    # الحكم على الإقرار **من البادئة المؤهّلة/النتيجة الدائمة**، مش من الإعداد ده.
+    # التزامن داخل الدفعة (`OD-04`) **ممنوع** بلا إثبات أمان على `Database._conn` وترتيب
+    # المستخدم؛ سياسة الاستطلاع المتسلسل مطابقة لـ `docs/OPERATIONS_RUNBOOK.md`.
     # OHB2-STAGE2 (D0): نبني التطبيق **بدون Updater** (`updater(None)`) ⇒ PTB بيسييب
     # `update_queue` + `_update_fetcher` (بيوزّع على نفس الـ handlers) **بس مفيش سحب تلقائي**
     # ⇒ مفيش poller تاني؛ حلقة `bot.polling` المخصّصة هي اللي بتسحب (نفس العملية/القاعدة).
@@ -248,7 +251,10 @@ def build_application(config: Config) -> Application:
             outbox_worker.start()
         if application.bot_data.get("creation_worker") is None:
             creation_worker = CreationWorker(
-                client, db, application.bot, config.openhands_base_url
+                client, db, application.bot, config.openhands_base_url,
+                # OHB2-WP-05 (NEW-DEF-02): إبطال كاش قايمة الشات بعد اكتمال إنشاء شات
+                # (نفس نمط `_send_prompt`/`delete_conversation_confirm`).
+                on_created=lambda: application.bot_data.pop("list_cache", None),
             )
             application.bot_data["creation_worker"] = creation_worker
             creation_worker.start()

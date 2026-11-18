@@ -2,8 +2,8 @@
 
 **Task ID:** `OHB2-REMEDIATION-BASELINE-CONSOLIDATION` *(Updated by Final Errata: `OHB2-REMEDIATION-BASELINE-FINAL-ERRATA`)*  
 **Baseline Date:** 2026-11-17  
-**Project Root Observed:** `/app/applet`  
-**Observable Environment:** `Python 3.11.2` (`main, Oct 7 2026, 12:35:07`), `Node v22.23.2`, `.git` absent (`git status` -> `fatal: not a git repository`)  
+**Re-verified Environment (this session):** Project root `/workspace/project/OpenHandBot`; `Python 3.13.15`; `Node v24.22.2`; `.git` **present** (branch `main`, `HEAD` `33530ca`, clean working tree at session start).  
+**Historical Observation (prior session, retained for provenance only):** Project root `/app/applet`; `Python 3.11.2`; `Node v22.23.2`; `.git` absent. The environment has since changed; the re-verified facts above supersede it.  
 **Status:** **`PLANNING_BASELINE_ONLY — NOT IMPLEMENTATION AUTHORIZATION`**
 
 ---
@@ -21,6 +21,12 @@ This document establishes the single authoritative remediation baseline for **Op
    - `docs/audits/OHB2-FILE-BY-FILE-AUDIT.md`
 2. The independent adversarial validation report:
    - `docs/audits/OHB2-INDEPENDENT-AUDIT-REPORT-VALIDATION.md`
+3. The corrected owner-decision briefing and its independent review (used for the owner-decision register, `OD-01`..`OD-05`, and the provisional priority sequence):
+   - `docs/audits/OHB2-OWNER-DECISIONS-BRIEFING.md`
+   - `docs/reviews/OHB2-OWNER-DECISIONS-BRIEFING-INDEPENDENT-REVIEW.md`
+   - `docs/reviews/OHB2-OWNER-DECISIONS-BRIEFING-REVIEW-FIXES-REPORT.md`
+
+**Consolidation scope (this session):** Re-verified the corrected factual baseline against live source, added the three-category defect classification (`A` Runtime / `B` AUDIT ERRATA / `C` QUALITY GAP), the owner-approved provisional priority sequence, and re-checked the environment. No implementation work is authorized.
 
 ### A.2 Authority, Supersession, and Non-Modification Policy
 - **Supersession:** Where any specification, count, line scope, feature classification, dependency ordering, or technical assumption in the six original audit reports conflicts with `OHB2-INDEPENDENT-AUDIT-REPORT-VALIDATION.md` or with this document, **this document supersedes the conflicting implementation guidance**.
@@ -29,19 +35,19 @@ This document establishes the single authoritative remediation baseline for **Op
 - **Strict Mini App Exclusion:** The Telegram Mini App subsystem (`bot/web/*`, `bot/web/static/*`, `tests/frontend/*`, `tests/test_miniapp_*.py`, `tests/test_real_http_miniapp_download.py`, `tests/_miniapp_helpers.py`, `docs/MINI_APP.md`, and `Config.mini_app_*` fields) is **`EXCLUDED_MINI_APP`** and must not be modified. Cross-boundary dependencies discovered via read-only inspection are documented explicitly and gated on owner decisions.
 
 ### A.3 Observable Workspace & Git Limitations
-- **Actual Project Root:** `/app/applet`.
-- **Git Metadata:** `.git` directory is absent (`ls: cannot access '.git': No such file or directory`; `git status` -> `fatal: not a git repository`). Current branch, `HEAD`, whether files are committed/modified/untracked, GitHub-vs-local differences, working-tree cleanliness, and remote CI run logs **cannot be verified locally**; no clean working tree is inferred.
-- **Audit Package Inventory:** All 7 pre-existing audit/validation files under `docs/audits/` (`6` prior audit/plan docs + `OHB2-INDEPENDENT-AUDIT-REPORT-VALIDATION.md`) were verified present on disk prior to creating this baseline and remain unmodified.
-- **Runtime / Package State:** `Python 3.11.2` and `Node v22.23.2` are present. Runtime/dev Python packages (`pytest`, `pyflakes`, `bandit`, `pip_audit`, `telegram`, `httpx`, `starlette`, `uvicorn`, `dotenv`, `anyio`) are absent (`BLOCKED` for Python behavioral/lint/SAST/SCA checks).
+- **Actual Project Root (re-verified this session):** `/workspace/project/OpenHandBot`.
+- **Git Metadata (re-verified this session):** `.git` **is present**. `git rev-parse --abbrev-ref HEAD` -> `main`; `HEAD` = `33530cad02f37755da47e7eedac57764a354a75b`; `git status --porcelain` was **clean** at session start. Remote `origin` = `https://github.com/TM-AEM/OpenHandBot.git`. Working-tree cleanliness is therefore verifiable locally now (it was not in the prior session). Remote GitHub Actions run logs remain outside local verification scope.
+- **Audit Package Inventory:** All `9` audit/baseline files under `docs/audits/` (`6` original audit/plan docs + `OHB2-INDEPENDENT-AUDIT-REPORT-VALIDATION.md` + `OHB2-OWNER-DECISIONS-BRIEFING.md` + this baseline) were verified present and tracked; the original audit and validation reports remain unmodified.
+- **Runtime / Package State (re-verified this session):** `Python 3.13.15` and `Node v24.22.2` are present. Runtime/dev Python packages (`pytest`, `pyflakes`, `bandit`, `pip_audit`, `telegram`, `httpx`, `starlette`, `uvicorn`, `dotenv`, `anyio`) are **absent** (`BLOCKED` for Python behavioral/lint/SAST/SCA checks). `ast.parse` over `165/165` `.py` files passed (`0` syntax errors). `node --test tests/frontend/*.test.js` -> `280` tests, `280` pass, `0` fail (read-only).
 
 ---
 
 ## B. Corrected Factual Baseline
 
-Every remediation work package (`WP-01`..`WP-10`) and parity check must use these source-verified facts instead of the superseded claims from the original audit package:
+Every remediation work package (`WP-01`..`WP-10`) and parity check must use these source-verified facts instead of the superseded claims from the original audit package. Each item below records the **re-verified** value from this session (2026-11-17) with its evidence; where the environment changed since the prior baseline, the change is stated explicitly.
 
-1. **Container Python Version:** The active container executes **`Python 3.11.2`** (not `3.10.12`). Python `>= 3.11` (`bot/bootstrap.py::MIN_PYTHON`) is satisfied by the interpreter; local Python CI/runtime gates are blocked solely because the virtual environment and the `10` third-party packages from `requirements.txt` / `requirements-dev.txt` are not installed.
-2. **SQLite Schema Table Count:** `Database._init_schema()` (`bot/db.py:590-816`) defines **`17` tables** (not `19`): `watched`, `user_state`, `outbox`, `creation_jobs`, `completion_pending`, `settings`, `notification_state`, `notifier_pending`, `notifier_retry_not_before`, `notification_inbox`, `deleted_conversations`, `web_sessions`, `processed_updates`, `update_failures`, `attachment_batches`, `attachment_items`, `attachment_message_identity`. `docs/OPERATIONS_RUNBOOK.md` §4 (`lines 73-74`) lists `4` tables and omits `13` (`4 + 13 = 17`); across the full runbook (`§§5–8`), `6` tables appear and `11` are missing (`settings`, `notification_state`, `notifier_pending`, `notifier_retry_not_before`, `notification_inbox`, `deleted_conversations`, `web_sessions`, `update_failures`, `attachment_batches`, `attachment_items`, `attachment_message_identity`).
+1. **Container Python Version:** The active container executes **`Python 3.13.15`** (re-verified this session via `python3 --version`). The **prior baseline's claim of `Python 3.11.2` is now superseded** — the environment changed. The original audit's claim of `3.10.12` was also wrong. Python `>= 3.11` (`bot/bootstrap.py::MIN_PYTHON`) is satisfied; local Python CI/runtime gates are blocked solely because the virtual environment and the `10` third-party packages from `requirements.txt` / `requirements-dev.txt` are not installed. The project's CI matrix (`.github/workflows/ci.yml:23`) targets `Python 3.11` & `3.13`, so `3.13.15` is a supported target version.
+2. **SQLite Schema Table Count:** `Database._init_schema()` (`bot/db.py:587+`) defines **`17` tables** (not `19`) — re-verified this session by counting `CREATE TABLE IF NOT EXISTS` names: `watched`, `user_state`, `outbox`, `creation_jobs`, `completion_pending`, `settings`, `notification_state`, `notifier_pending`, `notifier_retry_not_before`, `notification_inbox`, `deleted_conversations`, `web_sessions`, `processed_updates`, `update_failures`, `attachment_batches`, `attachment_items`, `attachment_message_identity`. `docs/OPERATIONS_RUNBOOK.md` §4 (`lines 73-74`) lists only `4` tables (`watched`, `user_state`, `outbox`, `creation_jobs`) and omits `13` (`4 + 13 = 17`).
 3. **Feature Visibility State:** `bot/features.py:15` sets **`DEFERRED_FEATURES_HIDDEN = False`**. Therefore `is_hidden(feature)` (`bot/features.py:20-22`) returns `False` for `"files"`, `"export"`, `"cost"`, and `"followups"`, making all four active, rendered, and live-reachable in Telegram keyboards and handlers (`README.md` / `bot/app.py`).
 4. **Already-Migrated Operational Failure Propagation:** In `bot/handlers.py`, both **`list_conversations` (`L917`)** and **`_show_repos` (`L2446`)** already call `await _raise_if_operational_api_failure(exc)` inside their `except ApiError:` handlers, so `5xx`/`429`/network failures in those two functions already propagate rather than being swallowed into `EXPLICITLY_IGNORED`.
 5. **Exact `_ACK_ELIGIBLE` Outcome Set:** `bot/update_outcomes.py:40-48` defines `_ACK_ELIGIBLE` strictly as `{DURABLE_COMPLETED, DURABLE_INTENT_RECORDED, EXPLICITLY_IGNORED, DUPLICATE_COMPLETED, REJECTED_INELIGIBLE}`. Constants named `AMBIGUOUS_EXTERNAL` and `DISPLAY_FAILED` do **not** exist; `handlers.mark_ambiguous_external` records `PARTIAL_OR_UNKNOWN` (`bot/handlers.py:604`) and `handlers.mark_display_failed` records `FAILED_TRANSIENT` (`bot/handlers.py:626`), both of which belong to fail-closed `_INELIGIBLE` (`bot/update_outcomes.py:51-53`).
@@ -54,11 +60,27 @@ Every remediation work package (`WP-01`..`WP-10`) and parity check must use thes
 
 Confidence legend: `CONFIRMED` (directly verified in source), `CONFIRMED_WITH_SCOPE_CORRECTION` (verified with narrowed/corrected scope), `UNVERIFIED_EXTERNAL` (code path verified, live runtime/external behavior unverified locally).
 
+**Defect-classification legend (mandatory three categories).** Every finding in this register carries exactly one category label:
+
+- **`A. RUNTIME DEFECT`** — an actual or independently validated defect affecting runtime behavior, data integrity, reliability, security, or user-visible functionality.
+- **`B. AUDIT ERRATA`** — an incorrect statement, unsupported claim, inaccurate source reference, or classification mistake in previous audit documentation. This is **not** an OpenHandBot runtime defect.
+- **`C. QUALITY GAP`** — a missing test, incomplete verification, documentation/configuration parity gap, or other quality-assurance deficiency that is **not** an independently established runtime defect.
+
+**Register integrity:** Each `DEF-ID` appears exactly once in `§C.1`; each `NEW-DEF-ID` appears exactly once in `§C.2`. Other sections reference IDs without duplicating register entries.
+
+**Classification summary (per-finding labels appear as `- **Classification:**` in each entry):**
+- **`A. RUNTIME DEFECT`:** `DEF-001`..`DEF-015` and `NEW-DEF-01`..`NEW-DEF-06` (defects affecting runtime behavior, data integrity, reliability, security, or user-visible functionality).
+- **`B. AUDIT ERRATA`:** `NEW-DEF-07` (mandatory — incorrect statements/classifications in prior audit documentation; **not** a runtime defect).
+- **`C. QUALITY GAP`:** `DEF-016` (external infrastructure qualification unverified), `DEF-017` (operational documentation/runbook parity drift), `DEF-018` (repository hygiene / startup-preflight gap), `DEF-019` (verification-environment/tooling gap), and `NEW-DEF-08` (mandatory — missing parity tests). These are verification, documentation-parity, or tooling gaps, **not** independently established runtime defects.
+
+*Rationale for `C` on `DEF-016`..`DEF-019`:* none of these four is a confirmed defect in executing code — they are respectively an unexecuted external qualification, a documentation-parity gap, a repository-hygiene/preflight omission, and a blocked test environment. They are retained in the register (not removed) but separated from the runtime defects as required.
+
 ### C.1 Original Audit Defects (`DEF-001`..`DEF-019`)
 
 #### `DEF-001` — Permanent Normal Text-Prompt Self-DoS ("Owner Brick") After Any Document Attachment
 - **ID:** `DEF-001`
 - **Category:** State Machine / Feature Integration / Operational Availability (Runtime Defect)
+- **Classification:** `A. RUNTIME DEFECT`
 - **Severity:** `CRITICAL`
 - **Validation Verdict:** `CONFIRMED`
 - **Exact Source Location:** `bot/config.py:43,315-317`; `bot/handlers.py:1885,2052-2204,2245,2291-2309`; `bot/db.py:812-814,1364-1395,1493-1663`; `bot/attachments.py:1095-1115`
@@ -73,6 +95,7 @@ Confidence legend: `CONFIRMED` (directly verified in source), `CONFIRMED_WITH_SC
 #### `DEF-002` — Head-of-Line Polling Offset Deadlock on `FAILED_PERMANENT` & Transient Exception Misclassification
 - **ID:** `DEF-002`
 - **Category:** Polling / Telegram ACK Reliability / Error Classification (Runtime Defect)
+- **Classification:** `A. RUNTIME DEFECT`
 - **Severity:** `HIGH`
 - **Validation Verdict:** `CONFIRMED`
 - **Exact Source Location:** `bot/update_outcomes.py:40-53,93-110`; `bot/polling.py:155-173,202-208`; `bot/handlers.py:477-495,1150-1154,1468,1567`
@@ -87,6 +110,7 @@ Confidence legend: `CONFIRMED` (directly verified in source), `CONFIRMED_WITH_SC
 #### `DEF-003` — Missing Outcome (`outcome=None` -> Ack Block) & `reposearch` Error/Expiry Handling
 - **ID:** `DEF-003`
 - **Category:** Handler Outcome Contract / Control Flow (Runtime Defect)
+- **Classification:** `A. RUNTIME DEFECT`
 - **Severity:** `HIGH`
 - **Validation Verdict:** `CONFIRMED_WITH_SCOPE_CORRECTION`
 - **Exact Source Location:** `bot/handlers.py:2275-2283` (`handle_text` `reposearch`), `2351-2354` (`_send_prompt`), `2534-2536` (`_start_new_chat`), `2795-2798` (`outbox_mark_sent`); `(already fixed for 5xx: 2446 _show_repos)`
@@ -101,6 +125,7 @@ Confidence legend: `CONFIRMED` (directly verified in source), `CONFIRMED_WITH_SC
 #### `DEF-004` — Incomplete `Stage4-F1` Operational Failure Propagation & Unguarded `send_document`
 - **ID:** `DEF-004`
 - **Category:** Error Propagation / Fail-Closed ACK Semantics (Runtime Defect)
+- **Classification:** `A. RUNTIME DEFECT`
 - **Severity:** `HIGH`
 - **Validation Verdict:** `CONFIRMED_WITH_SCOPE_CORRECTION`
 - **Exact Source Location:** `bot/handlers.py:1129-1142` (`send_reply_txt`), `1206-1212` (`watch_conversation`), `1276-1282` (`delete_conversation_prompt`), `1307-1318` (`delete_conversation_confirm`), `1449-1468` (`export_conversation`), `1567` (`show_file`), `1585-1591` (`reply_prompt`); `(already fixed: 917 list_conversations, 2446 _show_repos)`
@@ -115,6 +140,7 @@ Confidence legend: `CONFIRMED` (directly verified in source), `CONFIRMED_WITH_SC
 #### `DEF-005` — Unwrapped `await q.answer()` Across 24 of 28 Callback Call Sites
 - **ID:** `DEF-005`
 - **Category:** Error Handling / Telegram Callback Lifecycle (Runtime Defect)
+- **Classification:** `A. RUNTIME DEFECT`
 - **Severity:** `HIGH`
 - **Validation Verdict:** `CONFIRMED` *(evidence note: `L857` is duplicate `update_id` short-circuit, not DB-fail)*
 - **Exact Source Location:** `bot/handlers.py` bare sites (`780,799,834,850,857,893,965,1033,1072,1167,1195,1229,1266,1296,1439,1477,1526,1575,2302,2380,2401,2424,2473,2500`) vs wrapped (`866,1120,1348,1402`)
@@ -129,6 +155,7 @@ Confidence legend: `CONFIRMED` (directly verified in source), `CONFIRMED_WITH_SC
 #### `DEF-006` — Custom Poller Batch Serialization vs `concurrent_updates(True)` Rationale
 - **ID:** `DEF-006`
 - **Category:** Concurrency / Responsiveness / Architecture Alignment (Runtime / Architecture)
+- **Classification:** `A. RUNTIME DEFECT`
 - **Severity:** `MEDIUM`
 - **Validation Verdict:** `CONFIRMED`
 - **Exact Source Location:** `bot/polling.py:161-162,175-178` vs `bot/app.py:75-87`; `docs/OPERATIONS_RUNBOOK.md:123-127`
@@ -143,6 +170,7 @@ Confidence legend: `CONFIRMED` (directly verified in source), `CONFIRMED_WITH_SC
 #### `DEF-007` — `Watcher.tick` and `Notifier._process` Missing `continue`/`return` After `clear_retry_not_before` Failure
 - **ID:** `DEF-007`
 - **Category:** Notification Reliability / Control Flow (Runtime Defect)
+- **Classification:** `A. RUNTIME DEFECT`
 - **Severity:** `MEDIUM`
 - **Validation Verdict:** `CONFIRMED`
 - **Exact Source Location:** `bot/watcher.py:215-221`; `bot/notifier.py:522-528`
@@ -157,6 +185,7 @@ Confidence legend: `CONFIRMED` (directly verified in source), `CONFIRMED_WITH_SC
 #### `DEF-008` — `deliver_outbox(outbox_id)` Helper Ignores Target `outbox_id` and `mature_before`
 - **ID:** `DEF-008`
 - **Category:** Outbox Delivery / Function Contract (Runtime Defect)
+- **Classification:** `A. RUNTIME DEFECT`
 - **Severity:** `MEDIUM`
 - **Validation Verdict:** `CONFIRMED`
 - **Exact Source Location:** `bot/outbox.py:210-224`; `bot/handlers.py:2366-2367`
@@ -171,6 +200,7 @@ Confidence legend: `CONFIRMED` (directly verified in source), `CONFIRMED_WITH_SC
 #### `DEF-009` — UI Formatters and Keyboards Pass Raw `execution_status` Instead of `get_status(conv)`
 - **ID:** `DEF-009`
 - **Category:** UI Consistency / Status Normalization (Runtime Defect)
+- **Classification:** `A. RUNTIME DEFECT`
 - **Severity:** `MEDIUM`
 - **Validation Verdict:** `CONFIRMED`
 - **Exact Source Location:** `bot/messages.py:20-61,105,138`; `bot/keyboards.py:113`; `bot/handlers.py:1377` *(plus `bot/handlers.py:1220` `watch_conversation`)*
@@ -185,6 +215,7 @@ Confidence legend: `CONFIRMED` (directly verified in source), `CONFIRMED_WITH_SC
 #### `DEF-010` — 64-Byte `callback_data` Overflow for Valid 56–64 Char Conversation IDs
 - **ID:** `DEF-010`
 - **Category:** Input Bounds / Telegram API Compatibility (Runtime Defect)
+- **Classification:** `A. RUNTIME DEFECT`
 - **Severity:** `MEDIUM`
 - **Validation Verdict:** `CONFIRMED`
 - **Exact Source Location:** `bot/files.py:29,36` (`MAX_CONVERSATION_ID_LEN=64`); `bot/keyboards.py:9-16,94-95,114,138-215`
@@ -199,6 +230,7 @@ Confidence legend: `CONFIRMED` (directly verified in source), `CONFIRMED_WITH_SC
 #### `DEF-011` — Missing Cross-Download Reservation Lock, Sync Disk I/O, & Misleading Acceptance UX
 - **ID:** `DEF-011`
 - **Category:** Concurrency / Resource Quotas / UX Integrity (Runtime Defect)
+- **Classification:** `A. RUNTIME DEFECT`
 - **Severity:** `MEDIUM`
 - **Validation Verdict:** `CONFIRMED`
 - **Exact Source Location:** `bot/attachments.py:612-644,699-735,1062-1135`; `bot/handlers.py:1609-1611,1689,1714-1990`
@@ -213,6 +245,7 @@ Confidence legend: `CONFIRMED` (directly verified in source), `CONFIRMED_WITH_SC
 #### `DEF-012` — `CreationWorker` `wait_for_start` Branches Missing Non-`ApiError` (& Resumed `CancelledError`) Fallback
 - **ID:** `DEF-012`
 - **Category:** Concurrency / Worker Error Recovery (Runtime Defect)
+- **Classification:** `A. RUNTIME DEFECT`
 - **Severity:** `MEDIUM`
 - **Validation Verdict:** `CONFIRMED`
 - **Exact Source Location:** `bot/outbox.py:592-595,733-746,792-806`
@@ -227,6 +260,7 @@ Confidence legend: `CONFIRMED` (directly verified in source), `CONFIRMED_WITH_SC
 #### `DEF-013` — Non-Atomic Expired-Awaiting Clear vs `EXPLICITLY_IGNORED` Outcome Commit
 - **ID:** `DEF-013`
 - **Category:** Atomicity / Crash Consistency (Runtime Defect)
+- **Classification:** `A. RUNTIME DEFECT`
 - **Severity:** `LOW`
 - **Validation Verdict:** `CONFIRMED`
 - **Exact Source Location:** `bot/handlers.py:2253-2261`
@@ -241,6 +275,7 @@ Confidence legend: `CONFIRMED` (directly verified in source), `CONFIRMED_WITH_SC
 #### `DEF-014` — Mini App `OHB2-MT-2` Attachment Download Blocked After `intent_recorded` & Unverified WebView Gate
 - **ID:** `DEF-014`
 - **Category:** Cross-Boundary Feature Coupling / Excluded Mini App (`EXCLUDED_MINI_APP`)
+- **Classification:** `A. RUNTIME DEFECT`
 - **Severity:** `MEDIUM`
 - **Validation Verdict:** `CONFIRMED`
 - **Exact Source Location:** `bot/web/services.py:758-870` (`list_staged_attachments`, `download_attachment`); `bot/web/app.py:365-371,771-827`; `bot/db.py:1572-1663`; `docs/reviews/OHB2-MT2-COMPLETION-AND-ADVERSARIAL-VERIFICATION.md`
@@ -255,6 +290,7 @@ Confidence legend: `CONFIRMED` (directly verified in source), `CONFIRMED_WITH_SC
 #### `DEF-015` — Remote Attachment Delivery (`P0 Stage B1/B2`) Blocked by Missing Scoped Credential & SSRF Allowlist
 - **ID:** `DEF-015`
 - **Category:** Missing Core Feature / Security Gate (Deferred)
+- **Classification:** `A. RUNTIME DEFECT`
 - **Severity:** `HIGH`
 - **Validation Verdict:** `CONFIRMED`
 - **Exact Source Location:** `bot/openhands_client.py` (no upload method); `README.md:175-184`; `docs/proposals/OHB2-AGENT-SERVER-FILE-UPLOAD-ARCHITECTURE.md`; `.agent/PROGRESS.md:20-37`
@@ -269,6 +305,7 @@ Confidence legend: `CONFIRMED` (directly verified in source), `CONFIRMED_WITH_SC
 #### `DEF-016` — Hosting Qualification (`HOST-01`/`HOST-02`/`H1`) & Live Enzonic SFTP Verification Unconfirmed
 - **ID:** `DEF-016`
 - **Category:** Deployment Readiness / External Infrastructure (`UNVERIFIED_EXTERNAL`)
+- **Classification:** `C. QUALITY GAP`
 - **Severity:** `HIGH`
 - **Validation Verdict:** `CONFIRMED`
 - **Exact Source Location:** `.github/workflows/enzonic-sftp-readonly-check.yml:1-126`; `tools/katabump-sqlite-canary/canary.py:1-245`; `docs/DEPLOY_ENZONIC.md`; `docs/OHB2_ENZONIC_DEPLOYMENT_PREFLIGHT.md`; `docs/OHB2_HOSTING_DECISION.md`
@@ -283,6 +320,7 @@ Confidence legend: `CONFIRMED` (directly verified in source), `CONFIRMED_WITH_SC
 #### `DEF-017` — Severe Documentation, Runbook, and Startup Contract Drift
 - **ID:** `DEF-017`
 - **Category:** Documentation / Operational Runbook Integrity
+- **Classification:** `C. QUALITY GAP`
 - **Severity:** `MEDIUM`
 - **Validation Verdict:** `CONFIRMED_WITH_SCOPE_CORRECTION`
 - **Exact Source Location:** `docs/ZERO_TOUCH_STARTUP.md:52-53,242`; `docs/OPERATIONS_RUNBOOK.md:46-54,73-74,135-137,362`; `README.md:70-89`; `.env.example:1-20`; `docs/API_NOTES.md:81` vs `bot/openhands_client.py:344`
@@ -297,6 +335,7 @@ Confidence legend: `CONFIRMED` (directly verified in source), `CONFIRMED_WITH_SC
 #### `DEF-018` — Unwired AI Studio React/Vite Scaffold & Missing Explicit `anyio` Probe in `start.sh`
 - **ID:** `DEF-018`
 - **Category:** Repository Hygiene / Startup Preflight
+- **Classification:** `C. QUALITY GAP`
 - **Severity:** `LOW`
 - **Validation Verdict:** `CONFIRMED`
 - **Exact Source Location:** `package.json:1-35`, `vite.config.ts:1-22`, `tsconfig.json:1-28`, `index.html:1-19`, `metadata.json:1-7`, `src/App.tsx:1-9`, `src/main.tsx:1-6`, `src/index.css:1-2`, `bun.lock`; `start.sh:56`
@@ -311,13 +350,14 @@ Confidence legend: `CONFIRMED` (directly verified in source), `CONFIRMED_WITH_SC
 #### `DEF-019` — Python Test Suite, Lint, SAST, and SCA Blocked Locally in Current Container
 - **ID:** `DEF-019`
 - **Category:** Verification Environment / Tooling Gap
+- **Classification:** `C. QUALITY GAP`
 - **Severity:** `HIGH`
 - **Validation Verdict:** `CONFIRMED_WITH_SCOPE_CORRECTION`
 - **Exact Source Location:** Container environment; `requirements.txt:1-10`; `requirements-dev.txt:1-10`; `.github/workflows/ci.yml:1-68`; `tests/test_*.py`
-- **Root Cause:** Missing `.venv` and all `10` runtime/dev Python packages (`pytest`, `pyflakes`, `bandit`, `pip_audit`, `telegram`, `httpx`, `starlette`, `uvicorn`, `dotenv`, `anyio`). **Scope Correction:** Container already runs **`Python 3.11.2`** (NOT `3.10.12`).
+- **Root Cause:** Missing `.venv` and all `10` runtime/dev Python packages (`pytest`, `pyflakes`, `bandit`, `pip_audit`, `telegram`, `httpx`, `starlette`, `uvicorn`, `dotenv`, `anyio`). **Scope Correction:** At the time of the original audit the container ran **`Python 3.11.2`** (NOT `3.10.12`); the current container runs **`Python 3.13.15`** (re-verified this session).
 - **User / System Impact:** Behavioral Python tests (`pytest`), lint (`pyflakes`), SAST (`bandit`), and SCA (`pip_audit`) cannot execute in this container; AST + Node checks alone cannot certify backend behavior.
 - **Dependencies:** Gates release of every WP (`WP-09`).
-- **Proposed Remediation:** See `WP-09` (run full `.github/workflows/ci.yml` matrix on Python 3.11 & 3.13 + Node 22 in clean venv/CI).
+- **Proposed Remediation:** See `WP-09` (run full `.github/workflows/ci.yml` matrix on Python 3.11 & 3.13 + Node 24 in clean venv/CI).
 - **Required Regression Tests:** Full CI matrix green.
 - **Owner Approval Requirements:** `NONE` (standard CI execution).
 - **Mini App Cross-Boundary Implications:** Includes `tests/test_miniapp_*.py` execution in CI read-only verification without editing them.
@@ -331,6 +371,7 @@ Confidence legend: `CONFIRMED` (directly verified in source), `CONFIRMED_WITH_SC
 #### `NEW-DEF-01` — Five Bare `await q.edit_message_text(...)` Calls Without `_safe_edit`
 - **ID:** `NEW-DEF-01`
 - **Category:** Runtime Defect (Telegram UI Error Handling / Polling Deadlock Trigger)
+- **Classification:** `A. RUNTIME DEFECT`
 - **Severity:** `HIGH`
 - **Validation Verdict:** `CONFIRMED`
 - **Exact Source Location:** `bot/handlers.py:787,793` (`app_open`), `805` (`show_menu`), `841` (`notifications_menu`), `869` (`notifications_toggle`)
@@ -345,6 +386,7 @@ Confidence legend: `CONFIRMED` (directly verified in source), `CONFIRMED_WITH_SC
 #### `NEW-DEF-02` — Production Conversation Creation Never Invalidates `list_cache`
 - **ID:** `NEW-DEF-02`
 - **Category:** Runtime Defect (Cache Coherency)
+- **Classification:** `A. RUNTIME DEFECT`
 - **Severity:** `MEDIUM`
 - **Validation Verdict:** `CONFIRMED`
 - **Exact Source Location:** `bot/handlers.py:2513-2541` (`_start_new_chat`) vs `2356` (`_send_prompt`), `1331` (`delete_conversation_confirm`), `2558` (test-only `_create_chat`); `bot/outbox.py:811-833` (`_finish_creation`)
@@ -359,6 +401,7 @@ Confidence legend: `CONFIRMED` (directly verified in source), `CONFIRMED_WITH_SC
 #### `NEW-DEF-03` — Non-Atomic Active `user_state`/`watched` Mutations & Premature `renew_awaiting`
 - **ID:** `NEW-DEF-03`
 - **Category:** Runtime Defect (Transaction Ordering & Input Validation)
+- **Classification:** `A. RUNTIME DEFECT`
 - **Severity:** `LOW/MEDIUM`
 - **Validation Verdict:** `CONFIRMED`
 - **Exact Source Location:** `bot/handlers.py:1216-1224` (`watch_conversation`), `1241-1260` (`unwatch_conversation`), `1592-1598` (`reply_prompt`), `2262-2263` (`handle_text` `renew_awaiting`), `2295-2297` (`cancel_route`), `2307-2309` (`cancel_route_button`), `2429-2431` (`repo_search_prompt`), `2492-2494` (`pick_repo`), `2505-2510` (`new_chat_no_repo`)
@@ -373,6 +416,7 @@ Confidence legend: `CONFIRMED` (directly verified in source), `CONFIRMED_WITH_SC
 #### `NEW-DEF-04` — Uncaught Raw `send_message` / `send_copyable` / `send_long` Calls in Reply & Error Branches
 - **ID:** `NEW-DEF-04`
 - **Category:** Runtime Defect (Telegram Error Handling)
+- **Classification:** `A. RUNTIME DEFECT`
 - **Severity:** `MEDIUM`
 - **Validation Verdict:** `CONFIRMED`
 - **Exact Source Location:** `bot/handlers.py:1045,1057,1062,1065` (`copy_reply`), `1084,1096,1101,1104` (`full_reply`), `1131,1137,1144,1152,1160` (`send_reply_txt`)
@@ -387,6 +431,7 @@ Confidence legend: `CONFIRMED` (directly verified in source), `CONFIRMED_WITH_SC
 #### `NEW-DEF-05` — `collect_conversations` Lacks Repeated-Cursor (`seen_pages`) Guard
 - **ID:** `NEW-DEF-05`
 - **Category:** Runtime Defect (Pagination Loop Resilience)
+- **Classification:** `A. RUNTIME DEFECT`
 - **Severity:** `LOW`
 - **Validation Verdict:** `CONFIRMED`
 - **Exact Source Location:** `bot/openhands_client.py:609-615`
@@ -401,6 +446,7 @@ Confidence legend: `CONFIRMED` (directly verified in source), `CONFIRMED_WITH_SC
 #### `NEW-DEF-06` — `UNSUPPORTED_ATTACHMENT_TEXT` Steers Users to Documents Even When Disabled
 - **ID:** `NEW-DEF-06`
 - **Category:** Runtime Defect (Policy-Inconsistent User Messaging)
+- **Classification:** `A. RUNTIME DEFECT`
 - **Severity:** `LOW`
 - **Validation Verdict:** `CONFIRMED`
 - **Exact Source Location:** `bot/handlers.py:1603-1606,1992-2013`
@@ -416,7 +462,8 @@ Confidence legend: `CONFIRMED` (directly verified in source), `CONFIRMED_WITH_SC
 
 #### `NEW-DEF-07` — Factual & Classification Errors Across Prior Audit Reports
 - **ID:** `NEW-DEF-07`
-- **Category:** Documentation / Audit Inaccuracy (NOT a runtime defect)
+- **Category:** `B. AUDIT ERRATA` — Documentation / Audit Inaccuracy (**NOT** an OpenHandBot runtime defect)
+- **Classification:** `B. AUDIT ERRATA`
 - **Severity:** `HIGH` *(for planning accuracy)*
 - **Validation Verdict:** `CONFIRMED`
 - **Exact Source Location:** `docs/audits/OHB2-INCOMPLETE-FEATURES.md:31`; `docs/audits/OHB2-COMPLETE-REPOSITORY-AUDIT.md:20,51,84,94,96`; `docs/audits/OHB2-AUDIT-EXECUTIVE-SUMMARY.md:18-19`; `docs/audits/OHB2-COMPLETE-DEFECT-REGISTER.md` (`DEF-003`,`DEF-004`,`DEF-005`,`DEF-017`,`DEF-019`); `docs/audits/OHB2-REMEDIATION-MASTER-PLAN.md:166,202,207`; `docs/audits/OHB2-FILE-BY-FILE-AUDIT.md:82,85,145,181`
@@ -432,7 +479,8 @@ Confidence legend: `CONFIRMED` (directly verified in source), `CONFIRMED_WITH_SC
 
 #### `NEW-DEF-08` — Missing Documentation, Env Var & Schema Parity Tests
 - **ID:** `NEW-DEF-08`
-- **Category:** Test and Quality Gap (NOT a runtime defect)
+- **Category:** `C. QUALITY GAP` — Test and Quality Gap (**NOT** an OpenHandBot runtime defect; **NOT** automatically a user-facing defect)
+- **Classification:** `C. QUALITY GAP`
 - **Severity:** `MEDIUM`
 - **Validation Verdict:** `CONFIRMED`
 - **Exact Source Location:** `tests/test_deploy_manifest.py`; `tests/test_zero_touch_contract.py`
@@ -470,6 +518,26 @@ Confidence legend: `CONFIRMED` (directly verified in source), `CONFIRMED_WITH_SC
 ---
 
 ## E. Corrected `WP-01`..`WP-10` Specifications (With Mandatory Technical Safeguards)
+
+### E.0 Owner-Approved Provisional Priority Sequence
+
+The following sequence is the **owner-approved provisional planning priority** (provisional planning guidance only — **not** permission to implement). It is preserved exactly as approved; any deviation must be documented with a technical reason and owner approval where required.
+
+| Priority | Work package | Objective |
+|---|---|---|
+| `P0` | `WP-01` | Remove the normal-message sending obstruction and address attachment emergency mitigation |
+| `P1` | `WP-02` | Protect Telegram callback answers and edits |
+| `P1` | `WP-03` | Correct conversation authorization paths and operation outcomes |
+| `P1` | `WP-04` | Prevent polling interruption caused by network and update-processing errors |
+| `P2` | `WP-05` | Correct workers, cache invalidation, and cursor handling |
+| `P2` | `WP-06` | Correct status presentation and oversized callback references |
+| `P2` | `WP-07` | Ensure state consistency, attachment recovery, and SQLite safety |
+| `P3` | `WP-08` | Correct documentation, configuration inventories, and parity tests |
+| `P3` | `WP-09` | Execute the complete verification matrix |
+| `P4` | `WP-10` | Qualify external hosting and infrastructure |
+
+**Note on ordering vs. dependencies (`§G`):** `WP-02`, `WP-03`, and `WP-04` are all `P1` but must **not** be assumed parallelizable — they share `bot/handlers.py`, the outcome/acknowledgement code, and overlapping tests, and are therefore **sequenced** (`WP-02` -> `WP-03` -> `WP-04`). Likewise `WP-08` (`P3`) depends on `WP-01`, `WP-04`, `WP-06`, and `WP-07` finalizing defaults, commands, and schema before documentation/parity is frozen. The priority tiers express owner urgency; the dependency graph (`§G`) governs executable order.
+
 
 ### `WP-01` — Attachment Emergency Mitigation & Safe Lifecycle Escape
 - **Objective:** Eliminate `DEF-001` permanent text-prompt self-DoS while respecting D-34/D-35 governance, data safety, and Mini App `MT-2` decision boundaries.
@@ -649,30 +717,43 @@ Confidence legend: `CONFIRMED` (directly verified in source), `CONFIRMED_WITH_SC
 ---
 
 ### `WP-09` — Full CI Verification Matrix Execution
-- **Objective:** Execute and report six strictly independent verification evidence categories on supported target runtimes (`Python 3.11`, `Python 3.13`, `Node 22`) before any remediation release gate can pass.
+- **Objective:** Execute and report seven strictly independent verification evidence categories on supported target runtimes (`Python 3.11`, `Python 3.13`, `Node 24`) before any remediation release gate can pass.
 - **Included Defect IDs:** `DEF-019` (gates closure of `DEF-001`..`DEF-018` and `NEW-DEF-01`..`NEW-DEF-08`).
 - **Explicit Exclusions & Hard Reporting Prohibitions:**
-  - **AST parsing (`ast.parse`) NEVER counts as behavioral verification.**
+  - **Syntax checks (`ast.parse` / `node --check`) NEVER count as behavioral verification.**
   - **Frontend test success (`node --test`) NEVER counts as backend verification.**
   - **Missing dependencies NEVER produce `PASS` — they must be reported strictly as `BLOCKED`.**
   - **Unavailable external infrastructure NEVER counts as qualified — it remains `NOT_RUN` / `UNVERIFIED`.**
   - **Partial test execution MUST NEVER be reported as a complete suite pass.**
+  - **Historical results (`docs/reviews/*`) MUST NEVER be reported as current execution evidence.**
   - **Mini App exclusion preserved:** execute existing `tests/test_miniapp_*.py` and `tests/frontend/*.test.js` strictly **read-only** without modifying any excluded Mini App code, test, configuration, or `docs/MINI_APP.md`.
 - **Exact Source Areas:** `.github/workflows/ci.yml:1-68`, `requirements.txt`, `requirements-dev.txt`, `tests/` (`126` `test_*.py` test files out of `131` `.py` files total, excluding `5` helper/config files: `__init__.py`, `conftest.py`, `_miniapp_helpers.py`, `_mutation_harness.py`, `_real_http.py`), `tests/frontend/` (`23` `*.test.js` test files out of `24` files total, excluding helper `dom_stub.js`), `start.sh`, external `WP-10` qualification scripts/workflows.
 - **Independent Verification Evidence Categories (`PASS` / `FAIL` / `BLOCKED` / `NOT_RUN` Strictly Separated):**
 
-  | # | Independent Category | Target Commands / Scope | What It Proves | What It Does NOT Prove | Exact Pass Criteria & Required Output | Baseline Container Status |
+  | # | Independent Category | Target Commands / Scope | What It Proves | What It Does NOT Prove | Exact Pass Criteria & Required Output | Baseline Container Status (this session) |
   |---|---|---|---|---|---|---|
-  | **1** | **Backend Behavioral Tests** | `python -m pytest` across unit/handler/worker/DB behavioral test modules (`Python 3.11` & `3.13`) | In-process handler/worker/DB/state-machine logic, exception paths, callback safety, and unit invariants with mocks/test doubles | Real OS/multi-module E2E wiring, Telegram/OpenHands network behavior, live hosting durability, or frontend JS UX | Exit code `0`; exact `passed / failed / skipped / xfailed` counts logged (`0` failures; `0` skipped failures masking defects) | **`BLOCKED`** (`10/10` Python packages missing) |
-  | **2** | **Backend Integration Tests** | Full `python -m pytest -q` (E2E polling, SQLite WAL/crash recovery, startup contracts + read-only `tests/test_miniapp_*.py` & `tests/test_real_http_miniapp_download.py`) | Cross-module bot + SQLite + ASGI read-only integration, crash-recovery transitions, and regression immunity across the full Python suite | Static lint/SAST/SCA hygiene, browser WebView rendering, or live Telegram/OpenHands/Enzonic infrastructure | Exit code `0` on **entire** Python suite (exact total test count + `0` failures on both `Python 3.11` & `3.13`; partial subset runs invalid) | **`BLOCKED`** (`10/10` Python packages missing) |
-  | **3** | **Static Analysis & Security Checks** | `python -m pyflakes bot/ automation/ tools/ main.py tests/`, `python -m bandit -r bot/ automation/ tools/ main.py -lll -s B613`, `python -m pip_audit -r requirements-dev.txt` | Absence of undefined names/unused imports (`pyflakes`), zero high-severity Python SAST issues (`bandit`), and zero known vulnerable pinned packages (`pip_audit`) | Runtime behavioral correctness, logic defects, or zero-day/unpinned external host posture | All 3 commands exit `0` with exact command output (`0` `pyflakes` diagnostics, `0` high-severity `bandit` findings, `No known vulnerabilities found`) | **`BLOCKED`** (`pyflakes`, `bandit`, `pip_audit` absent) |
-  | **4** | **Frontend / Mini App Regression Tests (Read-Only)** | `node --test tests/frontend/*.test.js` (`Node 22`; read-only execution without editing any excluded Mini App file) | Frontend JavaScript unit/UI logic invariants and regression checks inside `tests/frontend/*.test.js` | Backend Python behavior, Telegram Bot handlers, ASGI FastAPI/Starlette runtime, or physical Android 12 WebView download UX | Exit code `0`, exact counts reported (`280 pass / 0 fail / 0 skipped`), and `0` Mini App files modified | **`PASS`** (`280 tests, 280 pass, 0 fail` on `Node v22.23.2`; backend remains unverified) |
-  | **5** | **Environment & Dependency Verification** | `python3 --version`, `node --version`, `.venv`/installed package check against `requirements.txt` & `requirements-dev.txt`, `ast.parse` syntax-only sanity, `start.sh` module check, `.git` check | Interpreter versions (`Python 3.11.2`/`3.13`, `Node v22.23.2`), syntax parsability (`ast.parse`), dependency presence/absence, and VCS metadata availability | **Does NOT prove runtime behavioral correctness, lint cleanliness, SAST/SCA safety, or live connectivity** (`ast.parse` is strictly non-behavioral) | Target runtime/CI interpreter & pinned packages present (`10/10` installed in CI/venv) + `ast_fail=0` + exact version/package output logged | **Partial / Degraded:** `Python 3.11.2` + `Node v22.23.2` + `ast.parse` (`165/165`) present; **`10/10` Python packages absent (`BLOCKED`)**; `.git` absent |
-  | **6** | **External Infrastructure Qualification (`WP-10`)** | Out-of-band Enzonic host fingerprint + `enzonic-sftp-readonly-check.yml`, live `canary.py` (`H1`), `HOST-02` public HTTPS ingress, upstream OpenHands check | Real Enzonic SFTP authentication, durable SQLite persistence across host container restarts, live HTTPS/TLS ingress, and live OpenHands API schema support | Local code correctness without Categories 1–5; never inferred from local mocks or CI | Real external execution logs/artifacts under `OD-05` proving green `workflow_dispatch`, multi-restart `H1` persistence, and `HOST-02` TLS | **`NOT_RUN`** (unverified external infra) |
+  | **1** | **Syntax Checks** | `ast.parse` over all `.py`; `node --check` on inline/standalone JS | Files are syntactically parsable only | **Nothing behavioral** — a file can parse and still be logically wrong | `ast_fail = 0`; no `node --check` syntax errors; output logged | **`PASS`** (`165/165` `.py` parse clean; JS unchanged) |
+  | **2** | **Unit Tests** | `python -m pytest` over unit/handler/worker/DB behavioral modules (`Python 3.11` & `3.13`) | In-process handler/worker/DB/state-machine logic, exception paths, callback safety, unit invariants with test doubles | Real OS/multi-module E2E wiring, Telegram/OpenHands network behavior, live hosting durability, or frontend JS UX | Exit code `0`; exact `passed / failed / skipped / xfailed` counts (`0` failures; `0` skipped failures masking defects) | **`BLOCKED`** (`10/10` Python packages missing) |
+  | **3** | **Integration Tests** | Full `python -m pytest -q` (E2E polling, SQLite WAL/crash recovery, startup contracts + read-only `tests/test_miniapp_*.py` & `tests/test_real_http_miniapp_download.py`) | Cross-module bot + SQLite + ASGI read-only integration, crash-recovery transitions, regression immunity across the full Python suite | Static lint/SAST/SCA hygiene, browser WebView rendering, or live Telegram/OpenHands/Enzonic infrastructure | Exit code `0` on **entire** Python suite (exact total count + `0` failures on both `Python 3.11` & `3.13`; partial subset runs invalid) | **`BLOCKED`** (`10/10` Python packages missing) |
+  | **4** | **Static Analysis** | `python -m pyflakes bot/ automation/ tools/ main.py tests/` | Absence of undefined names / unused imports | Runtime behavioral correctness or logic defects | Exit code `0`; `0` `pyflakes` diagnostics | **`BLOCKED`** (`pyflakes` absent) |
+  | **5** | **SAST** | `python -m bandit -r bot/ automation/ tools/ main.py -lll -s B613` | Zero high-severity Python SAST findings | Runtime behavioral correctness or zero-day host posture | Exit code `0`; `0` high-severity `bandit` findings | **`BLOCKED`** (`bandit` absent) |
+  | **6** | **Dependency Vulnerability Scanning** | `python -m pip_audit -r requirements-dev.txt` | Zero known vulnerabilities in pinned packages | Runtime behavioral correctness or unpinned external host posture | Exit code `0`; `No known vulnerabilities found` | **`BLOCKED`** (`pip_audit` absent) |
+  | **7** | **External Infrastructure Checks (`WP-10`)** | Out-of-band Enzonic host fingerprint + `enzonic-sftp-readonly-check.yml`, live `canary.py` (`H1`), `HOST-02` public HTTPS ingress, upstream OpenHands check | Real Enzonic SFTP authentication, durable SQLite persistence across host container restarts, live HTTPS/TLS ingress, and live OpenHands API schema support | Local code correctness without Categories 1–6; never inferred from local mocks or CI | Real external execution logs/artifacts under `OD-05` proving green `workflow_dispatch`, multi-restart `H1` persistence, and `HOST-02` TLS | **`NOT_RUN`** (unverified external infra) |
 
-- **Dependencies:** Gates completion of `WP-01`..`WP-08`; Category `6` remains strictly decoupled under `WP-10` & `OD-05`.
-- **Required Owner Approvals:** `NONE` for CI execution; **REQUIRED** if `pip_audit` forces dependency pin changes outside original scope (`AGENTS.md` §4), or for any Category `6` (`WP-10`) live operation (`OD-05`).
-- **Acceptance Criteria:** Explicit per-category status ledger (`PASS` / `FAIL` / `BLOCKED` / `NOT_RUN`) with exact command output and counts; Categories `1`, `2`, `3`, `4`, and `5` all **`PASS`** on `Python 3.11`, `Python 3.13`, and `Node 22` before local code release (`Gates A–C`), and Category `6` **`PASS`** before `Gate D` cutover.
+- **Frontend / Mini App regression suite (read-only, separate from backend):** `node --test tests/frontend/*.test.js` (CI target `Node 24`; read-only, `0` Mini App files edited) -> **`PASS`** this session (`280` tests, `280` pass, `0` fail, `0` skipped on local `Node v24.22.2`). This confirms JavaScript unit invariants only and **proves nothing** about backend Python behavior, ASGI runtime, or live Android 12 WebView download UX.
+- **Evidence-source discipline (mandatory distinctions):**
+
+  | Evidence class | Meaning | Reporting rule |
+  |---|---|---|
+  | **Actually run (this session)** | Commands executed in the current container with captured output | Report as `PASS`/`FAIL` with exact counts; only Categories `1` (syntax) and the read-only frontend suite qualify here. |
+  | **Blocked by missing dependencies** | Command cannot execute because required packages are absent | Report strictly as **`BLOCKED`** — never `PASS`. |
+  | **Not run** | Command not attempted (e.g., external infra, `Python 3.11`/`3.13` CI matrix) | Report strictly as **`NOT_RUN`** / `UNVERIFIED`. |
+  | **Historical results** | Counts recorded in `docs/reviews/*` from earlier sessions | Archival only; **never** current execution evidence. |
+  | **Future acceptance requirements** | What must pass before a release gate | State as acceptance criteria, **not** as achieved status. |
+
+- **Dependencies:** Gates completion of `WP-01`..`WP-08`; Category `7` remains strictly decoupled under `WP-10` & `OD-05`.
+- **Required Owner Approvals:** `NONE` for CI execution; **REQUIRED** if `pip_audit` forces dependency pin changes outside original scope (`AGENTS.md` §4), or for any Category `7` (`WP-10`) live operation (`OD-05`).
+- **Acceptance Criteria:** Explicit per-category status ledger (`PASS` / `FAIL` / `BLOCKED` / `NOT_RUN`) with exact command output and counts; Categories `1`–`6` all **`PASS`** on `Python 3.11`, `Python 3.13`, and `Node 24` before local code release (`Gates A–C`), and Category `7` **`PASS`** before `Gate D` cutover.
 - **Regression Tests:** Full repository suite (`126` `test_*.py` Python test modules among `131` `tests/**/*.py` files + `23` `*.test.js` JS test modules among `24` `tests/frontend/*` files + new WP tests), executed without skipping/disabling failing checks.
 - **Rollback / Recovery Considerations:** Verification gate only; any `FAIL`, `BLOCKED`, or partial-run gap blocks gate transition.
 - **Verification Requirements:** Real per-category command transcripts and counts from actual target environments (never historical `docs/reviews/*` archives or `ast.parse` substitutes).
@@ -708,8 +789,45 @@ Confidence legend: `CONFIRMED` (directly verified in source), `CONFIRMED_WITH_SC
 - **`WP-06`:** `"unknown": "غير معروف"` added to `STATE_LABELS` before switching UI + `watch_conversation:1220` to `get_status(conv)`; 64-byte `CALLBACK_DATA_LIMIT` preserved; `callback_refs` explicitly flagged **`NOT_YET_IMPLEMENTED — DESIGN PREREQUISITE`** requiring TTL/expiry, bounded cleanup, malformed/missing/expired handling without polling crashes, `telegram_id`/conversation/action binding, cross-user reuse protection, and dedicated tests; zero Mini App edits.
 - **`WP-07`:** `NEW-DEF-03` included; explicit separation between SQLite atomic commit and best-effort Telegram HTTP reply; `renew_awaiting` moved after whitespace check; both `StagingStore` and `AttachmentReaper.sweep` disk I/O handled safely; quota reservation lock; concurrent polling blocked unless connection safety + per-user serialization are proven (`OD-04`); comments/runbook aligned.
 - **`WP-08`:** `17` SQLite tables (or `18` only if `callback_refs` design prerequisite is approved & implemented); all `20` env vars; `notification_inbox` recovery; `ZERO_TOUCH_STARTUP.md` deletion & readiness fixes; `NEW-DEF-08` parity tests; `docs/MINI_APP.md` and `Config.mini_app_*` untouched.
-- **`WP-09`:** Python `3.11`/`3.13` + Node `22` matrix with 6 strictly independent evidence categories (`PASS` / `FAIL` / `BLOCKED` / `NOT_RUN`), exact test counts, and hard bans on `ast.parse`-as-behavioral, frontend-as-backend, missing-deps-as-pass, or partial-as-complete reporting; Mini App files strictly unmodified.
+- **`WP-09`:** Python `3.11`/`3.13` + Node `24` matrix with 7 strictly independent evidence categories (Syntax `1`, Unit `2`, Integration `3`, Static Analysis `4`, SAST `5`, Dependency Scan `6`, External `7`) reported as `PASS` / `FAIL` / `BLOCKED` / `NOT_RUN`, exact test counts, mandatory evidence-source discipline (actually-run vs blocked vs not-run vs historical vs future acceptance), and hard bans on syntax-as-behavioral, frontend-as-backend, missing-deps-as-pass, partial-as-complete, or historical-as-current reporting; Mini App files strictly unmodified.
 - **`WP-10`:** External live qualification completely decoupled and owner-authorized (`OD-05`).
+
+---
+
+## F.1 Special Technical Safeguard A — `NEW-DEF-03`: Distributed State & Delivery (`SQLite` + Telegram)
+
+SQLite (durable local state) and the Telegram Bot API (external delivery) are **two separate systems** and **cannot** be treated as one atomic transaction. No design in this baseline may claim exactly-once external delivery. The required design contract for `NEW-DEF-03` (and its companion `DEF-013`) is:
+
+1. **Durable state transitions:** All local state changes (`clear_awaiting`, `set_awaiting`, `add_watched`, `remove_watched`, attachment batch/item transitions) are committed **first and atomically inside SQLite** (a single `BEGIN IMMEDIATE` transaction together with the update outcome record where safe), so a crash never leaves a half-written local state.
+2. **Retry semantics:** Local state changes are idempotent and safe to re-execute after a crash or redelivery; re-execution must converge to the same state (CAS / `INSERT OR IGNORE` / conditional `UPDATE ... WHERE status=...`).
+3. **Idempotency boundaries:** The idempotency key is the Telegram `update_id` (via `processed_updates`). An operation whose local effect already committed must not re-apply a second time on redelivery.
+4. **Ambiguous delivery outcomes:** A Telegram `send` that fails after the request may or may not have been delivered is recorded as ambiguous (`PARTIAL_OR_UNKNOWN`), **never** as success. The user may see a duplicate; the system must not lose data.
+5. **Crash recovery:** On restart, in-flight operations are re-derived from durable SQLite state; `processed_updates` is the dedup source and `settings.acknowledgment_boundary` (monotonic) is the resume point.
+6. **Duplicate prevention where technically possible:** Use `update_id` dedup and CAS to avoid re-sending where the delivery outcome is known; accept that **at-least-once** is the achievable guarantee for Telegram delivery.
+7. **Reconciliation behavior:** Ambiguous/uncertain records remain for operator reconciliation; no silent auto-resolution of ambiguous external outcomes.
+8. **Data retention & cleanup:** Terminal records (`reaped`, `expired`, `rejected`) and `attachment_message_identity` (FK `ON DELETE RESTRICT`) are retained per D-35; reaping is DB-first then file-unlink, idempotent on retry.
+9. **Failure reporting:** Failures are recorded in `update_failures` (with `reason`/timestamp) and surfaced to operators; fail-closed blocking of the acknowledgement boundary is preserved.
+
+**Prohibited:** claiming exactly-once delivery; proposing a false atomic transaction spanning SQLite and Telegram; silently treating an ambiguous outcome as success.
+
+---
+
+## F.2 Special Technical Safeguard B — `OSError` & Network Exception Classification
+
+Exception retry classification must **not** use broad class-name matching alone (e.g., "all `OSError` are transient"). Each classification entry must document the following, and unknown/unsafe outcomes must **never** be silently treated as successful or safely retryable:
+
+| Attribute | Requirement |
+|---|---|
+| **Exact exception class** | Name the precise class (`telegram.error.RetryAfter`, `telegram.error.TimedOut`, `telegram.error.NetworkError`, `asyncio.TimeoutError`, `httpx.TransportError`, specific `OSError` sub-types/`errno`). |
+| **Originating operation** | State which call raised it (e.g., `q.answer`, `send_document`, `getUpdates`, staging `os.fsync`). |
+| **Idempotent?** | Whether re-running the operation is safe (no duplicate side effect). |
+| **External side effect may already have occurred?** | Whether the remote action could have partially completed. |
+| **Retry safe?** | `FAILED_TRANSIENT` only when retry is provably safe; otherwise fail-closed. |
+| **Retry limits & backoff** | Bounded attempts with backoff; no unbounded loops. |
+| **Permanent failure behavior** | Deterministic non-retryable failures -> `FAILED_PERMANENT` (fail-closed, no auto-skip). |
+| **Unknown-outcome behavior** | Ambiguous -> `PARTIAL_OR_UNKNOWN` (never success, never silent retry). |
+
+**Scoped `OSError` rule:** transient socket/network errors (`ConnectionError`, `TimeoutError`, `errno` `EAGAIN`/`ECONNRESET`/`ETIMEDOUT`) may be `FAILED_TRANSIENT`; local disk/permission/structural errors (`PermissionError`, `FileNotFoundError`, `IsADirectoryError`, `ENOSPC`) must remain `FAILED_PERMANENT` or be surfaced for operator triage. The same contextual discipline applies to `httpx` and Telegram exceptions. This safeguard is realized in `WP-04` and must not introduce automatic poison-update skipping (`OD-02`).
 
 ---
 
@@ -755,7 +873,7 @@ Phase 3 — Documentation & Verification Gate
    WP-08 [DEF-017, DEF-018, NEW-DEF-08] (Must follow WP-01, WP-04, WP-06, WP-07)
       │
       ▼
-   WP-09 [DEF-019] (Full Python 3.11 & 3.13 CI + Node 22 Gate for WP-01..WP-08)
+   WP-09 [DEF-019] (Full Python 3.11 & 3.13 CI + Node 24 Gate for WP-01..WP-08)
       │
       ▼
 Phase 4 — External Infrastructure Qualification (Strictly Separate & Owner-Gated)
@@ -763,6 +881,20 @@ Phase 4 — External Infrastructure Qualification (Strictly Separate & Owner-Gat
 ```
 
 *Cycle Check:* Strictly acyclic (every edge flows strictly forward from Phase 0 -> Phase 1 -> Phase 2 -> Phase 2b -> Phase 3 -> Phase 4).
+
+**Dependency-graph legend (mandatory classifications):**
+
+| Edge / node class | Meaning | Members |
+|---|---|---|
+| **Mandatory prerequisites** | Hard sequencing edges between WPs | `WP-01` -> `WP-07`; `WP-02` -> `WP-03` -> `WP-04`; `WP-01`/`WP-04`/`WP-06`/`WP-07` -> `WP-08`; `WP-01`..`WP-08` -> `WP-09`; `Gates A–C` -> `WP-10` |
+| **Owner-decision blockers** | Cannot proceed until the owner decides | `OD-01` + `OD-03` -> `WP-01`; `OD-02` -> `WP-04` Part 2; `OD-04` -> `WP-07` concurrency; `OD-05` -> `WP-10` |
+| **Mini App cross-boundary blockers** | Backend changes that could alter excluded Mini App behavior | `DEF-014` (`MT-2`) `BLOCKED_BY_EXCLUDED_MINI_APP`; `ATTACHMENT_DOCUMENT_INTAKE_ENABLED` default (`OD-03`) traced to `bot/web/services.py` |
+| **Test-environment blockers** | Blocked by missing local dependencies | `WP-09` Categories `2`–`6` (`10/10` Python packages absent) |
+| **External qualification (separate track)** | Strictly decoupled from local code fixes | `WP-10` (Enzonic SFTP, `H1` canary, `HOST-02`) |
+
+**Phase mapping (preserved):** `1` Emergency reliability and message-path remediation; `2` Telegram callback and API functional correctness; `3` Polling and worker reliability; `4` State consistency and attachment recovery; `5` Documentation and quality parity; `6` Full verification; `7` External infrastructure qualification.
+
+**Parallelization caution:** `WP-02`, `WP-03`, and `WP-04` share `bot/handlers.py`, the outcome/acknowledgement code, and overlapping tests, so they are **sequenced, not parallelized**. `WP-05` and `WP-06` touch largely disjoint files and may run in parallel after Phase 1. Any dependency requiring different ordering must be documented with its technical reason.
 
 ---
 
@@ -773,7 +905,7 @@ Per `AGENTS.md` §14 and strict Mini App boundaries, **silence is NEVER treated 
 | Decision ID | Exact Question for Owner | Existing Behavior | Separated Policy Alternatives (Non-Selected) | Consequences | Can Work Proceed Without Decision? |
 |---|---|---|---|---|---|
 | **`OD-01`** *(D-34 `TERMINAL_UNPROVEN` — Genuine Owner Policy Decision)* | Under `classify_attachment_routing` (`bot/db.py:1557-1569`), which policy should govern future normal text prompts when an owner has terminal attachment batch rows without an `attachment_message_identity` match (`TERMINAL_UNPROVEN`)? **This decision cannot be inferred from preferred technical design; `classify_attachment_routing`, `D-34`, and `D-35` runtime semantics remain unchanged.** | `has_terminal_attachment_batch(telegram_id)` returns `True` globally across all conversations once any batch reaches `delivered`/`expired`/`rejected`/`failed`, so `_handle_accompanying_text` rejects all subsequent unmapped text via `TERMINAL_UNPROVEN` / `TERMINAL_ASSOCIATED` (`DEF-001`). | **Policy Outcome 1 — Preserve Existing `TERMINAL_UNPROVEN` Fail-Closed Behavior:** Keep `D-34` global terminal blocking unchanged in `classify_attachment_routing`; any unblocking requires an explicit, separate owner-authorized archival/reset action.<br>**Policy Outcome 2 — Permit Normal Text Routing Only Under a Precisely Defined, Verified Terminal Condition:** Permit unmapped text to pass only when an explicit, bounded, verified terminal criterion holds (e.g., confirmed `expired`/`rejected` terminal state with zero `LIVE`/`UNRESOLVED` batches and zero `attachment_message_identity` match, while keeping `TERMINAL_ASSOCIATED` strictly fail-closed) and update `D-34` contract/tests under owner authorization.<br>**Policy Outcome 3 — Require Manual Reconciliation When State or Message Identity Is Ambiguous:** Keep fail-closed blocking whenever batch status, ownership, `t0`, `UNRESOLVED` state (`intent_recorded`/`dispatching`/`uncertain`), `MULTI_LIVE`, or message-identity correlation is ambiguous, requiring explicit manual reconciliation rather than auto-routing. | **Outcome 1** preserves legacy `D-34` guarantees with zero relaxation, requiring manual/command unblocking.<br>**Outcome 2** unblocks unrelated text prompts automatically only within the verified condition, requiring explicit owner approval to amend `D-34` & D-34 tests.<br>**Outcome 3** prevents silent misrouting on ambiguity (combinable with Outcome 1 or 2 for ambiguous sub-cases). | **NO for affected `WP-01` routing behavior:** `classify_attachment_routing`, `D-34`, and `D-35` MUST NOT be altered and `WP-01` cannot implement terminal-routing changes until an explicit owner decision on `OD-01` is recorded. *(Unrelated `NEW-DEF-06` copy planning does not depend on `OD-01`.)* |
-| **`OD-02`** *(ADR §28.4 Poison Quarantine)* | What manual recovery policy should unblock head-of-line polling deadlocks (`DEF-002`) caused by genuine `FAILED_PERMANENT` updates (e.g., `TextDocumentTooLargeError`)? | `FAILED_PERMANENT` stays in `_INELIGIBLE` permanently; polling halts until manual SQLite DB intervention or Telegram 24h expiry. | **Option 1 (ADR §28.4 manual quarantine):** Add owner-only `/updates_status` and `/updates_skip <update_id> confirm` persisting a durable audit record and advancing offset only after explicit confirmation.<br>**Option 2 (Deterministic rejection split + manual skip):** Classify strictly deterministic user-limit rejections (like `TextDocumentTooLargeError` *after* user notification succeeded) as `REJECTED_INELIGIBLE` / `EXPLICITLY_IGNORED` while keeping unexpected exceptions fail-closed + `/updates_skip`. | **Option 1** keeps all unhandled errors fail-closed until manual inspection.<br>**Option 2** reduces operator intervention for known >50MB file notices, while still requiring `/updates_skip` for unforeseen permanent crashes. Both preserve `FAILED_TRANSIENT` fail-closed retries. | **WP-04 part 1 YES / part 2 NO:** Transient classifier fixes (`RetryAfter`/`TimedOut`/`NetworkError`) can be planned/implemented independently, but ADR §28.4 skip commands/outcomes MUST NOT be implemented without `OD-02`. |
+| **`OD-02`** *(ADR §28.4 Poison Quarantine)* | What manual recovery policy should unblock head-of-line polling deadlocks (`DEF-002`) caused by genuine `FAILED_PERMANENT` updates (e.g., `TextDocumentTooLargeError`)? | `FAILED_PERMANENT` stays in `_INELIGIBLE` permanently; polling halts until manual SQLite DB intervention or Telegram 24h expiry. `TelegramPoller.process_updates` (`bot/polling.py:161-162`) dispatches updates strictly sequentially in arrival order. The acknowledgement boundary is computed by `Database.commit_batch_outcomes` (`bot/db.py:2966-2988`) from `_outcome_in_txn` (`bot/db.py:3012-3016`), which reads **only** `processed_updates` — an `update_failures`-only record **cannot** advance the boundary. | **Option 1 (ADR §28.4 manual quarantine):** Add owner-only `/updates_status` and `/updates_skip <update_id> confirm` persisting a durable audit record and advancing offset only after explicit confirmation.<br>**Option 2 (Deterministic rejection split + manual skip):** Classify strictly deterministic user-limit rejections (like `TextDocumentTooLargeError` *after* user notification succeeded) as `REJECTED_INELIGIBLE` / `EXPLICITLY_IGNORED` while keeping unexpected exceptions fail-closed + `/updates_skip`.<br>**Option 3 (Defer schema quarantine):** `WP-04` Part 1 transient-classifier fix only, optional read-only `/updates_status`, leaving genuine permanent poison to an out-of-band operator runbook. | **Option 1** keeps all unhandled errors fail-closed until manual inspection.<br>**Option 2** reduces operator intervention for known >50MB file notices, while still requiring `/updates_skip` for unforeseen permanent crashes.<br>**Option 3** avoids any schema/command surface change but leaves `TextDocumentTooLargeError` wedging polling until manual DB work or 24h expiry. All options preserve `FAILED_TRANSIENT` fail-closed retries. **Risks of skipping/quarantining:** dropped reprocessing of a skipped `update_id`; same-batch interaction where the owner's `/updates_skip N confirm` arrives in `updates[1:]` while `updates[0]==N` is still head-of-line; required pre-dispatch skip check and an eligible override outcome readable by `_outcome_in_txn`. **Required if implemented:** owner-only authorization, explicit `<update_id> confirm` double-confirmation, durable auditability, and recovery behavior. | **WP-04 Part 1 YES / Part 2 NO:** Transient classifier fixes (`RetryAfter`/`TimedOut`/`NetworkError`/`asyncio.TimeoutError`/`httpx.TransportError`/scoped `OSError`) can be planned/implemented independently, but ADR §28.4 skip commands/outcomes MUST NOT be implemented without `OD-02`. No automatic poison-update skipping is implemented or authorized. |
 | **`OD-03`** *(Backend Flag Default vs Excluded Mini App `MT-2`)* | Do you authorize changing the default of `ATTACHMENT_DOCUMENT_INTAKE_ENABLED` (`bot/config.py:315-317`, `.env.example`) from `True` to `False`, knowing that this disables Telegram document staging unless explicitly opted into (`=1`), which in turn leaves the excluded Mini App `OHB2-MT-2` staged-attachments view empty by default? | `ATTACHMENT_DOCUMENT_INTAKE_ENABLED` defaults to `True`: Telegram stages documents (`pending`) so `MT-2` can download them, **but** any follow-up text triggers `DEF-001` & `DEF-014`. | **Option 1 (Default `False` opt-in):** Set default to `False` (operators wanting `MT-2` local transfer set `=1` explicitly once `WP-01` `/cancel` & `OD-01` are settled).<br>**Option 2 (Keep default `True`):** Retain `True` and ship `OD-01`-approved resolution + `/cancel` + honest local-only `ATTACHMENT_ACCEPTED_TEXT` (`"ملف محفوظ محليًا فقط — افتح التطبيق للتنزيل أو /cancel للإلغاء"`). | **Option 1** prevents out-of-the-box document staging bricking, but disables zero-config `MT-2` usage.<br>**Option 2** keeps `MT-2` enabled out of the box, relying completely on `OD-01` + `/cancel` safety first. | **NO for changing default in `WP-01`:** Changing the default silently alters excluded Mini App behavior and is blocked without explicit `OD-03`. |
 | **`OD-04`** *(Polling Concurrency vs Sequential Architecture in `WP-07`)* | Should `TelegramPoller.process_updates` (`bot/polling.py:161-162`) remain strictly sequential (`OPERATIONS_RUNBOOK.md:123-127` behavior), or be refactored to allow concurrent intra-batch dispatch (`bot/app.py:75-87`)? | `TelegramPoller.process_updates` runs one update at a time (`dispatch_and_wait`), while `Application.builder()` configures `.concurrent_updates(True)` over a single shared `sqlite3.Connection` (`check_same_thread=False`). | **Option 1 (Conservative sequential):** Preserve sequential per-batch dispatch and update `bot/app.py:75-87` comments to match `OPERATIONS_RUNBOOK.md:123-127`.<br>**Option 2 (Concurrent intra-batch):** Implement per-user async/DB locks, prove single-connection SQLite write safety, enqueue batch updates concurrently, and join once per batch. | **Option 1** carries zero intra-batch SQLite-lock/interleaving risk.<br>**Option 2** reduces batch head-of-line latency behind slow API reads, but risks SQLite transaction interleaving and same-user `user_state`/`attachment_batches` races unless proven. | **Option 1 comments-only alignment requires standard review; Option 2 BLOCKED** until technical proof and `OD-04` sign-off. |
 | **`OD-05`** *(External Live Infra & Stage B Reopen — `WP-10`)* | Authorization & credentials to execute live Enzonic SFTP fingerprint check, `H1` persistence canary, and future `Stage B` reopen. | All live infra unverified; Stage B deferred. | Execute `WP-10` externally only upon owner instruction. | Required before production launch. | `WP-01`..`WP-09` local/CI work can proceed without `OD-05`; production cutover cannot. |
@@ -782,24 +914,27 @@ Per `AGENTS.md` §14 and strict Mini App boundaries, **silence is NEVER treated 
 
 ## I. Objective Release Gates
 
-No gate may be declared passed using historical test records in `docs/reviews/*`, `ast.parse` syntax checks, partial suite runs, or Node frontend tests alone (`WP-09` Categories `1`–`6` are strictly independent).
+No gate may be declared passed using historical test records in `docs/reviews/*`, `ast.parse` syntax checks, partial suite runs, or Node frontend tests alone (`WP-09` Categories `1`–`7` are strictly independent). Every gate below records the **required evidence**, the **acceptance condition**, the **responsible WP**, the **blocking owner decisions**, and the **current status**.
 
-| Gate | Prerequisite WPs & Decisions | Objective, Measurable Pass Criteria |
-|---|---|---|
-| **Gate 0 — Governance & Decision Gate** | `OD-01`, `OD-02`, `OD-03`, `OD-04`, plus `WP-06` `callback_refs` Design Prerequisite & `WP-01` Pre-Change DB Inventory | Written owner decisions recorded in `.agent/PROGRESS.md` / decision log before editing gated components (`D-34`, `ATTACHMENT_DOCUMENT_INTAKE_ENABLED` default, ADR §28.4 poison skip, `WP-07` concurrency); `callback_refs` TTL/pruning/authz spec completed before `WP-06` DB changes; pre-change inventory captured before any irreversible `WP-01` cleanup. |
-| **Gate A — Emergency Attachment Safety** | `WP-01` + `WP-09` (Categories `1`, `2`, `3`, `4`, `5`) | `0` cross-conversation text bricks across `/cancel` and `OD-01`-approved terminal paths; ambiguous/unknown/`dispatching`/`uncertain` pre-existing batches preserved for manual reconciliation; idempotent reaper recovery verified; `UNSUPPORTED_ATTACHMENT_TEXT` accurate; `WP-09` Categories `1`–`5` `PASS`; `bot/web/*` & `bot/web/static/*` byte-for-byte unchanged (`0` diff). |
-| **Gate B — Callback, Outcome & Polling Resilience** | `WP-02` + `WP-03` + `WP-04` + `WP-09` (Categories `1`–`5`) | `0` bare `q.answer(` and `0` bare `q.edit_message_text(` in `bot/handlers.py`; `0` matched handler exits with `outcome=None`; all `6` auth-failure paths preserve `5xx`/`429`; `send_document` and raw `send_message` errors handled safely; transient network/Telegram errors classify `FAILED_TRANSIENT`; ADR §28.4 skip tested (if `OD-02` approved); `WP-09` Categories `1`–`5` `PASS` on `Python 3.11` & `3.13`. |
-| **Gate C — Worker, UI Normalization, State & Docs Parity** | `WP-05` + `WP-06` + `WP-07` + `WP-08` + `WP-09` (Categories `1`–`5`) | `clear_retry_not_before` failure skips cycle; both `wait_for_start` fallback paths tested; `deliver_outbox` target-isolated; `list_cache` cleared on creation; `seen_pages` halts loops; `STATE_LABELS["unknown"] == "غير معروف"` & `get_status()` unified; 64-char IDs pass `<= 64`-byte cap + `callback_refs` expiry/cleanup/authz tests pass; `StagingStore` & `AttachmentReaper.sweep` I/O non-blocking; `NEW-DEF-03` resolved; `17` (or schema-verified `18` if `callback_refs` added) SQLite tables & `20` env vars pass `NEW-DEF-08` parity tests; `WP-09` Categories `1`–`5` strictly `PASS` (`0` `FAIL`/`BLOCKED`) on `Python 3.11`, `Python 3.13`, and `Node 22`. |
-| **Gate D — External Production Cutover Readiness** | `WP-10` + Gates A–C + `OD-05` + `WP-09` (Category `6`) | Live Enzonic SFTP fingerprint independently verified + green `enzonic-sftp-readonly-check.yml` run; `tools/katabump-sqlite-canary/canary.py` survives actual container restarts (`H1`); `HOST-02` HTTPS ingress verified externally with zero Mini App edits; `WP-09` Category `6` strictly `PASS`. |
+| Gate | Prerequisite WPs & Decisions | Required Evidence | Acceptance Condition | Responsible WP | Blocking Owner Decisions | Current Status |
+|---|---|---|---|---|---|---|
+| **Gate 0 — Governance & Decision Gate** | `OD-01`, `OD-02`, `OD-03`, `OD-04`, plus `WP-06` `callback_refs` Design Prerequisite & `WP-01` Pre-Change DB Inventory | Written owner decisions recorded in a decision log | Decisions recorded before editing gated components (`D-34`, `ATTACHMENT_DOCUMENT_INTAKE_ENABLED` default, ADR §28.4 poison skip, `WP-07` concurrency); `callback_refs` TTL/pruning/authz spec completed before `WP-06` DB changes; pre-change inventory captured before any irreversible `WP-01` cleanup | Governance / `WP-01`, `WP-06` | `OD-01`, `OD-02`, `OD-03`, `OD-04` | **`PENDING_OWNER_DECISION`** |
+| **Gate A — Emergency Attachment Safety** | `WP-01` + `WP-09` (Categories `1`–`6`) | Test transcripts + `0`-diff proof on excluded Mini App files | `0` cross-conversation text bricks across `/cancel` and `OD-01`-approved terminal paths; ambiguous/unknown/`dispatching`/`uncertain` pre-existing batches preserved for manual reconciliation; idempotent reaper recovery verified; `UNSUPPORTED_ATTACHMENT_TEXT` accurate; `WP-09` Categories `1`–`6` `PASS`; `bot/web/*` & `bot/web/static/*` byte-for-byte unchanged (`0` diff) | `WP-01` | `OD-01`, `OD-03` | **`BLOCKED`** (`OD-01`/`OD-03` pending; backend tests `BLOCKED`) |
+| **Gate B — Callback, Outcome & Polling Resilience** | `WP-02` + `WP-03` + `WP-04` + `WP-09` (Categories `1`–`6`) | Test transcripts (Python `3.11` & `3.13`) | `0` bare `q.answer(` and `0` bare `q.edit_message_text(` in `bot/handlers.py`; `0` matched handler exits with `outcome=None`; all `6` auth-failure paths preserve `5xx`/`429`; `send_document` and raw `send_message` errors handled safely; transient network/Telegram errors classify `FAILED_TRANSIENT`; ADR §28.4 skip tested (if `OD-02` approved); `WP-09` Categories `1`–`6` `PASS` | `WP-02`, `WP-03`, `WP-04` | `OD-02` (for `WP-04` Part 2) | **`PENDING_OWNER_DECISION`** / backend tests `BLOCKED` |
+| **Gate C — Worker, UI Normalization, State & Docs Parity** | `WP-05` + `WP-06` + `WP-07` + `WP-08` + `WP-09` (Categories `1`–`6`) | Test transcripts (Python `3.11`/`3.13` + Node `24`) + parity tests | `clear_retry_not_before` failure skips cycle; both `wait_for_start` fallback paths tested; `deliver_outbox` target-isolated; `list_cache` cleared on creation; `seen_pages` halts loops; `STATE_LABELS["unknown"] == "غير معروف"` & `get_status()` unified; 64-char IDs pass `<= 64`-byte cap + `callback_refs` expiry/cleanup/authz tests pass; `StagingStore` & `AttachmentReaper.sweep` I/O non-blocking; `NEW-DEF-03` resolved; `17` (or schema-verified `18` if `callback_refs` added) SQLite tables & `20` env vars pass `NEW-DEF-08` parity tests; `WP-09` Categories `1`–`6` strictly `PASS` (`0` `FAIL`/`BLOCKED`) | `WP-05`–`WP-08` | `OD-04` (if concurrency proposed) | **`PENDING_OWNER_DECISION`** / backend tests `BLOCKED` |
+| **Gate D — External Production Cutover Readiness** | `WP-10` + Gates A–C + `OD-05` + `WP-09` (Category `7`) | External run logs/artifacts | Live Enzonic SFTP fingerprint independently verified + green `enzonic-sftp-readonly-check.yml` run; `tools/katabump-sqlite-canary/canary.py` survives actual container restarts (`H1`); `HOST-02` HTTPS ingress verified externally with zero Mini App edits; `WP-09` Category `7` strictly `PASS` | `WP-10` | `OD-05` | **`NOT_RUN`** / `PENDING_OWNER_DECISION` |
+
+*No gate may be marked passed on historical evidence alone. `NOT_RUN`, `BLOCKED`, `UNVERIFIED`, or `PENDING_OWNER_DECISION` are the correct statuses wherever the corresponding evidence has not been produced in the current environment.*
 
 ---
 
 ## J. Remaining Unknowns, Unverified Claims & Design Prerequisites
 
-1. **`WP-09` Categories `1`–`3` & `5` Backend Dependencies (`BLOCKED` Locally):** Backend behavioral `pytest`, integration `pytest -q`, `pyflakes`, `bandit -lll -s B613`, and `pip_audit` remain **`BLOCKED`** in this container because all `10` Python packages in `requirements.txt` / `requirements-dev.txt` are absent (`Python 3.11.2` + `165/165` `ast.parse` syntax-only checks and `Node v22.23.2` `280/280` read-only frontend tests do NOT prove backend correctness). Historical `docs/reviews/*` reports are strictly archival, not current pass evidence.
-2. **Git History & Working-Tree State (`UNVERIFIED`):** `.git` is absent (`ls: cannot access '.git': No such file or directory`; `git status` -> `fatal: not a git repository`). Current branch, `HEAD`, commit status, GitHub-vs-local diff, working-tree cleanliness, and prior GitHub Actions run logs cannot be inspected or inferred locally.
+1. **`WP-09` Categories `2`–`6` Backend Dependencies (`BLOCKED` Locally):** Backend unit `pytest`, integration `pytest -q`, `pyflakes`, `bandit -lll -s B613`, and `pip_audit` remain **`BLOCKED`** in this container because all `10` Python packages in `requirements.txt` / `requirements-dev.txt` are absent. `Python 3.13.15` + `165/165` `ast.parse` syntax-only checks (Category `1` `PASS`) and `Node v24.22.2` `280/280` read-only frontend tests do **NOT** prove backend correctness. Historical `docs/reviews/*` reports are strictly archival, not current pass evidence.
+2. **Git History & Working-Tree State (`PARTIALLY VERIFIED`):** `.git` **is present** this session (unlike the prior baseline). `HEAD` = `33530cad02f37755da7e7eedac57764a354a75b` on branch `main`, working tree **clean** at session start, remote `origin` = `https://github.com/TM-AEM/OpenHandBot.git`. Remote GitHub Actions run logs remain outside local verification scope (no authenticated CI-log inspection performed this session).
 3. **`WP-06` `callback_refs` Lifecycle & Security (`DESIGN_PREREQUISITE`):** No `callback_refs` table exists in `bot/db.py` (`17` tables). Concrete TTL window, bounded cleanup strategy, malformed/expired ref behavior, and user/conversation/action binding remain an unimplemented design prerequisite prior to modifying `WP-06` schema (which would expand schema count from `17` to `18` tables if implemented).
-4. **Live Hosting & Persistence (`DEF-016` / `WP-09` Category `6` — `NOT_RUN`):** Enzonic `us-four.enzonic.com:2022` SFTP host fingerprint validity, `ENZONIC_SSH_PRIVATE_KEY` functionality, SQLite durability across container restarts (`H1`), and `HOST-01`/`HOST-02` hosting capability remain unexecuted externally.
+4. **Live Hosting & Persistence (`DEF-016` / `WP-09` Category `7` — `NOT_RUN`):** Enzonic `us-four.enzonic.com:2022` SFTP host fingerprint validity, `ENZONIC_SSH_PRIVATE_KEY` functionality, SQLite durability across container restarts (`H1`), and `HOST-01`/`HOST-02` hosting capability remain unexecuted externally.
 5. **Upstream OpenHands Cloud API Spec (`UNVERIFIED`):** `docs/API_NOTES.md:81` cites OpenAPI `v1.68.1`, `bot/openhands_client.py:344` cites `v1.79.0`, and proposals cite `v1.87.1` — live upstream schemas and scoped upload support (`DEF-015`) remain unverified externally.
-6. **Excluded Mini App Runtime & WebView UX (`DEF-014` — `NOT_RUN` / `EXCLUDED_MINI_APP`):** Physical Android 12 Telegram WebView download verification for `MT-2` and live Mini App ASGI behavior under `HOST-02` remain unverified and outside modification scope.
+6. **Excluded Mini App Runtime & WebView UX (`DEF-014` — `NOT_RUN` / `EXCLUDED_MINI_APP`):** Physical Android 12 Telegram WebView download verification for `MT-2` and live Mini App ASGI behavior under `HOST-02` remain unverified and outside modification scope. Backend configuration dependencies used by Mini App integration paths (e.g., `ATTACHMENT_DOCUMENT_INTAKE_ENABLED`, `Config.mini_app_*` defaults) are traced in `§E`/`§H` and any change to them is owner-gated (`OD-03`).
 7. **Unresolved Owner Decisions (`OD-01`..`OD-05`):** All five owner decisions remain open (`PENDING_OWNER_DECISION`); no policy outcome or implementation step has been selected or executed on the owner's behalf.
+8. **Finding-source evidence completeness:** All `19` `DEF` and `8` `NEW-DEF` entries carry source locations verified this session. No finding is classified `UNRESOLVED_CLASSIFICATION`; the mandatory categories (`NEW-DEF-07` = `B. AUDIT ERRATA`, `NEW-DEF-08` = `C. QUALITY GAP`) are applied, and `NEW-DEF-01`..`NEW-DEF-06` are classified `A. RUNTIME DEFECT` from direct source evidence.

@@ -1489,16 +1489,40 @@ def test_list_conversations_collects_all_pages(tmp_path):
 
 
 def test_list_conversations_flags_truncation(tmp_path):
-    """لو القايمة أطول من الحد، نعلن إننا بنعرض جزء (مش إخفاء صامت)."""
+    """لو القايمة أطول من الحد (مؤشّرات مختلفة)، نعلن إننا بنعرض جزء (مش إخفاء صامت)."""
     class AlwaysMore:
+        def __init__(self):
+            self.calls = 0
+
         async def search_conversations(self, limit=100, page_id=None):
-            return {"items": [{"id": f"c{page_id}", "title": "x",
-                               "execution_status": "running"}], "next_page_id": "more"}
+            self.calls += 1
+            return {"items": [{"id": f"c{self.calls}", "title": "x",
+                               "execution_status": "running"}],
+                    "next_page_id": f"p{self.calls}"}
 
     ctx = make_context(1, tmp_path, client=AlwaysMore())
     upd = _list_update(1, 0)
     asyncio.run(h.list_conversations(upd, ctx))
     assert "القايمة طويلة" in upd.callback_query.edits[-1]
+
+
+def test_list_conversations_repeated_cursor_halts_without_false_truncation(tmp_path):
+    """OHB2-WP-05 (NEW-DEF-05): مؤشّر مكرّر يوقف الجمع فورًا بلا `truncated` كاذب."""
+    class Repeats:
+        def __init__(self):
+            self.calls = 0
+
+        async def search_conversations(self, limit=100, page_id=None):
+            self.calls += 1
+            return {"items": [{"id": "c1", "title": "x", "execution_status": "running"}],
+                    "next_page_id": "same"}
+
+    client = Repeats()
+    ctx = make_context(1, tmp_path, client=client)
+    upd = _list_update(1, 0)
+    asyncio.run(h.list_conversations(upd, ctx))
+    assert client.calls == 2                       # توقّف عند أول مؤشّر مكرّر
+    assert "القايمة طويلة" not in upd.callback_query.edits[-1]  # مفيش إعلان قطع كاذب
 
 
 # ===================== OHB2-PHASE5-FIX-04: bot fail-closed then recovery (P3-02)

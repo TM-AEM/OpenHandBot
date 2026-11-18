@@ -78,7 +78,10 @@
 
 ## مرجع
 - https://docs.openhands.dev/openhands/usage/cloud/cloud-api.md
-- مواصفات OpenAPI: `GET https://app.all-hands.dev/openapi.json` (v1.68.1 وقت الفحص).
+- مواصفات OpenAPI: `GET https://app.all-hands.dev/openapi.json`. النسخة **متحقّق منها وقت الفحص**
+  فقط: `v1.68.1` (لقطة تاريخية لهذا المستند)؛ الـ ADR سجّل `v1.87.1` (لقطة لاحقة) ومستندات P0
+  سجّلت `v1.91.0` (الأحدث وقت كتابتها). النسخة بتتغيّر من غير إشعار، فما تعتمدش عليها كمرجع
+  ثابت — افحص `info.version` لحظة الحاجة.
 
 ## OHB2-01 — عقد شكل الردود (تحقق schema)
 كل دوال `OpenHandsClient` العامة بتمرّ على `_as_items(data)`: بتقبل **مصفوفة مباشرة**

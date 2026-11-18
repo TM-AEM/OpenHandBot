@@ -616,7 +616,11 @@ def test_collect_conversations_dedupes_overlapping_pages():
 
 
 def test_collect_conversations_dedupe_does_not_loop_forever():
-    """إزالة التكرار ما بتضيفش دورات ولا بتسبب حلقة: عدد النداءات = عدد الصفحات."""
+    """مؤشّر مكرّر ⇒ توقّف عند أول تكرار، بلا حلقة وبلا `truncated` كاذب.
+
+    OHB2-WP-05 (NEW-DEF-05): قبل الإصلاح كان يكرّر حتى `max_pages` (20) طلب HTTP
+    ويعلّم `truncated=True` غلط. دلوقتي بنوقف فورًا عند رؤية نفس `next_page_id` تاني.
+    """
     import asyncio
     from bot.openhands_client import collect_conversations
 
@@ -626,13 +630,32 @@ def test_collect_conversations_dedupe_does_not_loop_forever():
 
         async def search_conversations(self, limit=100, page_id=None):
             self.calls += 1
-            # نفس العنصر في كل صفحة + مؤشّر دايمًا موجود ⇒ الحد هو اللي يوقّفه.
+            # نفس المؤشّر في كل صفحة ⇒ أول تكرار يوقف الحلقة فورًا.
             return {"items": [{"id": "dup"}], "next_page_id": "again"}
 
     c = SamePage()
     out = asyncio.run(collect_conversations(c, max_pages=4))
-    assert c.calls == 4                       # محدود بالحد، مفيش حلقة
+    assert c.calls == 2                       # توقّف عند أول مؤشّر مكرّر
     assert [i["id"] for i in out["items"]] == ["dup"]  # اتدمج لصف واحد
+    assert out["truncated"] is False          # مؤشّر مكرّر ⇒ مش صفحات إضافية حقيقية
+
+
+def test_collect_conversations_distinct_cursors_still_truncate():
+    """مؤشّرات **مختلفة** توصل للحد ⇒ `truncated=True` (الإعلان الصريح محفوظ)."""
+    import asyncio
+    from bot.openhands_client import collect_conversations
+
+    class GrowingPages:
+        def __init__(self):
+            self.calls = 0
+
+        async def search_conversations(self, limit=100, page_id=None):
+            self.calls += 1
+            return {"items": [{"id": f"c{page_id}"}], "next_page_id": f"p{self.calls}"}
+
+    c = GrowingPages()
+    out = asyncio.run(collect_conversations(c, max_pages=4))
+    assert c.calls == 4                       # مؤشّرات مختلفة ⇒ لحد الحد
     assert out["truncated"] is True           # لسه فيه صفحات ⇒ إعلان صريح
 
 

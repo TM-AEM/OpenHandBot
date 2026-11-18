@@ -606,6 +606,10 @@ async def collect_conversations(
     items: list[dict] = []
     page_id: str | None = None
     pages = 0
+    # OHB2-WP-05 (NEW-DEF-05): لو الـ API رجّع نفس `next_page_id` مرارًا، بنوقف **فورًا**
+    # عند أول تكرار بدل ما نكرّر لحد `max_pages` طلبات HTTP وندّعي `truncated=True` كذبًا.
+    seen_pages: set[str] = set()
+    truncated = False
     while pages < max(1, int(max_pages)):
         result = await client.search_conversations(limit=limit, page_id=page_id)
         items.extend(result.get("items", []))
@@ -613,9 +617,15 @@ async def collect_conversations(
         page_id = result.get("next_page_id")
         if not page_id:
             break
+        if page_id in seen_pages:
+            # مؤشّر مكرّر ⇒ توقّف فوري: مفيش صفحات إضافية حقيقية، فمفيش `truncated`.
+            page_id = None
+            break
+        seen_pages.add(page_id)
+        truncated = True
     deduped = _dedupe_by_id(items)
     deduped.sort(key=lambda it: it.get("updated_at") or "", reverse=True)
-    return {"items": deduped, "truncated": bool(page_id)}
+    return {"items": deduped, "truncated": bool(truncated and page_id)}
 
 
 def _dedupe_by_id(items: list[dict]) -> list[dict]:

@@ -3374,6 +3374,33 @@ class Database:
         self._conn.commit()
         return self._row_to_outbox(row) if row else None
 
+    def claim_outbox_by_id(
+        self, outbox_id: int, now: str, mature_before: str | None = None
+    ) -> OutboxItem | None:
+        """يحجز **سجلًا محدّدًا** (`outbox_id`) من 'pending' إلى 'claimed' ذرّيًا.
+
+        OHB2-WP-05 (DEF-008): المسار المباشر `deliver_outbox` كان يستدعي `claim_outbox`
+        غير المُقيَّد بالمعرّف، فيمكن أن يحجز ويرسل سجلًا آخر (أقدم) غير المطلوب. هنا
+        الحجز مقيَّد بالمعرّف نفسه، مع احترام نافذة النضج الاختيارية (`mature_before`).
+        يرجّع العنصر (بحالته بعد الحجز) أو None لو السجل غير 'pending' أو لم يستوفِ
+        النضج. `claimed` غير مؤهّل، فمستحيل ناخد نفس السجل مرتين.
+        """
+        if mature_before is None:
+            sql = (
+                "UPDATE outbox SET status=?, updated_at=? "
+                "WHERE id=? AND status=? RETURNING *"
+            )
+            params = (OUTBOX_CLAIMED, now, int(outbox_id), OUTBOX_PENDING)
+        else:
+            sql = (
+                "UPDATE outbox SET status=?, updated_at=? "
+                "WHERE id=? AND status=? AND updated_at<=? RETURNING *"
+            )
+            params = (OUTBOX_CLAIMED, now, int(outbox_id), OUTBOX_PENDING, mature_before)
+        row = self._conn.execute(sql, params).fetchone()
+        self._conn.commit()
+        return self._row_to_outbox(row) if row else None
+
     def seconds_until_mature(self, now: str, window: timedelta) -> float | None:
         """كم ثانية فاضلة لحد ما أقدم عنصر 'pending' يستوفي نافذة التجميع؟
 

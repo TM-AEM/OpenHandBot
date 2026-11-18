@@ -219,6 +219,10 @@ class Watcher:
                         "تعذّر مسح موعد إعادة محاولة الشات %s (%s)، هيتخطّى",
                         w.conversation_id, type(exc).__name__,
                     )
+                    # OHB2-WP-05 (DEF-007): الرسالة بتقول «هيتخطّى» — لازم نتخطّى فعلًا.
+                    # من غير `continue` كنا بنقع في مسار الإشعار رغم فشل المسح، فيتناقض
+                    # السجل مع السلوك (خطر إشعار مكرّر رغم إن الموعد لسه قايم).
+                    continue
             conv = convs.get(w.conversation_id)
             if not conv:
                 await self._handle_missing(w)

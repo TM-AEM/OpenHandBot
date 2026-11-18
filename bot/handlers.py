@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import io
 import logging
 import os
@@ -11,8 +12,16 @@ import time
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
+import httpx
 from telegram import InputFile, Update
 from telegram.constants import ParseMode
+from telegram.error import (
+    BadRequest as _TelegramBadRequest,
+    NetworkError as _TelegramNetworkError,
+    RetryAfter as _TelegramRetryAfter,
+    TelegramError,
+    TimedOut as _TelegramTimedOut,
+)
 from telegram.ext import ApplicationHandlerStop, ContextTypes
 
 from . import keyboards as kb
@@ -37,7 +46,7 @@ from .files import (
     authorize_conversation_detailed,
     file_status_message,
 )
-from .messages import escape_html, format_conversation_view, format_cost, pr_url, state_label
+from .messages import escape_html, format_conversation_view, format_cost, get_status, pr_url, state_label
 from .sender import TextDocumentTooLargeError, send_copyable, send_long, send_text_document
 
 log = logging.getLogger(__name__)
@@ -69,6 +78,50 @@ class _MessageAdapter:
 
     async def edit_message_text(self, text: str, **kwargs) -> None:
         await self._message.edit_text(text, **kwargs)
+
+
+async def _safe_answer(q, text=None, *, show_alert: bool = False) -> None:
+    """يردّ على كولباك تيليجرام بأمان: فشل الرد **مايوقفش** معالجة الكولباك ولا يكسر التعافي.
+
+    OHB2-WP-02 (DEF-005): استعلام قديم (`BadRequest: Query is too old`) أو مهلة عابرة
+    (`TimedOut`) في `q.answer` كان بيرمي استثناء غير مُلتقَط ⇒ `FAILED_PERMANENT` ⇒ حجب
+    الاستطلاع. هنا بنلتقط **`(TelegramError, asyncio.TimeoutError)` بس**، و**ما بنلتقطش
+    `asyncio.CancelledError`** (BaseException) ⇒ الإلغاء ينتشر زي ما هو. بنسجّل نوع الخطأ
+    بس (من غير نصه، ممكن يحتوي أسرار).
+
+    الاصطلاح (قرار المالك B): بلا نص ⇒ `q.answer()` بلا وسائط زائدة؛ بنص ⇒ تمرير **موضعي**؛
+    `show_alert` بيتمرّر **بس** لما يكون مطلوبًا فعلاً (True) عشان ما نمرّرش وسائط مفتاحية
+    غير مستخدمة للمستدعيات/الدوبلز.
+    """
+    try:
+        if text is None:
+            await q.answer()
+        elif show_alert:
+            await q.answer(text, show_alert=True)
+        else:
+            await q.answer(text)
+    except (TelegramError, asyncio.TimeoutError) as exc:
+        log.warning("تعذّر الرد على الكولباك (%s)", type(exc).__name__)
+
+
+async def _safe_edit_noop(query, text: str, **kwargs) -> bool:
+    """تعديل رسالة كولباك بأمان للمواقع الخمسة في OHB2-WP-02 (NEW-DEF-01).
+
+    فشل التعديل **الحميد/العابر** (`BadRequest: Message is not modified`، رسالة محذوفة،
+    `TimedOut`) بيتعالج كـ no-op غير حاجب ⇒ **مايتحوّلش** لـ `FAILED_PERMANENT`/`FAILED_TRANSIENT`
+    ولا يوقف الإقرار. بيلتقط **`(TelegramError, asyncio.TimeoutError)` بس** — **مايلتقطش**
+    `asyncio.CancelledError` (ينتشر)، و**مابيخفيش** أخطاء البرمجة/القاعدة غير المتوقّعة (بتنتشر).
+    بيسجّل نوع الخطأ بس (من غير نصه/أسرار). بيرجّع True لو اتعدّلت، وFalse لو فشل حميد.
+
+    منفصل عن `_safe_edit` **عمدًا** (قرار المالك A): `_safe_edit` بيعيد رفع أي خطأ مش
+    «not modified» (سلوك fail-closed مثبَّت بمُستدعِيه الآخرين) — ما بنغيّرهوش.
+    """
+    try:
+        await query.edit_message_text(text, **kwargs)
+        return True
+    except (TelegramError, asyncio.TimeoutError) as exc:
+        log.warning("تعذّر تعديل رسالة الكولباك (%s)", type(exc).__name__)
+        return False
 
 
 async def _safe_edit(query, text: str, **kwargs) -> bool:
@@ -106,6 +159,24 @@ async def _edit_or_send(query, text: str, chat_id: int, bot, **kwargs) -> bool:
                 log.warning("فشل إرسال العرض البديل (%s)", type(send_exc).__name__)
                 return False
         log.warning("فشل عرض الشات (%s)", type(exc).__name__)
+        return False
+
+
+async def _safe_send_html(bot, chat_id: int, text: str) -> bool:
+    """يرسل نصًّا (يُهرَّب) عبر `send_message` **بأمان**: يرجّع True لو اتبعت، False لو فشل التسليم.
+
+    OHB2-WP-03 (NEW-DEF-04): المسارات اللي كانت بتستدعي `context.bot.send_message`
+    الخام (رد/رفض/عرض) لازم ما تسيبش فشل تيليجرام يرمي استثناء غير مُلتقَط ⇒
+    `FAILED_PERMANENT` (DEF-002) وتعليق الاستطلاع. هنا بنلتقط **`(TelegramError,
+    asyncio.TimeoutError)` بس** — **ما بنلتقطش `asyncio.CancelledError`** (ينتشر) ولا
+    أخطاء البرمجة/القاعدة غير المتوقّعة (بتنتشر). بنسجّل نوع الخطأ بس (بلا نص، ممكن أسرار).
+    اللي بينده لازم ياخد باله من القيمة الراجعة ويسجّل فشل العرض (`mark_display_failed`).
+    """
+    try:
+        await bot.send_message(chat_id, escape_html(text), parse_mode=ParseMode.HTML)
+        return True
+    except (TelegramError, asyncio.TimeoutError) as exc:
+        log.warning("تعذّر إرسال رسالة تيليجرام (%s)", type(exc).__name__)
         return False
 
 
@@ -474,12 +545,71 @@ def _update_id(update: Update) -> int | None:
     return value if isinstance(value, int) else None
 
 
+def _is_transient_operational_error(exc: BaseException) -> bool:
+    """هل الاستثناء فشل **شبكي/تيليجرام عابر** مؤهّل لإعادة محاولة الدفعة؟
+
+    OHB2-WP-04 (DEF-002) — القاعدة المحافظة:
+
+    - **`telegram.error.BadRequest` ⇒ NOT transient** (رفض نهائي مؤكّد من تيليجرام، زي
+      «Query is too old» أو رسالة مش موجودة). مهم جدًا: في `python-telegram-bot` 22.8
+      الكلاس ده **فرع من `NetworkError`**، فلازم يتفحّص **قبل** `NetworkError` وإلا كان
+      هيتصنّف عابرًا غلط.
+    - **`telegram.error.RetryAfter` / `TimedOut` / `NetworkError` ⇒ transient** (rate limit
+      / مهلة / انقطاع شبكة).
+    - **`asyncio.TimeoutError` (== `TimeoutError`) ⇒ transient**.
+    - **`httpx.TransportError` ⇒ transient** (فشل نقل على مستوى الاتصال).
+    - **`OSError` المُقيَّد بالسّياق فقط:** أخطاء الشبكة/السوكيت العابرة
+      (`ConnectionError`، `TimeoutError`، `EAGAIN`/`EWOULDBLOCK`/`ECONNRESET`/`ETIMEDOUT`
+      /`ECONNREFUSED`/`EINTR`/`EPIPE`) ⇒ transient؛ لكن أخطاء القرص/الصلاحيات/البنية
+      المحلية (`PermissionError`، `FileNotFoundError`، `IsADirectoryError`، `ENOSPC`…)
+      تفضل **دائمة** ⇒ مش عابرة (مفيش إعادة محاولة صامتة لفشل غير شبكي).
+
+    ملاحظة: `CancelledError` بتتعامل في `_classify_failure` قبل الاستدعاء (مش عابرة هنا).
+    """
+    # فرع BadRequest **قبل** NetworkError لأن BadRequest ⊂ NetworkError في PTB 22.8.
+    if isinstance(exc, _TelegramBadRequest):
+        return False
+    if isinstance(exc, (_TelegramRetryAfter, _TelegramTimedOut, _TelegramNetworkError)):
+        return True
+    if isinstance(exc, asyncio.TimeoutError):
+        return True
+    if isinstance(exc, httpx.TransportError):
+        return True
+    if isinstance(exc, OSError):
+        # أخطاء السوكيت/الشبكة الفرعية (ConnectionError ⊃ BrokenPipeError/ConnectionResetError/
+        # ConnectionAbortedError/ConnectionRefusedError) دائمًا عابرة. غير كده نفحص errno.
+        if isinstance(exc, ConnectionError):
+            return True
+        code = getattr(exc, "errno", None)
+        return code in _TRANSIENT_OS_ERRNOS
+    return False
+
+
+# أكواد errno العابرة (شبكة/سوكيت/مقاطعة). أي كود تاني ⇒ فشل محلي دائم.
+_TRANSIENT_OS_ERRNOS = frozenset(
+    {
+        errno.EAGAIN,
+        errno.EWOULDBLOCK,
+        errno.EINTR,
+        errno.ECONNRESET,
+        errno.ECONNREFUSED,
+        errno.ECONNABORTED,
+        errno.ETIMEDOUT,
+        errno.EPIPE,
+        errno.EHOSTUNREACH,
+        errno.ENETUNREACH,
+    }
+)
+
+
 def _classify_failure(exc: BaseException) -> str:
     """يصنّف فشل الـ handler لفئة نتيجة (OHB2-MANUAL-POLLING-OUTCOME).
 
     - `asyncio.CancelledError` (إلغاء/إغلاق) ⇒ `PARTIAL_OR_UNKNOWN` (مفيش حسم).
-    - فشل SQLite **عابر** (BUSY/LOCKED) أو `ApiError` **تشغيلي** (5xx/429/بلا كود) ⇒
-      `FAILED_TRANSIENT` (إعادة محاولة الدفعة).
+    - فشل SQLite **عابر** (BUSY/LOCKED)، أو `ApiError` **تشغيلي** (5xx/429/بلا كود)،
+      أو **شبكي/تيليجرام عابر** (`RetryAfter`/`TimedOut`/`NetworkError`/`asyncio.TimeoutError`/
+      `httpx.TransportError`/`OSError` شبكي مُقيَّد) ⇒ `FAILED_TRANSIENT` (إعادة محاولة الدفعة).
+      `BadRequest` **مش** عابر (رفض نهائي)، حتى لو فرع من `NetworkError`.
     - أي حاجة تانية (فشل دائم/برمجي/رفض غير متوقّع) ⇒ `FAILED_PERMANENT`.
 
     التفويض للسياسة المشتركة في `update_outcomes.classify_error_outcome` (مصدر واحد)
@@ -487,8 +617,10 @@ def _classify_failure(exc: BaseException) -> str:
     """
     if isinstance(exc, asyncio.CancelledError):
         return update_outcomes.PARTIAL_OR_UNKNOWN
-    transient = (isinstance(exc, sqlite3.Error) and _is_transient_sqlite_error(exc)) or (
-        isinstance(exc, ApiError) and not outbox.is_permanent(exc)
+    transient = (
+        (isinstance(exc, sqlite3.Error) and _is_transient_sqlite_error(exc))
+        or (isinstance(exc, ApiError) and not outbox.is_permanent(exc))
+        or _is_transient_operational_error(exc)
     )
     return update_outcomes.classify_error_outcome(
         exc, transient=transient
@@ -777,33 +909,34 @@ async def app_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def app_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    await q.answer()
+    await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
         return
     url = _mini_app_url(context)
     if not url:
-        await q.edit_message_text(
+        await _safe_edit_noop(
+            q,
             f"{MINI_APP_UNAVAILABLE}\nالسبب: {_mini_app_diagnostic(context)}",
             reply_markup=kb.main_menu(_mini_app_url(context)),
         )
         mark_explicitly_ignored(update, context)
         return
-    await q.edit_message_text("افتح التطبيق من الزر:", reply_markup=kb.mini_app_launch(url))
+    await _safe_edit_noop(q, "افتح التطبيق من الزر:", reply_markup=kb.mini_app_launch(url))
     mark_explicitly_ignored(update, context)
 
 
 async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    await q.answer()
+    await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
         return
     context.bot_data["db"].clear_awaiting(update.effective_user.id)  # تنقّل = خروج من أي توجيه
-    await q.edit_message_text(
-        "أهلاً 👋 اختار من الأزرار:", reply_markup=kb.main_menu(_mini_app_url(context))
+    await _safe_edit_noop(
+        q, "أهلاً 👋 اختار من الأزرار:", reply_markup=kb.main_menu(_mini_app_url(context))
     )
     mark_explicitly_ignored(update, context)
 
@@ -831,14 +964,16 @@ async def notifications_command(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def notifications_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    await q.answer()
+    await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
         return
     db = context.bot_data["db"]
     enabled = db.get_notifications_enabled()
-    await q.edit_message_text(_notifications_text(enabled), reply_markup=kb.notifications_menu(enabled))
+    await _safe_edit_noop(
+        q, _notifications_text(enabled), reply_markup=kb.notifications_menu(enabled)
+    )
     mark_explicitly_ignored(update, context)
 
 
@@ -847,27 +982,26 @@ async def notifications_toggle(update: Update, context: ContextTypes.DEFAULT_TYP
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
-        await q.answer()
+        await _safe_answer(q)
         return
     db = context.bot_data["db"]
     # P3: التبديل + علامة «معالَج» في **معاملة واحدة** ⇒ إعادة تسليم نفس التحديث
     # (`update_id` متكرر) ما بتعكسش الحالة تاني؛ تحديث مختلف بيكمل التبديل عادي.
     new_state = db.toggle_notifications_once(_update_id(update), outbox.now_iso())
     if new_state is None:
-        await q.answer()  # تحديث مكرّر: مفيش تبديل تاني (ومافيش عرض مضلّل)
+        await _safe_answer(q)  # تحديث مكرّر: مفيش تبديل تاني (ومافيش عرض مضلّل)
         return
-    # OHB2-SW09: التبديل اتعمّل (commit) بالفعل فوق. فشل تأكيد الكولباك بعد الـ commit
-    # (استثناء تيليجرام/شبكة) **مايوقفش** تحديث الواجهة اللي بعده — التفضيل اتغيّر فعلًا
-    # ولازم الرسالة تعكس الحالة الجديدة. بنلفّ الـ answer لوحده بس (أضيق حدود ممكنة)،
-    # وبنكمّل للـ edit_message_text بالحالة المعمّلة. `except Exception` مايلتقطش
-    # `asyncio.CancelledError` (BaseException) ⇒ الإلغاء ينتشر زي ما هو. بنسجّل نوع الخطأ
-    # بس (من غير نص الاستثناء، ممكن يحتوي أسرار).
-    try:
-        await q.answer("تم التحديث ✅")
-    except Exception as exc:  # noqa: BLE001 — فشل تأكيد الكولباك مايوقفش تحديث الواجهة
-        log.warning("تعذّر الرد على الكولباك بعد تبديل الإشعارات (%s)", type(exc).__name__)
-    await q.edit_message_text(
-        _notifications_text(new_state), reply_markup=kb.notifications_menu(new_state)
+    # OHB2-SW09/OHB2-WP-02: التبديل اتعمّل (commit) بالفعل فوق. فشل تأكيد الكولباك بعد الـ
+    # commit (استثناء تيليجرام/شبكة) **مايوقفش** تحديث الواجهة اللي بعده — التفضيل اتغيّر فعلًا
+    # ولازم الرسالة تعكس الحالة الجديدة. `_safe_answer` بتلفّ الـ answer لوحده (بأضيق حدود)،
+    # وبتلتقط `(TelegramError, asyncio.TimeoutError)` بس ⇒ `asyncio.CancelledError` ينتشر،
+    # وبنسجّل نوع الخطأ بس (من غير نصه، ممكن يحتوي أسرار).
+    await _safe_answer(q, "تم التحديث ✅")
+    # OHB2-WP-02 (NEW-DEF-01): تعديل الرسالة بعد الـ commit عبر `_safe_edit_noop` ⇒ فشل تعديل
+    # حميد/عابر (رسالة محذوفة/«not modified»/مهلة) **مايحوّلش** `DURABLE_COMPLETED` لفشل ولا
+    # يلوّث `update_failures`؛ `DURABLE_COMPLETED` المُلتزَم في `toggle_notifications_once` محفوظ.
+    await _safe_edit_noop(
+        q, _notifications_text(new_state), reply_markup=kb.notifications_menu(new_state)
     )
 
 
@@ -890,7 +1024,7 @@ def _without_deleted(db, items: list[dict]) -> list[dict]:
 
 async def list_conversations(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    await q.answer()
+    await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
@@ -962,7 +1096,7 @@ async def list_conversations(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def open_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    await q.answer()
+    await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
@@ -1030,7 +1164,7 @@ async def open_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def copy_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """TASK 55 (المرحلة B): يبعت رد الـ agent جوه code block قابل للنسخ بضغطة."""
     q = update.callback_query
-    await q.answer()
+    await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
@@ -1042,7 +1176,8 @@ async def copy_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         context.bot_data["client"], context, conversation_id
     )
     if _conv is None:
-        await context.bot.send_message(chat_id, escape_html(message), parse_mode=ParseMode.HTML)
+        # OHB2-WP-03 (NEW-DEF-04): ردّ الفشل عبر `_safe_send_html` (مش send_message خام).
+        await _safe_send_html(context.bot, chat_id, message)
         # OHB2-SW-07: فشل upstream تشغيلي (5xx/429/بلا كود) ينتشر بعد الرسالة؛ رفض 4xx
         # المتوقّع + الرفض المشتقّ يرجّع عادي.
         if status is FileStatus.UPSTREAM_ERROR and not _is_expected_upstream_rejection(auth_exc):
@@ -1054,22 +1189,30 @@ async def copy_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     try:
         _, reply = await _get_exchange(context, conversation_id)
     except ApiError as exc:
-        await context.bot.send_message(chat_id, escape_html(error_text(exc)), parse_mode=ParseMode.HTML)
+        # فشل قراءة آخر تبادل: رسالة الخطأ المتنقّحة، ثم انتشار الفشل التشغيلي (SW-07).
+        # الفشل التشغيلي **يرفع قبل** أي تسجيل ⇒ مايتحوّلش لتجاهل/نجاح كاذب.
+        await _safe_send_html(context.bot, chat_id, error_text(exc))
         await _raise_if_operational_api_failure(exc)
         mark_explicitly_ignored(update, context)
         return
     if not reply:
-        await context.bot.send_message(chat_id, "لسه مفيش رد للشات ده.")
+        await _safe_send_html(context.bot, chat_id, "لسه مفيش رد للشات ده.")
         mark_explicitly_ignored(update, context)
         return
-    await send_copyable(chat_id, reply, context.bot)
+    try:
+        await send_copyable(chat_id, reply, context.bot)
+    except (TelegramError, asyncio.TimeoutError) as exc:
+        # OHB2-WP-03 (NEW-DEF-04): فشل تسليم الرد (فشل عرض) ⇒ failed_transient، مش نجاح.
+        log.warning("تعذّر إرسال الرد القابل للنسخ (%s)", type(exc).__name__)
+        mark_display_failed(update, context, "copy_reply_display_failed")
+        return
     mark_explicitly_ignored(update, context)
 
 
 async def full_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """TASK 55 (المرحلة B): يبعت الرد الكامل (نفس منطق send_long)."""
     q = update.callback_query
-    await q.answer()
+    await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
@@ -1081,7 +1224,8 @@ async def full_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         context.bot_data["client"], context, conversation_id
     )
     if _conv is None:
-        await context.bot.send_message(chat_id, escape_html(message), parse_mode=ParseMode.HTML)
+        # OHB2-WP-03 (NEW-DEF-04): ردّ الفشل عبر `_safe_send_html` (مش send_message خام).
+        await _safe_send_html(context.bot, chat_id, message)
         # OHB2-SW-07: فشل upstream تشغيلي (5xx/429/بلا كود) ينتشر بعد الرسالة؛ رفض 4xx
         # المتوقّع + الرفض المشتقّ يرجّع عادي.
         if status is FileStatus.UPSTREAM_ERROR and not _is_expected_upstream_rejection(auth_exc):
@@ -1093,15 +1237,21 @@ async def full_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     try:
         _, reply = await _get_exchange(context, conversation_id)
     except ApiError as exc:
-        await context.bot.send_message(chat_id, escape_html(error_text(exc)), parse_mode=ParseMode.HTML)
+        await _safe_send_html(context.bot, chat_id, error_text(exc))
         await _raise_if_operational_api_failure(exc)
         mark_explicitly_ignored(update, context)
         return
     if not reply:
-        await context.bot.send_message(chat_id, "لسه مفيش رد للشات ده.")
+        await _safe_send_html(context.bot, chat_id, "لسه مفيش رد للشات ده.")
         mark_explicitly_ignored(update, context)
         return
-    await send_long(chat_id, reply, context.bot)
+    try:
+        await send_long(chat_id, reply, context.bot)
+    except (TelegramError, asyncio.TimeoutError) as exc:
+        # OHB2-WP-03 (NEW-DEF-04): فشل تسليم الرد الكامل (فشل عرض) ⇒ failed_transient.
+        log.warning("تعذّر إرسال الرد الكامل (%s)", type(exc).__name__)
+        mark_display_failed(update, context, "full_reply_display_failed")
+        return
     mark_explicitly_ignored(update, context)
 
 
@@ -1116,32 +1266,35 @@ async def send_reply_txt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     قراءة أو إرسال — فمستحيل مستخدم يجيب رد حد تاني بتغيير الـ callback data.
     """
     q = update.callback_query
-    try:
-        await q.answer()
-    except Exception as exc:  # noqa: BLE001 — فشل إجابة الكولباك (استعلام قديم) مايوقفش التنزيل
-        log.warning("تعذّر الرد على الكولباك (%s)", type(exc).__name__)
+    await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
         return
     conversation_id = q.data.split(":", 1)[1]
     chat_id = q.message.chat_id
-    _conv, message = await _authorized_conversation(context.bot_data["client"], context, conversation_id)
+    # OHB2-WP-03 (DEF-004): مسار التفويض المفصّل عشان نفرّق الفشل التشغيلي (ينتشر) عن
+    # الرفض المتوقّع (يرجع عادي)، بدل ما نبلع 5xx/429 كتجاهل.
+    _conv, status, message, auth_exc = await _authorized_conversation_status(
+        context.bot_data["client"], context, conversation_id
+    )
     if _conv is None:
-        await context.bot.send_message(chat_id, escape_html(message), parse_mode=ParseMode.HTML)
+        await _safe_send_html(context.bot, chat_id, message)
+        if status is FileStatus.UPSTREAM_ERROR and not _is_expected_upstream_rejection(auth_exc):
+            await _raise_if_operational_api_failure(auth_exc)
         mark_explicitly_ignored(update, context)
         return
     try:
         _, reply = await _get_exchange(context, conversation_id)
     except ApiError as exc:
-        await context.bot.send_message(chat_id, escape_html(error_text(exc)), parse_mode=ParseMode.HTML)
-        if outbox.is_permanent(exc):
-            mark_explicitly_ignored(update, context)
-        else:
-            mark_ambiguous_external(update, context, "send_txt_upstream_failed")
+        # OHB2-WP-03 (DEF-004): فشل قراءة آخر تبادل تشغيلي (5xx/429/بلا كود) ⇒ ينتشر
+        # (FAILED_TRANSIENT غير مؤهّل) بعد عرض الرسالة؛ رفض 4xx المتوقّع يرجّع عادي (تجاهل).
+        await _safe_send_html(context.bot, chat_id, error_text(exc))
+        await _raise_if_operational_api_failure(exc)
+        mark_explicitly_ignored(update, context)
         return
     if not reply:
-        await context.bot.send_message(chat_id, "لسه مفيش رد للشات ده.")
+        await _safe_send_html(context.bot, chat_id, "لسه مفيش رد للشات ده.")
         mark_explicitly_ignored(update, context)
         return
     reply_to = getattr(q.message, "message_id", None)
@@ -1149,22 +1302,28 @@ async def send_reply_txt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await send_text_document(chat_id, reply, context.bot, reply_to_message_id=reply_to)
     except TextDocumentTooLargeError:
         # الحد الأقصى للحجم ⇒ مفيش إعادة محاولة مفيدة ⇒ فشل **دائم**.
-        await context.bot.send_message(chat_id, "الرد كبير أوي للتنزيل كملف نصي.")
+        await _safe_send_html(context.bot, chat_id, "الرد كبير أوي للتنزيل كملف نصي.")
         mark_failed_permanent(update, context, "text_document_too_large")
+        return
+    except (TelegramError, asyncio.TimeoutError) as exc:
+        # OHB2-WP-03 (NEW-DEF-04): فشل تسليم المستند (فشل عرض تيليجرام) ⇒ failed_transient.
+        log.warning("فشل إرسال ملف الرد النصي (%s)", type(exc).__name__)
+        await _safe_send_html(context.bot, chat_id, "تعذّر إرسال ملف النص دلوقتي، جرّب تاني.")
+        mark_display_failed(update, context, "send_txt_display_failed")
         return
     except Exception as exc:  # noqa: BLE001 — فشل الإرسال ⇒ ما ندّعيش النجاح؛ رسالة صريحة
         log.warning("فشل إرسال ملف الرد النصي (%s)", type(exc).__name__)
         # OHB2-MANUAL-POLLING-OUTCOME: فشل الإرسال الخارجي المُبتلَع ⇒ تسجيل فشل
         # (مايتقبلش كنجاح).
         record_update_failure(update, context, exc)
-        await context.bot.send_message(chat_id, "تعذّر إرسال ملف النص دلوقتي، جرّب تاني.")
+        await _safe_send_html(context.bot, chat_id, "تعذّر إرسال ملف النص دلوقتي، جرّب تاني.")
         return
     mark_explicitly_ignored(update, context)
 
 
 async def list_watches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    await q.answer()
+    await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
@@ -1192,7 +1351,7 @@ async def list_watches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def watch_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    await q.answer()
+    await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
@@ -1203,11 +1362,16 @@ async def watch_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # OHB2-09-06/A2-02: نفس عقد ملكية الشات قبل الإضافة (مفيش شات غير مملوك للمتابعة).
     # F-1: `allow_deleted=True` — زر «متابعة» إعادة تفاعل صريح (طبقة القاعدة بتشيل الشاهد
     # عبر `reengage=True`)، فمش مسار قراءة.
-    conv, message = await _authorized_conversation(
+    conv, status, message, auth_exc = await _authorized_conversation_status(
         client, context, conversation_id, allow_deleted=True
     )
     if conv is None:
         await _safe_edit(q, message)
+        # OHB2-WP-03 (DEF-004): الفشل التشغيلي (5xx/429/بلا كود) ⇒ `failed_transient`
+        # غير مؤهّل (fail-closed)؛ الرفض النهائي المتوقّع ⇒ تجاهل صريح مؤهّل.
+        if status is FileStatus.UPSTREAM_ERROR and not _is_expected_upstream_rejection(auth_exc):
+            mark_operational_failure(update, context, "watch_upstream_failure")
+            return
         mark_explicitly_ignored(update, context)
         return
     # NTF-19: لو الشات متابَع بالفعل، الضغطة دي إعادة نداء مكرّرة (double-tap) ⇒ نحافظ على
@@ -1217,7 +1381,7 @@ async def watch_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE)
         conversation_id, conv.get("title", ""), q.message.chat_id,
         new_lifecycle=False, reengage=True,
     )
-    db.set_last_state(conversation_id, conv.get("execution_status") or "")
+    db.set_last_state(conversation_id, get_status(conv))
     await _safe_edit(
         q, "تمام، الشات اتضاف للمتابعة ✅", reply_markup=kb.conversation_actions(conversation_id, True)
     )
@@ -1226,7 +1390,7 @@ async def watch_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def unwatch_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    await q.answer()
+    await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
@@ -1263,7 +1427,7 @@ async def unwatch_conversation(update: Update, context: ContextTypes.DEFAULT_TYP
 async def delete_conversation_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """OHB2-MINIAPP: يعرض تأكيد حذف الشات **من OpenHands**. تفويض الملكية قبل أي حذف."""
     q = update.callback_query
-    await q.answer()
+    await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
@@ -1273,11 +1437,16 @@ async def delete_conversation_prompt(update: Update, context: ContextTypes.DEFAU
     # (deleting/uncertain). الحذف المحلي بيسيب الشات في `deleted_conversations`، فحجب
     # شاشة التأكيد كان بيقطع إعادة المحاولة الموثّقة (نفس ما اتصلح في زر التأكيد
     # `deleteok:` والـ Mini App). الحماية الحقيقية في CAS الحذف جوه `delete_conversation`.
-    conv, message = await _authorized_conversation(
+    conv, status, message, auth_exc = await _authorized_conversation_status(
         context.bot_data["client"], context, conversation_id, allow_deleted=True
     )
     if conv is None:
         await _safe_edit(q, message)
+        # OHB2-WP-03 (DEF-004): الفشل التشغيلي (5xx/429/بلا كود) ⇒ `failed_transient`
+        # غير مؤهّل؛ الرفض النهائي المتوقّع ⇒ تجاهل صريح مؤهّل.
+        if status is FileStatus.UPSTREAM_ERROR and not _is_expected_upstream_rejection(auth_exc):
+            mark_operational_failure(update, context, "delete_prompt_upstream_failure")
+            return
         mark_explicitly_ignored(update, context)
         return
     title = conv.get("title") or "بدون عنوان"
@@ -1293,7 +1462,7 @@ async def delete_conversation_prompt(update: Update, context: ContextTypes.DEFAU
 async def delete_conversation_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """OHB2-MINIAPP: تأكيد حذف الشات **من OpenHands** ثم محليًا. تفويض الملكية إلزامي."""
     q = update.callback_query
-    await q.answer()
+    await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
@@ -1304,7 +1473,7 @@ async def delete_conversation_confirm(update: Update, context: ContextTypes.DEFA
     # تفويض الملكية **قبل** أي حذف — العميل بيبعت المعرّف بس، والملكية بتتأكد server-side.
     # F-1: `allow_deleted=True` — إعادة محاولة الحذف عملية صريحة على شات ممكن يكون متشاهد
     # (deleting/uncertain)؛ الحماية الحقيقية في طبقة القاعدة (CAS الحذف)، مش في حجب القراءة.
-    conv, status, message, _auth_exc = await _authorized_conversation_status(
+    conv, status, message, auth_exc = await _authorized_conversation_status(
         client, context, conversation_id, allow_deleted=True
     )
     if conv is None:
@@ -1314,6 +1483,12 @@ async def delete_conversation_confirm(update: Update, context: ContextTypes.DEFA
             and pending_state in (db.REMOTE_DELETING, db.REMOTE_UNCERTAIN)
         ):
             await _safe_edit(q, message)
+            # OHB2-WP-03 (DEF-004): الفشل التشغيلي (5xx/429/بلا كود) ⇒ `failed_transient`
+            # غير مؤهّل (fail-closed) — كان بيتسجّل تجاهل مؤهّل فيبلع الفشل العابر؛ الرفض
+            # النهائي المتوقّع (مش موجود/غير مصرّح/متشاهد) ⇒ تجاهل صريح مؤهّل.
+            if status is FileStatus.UPSTREAM_ERROR and not _is_expected_upstream_rejection(auth_exc):
+                mark_operational_failure(update, context, "delete_confirm_upstream_failure")
+                return
             mark_explicitly_ignored(update, context)
             return
     try:
@@ -1344,10 +1519,7 @@ async def delete_conversation_confirm(update: Update, context: ContextTypes.DEFA
 
 async def show_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    try:
-        await q.answer()
-    except Exception as exc:  # noqa: BLE001 — فشل الرد على الكولباك (استعلام قديم/عابر) مايوقفش عرض الحالة ولا يكسر التعافي
-        log.warning("تعذّر الرد على الكولباك (%s)", type(exc).__name__)
+    await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
@@ -1374,7 +1546,7 @@ async def show_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     lines = [
         f"العنوان: {conv.get('title') or 'بدون عنوان'}",
-        f"الحالة: {state_label(conv.get('execution_status'))}",
+        f"الحالة: {state_label(get_status(conv))}",
         f"الـ sandbox: {conv.get('sandbox_status') or 'غير معروف'}",
     ]
     link = pr_url(conv)
@@ -1398,10 +1570,7 @@ async def show_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def show_cost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    try:
-        await q.answer()
-    except Exception as exc:  # noqa: BLE001 — فشل الرد على الكولباك (استعلام قديم/عابر) مايوقفش عرض التكلفة ولا يكسر التعافي
-        log.warning("تعذّر الرد على الكولباك (%s)", type(exc).__name__)
+    await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
@@ -1436,7 +1605,7 @@ async def show_cost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def export_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    await q.answer()
+    await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
@@ -1446,10 +1615,17 @@ async def export_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
     # OHB2-09-A2-01: تفويض على مستوى الشات **قبل أي تنزيل** — نفس عقد FileService
     # (المعرّف + هوية المالك من /users/me + `created_by_user_id`، وفشل مغلق). بنستخدم
     # نفس خدمة الملفات المشتركة عشان مايبقاش فيه نسخة تانية من منطق التفويض.
-    conv, message = await _authorized_conversation(client, context, conversation_id)
+    # OHB2-WP-03 (DEF-004): المسار المفصّل عشان الفشل التشغيلي (5xx/429/بلا كود) ينتشر
+    # بدل ما يبلعه التجاهل.
+    conv, status, message, auth_exc = await _authorized_conversation_status(
+        client, context, conversation_id
+    )
     if conv is None:
         log.info("export: رفض تفويض الشات (ref=%s)", conversation_id)
         await _safe_edit(q, message)
+        if status is FileStatus.UPSTREAM_ERROR and not _is_expected_upstream_rejection(auth_exc):
+            mark_operational_failure(update, context, "export_upstream_failure")
+            return
         mark_explicitly_ignored(update, context)
         return
     try:
@@ -1460,21 +1636,31 @@ async def export_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         mark_explicitly_ignored(update, context)
         return
     except ApiError as exc:
+        # OHB2-WP-03 (DEF-004): فشل التصدير التشغيلي (5xx/429/بلا كود) ⇒ `failed_transient`
+        # غير مؤهّل (كان `partial_or_unknown`؛ أدق دلوقتي)، والرفض 4xx المتوقّع ⇒ تجاهل صريح.
         await _safe_edit(q, error_text(exc))
-        # فشل التصدير الخارجي المُبتلَع ⇒ نتيجة **غامضة** (مايتحسبش نجاح/تجاهل).
-        mark_ambiguous_external(update, context, "export_upstream_failed")
+        if outbox.is_permanent(exc):
+            mark_explicitly_ignored(update, context)
+        else:
+            mark_operational_failure(update, context, "export_upstream_failure")
         return
     buffer = io.BytesIO(data)
-    await context.bot.send_document(
-        chat_id=q.message.chat_id,
-        document=InputFile(buffer, filename=f"conversation-{conversation_id[:8]}.zip"),
-    )
+    try:
+        await context.bot.send_document(
+            chat_id=q.message.chat_id,
+            document=InputFile(buffer, filename=f"conversation-{conversation_id[:8]}.zip"),
+        )
+    except (TelegramError, asyncio.TimeoutError) as exc:
+        # OHB2-WP-03 (DEF-004/NEW-DEF-04): فشل تسليم المستند ⇒ failed_transient (مش نجاح).
+        log.warning("تعذّر إرسال ملف التصدير (%s)", type(exc).__name__)
+        mark_display_failed(update, context, "export_display_failed")
+        return
     mark_explicitly_ignored(update, context)
 
 
 async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    await q.answer()
+    await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
@@ -1523,7 +1709,7 @@ async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def show_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    await q.answer()
+    await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
@@ -1564,15 +1750,21 @@ async def show_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if content.truncated:
         body += "\n\n… (المعاينة مقصوصة — الملف أكبر من حد العرض الآمن.)"
     buffer = io.BytesIO(body.encode("utf-8"))
-    await context.bot.send_document(
-        chat_id=q.message.chat_id, document=InputFile(buffer, filename=name)
-    )
+    try:
+        await context.bot.send_document(
+            chat_id=q.message.chat_id, document=InputFile(buffer, filename=name)
+        )
+    except (TelegramError, asyncio.TimeoutError) as exc:
+        # OHB2-WP-03 (DEF-004/NEW-DEF-04): فشل تسليم معاينة الملف ⇒ failed_transient.
+        log.warning("تعذّر إرسال معاينة الملف (%s)", type(exc).__name__)
+        mark_display_failed(update, context, "show_file_display_failed")
+        return
     mark_explicitly_ignored(update, context)
 
 
 async def reply_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    await q.answer()
+    await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
@@ -1582,11 +1774,16 @@ async def reply_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # OHB2-09-A2-02/B2-06-04: تفويض ملكية الشات **قبل** أي توجيه لبرومت — نفس عقد
     # باقي مسارات الشات (ملفات/حالة/تفاصيل/تصدير). كده مايتفتحش توجيه برومت لشات
     # مش مملوك (فشل مغلق عند غياب/عدم تطابق المالك).
-    conv, message = await _authorized_conversation(
+    conv, status, message, auth_exc = await _authorized_conversation_status(
         context.bot_data["client"], context, conversation_id
     )
     if conv is None:
         await _safe_edit(q, message)
+        # OHB2-WP-03 (DEF-004): الفشل التشغيلي (5xx/429/بلا كود) ⇒ `failed_transient`
+        # غير مؤهّل؛ الرفض النهائي المتوقّع ⇒ تجاهل صريح مؤهّل.
+        if status is FileStatus.UPSTREAM_ERROR and not _is_expected_upstream_rejection(auth_exc):
+            mark_operational_failure(update, context, "reply_prompt_upstream_failure")
+            return
         mark_explicitly_ignored(update, context)
         return
     db.set_awaiting(update.effective_user.id, conversation_id, "reply")
@@ -2259,8 +2456,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         # البرومت **مااتنفّذش** عمدًا (الحالة منتهية) ⇒ تجاهل صريح (مفيش نية دائمة معلّقة).
         mark_explicitly_ignored(update, context)
         return
-    if kind == "route" and pending:
-        db.renew_awaiting(telegram_id)  # route مستمر: كل رسالة بتجدّد المهلة
+    if kind == "route" and pending and update.message.text.strip():
+        # OHB2-WP-07 (DEF-013): التجديد **بعد** التحقق من أن النص غير فراغ. نص مسافات
+        # مافيهوش برومت، فمينفعش يمدّد مهلة التوجيه (كان بيمدّدها قبل الفحص).
+        db.renew_awaiting(telegram_id)  # route مستمر: كل رسالة حقيقية بتجدّد المهلة
     if kind in ("reply", "route") and pending:
         consume = (telegram_id, "reply") if kind == "reply" else None
         await _send_prompt(
@@ -2275,12 +2474,25 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     elif kind == "reposearch":
         query = update.message.text.strip()
         sent = await update.message.reply_text("اختار مستودع للشات الجديد:\nبحث: " + query)
-        await _show_repos(_MessageAdapter(sent), context, page=0, query=query)
+        # OHB2-WP-03 (DEF-003): لو `_show_repos` رجعت False (رفض 4xx متوقّع) **ما
+        # نستهلكش** حالة البحث ⇒ الحالة تفضل قابلة لإعادة المحاولة (الفشل التشغيلي 5xx
+        # بيرفع من جوه `_show_repos` فينشر ولا يوصل هنا). ده يمنع فقد حالة `reposearch`
+        # عند 4xx. النجاح ⇒ نستهلك ونأكّد «معالَج» في معاملة واحدة.
+        if not await _show_repos(_MessageAdapter(sent), context, page=0, query=query):
+            # مفيش نيّة دائمة اتكتبت (مفيش سجل عمل) والرد اتعرض ⇒ تجاهل صريح مؤهّل للإقرار
+            # (بدل `outcome=None` اللي كان بيحجب الحدّ)، والحالة تفضل قائمة.
+            mark_explicitly_ignored(update, context)
+            return
         # P1: نستهلك حالة البحث **بعد** ما القايمة تتبعت (عطل قبل كده ⇒ إعادة التسليم تعيد
         # التنفيذ؛ قايمة مكرّرة غير ضارة)، والاستهلاك + علامة «معالَج» في معاملة واحدة.
-        db.consume_one_shot_awaiting(
+        if not db.consume_one_shot_awaiting(
             telegram_id, "reposearch", _update_id(update), outbox.now_iso()
-        )
+        ):
+            # OHB2-WP-03 (DEF-003): الحالة اتغيّرت/انتهت/مستهلكة بين القراءة والاستهلاك ⇒
+            # مفيش نتيجة ⇒ تجاهل صريح (بدل `outcome=None`).
+            uid = _update_id(update)
+            if uid is not None and db.update_outcome(uid) is None:
+                mark_explicitly_ignored(update, context)
     else:
         # OHB2-MANUAL-POLLING-OUTCOME: مسار مُتجاهَل صريح (مفيش نية دائمة) ⇒ نتيجة
         # `explicitly_ignored` (دليل دائم ⇒ مؤهّل للإقرار، مفيش إعادة معالجة لاحقة).
@@ -2299,7 +2511,7 @@ async def cancel_route(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def cancel_route_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    await q.answer()
+    await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
@@ -2349,8 +2561,15 @@ async def _send_prompt(
         update_id=_update_id(update), consume_awaiting=consume_awaiting,
     )
     if out_id == 0:
-        # فوز بسباق تزامن: الفائز سجّل النتيجة الدائمة ذرّيًا؛ مفيش نتيجة تانية هنا
-        # (غياب النتيجة = غير مؤهّل = آمن).
+        # OHB2-WP-03 (DEF-003): `out_id == 0` ليها سببان:
+        # (أ) سباق تزامن: تحديث مكرّر — الفائز سجّل النتيجة الدائمة **ذرّيًّا** مع السجل
+        #     ⇒ مفيش حاجة هنا (نسيب نتيجة الفائز).
+        # (ب) حالة انتظار اتغيّرت/انتهت/مستهلكة ⇒ مااتكتبش أي نيّة دائمة، ومااتسجّلتش أي
+        #     نتيجة ⇒ `outcome=None` كان بيعمل `PARTIAL_OR_UNKNOWN` ويحجب حدّ الإقرار.
+        #     فنسجّل «تجاهل صريح» (مفيش نيّة دائمة، وإعادة التسليم مش مفيدة — الحالة اتغيّرت).
+        uid = _update_id(update)
+        if uid is not None and db.update_outcome(uid) is None:
+            mark_explicitly_ignored(update, context)
         return
     # TASK 55 (C): ترتيب القايمة بيتغيّر بعد البرومت ⇒ نبطّل كاش القايمة.
     context.bot_data.pop("list_cache", None)
@@ -2377,7 +2596,7 @@ async def creation_recover(app) -> None:
 
 async def start_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    await q.answer()
+    await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
@@ -2398,7 +2617,7 @@ def _repo_nav(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> dict:
 
 async def repos_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    await q.answer()
+    await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
@@ -2421,7 +2640,7 @@ async def repos_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def repo_search_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    await q.answer()
+    await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
@@ -2433,7 +2652,14 @@ async def repo_search_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def _show_repos(
     q, context: ContextTypes.DEFAULT_TYPE, page: int, query: str, user_id: int | None = None
-) -> None:
+) -> bool:
+    """يعرض قايمة المستودعات. يرجّع True لو عرض القايمة (أو «مفيش نتايج»)، وFalse لو
+    رفض 4xx متوقّع (رسالة الخطأ اتعرضت ورجعنا عاديًّا).
+
+    OHB2-WP-03 (DEF-003): الفشل **التشغيلي** (5xx/429/بلا كود) يفضل ينتشر
+    (`_raise_if_operational_api_failure`) زي ما هو؛ القيمة الراجعة بتفرّق بس الرفض
+    المتوقّع عن النجاح عشان مسار `reposearch` ما يستهلكش حالة المستخدم عند 4xx.
+    """
     client = context.bot_data["client"]
     if user_id is None:
         user_id = context.bot_data["config"].owner_id
@@ -2442,9 +2668,9 @@ async def _show_repos(
     except ApiError as exc:
         await _safe_edit(q, error_text(exc))
         # OHB2-SW-07: فشل بحث المستودعات التشغيلي (5xx/429/بلا كود) ينتشر بعد عرض
-        # الرسالة بدل ما يتحوّل لإتمام ناجح؛ رفض 4xx المتوقّع يرجّع عادي.
+        # الرسالة بدل ما يتحوّل لإتمام ناجح؛ رفض 4xx المتوقّع يرجّع عادي (False).
         await _raise_if_operational_api_failure(exc)
-        return
+        return False
     start = page * REPOS_PAGE_SIZE
     chunk = repos[start : start + REPOS_PAGE_SIZE]
     if not chunk:
@@ -2453,7 +2679,7 @@ async def _show_repos(
             "ما لقيتش مستودعات. تقدر تبدأ شات بدون مستودع.",
             reply_markup=kb.repos_empty_menu(),
         )
-        return
+        return True
     # الأسماء الكاملة والبحث بيتخزّنوا هنا؛ الأزرار بتحمل رقم النسخة والفهرس بس (حد 64 بايت).
     gen = context.bot_data["repo_gen"] = context.bot_data.get("repo_gen", 0) + 1
     context.bot_data.setdefault("repo_nav", {})[user_id] = {
@@ -2466,11 +2692,12 @@ async def _show_repos(
     await _safe_edit(
         q, title, reply_markup=kb.repositories_menu(chunk, page, has_more, gen, start=start)
     )
+    return True
 
 
 async def pick_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    await q.answer()
+    await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
@@ -2497,7 +2724,7 @@ async def pick_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def new_chat_no_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """شات جديد من غير مستودع (المهمة OHB2: إنشاء شات بمستودع أو بدونه)."""
     q = update.callback_query
-    await q.answer()
+    await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
@@ -2532,7 +2759,12 @@ async def _start_new_chat(
         update_id=_update_id(update), consume_awaiting=consume_awaiting,
     )
     if job_id == 0:
-        # فوز بسباق تزامن: الفائز سجّل النتيجة ذرّيًا؛ مفيش نتيجة تانية هنا.
+        # OHB2-WP-03 (DEF-003): زي `_send_prompt` — إمّا سباق تزامن (الفائز سجّل النتيجة
+        # الدائمة ذرّيًّا) أو حالة `newchat` اتغيّرت/انتهت/مستهلكة ⇒ مفيش نيّة دائمة ولا
+        # نتيجة ⇒ نسجّل «تجاهل صريح» بدل `outcome=None` (اللي كان بيحجب حدّ الإقرار).
+        uid = _update_id(update)
+        if uid is not None and db.update_outcome(uid) is None:
+            mark_explicitly_ignored(update, context)
         return
     await update.message.reply_text("وصل ✅ جاري بدء شات جديد.")
     worker = context.bot_data.get("creation_worker")
@@ -2796,6 +3028,10 @@ async def outbox_mark_sent(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 await update.message.reply_text(
                     f"{label} {kind}:{rid} معَلّم '{final}' بالفعل — مفيش تغيير."
                 )
+                # OHB2-WP-03 (DEF-003): سباق CAS خسره اللي فاز وحسم السجل للحالة النهائية
+                # ⇒ مفيش نيّة دائمة هنا، لكن النتيجة مطلوبة ⇒ «تجاهل صريح» مؤهّل للإقرار
+                # (بدل `outcome=None` اللي كان بيعمل `partial_or_unknown` ويحجب الحدّ).
+                mark_explicitly_ignored(update, context)
             else:
                 await update.message.reply_text(
                     f"{label} {kind}:{rid} حالته '{status_now}' — الأمر ده لـ 'unknown' بس."

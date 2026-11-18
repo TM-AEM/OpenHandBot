@@ -26,6 +26,9 @@ STATE_LABELS = {
     "error": "خطأ",
     "stuck": "متعلّق",
     SANDBOX_ERROR: "خطأ بيئة",
+    # OHB2-WP-06 (DEF-009): `get_status({})` بترجّع "unknown" (نص)، فالمفتاح ده لازم
+    # يتضاف قبل ما نبدّل مواقع العرض لـ `get_status(conv)` عشان ما تظهرش كلمة إنجليزية.
+    "unknown": "غير معروف",
     None: "غير معروف",
 }
 
@@ -102,7 +105,7 @@ def format_conversation(conv: dict, reply: str | None) -> str:
     """نص خام (مش HTML). اللي بيعرضه لازم يهرّبه بـ escape_html."""
     title = conv.get("title") or "بدون عنوان"
     repo = conv.get("selected_repository") or "بدون مستودع"
-    state = state_label(conv.get("execution_status"))
+    state = state_label(get_status(conv))
     lines = [title, f"المستودع: {repo}", f"الحالة: {state}"]
     link = pr_url(conv)
     if link:
@@ -135,7 +138,7 @@ def format_conversation_view(conv: dict, user_text: str | None, reply: str | Non
     """
     title = conv.get("title") or "بدون عنوان"
     repo = conv.get("selected_repository") or "بدون مستودع"
-    state = state_label(conv.get("execution_status"))
+    state = state_label(get_status(conv))
     base = "\n".join([f"المستودع: {repo}", f"الحالة: {state}"])
     link = pr_url(conv)
     if link:

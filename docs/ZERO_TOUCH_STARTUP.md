@@ -49,8 +49,11 @@ Entry point: `main.py::main()` (run as `python main.py`).
 | 8 | **Telegram polling start** (single owner) | `main.main()` → `bot.polling.run_bot` (custom `getUpdates` loop; `updater(None)`; `deleteWebhook(drop_pending_updates=False)`) | platform-supervised |
 | 9 | **Graceful shutdown** | `bot.app._post_shutdown()` | closes workers, HTTP client, checkpoints + closes DB |
 
-Health/readiness reporting today is the **bootstrap status log line** (`bootstrap status: ...`, INFO,
-no secrets). The public `/health` route of the Mini App is unrelated and unchanged (§2).
+Health/readiness reporting: the Mini App backend exposes `/health` (liveness, 200, no DB check),
+`/ready` (readiness: DB integrity + worker start ⇒ 200, else 503), and `/status` (liveness +
+readiness + completion counters), matching `docs/OPERATIONS_RUNBOOK.md` §5. Independently, startup
+also logs a bootstrap status line (`bootstrap status: ...`, INFO, no secrets). These Mini App routes
+are unchanged by this document (§2).
 
 ---
 
@@ -239,8 +242,11 @@ does **not** silently rewrite history — the superseded items are named explici
   (`deleted_conversations`) is written in the same atomic transaction as the local cleanup, and every
   non-explicit recreate/recovery path is refused. Idempotency and safe concurrency are preserved.
 - **Notification boundary (explicit):** a Telegram send already in flight before deletion may still
-  arrive. Local deletion does **not** permanently delete the remote OpenHands conversation, and no
-  claim is made that it does.
+  arrive. Deletion is **both remote and local**: the backend issues a remote
+  `DELETE /app-conversations/{id}` (`bot/openhands_client.py::delete_conversation`, via
+  `bot/deletion.py`) and, on confirmed remote success, writes the local tombstone in the same atomic
+  transaction (`remote_confirmed=True`). The remote delete is **not reversible**; local state and the
+  tombstone are cleaned up atomically with it.
 
 ### 5b.5 Former R-1b Backup requirement — NO LONGER APPLICABLE
 

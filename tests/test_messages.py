@@ -17,6 +17,31 @@ def test_state_labels_arabic():
     assert state_label(None) == "غير معروف"
     assert state_label("weird") == "weird"
     assert state_label(SANDBOX_ERROR) == "خطأ بيئة"
+    # OHB2-WP-06 (DEF-009): المفتاح "unknown" لازم يرجع عربي، مش النص الخام.
+    assert state_label("unknown") == "غير معروف"
+
+
+def test_state_label_of_get_status_never_leaks_raw_string():
+    """OHB2-WP-06 (DEF-009): مواقع العرض بتمرّر get_status(conv) ⇒ لازم ترجمة عربية دائمًا."""
+    # execution_status=None ⇒ get_status ⇒ "unknown" ⇒ "غير معروف" (مش "unknown").
+    assert state_label(get_status({})) == "غير معروف"
+    assert state_label(get_status({"execution_status": None})) == "غير معروف"
+    # حروف كبيرة ⇒ تُنزَّل ثم تُترجم.
+    assert state_label(get_status({"execution_status": "FINISHED"})) == "منتهي"
+    # sandbox_status ∈ {ERROR, MISSING} ⇒ خطأ بيئة.
+    assert state_label(get_status({"execution_status": "running", "sandbox_status": "ERROR"})) == "خطأ بيئة"
+    assert state_label(get_status({"execution_status": "running", "sandbox_status": "MISSING"})) == "خطأ بيئة"
+
+
+def test_format_conversation_uses_normalized_status():
+    """DEF-009: `format_conversation`/`format_conversation_view` يعرضان الحالة المعيارية."""
+    conv = {"title": "t", "selected_repository": "o/r", "execution_status": "FINISHED"}
+    assert "الحالة: منتهي" in format_conversation(conv, None)
+    view, _ = format_conversation_view(conv, None, None)
+    assert "الحالة: منتهي" in view
+    # sandbox ERROR يتفوّق على execution_status في العرض.
+    err = {"title": "t", "execution_status": "running", "sandbox_status": "ERROR"}
+    assert "الحالة: خطأ بيئة" in format_conversation(err, None)
 
 
 def test_get_status_is_the_single_canonical_derivation():

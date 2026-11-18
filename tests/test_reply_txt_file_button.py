@@ -10,6 +10,7 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+from telegram.error import BadRequest
 
 import bot.handlers as h
 import bot.sender as sender
@@ -394,9 +395,14 @@ def test_txt_button_registered_as_own_handler():
 
 # -------------------------------- إضافي: فشل إجابة الكولباك مايوقفش التنزيل
 def test_txt_callback_answer_failure_still_delivers(tmp_path):
+    # OHB2-WP-02: الدوبل كان يرمي `RuntimeError` (نوع مش حقيقي من `q.answer`)؛ الكود القديم
+    # كان بيلتقط `Exception` عمومًا فكان بيخفي عدم دقة الدوبل. `_safe_answer` بيلتقط
+    # `(TelegramError, asyncio.TimeoutError)` بس (قرار المالك B)، و«Query is too old» نوعها
+    # الحقيقي `BadRequest` (⊂ TelegramError) — زي باقي دوبلز المستودع وزي اختبار WP-02 المحدّد.
+    # النيّة والتحقّقات زي ما هي: فشل الرد مايمنعش تسليم الملف.
     class FailingAnswerCQ(CQ):
         async def answer(self):
-            raise RuntimeError("query too old")
+            raise BadRequest("Query is too old")
 
     ctx = _ctx(tmp_path, FakeClient(reply="ردي الكامل"))
     _run_txt(ctx, FailingAnswerCQ("txt:A"))
