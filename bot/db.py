@@ -1882,46 +1882,116 @@ class Database:
         conn = self._conn
         conn.execute("BEGIN IMMEDIATE")
         try:
-            # OHB2-C7 (RESURRECTION-FIX): منع الإحياء. لو الشات عليه شاهد حذف دائم، أي
-            # مسار إنشاء/تحديث متابعة (worker/outbox/استرجاع) بيترفض — إلا لو المستخدم
-            # أعاد التفاعل صريح (`reengage=True`، من مسار watch/prompt) فبنشيل الشاهد
-            # ونكمل دورة نظيفة. الفحص جوه BEGIN IMMEDIATE ⇒ محصّن ضد حذف متزامن.
-            if self.is_deleted(conversation_id):
-                if not reengage:
-                    conn.rollback()
-                    return
-                self._clear_tombstone_nocommit(conversation_id)
-            if new_lifecycle:
-                row = conn.execute(
-                    "SELECT pending_delivery_state FROM watched WHERE conversation_id=?",
-                    (conversation_id,),
-                ).fetchone()
-                if row is not None and row["pending_delivery_state"]:
-                    # تسجيل التسليم القديم قبل بدء الدورة الجديدة (نفس المعاملة).
-                    self._mark_pending_delivered(
-                        conversation_id, row["pending_delivery_state"], now
-                    )
-                conn.execute(
-                    "INSERT INTO watched"
-                    "(conversation_id, title, chat_id, added_at, retry_count, watch_seq) "
-                    "VALUES(?, ?, ?, ?, 0, lower(hex(randomblob(16)))) "
-                    "ON CONFLICT(conversation_id) DO UPDATE SET title=excluded.title, "
-                    "chat_id=COALESCE(excluded.chat_id, watched.chat_id), "
-                    "added_at=COALESCE(watched.added_at, excluded.added_at), "
-                    "retry_count=0, pending_delivery_state=NULL, "
-                    "watch_seq=lower(hex(randomblob(16)))",
-                    (conversation_id, title, chat_id, now),
-                )
-            else:
-                conn.execute(
-                    "INSERT INTO watched"
-                    "(conversation_id, title, chat_id, added_at, retry_count, watch_seq) "
-                    "VALUES(?, ?, ?, ?, 0, lower(hex(randomblob(16)))) "
-                    "ON CONFLICT(conversation_id) DO UPDATE SET title=excluded.title, "
-                    "chat_id=COALESCE(excluded.chat_id, watched.chat_id)",
-                    (conversation_id, title, chat_id, now),
-                )
+            if not self._add_watched_nocommit(
+                conversation_id, title, chat_id, new_lifecycle=new_lifecycle,
+                reengage=reengage, now=now,
+            ):
+                conn.rollback()
+                return
             conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    def _add_watched_nocommit(
+        self,
+        conversation_id: str,
+        title: str,
+        chat_id: int | None,
+        *,
+        new_lifecycle: bool,
+        reengage: bool,
+        now: str,
+    ) -> bool:
+        """جسم `add_watched` **داخل معاملة المستدعي** (بدون commit).
+
+        ترجّع False لو الشات عليه شاهد حذف دائم و`reengage=False` (المستدعي يعمل rollback)،
+        وTrue لو الصف اتكتب. الـ hook `on_new_watch_lifecycle` **بره** الدالة دي (بيكتب
+        في معاملته الخاصة).
+        """
+        conn = self._conn
+        # OHB2-C7 (RESURRECTION-FIX): منع الإحياء. لو الشات عليه شاهد حذف دائم، أي
+        # مسار إنشاء/تحديث متابعة (worker/outbox/استرجاع) بيترفض — إلا لو المستخدم
+        # أعاد التفاعل صريح (`reengage=True`، من مسار watch/prompt) فبنشيل الشاهد
+        # ونكمل دورة نظيفة. الفحص جوه BEGIN IMMEDIATE ⇒ محصّن ضد حذف متزامن.
+        if self.is_deleted(conversation_id):
+            if not reengage:
+                return False
+            self._clear_tombstone_nocommit(conversation_id)
+        if new_lifecycle:
+            row = conn.execute(
+                "SELECT pending_delivery_state FROM watched WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()
+            if row is not None and row["pending_delivery_state"]:
+                # تسجيل التسليم القديم قبل بدء الدورة الجديدة (نفس المعاملة).
+                self._mark_pending_delivered(
+                    conversation_id, row["pending_delivery_state"], now
+                )
+            conn.execute(
+                "INSERT INTO watched"
+                "(conversation_id, title, chat_id, added_at, retry_count, watch_seq) "
+                "VALUES(?, ?, ?, ?, 0, lower(hex(randomblob(16)))) "
+                "ON CONFLICT(conversation_id) DO UPDATE SET title=excluded.title, "
+                "chat_id=COALESCE(excluded.chat_id, watched.chat_id), "
+                "added_at=COALESCE(watched.added_at, excluded.added_at), "
+                "retry_count=0, pending_delivery_state=NULL, "
+                "watch_seq=lower(hex(randomblob(16)))",
+                (conversation_id, title, chat_id, now),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO watched"
+                "(conversation_id, title, chat_id, added_at, retry_count, watch_seq) "
+                "VALUES(?, ?, ?, ?, 0, lower(hex(randomblob(16)))) "
+                "ON CONFLICT(conversation_id) DO UPDATE SET title=excluded.title, "
+                "chat_id=COALESCE(excluded.chat_id, watched.chat_id)",
+                (conversation_id, title, chat_id, now),
+            )
+        return True
+
+    def add_watched_and_record_outcome(
+        self,
+        conversation_id: str,
+        title: str,
+        chat_id: int | None,
+        last_state: str | None,
+        update_id: int | None,
+        now: str,
+        outcome: str,
+        *,
+        new_lifecycle: bool = True,
+        reengage: bool = False,
+        reason: str | None = None,
+    ) -> bool:
+        """OHB2-WP-07 (NEW-DEF-03): يضيف المتابعة **و`last_state`** ويسجّل النتيجة ذرّيًّا.
+
+        `watch_conversation` كان بيعمل `add_watched` (commit) ثم `set_last_state` (commit
+        تاني) ثم `mark_durable_completed` (commit تالت). أي عطل بينهم كان يسيب متابعة
+        **بلا نتيجة** (حجب حدّ الإقرار) أو بلا `last_state`. هنا التلاتة في **معاملة
+        واحدة** (`BEGIN IMMEDIATE`): إما كلهم يتحفظوا أو كلهم يتراجعوا. تعديل تيليجرام
+        يفضل **برّه** المعاملة (SQLite وتيليجرام مش معاملة موزّعة — عقد OHB2 §F.1).
+
+        ترجّع True لو الصف اتكتب، وFalse لو الشات محذوف و`reengage=False` (مفيش كتابة،
+        ومفيش نتيجة كمان — المستدعي بيتعامل معاها زي `add_watched`).
+        """
+        if new_lifecycle and self.on_new_watch_lifecycle is not None:
+            self.on_new_watch_lifecycle(conversation_id)
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if not self._add_watched_nocommit(
+                conversation_id, title, chat_id, new_lifecycle=new_lifecycle,
+                reengage=reengage, now=now,
+            ):
+                conn.rollback()
+                return False
+            if last_state is not None:
+                self._set_last_state_nocommit(conversation_id, last_state)
+            if update_id is not None:
+                self.mark_update_outcome(update_id, now, outcome, reason=reason, commit=False)
+            conn.commit()
+            return True
         except Exception:
             conn.rollback()
             raise
@@ -1992,7 +2062,15 @@ class Database:
         )
         self._conn.commit()
 
-    def remove_watched(self, conversation_id: str) -> None:
+    def remove_watched(
+        self,
+        conversation_id: str,
+        *,
+        update_id: int | None = None,
+        now: str | None = None,
+        outcome: str | None = None,
+        reason: str | None = None,
+    ) -> bool:
         """يشيل المتابعة، ويكمّل تسجيل أي تسليم معلّق — في معاملة ذرّية واحدة (NTF-15).
 
         لو فيه علامة تسليم معلّق (اتّبعت لتليجرام بس تسجيله الدائم فشل)، بنسجّلها في
@@ -2003,32 +2081,59 @@ class Database:
         OHB2-08-03: قبل أي كتابة، بننسّق دليل التسليم in-memory عبر `on_unwatch` (لو
         المراقب سجّله) — يثبّت أي تلميح مطابق كعلامة دائمة جوه نفس المعاملة، فالـ fallback
         (لما المراقب مش متاح) ما يفقدش دليل تسليم اتّبعت فعلًا ⇒ مفيش إشعار مكرّر.
+
+        OHB2-WP-07 (NEW-DEF-03): لو `outcome` متمرّر (ومعه `update_id`)، بيتسجّل نتيجة
+        التحديث **في نفس المعاملة** (مع الإزالة وإكمال التسليم المعلّق) ⇒ مستحيل تتحفظ
+        إزالة بلا نتيجة أو نتيجة بلا إزالة. القيم الافتراضية (`None`) تحفظ السلوك القديم
+        بالحرف (إزالة فقط، بلا كتابة نتيجة). تعديل تيليجرام يفضل **برّه** المعاملة.
         """
         if self.on_unwatch is not None:
             self.on_unwatch(conversation_id)
         conn = self._conn
         conn.execute("BEGIN IMMEDIATE")
         try:
-            row = conn.execute(
-                "SELECT pending_delivery_state FROM watched WHERE conversation_id=?",
-                (conversation_id,),
-            ).fetchone()
-            pending = row["pending_delivery_state"] if row else None
-            if pending:
-                # كتابة ضيّقة جوه نفس المعاملة (مفيش commit مستقل)، عشان التسجيل والحذف
-                # ينجحوا أو يفشلوا مع بعض.
-                self.record_notification_sent(
-                    conversation_id, pending, datetime.now(timezone.utc).isoformat(),
-                    _commit=False,
+            self._remove_watched_nocommit(conversation_id)
+            if outcome is not None and update_id is not None:
+                self.mark_update_outcome(
+                    update_id, now or datetime.now(timezone.utc).isoformat(), outcome,
+                    reason=reason, commit=False,
                 )
-            conn.execute("DELETE FROM watched WHERE conversation_id=?", (conversation_id,))
             conn.commit()
+            return True
         except Exception:
             conn.rollback()
             raise
 
+    def _remove_watched_nocommit(self, conversation_id: str) -> None:
+        """جسم `remove_watched` **داخل معاملة المستدعي** (بدون commit).
+
+        بيكمّل تسجيل أي تسليم معلّق (`pending_delivery_state`) ثم يحذف الصف — الاتنين
+        في نفس معاملة المستدعي. الحذف المكرّر no-op (idempotent).
+        """
+        conn = self._conn
+        row = conn.execute(
+            "SELECT pending_delivery_state FROM watched WHERE conversation_id=?",
+            (conversation_id,),
+        ).fetchone()
+        pending = row["pending_delivery_state"] if row else None
+        if pending:
+            # كتابة ضيّقة جوه نفس المعاملة (مفيش commit مستقل)، عشان التسجيل والحذف
+            # ينجحوا أو يفشلوا مع بعض.
+            self.record_notification_sent(
+                conversation_id, pending, datetime.now(timezone.utc).isoformat(),
+                _commit=False,
+            )
+        conn.execute("DELETE FROM watched WHERE conversation_id=?", (conversation_id,))
+
     def remove_watched_completing(
-        self, conversation_id: str, pending_status: str, now: str | None = None
+        self,
+        conversation_id: str,
+        pending_status: str,
+        now: str | None = None,
+        *,
+        update_id: int | None = None,
+        outcome: str | None = None,
+        reason: str | None = None,
     ) -> bool:
         """يزيل المتابعة ويكمّل تسليمًا معلّقًا **معروفًا للمستدعي** في معاملة واحدة (NTF-17).
 
@@ -2038,6 +2143,9 @@ class Database:
         بيرمي لو التسجيل فشل (مفيش حذف جزئي — الذرّية محفوظة).
 
         OHB2-08-03: بننسّق دليل in-memory عبر `on_unwatch` قبل أي كتابة (زي `remove_watched`).
+
+        OHB2-WP-07 (NEW-DEF-03): لو `outcome` متمرّر (ومعه `update_id`)، بيتسجّل نتيجة
+        التحديث في **نفس المعاملة** كمان. الافتراضي (`None`) يحفظ السلوك القديم.
         """
         if self.on_unwatch is not None:
             self.on_unwatch(conversation_id)
@@ -2045,21 +2153,37 @@ class Database:
         conn = self._conn
         conn.execute("BEGIN IMMEDIATE")
         try:
-            row = conn.execute(
-                "SELECT pending_delivery_state FROM watched WHERE conversation_id=?",
-                (conversation_id,),
-            ).fetchone()
-            if row is None:
-                conn.commit()
-                return False
-            status = row["pending_delivery_state"] or pending_status
-            self.record_notification_sent(conversation_id, status, now, _commit=False)
-            conn.execute("DELETE FROM watched WHERE conversation_id=?", (conversation_id,))
+            removed = self._remove_watched_completing_nocommit(
+                conversation_id, pending_status, now
+            )
+            if outcome is not None and update_id is not None:
+                self.mark_update_outcome(
+                    update_id, now, outcome, reason=reason, commit=False
+                )
             conn.commit()
-            return True
+            return removed
         except Exception:
             conn.rollback()
             raise
+
+    def _remove_watched_completing_nocommit(
+        self, conversation_id: str, pending_status: str, now: str
+    ) -> bool:
+        """جسم `remove_watched_completing` **داخل معاملة المستدعي** (بدون commit).
+
+        ترجّع True لو كان فيه صف واتشال، وFalse لو مفيش صف (no-op، مفيش كتابة).
+        """
+        conn = self._conn
+        row = conn.execute(
+            "SELECT pending_delivery_state FROM watched WHERE conversation_id=?",
+            (conversation_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        status = row["pending_delivery_state"] or pending_status
+        self.record_notification_sent(conversation_id, status, now, _commit=False)
+        conn.execute("DELETE FROM watched WHERE conversation_id=?", (conversation_id,))
+        return True
 
     def remove_watched_if_seq(self, conversation_id: str, expected_watch_seq: str) -> bool:
         """NTF-23: إزالة ذرّية **مشروطة** بمعرّف دورة المتابعة (compare-and-swap).
@@ -2660,10 +2784,14 @@ class Database:
         return row is not None
 
     def set_last_state(self, conversation_id: str, state: str) -> None:
+        self._set_last_state_nocommit(conversation_id, state)
+        self._conn.commit()
+
+    def _set_last_state_nocommit(self, conversation_id: str, state: str) -> None:
+        """يحدّث `last_state` **جوه معاملة المستدعي** (بدون commit)."""
         self._conn.execute(
             "UPDATE watched SET last_state=? WHERE conversation_id=?", (state, conversation_id)
         )
-        self._conn.commit()
 
     def update_watched_title(self, conversation_id: str, title: str) -> bool:
         """يحدّث عنوان شات متابَع (القرار: المراقب بيخزّن العنوان الطازج).
@@ -2704,6 +2832,19 @@ class Database:
         *,
         commit: bool = True,
     ) -> None:
+        self._set_awaiting_nocommit(telegram_id, conversation_id, kind, title, now)
+        if commit:
+            self._conn.commit()
+
+    def _set_awaiting_nocommit(
+        self,
+        telegram_id: int,
+        conversation_id: str | None,
+        kind: str | None,
+        title: str | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        """يضبط حالة الانتظار **جوه معاملة المستدعي** (بدون commit)."""
         stamp = (now or datetime.now(timezone.utc)).isoformat() if kind else None
         self._conn.execute(
             "INSERT INTO user_state(telegram_id, awaiting_conversation_id, awaiting_kind, "
@@ -2713,8 +2854,6 @@ class Database:
             "awaiting_title=excluded.awaiting_title",
             (telegram_id, conversation_id, kind, stamp, title),
         )
-        if commit:
-            self._conn.commit()
 
     def clear_awaiting(self, telegram_id: int) -> None:
         self.set_awaiting(telegram_id, None, None)
@@ -2768,6 +2907,70 @@ class Database:
             "awaiting_at=NULL, awaiting_title=NULL WHERE telegram_id=?",
             (telegram_id,),
         )
+
+    def clear_awaiting_and_record_outcome(
+        self,
+        telegram_id: int,
+        update_id: int | None,
+        now: str,
+        outcome: str,
+        *,
+        reason: str | None = None,
+    ) -> bool:
+        """OHB2-WP-07 (DEF-013/NEW-DEF-03): يمسح حالة انتظار **ويسجّل نتيجة التحديث ذرّيًّا**.
+
+        مسارات الرد/التوجيه (`/cancel`، التنقّل، انتهاء مهلة الحالة) كانت بتعمل
+        `clear_awaiting` (commit مستقل) **قبل** تسجيل النتيجة (`mark_durable_completed`/
+        `mark_explicitly_ignored`) — commit تانٍ. عطل بين الكتابتين كان يسيب حالة ممسوحة
+        **بلا** نتيجة مسجّلة ⇒ إعادة التسليم تقع في الفرع العام (تلميح `/start`) بدل السلوك
+        الصحيح. هنا الاتنين في **معاملة واحدة** (`BEGIN IMMEDIATE`): إما يتحفظوا معًا أو
+        يتراجعوا معًا. الإرسال لتليجرام يفضل **برّه** المعاملة (SQLite وتليجرام مش معاملة
+        موزّعة واحدة — عقد OHB2 §F.1). ترجّع True لو اتسجّلت نتيجة (`update_id` صالح)،
+        وFalse لو مفيش معرّف (مسح الحالة بس).
+        """
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._clear_awaiting_nocommit(telegram_id)
+            if update_id is not None:
+                self.mark_update_outcome(update_id, now, outcome, reason=reason, commit=False)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return update_id is not None
+
+    def set_awaiting_and_record_outcome(
+        self,
+        telegram_id: int,
+        conversation_id: str | None,
+        kind: str | None,
+        update_id: int | None,
+        now: str,
+        outcome: str,
+        *,
+        title: str | None = None,
+        reason: str | None = None,
+    ) -> bool:
+        """OHB2-WP-07 (NEW-DEF-03): يضبط حالة انتظار **ويسجّل نتيجة التحديث ذرّيًّا**.
+
+        المسارات اللي بتفتح توجيه (`reply_prompt`/`pick_repo`/`repo_search_prompt`/
+        `new_chat_no_repo`) كانت بتعمل `set_awaiting` (commit مستقل) **قبل** تسجيل النتيجة
+        (`mark_durable_completed`) — commit تانٍ. عطل بين الكتابتين كان يسيب حالة توجيه
+        مضبوطة **بلا** نتيجة ⇒ حجب حدّ الإقرار بلا سبب. هنا الاتنين في **معاملة واحدة**.
+        الإرسال لتليجرام يفضل **برّه** المعاملة. ترجّع True لو اتسجّلت نتيجة.
+        """
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._set_awaiting_nocommit(telegram_id, conversation_id, kind, title)
+            if update_id is not None:
+                self.mark_update_outcome(update_id, now, outcome, reason=reason, commit=False)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return update_id is not None
 
     def consume_one_shot_awaiting(
         self, telegram_id: int, expected_kind: str, update_id: int | None, now: str

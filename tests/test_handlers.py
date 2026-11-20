@@ -1049,14 +1049,14 @@ def test_exchange_cache_evicts_oldest(tmp_path):
 class _RemoveFailsDb(Database):
     """remove_watched يرمي خطأ SQLite (فحص مسار الفشل)."""
 
-    def remove_watched(self, conversation_id):
+    def remove_watched(self, conversation_id, **_kw):
         raise sqlite3.OperationalError("disk I/O error")
 
 
 class _RemoveFailsWatcher:
     """مراقب fake: unwatch يرمي خطأ SQLite."""
 
-    def unwatch(self, conversation_id):
+    def unwatch(self, conversation_id, **_kw):
         raise sqlite3.OperationalError("disk I/O error")
 
 
