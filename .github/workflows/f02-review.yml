@@ -236,7 +236,7 @@ jobs:
             exit 1
           fi
           set +e
-          python -m pytest tests/test_def011_fs_offload.py -q -k "T8b or T8c" \
+          python -m pytest tests/test_def011_fs_offload.py -v -k "T8b or T8c" \
             > evidence/negative-control.txt 2>&1
           rc=$?
           set -e
@@ -246,15 +246,20 @@ jobs:
             echo "::error::negative control passed; T8b does not discriminate the fix"
             exit 1
           fi
-          # T8c tests the byte cap, not the offload, so it must still pass.
-          if grep -q 'test_T8c_local_capped_read_enforces_cap' evidence/negative-control.txt \
-              && grep -qE '1 failed, 1 passed' evidence/negative-control.txt; then
-            echo "negative_control=T8b_fails_as_expected,T8c_still_passes" \
-              | tee evidence/negative-control-result.txt
-          else
-            echo "::error::negative control did not show the expected T8b-fails/T8c-passes split"
+          # -v prints names for both outcomes, so each assertion is unambiguous.
+          if ! grep -q 'test_T8b_local_capped_read_runs_off_event_loop_thread FAILED' \
+              evidence/negative-control.txt; then
+            echo "::error::T8b did not fail with the fix reverted; negative control invalid"
             exit 1
           fi
+          # T8c tests the byte cap, not the offload, so it must still pass.
+          if ! grep -q 'test_T8c_local_capped_read_enforces_cap PASSED' \
+              evidence/negative-control.txt; then
+            echo "::error::T8c did not pass; the revert was not surgical"
+            exit 1
+          fi
+          echo "negative_control=T8b_fails_as_expected,T8c_still_passes" \
+            | tee evidence/negative-control-result.txt
 
       - name: Write owner review instructions
         if: always()
