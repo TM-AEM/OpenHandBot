@@ -130,6 +130,7 @@ def conversation_actions(
     has_reply: bool = False,
     reply_cut: bool = False,
     mini_app_url: str = "",
+    files_cb: str | None = None,
 ) -> InlineKeyboardMarkup:
     # الميزات المؤجّلة (القرار 4): الملفات/التكلفة/التصدير مخفية، وزر المتابعة اليدوية
     # (تابع/إلغاء المتابعة) مخفي مع «متابعاتي». الأزرار الأساسية (رد/تحديث/رجوع/إلغاء
@@ -161,7 +162,7 @@ def conversation_actions(
     )
     extra: list[InlineKeyboardButton] = []
     if not features.is_hidden("files"):
-        extra.append(_btn(FILES, callback_data=f"files:{conversation_id}:0"))
+        extra.append(_btn(FILES, callback_data=files_cb or f"files:{conversation_id}:0"))
     if not features.is_hidden("cost"):
         extra.append(_btn(COST, callback_data=f"cost:{conversation_id}"))
     if extra:
@@ -184,6 +185,16 @@ def conversation_actions(
     # والحذف الفعلي محتاج تأكيد صريح (`delete_confirm_menu`).
     rows.append([_btn(DELETE, callback_data=f"delete:{conversation_id}")])
     return InlineKeyboardMarkup(rows)
+
+
+def files_only_menu(files_cb: str) -> InlineKeyboardMarkup:
+    """لوحة احتياطية قصيرة لمتصفح الملفات لما معرّف الشات الطويل يكسر حد 64 بايت."""
+    return InlineKeyboardMarkup(
+        [
+            [_btn(FILES, callback_data=files_cb)],
+            [_btn(MY_CHATS, callback_data="list:0")],
+        ]
+    )
 
 
 def delete_confirm_menu(conversation_id: str) -> InlineKeyboardMarkup:
@@ -212,6 +223,56 @@ def files_menu(
     if nav:
         rows.append(nav)
     rows.append([_btn(BACK, callback_data=f"open:{conversation_id}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def browser_menu(
+    nav: str,
+    dir_index: int,
+    dir_path: str,
+    entries: list[tuple[str, str, int]],
+    page: int,
+    total_pages: int,
+    has_parent: bool,
+) -> InlineKeyboardMarkup:
+    """لوحة متصفح الملفات الهرمي (DEF-010-safe: كل callback بيستخدم رمز/فهارس قصيرة).
+
+    `entries` = [(النوع، المسار الكامل، الفهرس الهدف)] — المجلدات الأول ثم الملفات.
+    """
+    rows: list[list[InlineKeyboardButton]] = []
+    for kind, path, target in entries:
+        name = path.rsplit("/", 1)[-1] or path
+        if kind == "dir":
+            rows.append([_btn(f"📁 {name[:58]}/", callback_data=f"fbd:{nav}:{target}")])
+        else:
+            rows.append(
+                [
+                    _btn(
+                        f"📄 {name[:58]}",
+                        callback_data=f"fbf:{nav}:{dir_index}:{target}",
+                    )
+                ]
+            )
+    nav_row: list[InlineKeyboardButton] = []
+    if has_parent:
+        nav_row.append(_btn("⬆️ لأعلى", callback_data=f"fbu:{nav}:{dir_index}"))
+    if dir_path:
+        nav_row.append(_btn("🏠 الرئيسية", callback_data=f"fbr:{nav}"))
+    if nav_row:
+        rows.append(nav_row)
+    page_row: list[InlineKeyboardButton] = []
+    if page > 0:
+        page_row.append(_btn("⬅️ السابق", callback_data=f"fbp:{nav}:{dir_index}:{page - 1}"))
+    if page < total_pages - 1:
+        page_row.append(_btn("➡️ التالي", callback_data=f"fbp:{nav}:{dir_index}:{page + 1}"))
+    if page_row:
+        rows.append(page_row)
+    rows.append(
+        [
+            _btn("🔄 تحديث", callback_data=f"fbx:{nav}:{dir_index}"),
+            _btn("↩️ رجوع للشات", callback_data=f"fbb:{nav}"),
+        ]
+    )
     return InlineKeyboardMarkup(rows)
 
 

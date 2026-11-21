@@ -151,6 +151,16 @@ def build_application(config: Config) -> Application:
     if not features.is_hidden("export"):
         app.add_handler(CallbackQueryHandler(handlers.export_conversation, pattern=r"^export:"))
     if not features.is_hidden("files"):
+        # OHB2-BOT-FILE-BROWSER: المسار الجديد (شجرة + ترقيم + رموز قصيرة). الـ handlers
+        # القديمة (`files:`/`file:`) باقية للرسائل القديمة فقط.
+        app.add_handler(CallbackQueryHandler(handlers.browse_open, pattern=r"^fbo:"))
+        app.add_handler(CallbackQueryHandler(handlers.browse_dir, pattern=r"^fbd:"))
+        app.add_handler(CallbackQueryHandler(handlers.browse_page, pattern=r"^fbp:"))
+        app.add_handler(CallbackQueryHandler(handlers.browse_up, pattern=r"^fbu:"))
+        app.add_handler(CallbackQueryHandler(handlers.browse_root, pattern=r"^fbr:"))
+        app.add_handler(CallbackQueryHandler(handlers.browse_file, pattern=r"^fbf:"))
+        app.add_handler(CallbackQueryHandler(handlers.browse_refresh, pattern=r"^fbx:"))
+        app.add_handler(CallbackQueryHandler(handlers.browse_back, pattern=r"^fbb:"))
         app.add_handler(CallbackQueryHandler(handlers.list_files, pattern=r"^files:"))
         app.add_handler(CallbackQueryHandler(handlers.show_file, pattern=r"^file:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.handle_text))

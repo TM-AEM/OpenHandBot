@@ -43,6 +43,7 @@ from .file_cache import FileCache
 from .openhands_client import collect_conversations
 from .files import (
     CONVERSATION_ERRORS,
+    MAX_PREVIEW_BYTES,
     FileService,
     FileStatus,
     authorize_conversation_detailed,
@@ -216,6 +217,31 @@ def _files_service(context: ContextTypes.DEFAULT_TYPE) -> FileService:
         identity=_identity_cache(context),
         db=context.bot_data.get("db"),
     )
+
+
+def _browser_cache(context: ContextTypes.DEFAULT_TYPE):
+    """ذاكرة لقطات متصفح الملفات (LRU + TTL + رموز قصيرة) — كائن واحد لكل بوت."""
+    from .file_browser import BrowserCache
+
+    return context.bot_data.setdefault("file_browser_cache", BrowserCache())
+
+
+def _files_open_cb(context: ContextTypes.DEFAULT_TYPE, conversation_id: str) -> str:
+    """callback قصير لزر «الملفات» — رمز ثابت بدل معرّف الشات الطويل (DEF-010)."""
+    return f"fbo:{_browser_cache(context).token_for(conversation_id)}"
+
+
+def _conversation_actions_or_files(
+    context: ContextTypes.DEFAULT_TYPE, conversation_id: str, *, files_cb: str, **kwargs
+):
+    """لوحة الشات الكاملة، أو لوحة ملفات مختصرة لو معرّف الشات الطويل كسر حد 64 بايت.
+
+    ده مسار احتياطي لمتصفح الملفات فقط (DEF-010)؛ مسارات الشات التانية مااتغيّرتش.
+    """
+    try:
+        return kb.conversation_actions(conversation_id, files_cb=files_cb, **kwargs)
+    except ValueError:
+        return kb.files_only_menu(files_cb)
 
 
 def _is_expected_upstream_rejection(exc: ApiError | None) -> bool:
@@ -1194,6 +1220,7 @@ async def open_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         has_reply=reply is not None,
         reply_cut=reply_cut,
         mini_app_url=_mini_app_url(context),
+        files_cb=_files_open_cb(context, conversation_id),
     )
     # القرار 1: بعد فتح الشات، رسايلك الجاية بتتوجّه له 10 دقايق من آخر نشاط (مع زر إلغاء).
     # بنفعّل التوجيه بس بعد ما العرض يظهر فعلاً، عشان فشل العرض ما يسبش توجيه مفعّل من غير
@@ -1449,7 +1476,11 @@ async def watch_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE)
         new_lifecycle=False, reengage=True,
     )
     await _safe_edit(
-        q, "تمام، الشات اتضاف للمتابعة ✅", reply_markup=kb.conversation_actions(conversation_id, True)
+        q,
+        "تمام، الشات اتضاف للمتابعة ✅",
+        reply_markup=kb.conversation_actions(
+            conversation_id, True, files_cb=_files_open_cb(context, conversation_id)
+        ),
     )
 
 
@@ -1574,6 +1605,9 @@ async def delete_conversation_confirm(update: Update, context: ContextTypes.DEFA
     # بدء الشات). مابنبطّلوش في حالات الفشل/النتيجة المجهولة (الشات ممكن لسه بعيدًا).
     if result.status == deletion.STATUS_DELETED:
         context.bot_data.pop("list_cache", None)
+        # قوايم/لقطات الملفات للشات المحذوف تبقى بايتة (مفيش تنقّل على مسارات قديمة).
+        _file_cache(context).invalidate(conversation_id)
+        _browser_cache(context).invalidate(conversation_id)
     await _safe_edit(
         q,
         result.message,
@@ -1626,7 +1660,9 @@ async def show_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # المستخدم طلبه، ففشل عرضه (False) لازم يتسجّل صريح بدل ما نرجّع وكأننا نجحنا.
     if not await _edit_or_send(
         q, "\n".join(lines), q.message.chat_id, context.bot,
-        reply_markup=kb.conversation_actions(conversation_id),
+        reply_markup=kb.conversation_actions(
+            conversation_id, files_cb=_files_open_cb(context, conversation_id)
+        ),
     ):
         log.warning("تعذّر عرض حالة الشات %s (فشل تعديل/إرسال تيليجرام).", conversation_id)
         mark_display_failed(update, context, "show_status_display_failed")
@@ -1664,7 +1700,9 @@ async def show_cost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # OHB2-SW-05: نفس منطق show_status — فشل عرض التكلفة يتسجّل بدل ما يتجاهله الكود.
     if not await _edit_or_send(
         q, format_cost(conv.get("metrics")), q.message.chat_id, context.bot,
-        reply_markup=kb.conversation_actions(conversation_id),
+        reply_markup=kb.conversation_actions(
+            conversation_id, files_cb=_files_open_cb(context, conversation_id)
+        ),
     ):
         log.warning("تعذّر عرض تكلفة الشات %s (فشل تعديل/إرسال تيليجرام).", conversation_id)
         mark_display_failed(update, context, "show_cost_display_failed")
@@ -1760,7 +1798,13 @@ async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     files = list(listing.files)
     if not files:
-        await _safe_edit(q, "ما فيهاش ملفات.", reply_markup=kb.conversation_actions(conversation_id))
+        await _safe_edit(
+            q,
+            "ما فيهاش ملفات.",
+            reply_markup=_conversation_actions_or_files(
+                context, conversation_id, files_cb=_files_open_cb(context, conversation_id)
+            ),
+        )
         mark_explicitly_ignored(update, context)
         return
     # نخزّن القايمة عشان الـ callback data (حد 64 بايت) ما يشيلش المسار الكامل.
@@ -1809,7 +1853,7 @@ async def show_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     content = await _files_service(context).read_preview(conversation_id, path)
     if content.status is not FileStatus.OK:
         # ثنائي/ترميز غير مدعوم/كبير/مش موجود/غير مصرّح ⇒ رسالة واضحة بدل محتوى مشوّه.
-        await _safe_edit(q, file_status_message(content.status, content.error))
+        await _safe_edit(q, _bot_file_status_message(content.status, content.error))
         if content.status is FileStatus.UPSTREAM_ERROR:
             mark_ambiguous_external(update, context, "file_preview_upstream_error")
         else:
@@ -1829,6 +1873,324 @@ async def show_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         log.warning("تعذّر إرسال معاينة الملف (%s)", type(exc).__name__)
         mark_display_failed(update, context, "show_file_display_failed")
         return
+    mark_explicitly_ignored(update, context)
+
+
+# ---------------------------------------------------------------- متصفح الملفات الهرمي
+_BINARY_UNAVAILABLE = (
+    "الملف ده ثنائي (مثل ZIP أو صورة)، والبوت بيعرض الملفات النصية بس. "
+    "تنزيل بايتات ملفات مساحة العمل مش متاح حاليًا عبر تكامل Cloud V1 المدعوم."
+)
+_NOT_UTF8_UNAVAILABLE = (
+    "الملف بترميز غير مدعوم (مش UTF-8)، فمش ممكن معاينته كنص. "
+    "تنزيل بايتات الملف مش متاح حاليًا عبر Cloud V1 المدعوم."
+)
+_TOO_LARGE_UNAVAILABLE = (
+    f"الملف أكبر من حد المعاينة النصية الآمن ({MAX_PREVIEW_BYTES // 1024} KiB). "
+    "تنزيل بايتات الملف مش متاح حاليًا عبر Cloud V1 المدعوم."
+)
+_FILES_BROWSER_TOO_LARGE = (
+    "قايمة الملفات أكبر من حد التصفح المؤقت الآمن. جرّب شات أصغر أو استخدم قايمة الملفات "
+    "من جديد بعد تقليل عدد الملفات."
+)
+
+
+def _bot_file_status_message(status: FileStatus, error: str | None = None) -> str:
+    """رسالة البوت للملفات غير النصية — لا تقول إن ZIP ممنوع، ولا تدّعي تنزيلًا."""
+    if status is FileStatus.BINARY:
+        return _BINARY_UNAVAILABLE
+    if status is FileStatus.NOT_UTF8:
+        return _NOT_UTF8_UNAVAILABLE
+    if status is FileStatus.TOO_LARGE:
+        return _TOO_LARGE_UNAVAILABLE
+    return file_status_message(status, error)
+
+
+def _browser_get(context: ContextTypes.DEFAULT_TYPE, nav: str):
+    if not isinstance(nav, str) or not nav:
+        return None
+    return _browser_cache(context).get(nav)
+
+
+def _browser_owned(update: Update, state) -> bool:
+    return state is not None and state.owner_id == update.effective_user.id
+
+
+async def _render_browser(q, state, dir_index: int, page: int) -> None:
+    if not isinstance(dir_index, int) or dir_index < 0 or dir_index >= len(state.dirs):
+        await _safe_edit(q, _FILES_EXPIRED)
+        return
+    dir_path = state.dirs[dir_index]
+    page = state.clamp_page(dir_path, page)
+    entries = list(state.page_entries(dir_path, page))
+    total_pages = state.page_count(dir_path)
+    await _safe_edit(
+        q,
+        f"📁 {dir_path or '/'}\nصفحة {page + 1}/{total_pages}",
+        reply_markup=kb.browser_menu(
+            state.nav, dir_index, dir_path, entries, page, total_pages, dir_path != ""
+        ),
+    )
+
+
+async def browse_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """فتح متصفح الملفات من زر «الملفات» برمز شات قصير (DEF-010-safe)."""
+    q = update.callback_query
+    await _safe_answer(q)
+    if not _allowed(update, context.bot_data["config"]):
+        _authorization_ignored(update, context)
+        return
+    try:
+        token = q.data.split(":", 1)[1]
+    except IndexError:
+        await _safe_edit(q, _FILES_EXPIRED)
+        mark_explicitly_ignored(update, context)
+        return
+    cache = _browser_cache(context)
+    conversation_id = cache.conversation_for(token)
+    if not conversation_id:
+        await _safe_edit(q, _FILES_EXPIRED)
+        mark_explicitly_ignored(update, context)
+        return
+    listing = await _files_service(context).list_files(conversation_id)
+    if listing.status is not FileStatus.OK:
+        await _safe_edit(q, file_status_message(listing.status, listing.error))
+        if listing.status is FileStatus.UPSTREAM_ERROR:
+            mark_ambiguous_external(update, context, "files_listing_upstream_error")
+        else:
+            mark_explicitly_ignored(update, context)
+        return
+    if not listing.files:
+        await _safe_edit(
+            q,
+            "ما فيهاش ملفات.",
+            reply_markup=_conversation_actions_or_files(
+                context, conversation_id, files_cb=f"fbo:{token}"
+            ),
+        )
+        mark_explicitly_ignored(update, context)
+        return
+    state = cache.put(conversation_id, update.effective_user.id, listing.files)
+    if state.nav not in cache:
+        await _safe_edit(q, _FILES_BROWSER_TOO_LARGE)
+        mark_explicitly_ignored(update, context)
+        return
+    await _render_browser(q, state, 0, 0)
+    mark_explicitly_ignored(update, context)
+
+
+async def browse_dir(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await _safe_answer(q)
+    if not _allowed(update, context.bot_data["config"]):
+        _authorization_ignored(update, context)
+        return
+    try:
+        _, nav, raw_dir = q.data.split(":", 2)
+        dir_index = int(raw_dir)
+    except (ValueError, TypeError):
+        await _safe_edit(q, _FILES_EXPIRED)
+        mark_explicitly_ignored(update, context)
+        return
+    state = _browser_get(context, nav)
+    if not _browser_owned(update, state):
+        await _safe_edit(q, _FILES_EXPIRED)
+        mark_explicitly_ignored(update, context)
+        return
+    await _render_browser(q, state, dir_index, 0)
+    mark_explicitly_ignored(update, context)
+
+
+async def browse_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await _safe_answer(q)
+    if not _allowed(update, context.bot_data["config"]):
+        _authorization_ignored(update, context)
+        return
+    try:
+        _, nav, raw_dir, raw_page = q.data.split(":", 3)
+        dir_index, page = int(raw_dir), int(raw_page)
+    except (ValueError, TypeError):
+        await _safe_edit(q, _FILES_EXPIRED)
+        mark_explicitly_ignored(update, context)
+        return
+    state = _browser_get(context, nav)
+    if not _browser_owned(update, state):
+        await _safe_edit(q, _FILES_EXPIRED)
+        mark_explicitly_ignored(update, context)
+        return
+    await _render_browser(q, state, dir_index, page)
+    mark_explicitly_ignored(update, context)
+
+
+async def browse_up(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await _safe_answer(q)
+    if not _allowed(update, context.bot_data["config"]):
+        _authorization_ignored(update, context)
+        return
+    try:
+        _, nav, raw_dir = q.data.split(":", 2)
+        dir_index = int(raw_dir)
+    except (ValueError, TypeError):
+        await _safe_edit(q, _FILES_EXPIRED)
+        mark_explicitly_ignored(update, context)
+        return
+    state = _browser_get(context, nav)
+    if not _browser_owned(update, state) or not (0 <= dir_index < len(state.dirs)):
+        await _safe_edit(q, _FILES_EXPIRED)
+        mark_explicitly_ignored(update, context)
+        return
+    from .file_browser import parent_path
+
+    parent = parent_path(state.dirs[dir_index])
+    await _render_browser(q, state, state.dir_index.get(parent, 0), 0)
+    mark_explicitly_ignored(update, context)
+
+
+async def browse_root(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await _safe_answer(q)
+    if not _allowed(update, context.bot_data["config"]):
+        _authorization_ignored(update, context)
+        return
+    try:
+        _, nav = q.data.split(":", 1)
+    except ValueError:
+        await _safe_edit(q, _FILES_EXPIRED)
+        mark_explicitly_ignored(update, context)
+        return
+    state = _browser_get(context, nav)
+    if not _browser_owned(update, state):
+        await _safe_edit(q, _FILES_EXPIRED)
+        mark_explicitly_ignored(update, context)
+        return
+    await _render_browser(q, state, 0, 0)
+    mark_explicitly_ignored(update, context)
+
+
+async def browse_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """تحديث اللقطة (ملفات اتضافت/اتشالت) مع البقاء في نفس المجلد إن أمكن."""
+    q = update.callback_query
+    await _safe_answer(q)
+    if not _allowed(update, context.bot_data["config"]):
+        _authorization_ignored(update, context)
+        return
+    try:
+        _, nav, raw_dir = q.data.split(":", 2)
+        dir_index = int(raw_dir)
+    except (ValueError, TypeError):
+        await _safe_edit(q, _FILES_EXPIRED)
+        mark_explicitly_ignored(update, context)
+        return
+    state = _browser_get(context, nav)
+    if not _browser_owned(update, state):
+        await _safe_edit(q, _FILES_EXPIRED)
+        mark_explicitly_ignored(update, context)
+        return
+    old_dir = state.dirs[dir_index] if 0 <= dir_index < len(state.dirs) else ""
+    listing = await _files_service(context).list_files(state.conversation_id)
+    if listing.status is not FileStatus.OK:
+        await _safe_edit(q, file_status_message(listing.status, listing.error))
+        if listing.status is FileStatus.UPSTREAM_ERROR:
+            mark_ambiguous_external(update, context, "files_listing_upstream_error")
+        else:
+            mark_explicitly_ignored(update, context)
+        return
+    if not listing.files:
+        token = _browser_cache(context).token_for(state.conversation_id)
+        await _safe_edit(
+            q,
+            "ما فيهاش ملفات.",
+            reply_markup=_conversation_actions_or_files(
+                context, state.conversation_id, files_cb=f"fbo:{token}"
+            ),
+        )
+        mark_explicitly_ignored(update, context)
+        return
+    cache = _browser_cache(context)
+    new_state = cache.put(state.conversation_id, update.effective_user.id, listing.files)
+    if new_state.nav not in cache:
+        await _safe_edit(q, _FILES_BROWSER_TOO_LARGE)
+        mark_explicitly_ignored(update, context)
+        return
+    await _render_browser(q, new_state, new_state.dir_index.get(old_dir, 0), 0)
+    mark_explicitly_ignored(update, context)
+
+
+async def browse_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await _safe_answer(q)
+    if not _allowed(update, context.bot_data["config"]):
+        _authorization_ignored(update, context)
+        return
+    try:
+        _, nav, raw_dir, raw_file = q.data.split(":", 3)
+        dir_index, file_index = int(raw_dir), int(raw_file)
+    except (ValueError, TypeError):
+        await _safe_edit(q, _FILES_EXPIRED)
+        mark_explicitly_ignored(update, context)
+        return
+    state = _browser_get(context, nav)
+    if not _browser_owned(update, state) or not (0 <= dir_index < len(state.dirs)):
+        await _safe_edit(q, _FILES_EXPIRED)
+        mark_explicitly_ignored(update, context)
+        return
+    files = state.dir_files.get(state.dirs[dir_index], ())
+    if not (0 <= file_index < len(files)):
+        await _safe_edit(q, _FILES_EXPIRED)
+        mark_explicitly_ignored(update, context)
+        return
+    path = files[file_index]
+    content = await _files_service(context).read_preview(state.conversation_id, path)
+    if content.status is not FileStatus.OK:
+        await _safe_edit(q, _bot_file_status_message(content.status, content.error))
+        if content.status is FileStatus.UPSTREAM_ERROR:
+            mark_ambiguous_external(update, context, "file_preview_upstream_error")
+        else:
+            mark_explicitly_ignored(update, context)
+        return
+    body = content.text or ""
+    name = path.rsplit("/", 1)[-1] or "file.txt"
+    if content.truncated:
+        body += "\n\n… (المعاينة مقصوصة — الملف أكبر من حد العرض الآمن.)"
+    buffer = io.BytesIO(body.encode("utf-8"))
+    try:
+        await context.bot.send_document(
+            chat_id=q.message.chat_id, document=InputFile(buffer, filename=name)
+        )
+    except (TelegramError, asyncio.TimeoutError) as exc:
+        log.warning("تعذّر إرسال معاينة الملف (%s)", type(exc).__name__)
+        mark_display_failed(update, context, "browse_file_display_failed")
+        return
+    mark_explicitly_ignored(update, context)
+
+
+async def browse_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await _safe_answer(q)
+    if not _allowed(update, context.bot_data["config"]):
+        _authorization_ignored(update, context)
+        return
+    try:
+        _, nav = q.data.split(":", 1)
+    except ValueError:
+        await _safe_edit(q, _FILES_EXPIRED)
+        mark_explicitly_ignored(update, context)
+        return
+    state = _browser_get(context, nav)
+    if not _browser_owned(update, state):
+        await _safe_edit(q, _FILES_EXPIRED)
+        mark_explicitly_ignored(update, context)
+        return
+    token = _browser_cache(context).token_for(state.conversation_id)
+    await _safe_edit(
+        q,
+        "رجعت للشات.",
+        reply_markup=_conversation_actions_or_files(
+            context, state.conversation_id, files_cb=f"fbo:{token}"
+        ),
+    )
     mark_explicitly_ignored(update, context)
 
 
@@ -1863,7 +2225,9 @@ async def reply_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await _safe_edit(
         q,
         "ابعت البرومت اللي عايز تبعته للشات ده دلوقتي.",
-        reply_markup=kb.conversation_actions(conversation_id),
+        reply_markup=kb.conversation_actions(
+            conversation_id, files_cb=_files_open_cb(context, conversation_id)
+        ),
     )
 
 
@@ -1958,12 +2322,27 @@ def _attachment_file_id(message) -> str | None:
 
 
 def _attachment_service(context: ContextTypes.DEFAULT_TYPE):
-    from .attachments import AttachmentService, StagingStore
+    from .attachments import (
+        MAX_ITEMS_PER_BATCH,
+        MAX_STAGING_TOTAL_BYTES,
+        AttachmentService,
+        StagingStore,
+    )
 
     db = context.bot_data["db"]
     store = context.bot_data.get("attachment_store")
     if store is None:
-        store = StagingStore(db, context.bot_data["config"].db_path)
+        # OHB2-WP07-DEF011-A (Option B, owner-approved 2026-11-21): enforce the
+        # per-batch file cap (10) and the global staged-byte cap (64 MiB) in the
+        # single production store. `StagingStore` defaults stay `None`, so no
+        # other caller gets implicit enforcement; the 3 MiB per-file cap remains
+        # always on. Preserved orphan files still count toward the global cap.
+        store = StagingStore(
+            db,
+            context.bot_data["config"].db_path,
+            max_items_per_batch=MAX_ITEMS_PER_BATCH,
+            max_total_bytes=MAX_STAGING_TOTAL_BYTES,
+        )
         context.bot_data["attachment_store"] = store
     return AttachmentService(db, store, context.bot_data["client"], _identity_cache(context))
 

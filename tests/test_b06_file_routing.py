@@ -138,14 +138,18 @@ def test_show_file_too_large_is_safe(tmp_path):
     client = FileFlowClient(files=["big.py"], read_error=ResponseTooLargeError())
     update, ctx = _run_show_file(tmp_path, client, ["big.py"])
     assert ctx.bot.documents == []
-    assert "كبير" in update.callback_query.edits[-1]
+    message = update.callback_query.edits[-1]
+    assert "256 KiB" in message
+    assert "Cloud V1" in message
 
 
 def test_show_file_binary_is_safe(tmp_path):
     client = FileFlowClient(files=["bin.dat"], content="a\x00b")
     update, ctx = _run_show_file(tmp_path, client, ["bin.dat"])
     assert ctx.bot.documents == []
-    assert "مش نص" in update.callback_query.edits[-1]
+    message = update.callback_query.edits[-1]
+    assert "ثنائي" in message
+    assert "Cloud V1" in message
 
 
 def test_show_file_upstream_error_is_safe(tmp_path):

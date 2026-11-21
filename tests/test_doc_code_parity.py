@@ -111,6 +111,9 @@ PROPOSAL = (
 BATCH_REPORT = (
     ROOT / "docs/reviews/OHB2-WP07-FINAL-STABILIZATION-BATCH-REPORT.md"
 ).read_text(encoding="utf-8")
+F01_REPORT = (
+    ROOT / "docs/reviews/OHB2-WP07-BATCH04-DEF011-F01-IMPLEMENTATION-REPORT.md"
+).read_text(encoding="utf-8")
 ATTACHMENTS_SRC = (ROOT / "bot/attachments.py").read_text(encoding="utf-8")
 
 CORRECTION_MARKER = "LATER CORRECTION"
@@ -295,3 +298,32 @@ def test_t4_both_notices_share_date_status_and_scope_language():
     assert "five" in proposal_notice and "five" in report_notice, (
         "الوثيقتين لازم يذكروا نفس العدد (خمسة) لـ to_thread"
     )
+
+
+# --- T-5: تصحيح مرجع F-03 المتقادم في تقرير BATCH04-F01 ----------------------
+
+
+def test_t5_batch04_f01_report_correction_notice():
+    """T-5: تقرير F-01 التاريخي لازم يحمل إشعار تصحيح مؤرّخ لمرجع F-03 المتقادم."""
+    notice = _correction_notice(F01_REPORT)
+
+    # الإشعار موجود ومؤرّخ، ويسجّل حكم المراجعة المستقلة ويشير لتقريرها بالمسار الصحيح.
+    assert F03_DATE in notice, "إشعار تصحيح BATCH04-F01 لازم يحمل تاريخ التصحيح"
+    assert "F03_REVIEW_PASS" in notice, (
+        "الإشعار لازم يسجّل حكم المراجعة المستقلة F03_REVIEW_PASS"
+    )
+    assert "docs/reviews/OHB2-WP07-DEF011-F03-GENUINELY-INDEPENDENT-REVIEW-REPORT.md" in notice, (
+        "الإشعار لازم يشير لتقرير المراجعة المستقلة بالمسار الصحيح"
+    )
+
+    # الادّعاء التاريخي الأصلي لازم يفضل موجود حرفيًا (مش اتمسح ولا اتعاد كتابته).
+    assert (
+        '| **F-03** (stale acceptance doc claiming "0 `to_thread`") '
+        "| **OPEN / NOT FIXED** | Batch-03 DOC-01; not part of this task. |"
+    ) in F01_REPORT, "الادّعاء التاريخي عن F-03 اتمسح — الإصلاح لازم يكون إضافي فقط"
+
+    # ممنوع ادّعاء إن DEF-011 مقفول: الإشعار لازم يصرّح إنه لسه مفتوح وما بيقفلوش.
+    lowered = notice.lower()
+    assert "remains open" in lowered, "الإشعار لازم يصرّح إن DEF-011 لسه مفتوح"
+    assert "not close" in lowered, "الإشعار لازم يوضّح إنه ما بيقفلش DEF-011"
+

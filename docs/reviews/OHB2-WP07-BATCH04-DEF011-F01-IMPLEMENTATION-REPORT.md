@@ -300,6 +300,20 @@ Delta vs the pre-fix snapshot: **+162 / −65 lines** (`/tmp/f01.diff`).
 | **F-03** (stale acceptance doc claiming "0 `to_thread`") | **OPEN / NOT FIXED** | Batch-03 DOC-01; not part of this task. |
 | Residual ~200 ms loop gap in large sweeps | **NOTED, NOT FIXED** | This is the synchronous SQLite DB phase on its owner thread, not F-01. Would require DB batching — a separate decision. |
 
+> **⚠ LATER CORRECTION — 2026-11-21 (append-only; the historical F-03 row above is unchanged).**
+> The **F-03** row above ("**OPEN / NOT FIXED**") was accurate when this report was written on
+> **2026-11-19**; it is now **SUPERSEDED**. F-03 (the stale acceptance documents claiming
+> "0 `to_thread`") was subsequently corrected with dated, additive supersession notices and guarded by
+> parity tests, and it then passed a **genuinely independent review** with the verdict
+> **`F03_REVIEW_PASS`** — see
+> `docs/reviews/OHB2-WP07-DEF011-F03-GENUINELY-INDEPENDENT-REVIEW-REPORT.md`.
+>
+> This correction closes **only the F-03 documentation remediation**; it does not close `DEF-011`.
+> **`DEF-011` as a whole remains OPEN.** `DEF-011-A` (quota reservation ledger) and `DEF-011-C`
+> (attachment acceptance UX copy) remain **NOT IMPLEMENTED**, and `D6` (repeated raw cancellation during
+> drain) remains **deferred**. The historical F-03 row is preserved unchanged above as a historical
+> record.
+
 Unchanged blockers carried forward: DEF-006, DEF-013, NEW-DEF-03, NAV-01..06,
 WP-05, WP-06, WP-08 were **not** modified by this task.
 

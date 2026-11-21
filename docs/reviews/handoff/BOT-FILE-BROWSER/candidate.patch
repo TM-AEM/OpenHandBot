@@ -1,0 +1,1736 @@
+diff --git a/bot/app.py b/bot/app.py
+index 4747364..67d2fa0 100644
+--- a/bot/app.py
++++ b/bot/app.py
+@@ -151,6 +151,16 @@ def build_application(config: Config) -> Application:
+     if not features.is_hidden("export"):
+         app.add_handler(CallbackQueryHandler(handlers.export_conversation, pattern=r"^export:"))
+     if not features.is_hidden("files"):
++        # OHB2-BOT-FILE-BROWSER: المسار الجديد (شجرة + ترقيم + رموز قصيرة). الـ handlers
++        # القديمة (`files:`/`file:`) باقية للرسائل القديمة فقط.
++        app.add_handler(CallbackQueryHandler(handlers.browse_open, pattern=r"^fbo:"))
++        app.add_handler(CallbackQueryHandler(handlers.browse_dir, pattern=r"^fbd:"))
++        app.add_handler(CallbackQueryHandler(handlers.browse_page, pattern=r"^fbp:"))
++        app.add_handler(CallbackQueryHandler(handlers.browse_up, pattern=r"^fbu:"))
++        app.add_handler(CallbackQueryHandler(handlers.browse_root, pattern=r"^fbr:"))
++        app.add_handler(CallbackQueryHandler(handlers.browse_file, pattern=r"^fbf:"))
++        app.add_handler(CallbackQueryHandler(handlers.browse_refresh, pattern=r"^fbx:"))
++        app.add_handler(CallbackQueryHandler(handlers.browse_back, pattern=r"^fbb:"))
+         app.add_handler(CallbackQueryHandler(handlers.list_files, pattern=r"^files:"))
+         app.add_handler(CallbackQueryHandler(handlers.show_file, pattern=r"^file:"))
+     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.handle_text))
+diff --git a/bot/file_browser.py b/bot/file_browser.py
+new file mode 100644
+index 0000000..c92abfa
+--- /dev/null
++++ b/bot/file_browser.py
+@@ -0,0 +1,239 @@
++"""OHB2-BOT-FILE-BROWSER: شجرة مجلدات + ترقيم ثابت فوق قايمة مسارات مسطّحة.
++
++الـ OpenHands Cloud V1 بيرجّع **قايمة مسارات نسبية مسطّحة** (`GET /app-conversations/{id}/files`)،
++مفيش مدخلات مجلدات ولا صفحات من الـ API. الموديول ده بيبني الشجرة **محليًا** (زي ما الـ Mini App
++بيعمل في `bot/web/static/files.js::buildTree`) ويحتفظ بلقطة محدودة في الذاكرة للترقيم الثابت.
++
++حدود الذاكرة (نفس فلسفة `bot/file_cache.py`):
++- عدد لقطات محدود + مجموع أحرف محدود + TTL.
++- مفيش تحميل متكرر للقايمة الكاملة لكل صفحة: اللقطة بتتبني مرة عند الفتح/التحديث.
++- الـ API نفسه بيرجّع القايمة كاملة، فمفيش طريقة لتجنّب تحميلها مرة واحدة؛ بنحمّلها **مرة واحدة**
++  لكل جلسة تصفّح ونرقّم محليًا (trade-off موثّق).
++"""
++from __future__ import annotations
++
++import hashlib
++import secrets
++import time
++from collections import OrderedDict
++from dataclasses import dataclass
++
++from .files import is_safe_workspace_path
++
++PAGE_SIZE = 10
++MAX_ENTRIES = 16
++MAX_TOTAL_CHARS = 50_000
++MAX_TOKENS = 128
++STATE_TTL_SECONDS = 30 * 60
++
++
++@dataclass(frozen=True)
++class BrowserState:
++    """لقطة تصفّح ثابتة لشات واحد.
++
++    `dirs` مرتّبة تصاعديًا و`""` (الجذر) أولها. `subdirs[dir]` = مسارات المجلدات الفرعية
++    الكاملة المرتّبة، و`dir_files[dir]` = مسارات الملفات المباشرة في المجلد (مش المتداخلة).
++    """
++
++    nav: str
++    conversation_id: str
++    owner_id: int
++    dirs: tuple[str, ...]
++    dir_index: dict[str, int]
++    subdirs: dict[str, tuple[str, ...]]
++    dir_files: dict[str, tuple[str, ...]]
++    created_at: float
++
++    def entries(self, dir_path: str) -> tuple[tuple[str, str, int], ...]:
++        """مدخلات مجلد: المجلدات الأول (مرتّبة) وبعدها الملفات (مرتّبة).
++
++        العنصر = (النوع، المسار الكامل، الفهرس الهدف). للمجلد الفهرس = فهرس المجلد
++        العالمي في `dirs`؛ للملف الفهرس = موقعه داخل ملفات هذا المجلد.
++        """
++        out: list[tuple[str, str, int]] = []
++        for child in self.subdirs.get(dir_path, ()):
++            out.append(("dir", child, self.dir_index[child]))
++        for index, path in enumerate(self.dir_files.get(dir_path, ())):
++            out.append(("file", path, index))
++        return tuple(out)
++
++    def page_count(self, dir_path: str) -> int:
++        count = len(self.entries(dir_path))
++        return max(1, (count + PAGE_SIZE - 1) // PAGE_SIZE)
++
++    def clamp_page(self, dir_path: str, page: int) -> int:
++        return min(max(0, int(page)), self.page_count(dir_path) - 1)
++
++    def page_entries(self, dir_path: str, page: int) -> tuple[tuple[str, str, int], ...]:
++        entries = self.entries(dir_path)
++        start = self.clamp_page(dir_path, page) * PAGE_SIZE
++        return entries[start : start + PAGE_SIZE]
++
++
++def parent_path(path: str) -> str:
++    """المجلد الأب لمسار مجلد (الجذر `""` هو أب كل شيء في المستوى الأول)."""
++    return path.rsplit("/", 1)[0] if "/" in path else ""
++
++
++def build_state(
++    nav: str,
++    conversation_id: str,
++    owner_id: int,
++    paths,
++    *,
++    now: float | None = None,
++) -> BrowserState:
++    """يبني شجرة من مسارات نسبية مسطّحة.
++
++    المسارات غير الآمنة تُسقط (fail closed) بنفس `is_safe_workspace_path` المستخدم في
++    `FileService.list_files`. مفيش اختلاق مجلدات فارغة: المجلد يظهر بس لو مسار ملف
++    حقيقي بيمرّ بيه.
++    """
++    dirs_set: set[str] = {""}
++    subdirs: dict[str, set[str]] = {}
++    dir_files: dict[str, set[str]] = {}
++    clean = sorted({p for p in (paths or ()) if is_safe_workspace_path(p)})
++    for path in clean:
++        parts = path.split("/")
++        parent = ""
++        for segment in parts[:-1]:
++            child = segment if not parent else f"{parent}/{segment}"
++            dirs_set.add(child)
++            subdirs.setdefault(parent, set()).add(child)
++            parent = child
++        dir_files.setdefault(parent, set()).add(path)
++    dirs = tuple(sorted(dirs_set))
++    return BrowserState(
++        nav=nav,
++        conversation_id=conversation_id,
++        owner_id=int(owner_id),
++        dirs=dirs,
++        dir_index={path: index for index, path in enumerate(dirs)},
++        subdirs={path: tuple(sorted(values)) for path, values in subdirs.items()},
++        dir_files={path: tuple(sorted(values)) for path, values in dir_files.items()},
++        created_at=time.monotonic() if now is None else float(now),
++    )
++
++
++def _state_chars(state: BrowserState) -> int:
++    return sum(len(path) for path in state.dirs) + sum(
++        len(path) for files in state.dir_files.values() for path in files
++    )
++
++
++class BrowserCache:
++    """ذاكرة لقطات التصفّح + ربط رموز قصيرة بمعرّفات الشاتات.
++
++    الرمز (`token_for`) ثابت لكل شات (SHA-256 مختصر) عشان زر «الملفات» يفضل شغّال
++    من غير ما نضع معرّف الشات الطويل في `callback_data` (DEF-010). رمز التصفّح (`nav`)
++    عشوائي لكل لقطة، واللقطة نفسها بتفضل صالحة عبر الصفحات/المجلدات لحد الإخلاء أو
++    الـ TTL أو التحديث.
++    """
++
++    def __init__(
++        self,
++        *,
++        max_entries: int = MAX_ENTRIES,
++        max_total_chars: int = MAX_TOTAL_CHARS,
++        max_tokens: int = MAX_TOKENS,
++        ttl_seconds: float | None = STATE_TTL_SECONDS,
++    ) -> None:
++        self._max_entries = max(1, int(max_entries))
++        self._max_total_chars = max(0, int(max_total_chars))
++        self._max_tokens = max(1, int(max_tokens))
++        self._ttl_seconds = ttl_seconds
++        self._states: OrderedDict[str, BrowserState] = OrderedDict()
++        self._chars = 0
++        self._tokens: OrderedDict[str, str] = OrderedDict()
++        self._cid_tokens: dict[str, str] = {}
++
++    # ---------------------------------------------------------- conversation token
++    def token_for(self, conversation_id: str) -> str:
++        existing = self._cid_tokens.get(conversation_id)
++        if existing is not None and self._tokens.get(existing) == conversation_id:
++            self._tokens.move_to_end(existing)
++            return existing
++        token = hashlib.sha256(
++            ("ohb2-files:" + str(conversation_id)).encode("utf-8")
++        ).hexdigest()[:16]
++        while token in self._tokens and self._tokens[token] != conversation_id:
++            token = hashlib.sha256(
++                (token + ":" + str(conversation_id)).encode("utf-8")
++            ).hexdigest()[:16]
++        self._tokens[token] = conversation_id
++        self._cid_tokens[conversation_id] = token
++        self._evict_tokens()
++        return token
++
++    def conversation_for(self, token: str) -> str | None:
++        if not isinstance(token, str):
++            return None
++        conversation_id = self._tokens.get(token)
++        if conversation_id is not None:
++            self._tokens.move_to_end(token)
++        return conversation_id
++
++    # ------------------------------------------------------------------- snapshots
++    def put(self, conversation_id: str, owner_id: int, paths) -> BrowserState:
++        # اللقطة القديمة لنفس الشات تُسقط (تحديث)، لكن رمز الشات يفضل صالح عشان زر
++        # «الملفات» ما يبوظش بعد أول فتح.
++        self._drop_states_for(conversation_id)
++        nav = secrets.token_hex(8)
++        while nav in self._states:
++            nav = secrets.token_hex(8)
++        state = build_state(nav, conversation_id, owner_id, paths)
++        self._states[nav] = state
++        self._chars += _state_chars(state)
++        self._evict_states()
++        return state
++
++    def get(self, nav: str) -> BrowserState | None:
++        state = self._states.get(nav)
++        if state is None:
++            return None
++        if self._ttl_seconds is not None and time.monotonic() - state.created_at > self._ttl_seconds:
++            self._drop_state(nav)
++            return None
++        self._states.move_to_end(nav)
++        return state
++
++    def invalidate(self, conversation_id: str) -> None:
++        self._drop_states_for(conversation_id)
++        token = self._cid_tokens.pop(conversation_id, None)
++        if token is not None:
++            self._tokens.pop(token, None)
++
++    def clear(self) -> None:
++        self._states.clear()
++        self._tokens.clear()
++        self._cid_tokens.clear()
++        self._chars = 0
++
++    def __len__(self) -> int:
++        return len(self._states)
++
++    def __contains__(self, nav: object) -> bool:
++        return nav in self._states
++
++    # ---------------------------------------------------------------------- internals
++    def _drop_state(self, nav: str) -> None:
++        state = self._states.pop(nav, None)
++        if state is not None:
++            self._chars -= _state_chars(state)
++
++    def _drop_states_for(self, conversation_id: str) -> None:
++        for nav in [n for n, s in self._states.items() if s.conversation_id == conversation_id]:
++            self._drop_state(nav)
++
++    def _evict_states(self) -> None:
++        while self._states and (
++            len(self._states) > self._max_entries or self._chars > self._max_total_chars
++        ):
++            _, state = self._states.popitem(last=False)
++            self._chars -= _state_chars(state)
++
++    def _evict_tokens(self) -> None:
++        while len(self._tokens) > self._max_tokens:
++            token, conversation_id = self._tokens.popitem(last=False)
++            if self._cid_tokens.get(conversation_id) == token:
++                self._cid_tokens.pop(conversation_id, None)
+diff --git a/bot/handlers.py b/bot/handlers.py
+index 06f268b..9f2ed60 100644
+--- a/bot/handlers.py
++++ b/bot/handlers.py
+@@ -43,6 +43,7 @@ from .file_cache import FileCache
+ from .openhands_client import collect_conversations
+ from .files import (
+     CONVERSATION_ERRORS,
++    MAX_PREVIEW_BYTES,
+     FileService,
+     FileStatus,
+     authorize_conversation_detailed,
+@@ -218,6 +219,31 @@ def _files_service(context: ContextTypes.DEFAULT_TYPE) -> FileService:
+     )
+ 
+ 
++def _browser_cache(context: ContextTypes.DEFAULT_TYPE):
++    """ذاكرة لقطات متصفح الملفات (LRU + TTL + رموز قصيرة) — كائن واحد لكل بوت."""
++    from .file_browser import BrowserCache
++
++    return context.bot_data.setdefault("file_browser_cache", BrowserCache())
++
++
++def _files_open_cb(context: ContextTypes.DEFAULT_TYPE, conversation_id: str) -> str:
++    """callback قصير لزر «الملفات» — رمز ثابت بدل معرّف الشات الطويل (DEF-010)."""
++    return f"fbo:{_browser_cache(context).token_for(conversation_id)}"
++
++
++def _conversation_actions_or_files(
++    context: ContextTypes.DEFAULT_TYPE, conversation_id: str, *, files_cb: str, **kwargs
++):
++    """لوحة الشات الكاملة، أو لوحة ملفات مختصرة لو معرّف الشات الطويل كسر حد 64 بايت.
++
++    ده مسار احتياطي لمتصفح الملفات فقط (DEF-010)؛ مسارات الشات التانية مااتغيّرتش.
++    """
++    try:
++        return kb.conversation_actions(conversation_id, files_cb=files_cb, **kwargs)
++    except ValueError:
++        return kb.files_only_menu(files_cb)
++
++
+ def _is_expected_upstream_rejection(exc: ApiError | None) -> bool:
+     """OHB2-SW-07: هل `UPSTREAM_ERROR` ده **رفض 4xx متوقّع** (لا ينتشر)؟
+ 
+@@ -1194,6 +1220,7 @@ async def open_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE)
+         has_reply=reply is not None,
+         reply_cut=reply_cut,
+         mini_app_url=_mini_app_url(context),
++        files_cb=_files_open_cb(context, conversation_id),
+     )
+     # القرار 1: بعد فتح الشات، رسايلك الجاية بتتوجّه له 10 دقايق من آخر نشاط (مع زر إلغاء).
+     # بنفعّل التوجيه بس بعد ما العرض يظهر فعلاً، عشان فشل العرض ما يسبش توجيه مفعّل من غير
+@@ -1449,7 +1476,11 @@ async def watch_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE)
+         new_lifecycle=False, reengage=True,
+     )
+     await _safe_edit(
+-        q, "تمام، الشات اتضاف للمتابعة ✅", reply_markup=kb.conversation_actions(conversation_id, True)
++        q,
++        "تمام، الشات اتضاف للمتابعة ✅",
++        reply_markup=kb.conversation_actions(
++            conversation_id, True, files_cb=_files_open_cb(context, conversation_id)
++        ),
+     )
+ 
+ 
+@@ -1574,6 +1605,9 @@ async def delete_conversation_confirm(update: Update, context: ContextTypes.DEFA
+     # بدء الشات). مابنبطّلوش في حالات الفشل/النتيجة المجهولة (الشات ممكن لسه بعيدًا).
+     if result.status == deletion.STATUS_DELETED:
+         context.bot_data.pop("list_cache", None)
++        # قوايم/لقطات الملفات للشات المحذوف تبقى بايتة (مفيش تنقّل على مسارات قديمة).
++        _file_cache(context).invalidate(conversation_id)
++        _browser_cache(context).invalidate(conversation_id)
+     await _safe_edit(
+         q,
+         result.message,
+@@ -1626,7 +1660,9 @@ async def show_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
+     # المستخدم طلبه، ففشل عرضه (False) لازم يتسجّل صريح بدل ما نرجّع وكأننا نجحنا.
+     if not await _edit_or_send(
+         q, "\n".join(lines), q.message.chat_id, context.bot,
+-        reply_markup=kb.conversation_actions(conversation_id),
++        reply_markup=kb.conversation_actions(
++            conversation_id, files_cb=_files_open_cb(context, conversation_id)
++        ),
+     ):
+         log.warning("تعذّر عرض حالة الشات %s (فشل تعديل/إرسال تيليجرام).", conversation_id)
+         mark_display_failed(update, context, "show_status_display_failed")
+@@ -1664,7 +1700,9 @@ async def show_cost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+     # OHB2-SW-05: نفس منطق show_status — فشل عرض التكلفة يتسجّل بدل ما يتجاهله الكود.
+     if not await _edit_or_send(
+         q, format_cost(conv.get("metrics")), q.message.chat_id, context.bot,
+-        reply_markup=kb.conversation_actions(conversation_id),
++        reply_markup=kb.conversation_actions(
++            conversation_id, files_cb=_files_open_cb(context, conversation_id)
++        ),
+     ):
+         log.warning("تعذّر عرض تكلفة الشات %s (فشل تعديل/إرسال تيليجرام).", conversation_id)
+         mark_display_failed(update, context, "show_cost_display_failed")
+@@ -1760,7 +1798,13 @@ async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
+         return
+     files = list(listing.files)
+     if not files:
+-        await _safe_edit(q, "ما فيهاش ملفات.", reply_markup=kb.conversation_actions(conversation_id))
++        await _safe_edit(
++            q,
++            "ما فيهاش ملفات.",
++            reply_markup=_conversation_actions_or_files(
++                context, conversation_id, files_cb=_files_open_cb(context, conversation_id)
++            ),
++        )
+         mark_explicitly_ignored(update, context)
+         return
+     # نخزّن القايمة عشان الـ callback data (حد 64 بايت) ما يشيلش المسار الكامل.
+@@ -1809,7 +1853,7 @@ async def show_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+     content = await _files_service(context).read_preview(conversation_id, path)
+     if content.status is not FileStatus.OK:
+         # ثنائي/ترميز غير مدعوم/كبير/مش موجود/غير مصرّح ⇒ رسالة واضحة بدل محتوى مشوّه.
+-        await _safe_edit(q, file_status_message(content.status, content.error))
++        await _safe_edit(q, _bot_file_status_message(content.status, content.error))
+         if content.status is FileStatus.UPSTREAM_ERROR:
+             mark_ambiguous_external(update, context, "file_preview_upstream_error")
+         else:
+@@ -1832,6 +1876,324 @@ async def show_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+     mark_explicitly_ignored(update, context)
+ 
+ 
++# ---------------------------------------------------------------- متصفح الملفات الهرمي
++_BINARY_UNAVAILABLE = (
++    "الملف ده ثنائي (مثل ZIP أو صورة)، والبوت بيعرض الملفات النصية بس. "
++    "تنزيل بايتات ملفات مساحة العمل مش متاح حاليًا عبر تكامل Cloud V1 المدعوم."
++)
++_NOT_UTF8_UNAVAILABLE = (
++    "الملف بترميز غير مدعوم (مش UTF-8)، فمش ممكن معاينته كنص. "
++    "تنزيل بايتات الملف مش متاح حاليًا عبر Cloud V1 المدعوم."
++)
++_TOO_LARGE_UNAVAILABLE = (
++    f"الملف أكبر من حد المعاينة النصية الآمن ({MAX_PREVIEW_BYTES // 1024} KiB). "
++    "تنزيل بايتات الملف مش متاح حاليًا عبر Cloud V1 المدعوم."
++)
++_FILES_BROWSER_TOO_LARGE = (
++    "قايمة الملفات أكبر من حد التصفح المؤقت الآمن. جرّب شات أصغر أو استخدم قايمة الملفات "
++    "من جديد بعد تقليل عدد الملفات."
++)
++
++
++def _bot_file_status_message(status: FileStatus, error: str | None = None) -> str:
++    """رسالة البوت للملفات غير النصية — لا تقول إن ZIP ممنوع، ولا تدّعي تنزيلًا."""
++    if status is FileStatus.BINARY:
++        return _BINARY_UNAVAILABLE
++    if status is FileStatus.NOT_UTF8:
++        return _NOT_UTF8_UNAVAILABLE
++    if status is FileStatus.TOO_LARGE:
++        return _TOO_LARGE_UNAVAILABLE
++    return file_status_message(status, error)
++
++
++def _browser_get(context: ContextTypes.DEFAULT_TYPE, nav: str):
++    if not isinstance(nav, str) or not nav:
++        return None
++    return _browser_cache(context).get(nav)
++
++
++def _browser_owned(update: Update, state) -> bool:
++    return state is not None and state.owner_id == update.effective_user.id
++
++
++async def _render_browser(q, state, dir_index: int, page: int) -> None:
++    if not isinstance(dir_index, int) or dir_index < 0 or dir_index >= len(state.dirs):
++        await _safe_edit(q, _FILES_EXPIRED)
++        return
++    dir_path = state.dirs[dir_index]
++    page = state.clamp_page(dir_path, page)
++    entries = list(state.page_entries(dir_path, page))
++    total_pages = state.page_count(dir_path)
++    await _safe_edit(
++        q,
++        f"📁 {dir_path or '/'}\nصفحة {page + 1}/{total_pages}",
++        reply_markup=kb.browser_menu(
++            state.nav, dir_index, dir_path, entries, page, total_pages, dir_path != ""
++        ),
++    )
++
++
++async def browse_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
++    """فتح متصفح الملفات من زر «الملفات» برمز شات قصير (DEF-010-safe)."""
++    q = update.callback_query
++    await _safe_answer(q)
++    if not _allowed(update, context.bot_data["config"]):
++        _authorization_ignored(update, context)
++        return
++    try:
++        token = q.data.split(":", 1)[1]
++    except IndexError:
++        await _safe_edit(q, _FILES_EXPIRED)
++        mark_explicitly_ignored(update, context)
++        return
++    cache = _browser_cache(context)
++    conversation_id = cache.conversation_for(token)
++    if not conversation_id:
++        await _safe_edit(q, _FILES_EXPIRED)
++        mark_explicitly_ignored(update, context)
++        return
++    listing = await _files_service(context).list_files(conversation_id)
++    if listing.status is not FileStatus.OK:
++        await _safe_edit(q, file_status_message(listing.status, listing.error))
++        if listing.status is FileStatus.UPSTREAM_ERROR:
++            mark_ambiguous_external(update, context, "files_listing_upstream_error")
++        else:
++            mark_explicitly_ignored(update, context)
++        return
++    if not listing.files:
++        await _safe_edit(
++            q,
++            "ما فيهاش ملفات.",
++            reply_markup=_conversation_actions_or_files(
++                context, conversation_id, files_cb=f"fbo:{token}"
++            ),
++        )
++        mark_explicitly_ignored(update, context)
++        return
++    state = cache.put(conversation_id, update.effective_user.id, listing.files)
++    if state.nav not in cache:
++        await _safe_edit(q, _FILES_BROWSER_TOO_LARGE)
++        mark_explicitly_ignored(update, context)
++        return
++    await _render_browser(q, state, 0, 0)
++    mark_explicitly_ignored(update, context)
++
++
++async def browse_dir(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
++    q = update.callback_query
++    await _safe_answer(q)
++    if not _allowed(update, context.bot_data["config"]):
++        _authorization_ignored(update, context)
++        return
++    try:
++        _, nav, raw_dir = q.data.split(":", 2)
++        dir_index = int(raw_dir)
++    except (ValueError, TypeError):
++        await _safe_edit(q, _FILES_EXPIRED)
++        mark_explicitly_ignored(update, context)
++        return
++    state = _browser_get(context, nav)
++    if not _browser_owned(update, state):
++        await _safe_edit(q, _FILES_EXPIRED)
++        mark_explicitly_ignored(update, context)
++        return
++    await _render_browser(q, state, dir_index, 0)
++    mark_explicitly_ignored(update, context)
++
++
++async def browse_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
++    q = update.callback_query
++    await _safe_answer(q)
++    if not _allowed(update, context.bot_data["config"]):
++        _authorization_ignored(update, context)
++        return
++    try:
++        _, nav, raw_dir, raw_page = q.data.split(":", 3)
++        dir_index, page = int(raw_dir), int(raw_page)
++    except (ValueError, TypeError):
++        await _safe_edit(q, _FILES_EXPIRED)
++        mark_explicitly_ignored(update, context)
++        return
++    state = _browser_get(context, nav)
++    if not _browser_owned(update, state):
++        await _safe_edit(q, _FILES_EXPIRED)
++        mark_explicitly_ignored(update, context)
++        return
++    await _render_browser(q, state, dir_index, page)
++    mark_explicitly_ignored(update, context)
++
++
++async def browse_up(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
++    q = update.callback_query
++    await _safe_answer(q)
++    if not _allowed(update, context.bot_data["config"]):
++        _authorization_ignored(update, context)
++        return
++    try:
++        _, nav, raw_dir = q.data.split(":", 2)
++        dir_index = int(raw_dir)
++    except (ValueError, TypeError):
++        await _safe_edit(q, _FILES_EXPIRED)
++        mark_explicitly_ignored(update, context)
++        return
++    state = _browser_get(context, nav)
++    if not _browser_owned(update, state) or not (0 <= dir_index < len(state.dirs)):
++        await _safe_edit(q, _FILES_EXPIRED)
++        mark_explicitly_ignored(update, context)
++        return
++    from .file_browser import parent_path
++
++    parent = parent_path(state.dirs[dir_index])
++    await _render_browser(q, state, state.dir_index.get(parent, 0), 0)
++    mark_explicitly_ignored(update, context)
++
++
++async def browse_root(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
++    q = update.callback_query
++    await _safe_answer(q)
++    if not _allowed(update, context.bot_data["config"]):
++        _authorization_ignored(update, context)
++        return
++    try:
++        _, nav = q.data.split(":", 1)
++    except ValueError:
++        await _safe_edit(q, _FILES_EXPIRED)
++        mark_explicitly_ignored(update, context)
++        return
++    state = _browser_get(context, nav)
++    if not _browser_owned(update, state):
++        await _safe_edit(q, _FILES_EXPIRED)
++        mark_explicitly_ignored(update, context)
++        return
++    await _render_browser(q, state, 0, 0)
++    mark_explicitly_ignored(update, context)
++
++
++async def browse_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
++    """تحديث اللقطة (ملفات اتضافت/اتشالت) مع البقاء في نفس المجلد إن أمكن."""
++    q = update.callback_query
++    await _safe_answer(q)
++    if not _allowed(update, context.bot_data["config"]):
++        _authorization_ignored(update, context)
++        return
++    try:
++        _, nav, raw_dir = q.data.split(":", 2)
++        dir_index = int(raw_dir)
++    except (ValueError, TypeError):
++        await _safe_edit(q, _FILES_EXPIRED)
++        mark_explicitly_ignored(update, context)
++        return
++    state = _browser_get(context, nav)
++    if not _browser_owned(update, state):
++        await _safe_edit(q, _FILES_EXPIRED)
++        mark_explicitly_ignored(update, context)
++        return
++    old_dir = state.dirs[dir_index] if 0 <= dir_index < len(state.dirs) else ""
++    listing = await _files_service(context).list_files(state.conversation_id)
++    if listing.status is not FileStatus.OK:
++        await _safe_edit(q, file_status_message(listing.status, listing.error))
++        if listing.status is FileStatus.UPSTREAM_ERROR:
++            mark_ambiguous_external(update, context, "files_listing_upstream_error")
++        else:
++            mark_explicitly_ignored(update, context)
++        return
++    if not listing.files:
++        token = _browser_cache(context).token_for(state.conversation_id)
++        await _safe_edit(
++            q,
++            "ما فيهاش ملفات.",
++            reply_markup=_conversation_actions_or_files(
++                context, state.conversation_id, files_cb=f"fbo:{token}"
++            ),
++        )
++        mark_explicitly_ignored(update, context)
++        return
++    cache = _browser_cache(context)
++    new_state = cache.put(state.conversation_id, update.effective_user.id, listing.files)
++    if new_state.nav not in cache:
++        await _safe_edit(q, _FILES_BROWSER_TOO_LARGE)
++        mark_explicitly_ignored(update, context)
++        return
++    await _render_browser(q, new_state, new_state.dir_index.get(old_dir, 0), 0)
++    mark_explicitly_ignored(update, context)
++
++
++async def browse_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
++    q = update.callback_query
++    await _safe_answer(q)
++    if not _allowed(update, context.bot_data["config"]):
++        _authorization_ignored(update, context)
++        return
++    try:
++        _, nav, raw_dir, raw_file = q.data.split(":", 3)
++        dir_index, file_index = int(raw_dir), int(raw_file)
++    except (ValueError, TypeError):
++        await _safe_edit(q, _FILES_EXPIRED)
++        mark_explicitly_ignored(update, context)
++        return
++    state = _browser_get(context, nav)
++    if not _browser_owned(update, state) or not (0 <= dir_index < len(state.dirs)):
++        await _safe_edit(q, _FILES_EXPIRED)
++        mark_explicitly_ignored(update, context)
++        return
++    files = state.dir_files.get(state.dirs[dir_index], ())
++    if not (0 <= file_index < len(files)):
++        await _safe_edit(q, _FILES_EXPIRED)
++        mark_explicitly_ignored(update, context)
++        return
++    path = files[file_index]
++    content = await _files_service(context).read_preview(state.conversation_id, path)
++    if content.status is not FileStatus.OK:
++        await _safe_edit(q, _bot_file_status_message(content.status, content.error))
++        if content.status is FileStatus.UPSTREAM_ERROR:
++            mark_ambiguous_external(update, context, "file_preview_upstream_error")
++        else:
++            mark_explicitly_ignored(update, context)
++        return
++    body = content.text or ""
++    name = path.rsplit("/", 1)[-1] or "file.txt"
++    if content.truncated:
++        body += "\n\n… (المعاينة مقصوصة — الملف أكبر من حد العرض الآمن.)"
++    buffer = io.BytesIO(body.encode("utf-8"))
++    try:
++        await context.bot.send_document(
++            chat_id=q.message.chat_id, document=InputFile(buffer, filename=name)
++        )
++    except (TelegramError, asyncio.TimeoutError) as exc:
++        log.warning("تعذّر إرسال معاينة الملف (%s)", type(exc).__name__)
++        mark_display_failed(update, context, "browse_file_display_failed")
++        return
++    mark_explicitly_ignored(update, context)
++
++
++async def browse_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
++    q = update.callback_query
++    await _safe_answer(q)
++    if not _allowed(update, context.bot_data["config"]):
++        _authorization_ignored(update, context)
++        return
++    try:
++        _, nav = q.data.split(":", 1)
++    except ValueError:
++        await _safe_edit(q, _FILES_EXPIRED)
++        mark_explicitly_ignored(update, context)
++        return
++    state = _browser_get(context, nav)
++    if not _browser_owned(update, state):
++        await _safe_edit(q, _FILES_EXPIRED)
++        mark_explicitly_ignored(update, context)
++        return
++    token = _browser_cache(context).token_for(state.conversation_id)
++    await _safe_edit(
++        q,
++        "رجعت للشات.",
++        reply_markup=_conversation_actions_or_files(
++            context, state.conversation_id, files_cb=f"fbo:{token}"
++        ),
++    )
++    mark_explicitly_ignored(update, context)
++
++
+ async def reply_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+     q = update.callback_query
+     await _safe_answer(q)
+@@ -1863,7 +2225,9 @@ async def reply_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
+     await _safe_edit(
+         q,
+         "ابعت البرومت اللي عايز تبعته للشات ده دلوقتي.",
+-        reply_markup=kb.conversation_actions(conversation_id),
++        reply_markup=kb.conversation_actions(
++            conversation_id, files_cb=_files_open_cb(context, conversation_id)
++        ),
+     )
+ 
+ 
+diff --git a/bot/keyboards.py b/bot/keyboards.py
+index bf4e2bf..821c616 100644
+--- a/bot/keyboards.py
++++ b/bot/keyboards.py
+@@ -130,6 +130,7 @@ def conversation_actions(
+     has_reply: bool = False,
+     reply_cut: bool = False,
+     mini_app_url: str = "",
++    files_cb: str | None = None,
+ ) -> InlineKeyboardMarkup:
+     # الميزات المؤجّلة (القرار 4): الملفات/التكلفة/التصدير مخفية، وزر المتابعة اليدوية
+     # (تابع/إلغاء المتابعة) مخفي مع «متابعاتي». الأزرار الأساسية (رد/تحديث/رجوع/إلغاء
+@@ -161,7 +162,7 @@ def conversation_actions(
+     )
+     extra: list[InlineKeyboardButton] = []
+     if not features.is_hidden("files"):
+-        extra.append(_btn(FILES, callback_data=f"files:{conversation_id}:0"))
++        extra.append(_btn(FILES, callback_data=files_cb or f"files:{conversation_id}:0"))
+     if not features.is_hidden("cost"):
+         extra.append(_btn(COST, callback_data=f"cost:{conversation_id}"))
+     if extra:
+@@ -186,6 +187,16 @@ def conversation_actions(
+     return InlineKeyboardMarkup(rows)
+ 
+ 
++def files_only_menu(files_cb: str) -> InlineKeyboardMarkup:
++    """لوحة احتياطية قصيرة لمتصفح الملفات لما معرّف الشات الطويل يكسر حد 64 بايت."""
++    return InlineKeyboardMarkup(
++        [
++            [_btn(FILES, callback_data=files_cb)],
++            [_btn(MY_CHATS, callback_data="list:0")],
++        ]
++    )
++
++
+ def delete_confirm_menu(conversation_id: str) -> InlineKeyboardMarkup:
+     """تأكيد حذف الشات (OHB2-MINIAPP): زر تأكيد صريح + زر إلغاء. الحذف بعيد فعلي (من OpenHands) ثم تثبيت محلي."""
+     return InlineKeyboardMarkup(
+@@ -215,6 +226,56 @@ def files_menu(
+     return InlineKeyboardMarkup(rows)
+ 
+ 
++def browser_menu(
++    nav: str,
++    dir_index: int,
++    dir_path: str,
++    entries: list[tuple[str, str, int]],
++    page: int,
++    total_pages: int,
++    has_parent: bool,
++) -> InlineKeyboardMarkup:
++    """لوحة متصفح الملفات الهرمي (DEF-010-safe: كل callback بيستخدم رمز/فهارس قصيرة).
++
++    `entries` = [(النوع، المسار الكامل، الفهرس الهدف)] — المجلدات الأول ثم الملفات.
++    """
++    rows: list[list[InlineKeyboardButton]] = []
++    for kind, path, target in entries:
++        name = path.rsplit("/", 1)[-1] or path
++        if kind == "dir":
++            rows.append([_btn(f"📁 {name[:58]}/", callback_data=f"fbd:{nav}:{target}")])
++        else:
++            rows.append(
++                [
++                    _btn(
++                        f"📄 {name[:58]}",
++                        callback_data=f"fbf:{nav}:{dir_index}:{target}",
++                    )
++                ]
++            )
++    nav_row: list[InlineKeyboardButton] = []
++    if has_parent:
++        nav_row.append(_btn("⬆️ لأعلى", callback_data=f"fbu:{nav}:{dir_index}"))
++    if dir_path:
++        nav_row.append(_btn("🏠 الرئيسية", callback_data=f"fbr:{nav}"))
++    if nav_row:
++        rows.append(nav_row)
++    page_row: list[InlineKeyboardButton] = []
++    if page > 0:
++        page_row.append(_btn("⬅️ السابق", callback_data=f"fbp:{nav}:{dir_index}:{page - 1}"))
++    if page < total_pages - 1:
++        page_row.append(_btn("➡️ التالي", callback_data=f"fbp:{nav}:{dir_index}:{page + 1}"))
++    if page_row:
++        rows.append(page_row)
++    rows.append(
++        [
++            _btn("🔄 تحديث", callback_data=f"fbx:{nav}:{dir_index}"),
++            _btn("↩️ رجوع للشات", callback_data=f"fbb:{nav}"),
++        ]
++    )
++    return InlineKeyboardMarkup(rows)
++
++
+ def repositories_menu(items: list[dict], page: int, has_more: bool, gen: int, start: int = 0) -> InlineKeyboardMarkup:
+     """أزرار المستودعات بدون أي نص حر في callback_data.
+ 
+diff --git a/docs/audits/OHB2-BOT-FILE-BROWSER-AND-BINARY-UX-IMPLEMENTATION-REPORT.md b/docs/audits/OHB2-BOT-FILE-BROWSER-AND-BINARY-UX-IMPLEMENTATION-REPORT.md
+new file mode 100644
+index 0000000..e2669a0
+--- /dev/null
++++ b/docs/audits/OHB2-BOT-FILE-BROWSER-AND-BINARY-UX-IMPLEMENTATION-REPORT.md
+@@ -0,0 +1,247 @@
++# OHB2 — Bot File Browser & Binary UX Implementation Report
++
++**Task ID:** `OHB2-BOT-FILE-BROWSER-AND-BINARY-UX-IMPLEMENTATION`
++**Date:** 2026-11-21
++**Scope:** Telegram Bot only — folder-aware browsing, reliable pagination/navigation, and an accurate
++binary/ZIP user experience. **No raw workspace ZIP/binary delivery.**
++
++**Final status:** `IMPLEMENTATION_DONE_WITH_NOTES`
++
++All acceptance criteria are met. The notes cover pre-existing DEF-010 breadth, API limitations (empty
++directories), the bounded-snapshot trade-off, and the absence of an independent reviewer environment.
++
++---
++
++## 1. Baseline
++
++| Item | Value |
++|---|---|
++| Branch | `openhands-workspace-11yyMvqKPjTrIZt1RRpWq9` |
++| HEAD | `30dfa0d6432cdb8f7787edde38f48fb482b6ced6` (= `origin/main`; unchanged) |
++| Working tree | **not clean** — pre-existing uncommitted work was present and preserved |
++| Python | 3.13.15; pytest 9.0.3 |
++| Prior recorded full-suite baseline | 3467 passed (DEF-011-A candidate working tree, previous session) |
++
++Pre-existing working-tree changes (not made by this task, preserved):
++
++- `bot/attachments.py` — DEF-011-A Option B limits (uncommitted).
++- `bot/handlers.py` — DEF-011-A Option B wiring in `_attachment_service` (+19/−2 of the total diff).
++- `docs/reviews/OHB2-WP07-BATCH04-DEF011-F01-IMPLEMENTATION-REPORT.md`, `tests/test_doc_code_parity.py`.
++- Untracked DEF-011-A / F-03 reports, `docs/reviews/handoff/`, `tests/test_def011_a_option_b_limits.py`,
++  `DEF011-A-OPTION-B-REVIEW-HANDOFF.zip`.
++
++The diagnosis (`docs/audits/OHB2-BOT-FILE-DELIVERY-AND-BROWSER-DIAGNOSIS.md`) was re-verified against the
++current working tree before editing: `show_file` is text-preview-only, the file API returns a flat path
++array, and pagination re-fetched the whole list per page.
++
++---
++
++## 2. Implemented changes by problem
++
++### Problem 1 — Folder-aware browsing
++
++- New pure module `bot/file_browser.py`:
++  - `build_state()` builds a directory tree from the flat relative-path list returned by
++    `GET /app-conversations/{id}/files`. It filters with the existing `is_safe_workspace_path` (fail closed),
++    derives every intermediate directory, and stores only directories that a real file path passes through.
++    **No empty directories are invented.**
++  - `BrowserState` keeps `dirs` (including `""` root), `dir_index`, `subdirs`, and `dir_files`. Entries are
++    rendered **directories first, then files**, both deterministically sorted.
++  - `parent_path()` provides parent navigation.
++- New keyboard `bot/keyboards.py::browser_menu` renders `📁 <dir>/` and `📄 <file>` buttons, plus
++  `⬆️ لأعلى`, `🏠 الرئيسية`, `⬅️ السابق`, `➡️ التالي`, `🔄 تحديث`, and `↩️ رجوع للشات`.
++- New handlers in `bot/handlers.py`: `browse_open`, `browse_dir`, `browse_up`, `browse_root`, `browse_back`.
++  The current directory is shown in the message (`📁 /` or `📁 src/util`) and in the page indicator.
++- `bot/keyboards.py::conversation_actions` accepts an optional `files_cb`; the Files button now uses the
++  short browser callback (`fbo:<token>`). All bot call sites that render the conversation actions pass it
++  (`open_conversation`, `watch_conversation`, `show_status`, `show_cost`, the legacy empty `list_files`, and
++  `reply_prompt`).
++- `bot/app.py` registers the new `fbo:`, `fbd:`, `fbp:`, `fbu:`, `fbr:`, `fbf:`, `fbx:`, `fbb:` handlers.
++  The legacy `files:`/`file:` handlers remain for old messages.
++
++**Behavior and limitations**
++
++- Enter a directory, go up one level, return to root, or return to the chat.
++- Files are listed only for the current directory; nested files are not mixed in.
++- Duplicate basenames in different directories are distinct: the state stores full paths, and file
++  callbacks carry the directory index + file index.
++- Paths with spaces and Unicode work (indices in callback data; no path encoding).
++- Empty root: «ما فيهاش ملفات.» with the conversation actions.
++- A directory containing only nested directories is handled (shows its subdirectories).
++- **Empty directories are not representable**: the Cloud V1 API returns only file paths, so a directory
++  with no files anywhere cannot appear. This is documented, not fabricated.
++- Very large listings above the bounded cache budget produce a clear message instead of a broken keyboard.
++
++### Problem 2 — Reliable and efficient pagination/navigation
++
++- New `BrowserCache` in `bot/file_browser.py`:
++  - Bounded snapshot: `MAX_ENTRIES=16`, `MAX_TOTAL_CHARS=50_000` (same budget family as `FileCache`),
++    `STATE_TTL_SECONDS=30*60`, and `MAX_TOKENS=128` for short conversation tokens.
++  - LRU eviction for snapshots and tokens; expired/invalid/evicted state returns the existing
++    «قايمة الملفات دي قديمة…» message.
++- Pagination is **local to the snapshot**: `browse_open`/`browse_refresh` fetch once; `browse_page`,
++  `browse_dir`, `browse_up`, and `browse_root` reuse the cached state. The upstream list is **not**
++  re-fetched for every page.
++- `BrowserState.page_count`, `clamp_page`, and `page_entries` provide first/middle/final pages, Previous,
++  Next, current page, total pages, and boundary clamping.
++- The current directory is preserved while paging.
++- Page/file/directory callbacks share the same snapshot nav, so moving between pages does **not**
++  invalidate valid file-selection callbacks. A refresh deliberately replaces the snapshot.
++- Deterministic ordering (`sorted()` dirs, then `sorted()` files) prevents duplicates/skips between pages.
++- Files added/removed after the snapshot: the snapshot stays stable; `🔄 تحديث` re-fetches and rebuilds
++  while trying to stay in the same directory. If the refreshed listing is empty, the browser returns to the
++  conversation actions.
++- Memory stays bounded: the cache evicts by count/chars/TTL; an oversized snapshot is refused with a clear
++  message rather than retained unbounded. The API itself only offers a complete flat listing, so one
++  bounded snapshot per browsing session is the documented trade-off.
++- Cache lifecycle: snapshots are dropped for a conversation on refresh/new open; `_file_cache` and
++  `_browser_cache` are invalidated when a conversation is confirmed deleted.
++
++**DEF-010 result**
++
++- New file-browser callbacks use a 16-hex token and small indices:
++  - `fbo:<16 hex>` = 20 bytes (Files button);
++  - `fbd:<nav>:<dir>`, `fbu:<nav>:<dir>`, `fbr:<nav>`, `fbx:<nav>:<dir>`, `fbb:<nav>`;
++  - `fbp:<nav>:<dir>:<page>`, `fbf:<nav>:<dir>:<file>`.
++  All stay well below 64 bytes even for a 64-character conversation ID (tested).
++- A short fallback keyboard (`files_only_menu`: Files + «شاتاتي») is used if the full conversation actions
++  would exceed 64 bytes for a long ID, so the browser's «رجوع للشات» and empty-root paths do not crash.
++- **Note:** the pre-existing DEF-010 breadth in the rest of `conversation_actions` / conversation-list
++  callbacks (e.g., `reply:<full-id>`, `open:<full-id>`, `deleteok:<full-id>`) is **not expanded** by this
++  task. Those callbacks still embed the full conversation ID. The file-browser family is DEF-010-safe and
++  tested; the broader issue remains tracked separately.
++
++### Problem 3 — Binary/ZIP user experience
++
++- `bot/handlers.py::_bot_file_status_message` distinguishes:
++  - `BINARY` → «الملف ده ثنائي (مثل ZIP أو صورة)، والبوت بيعرض الملفات النصية بس. تنزيل بايتات ملفات
++    مساحة العمل مش متاح حاليًا عبر تكامل Cloud V1 المدعوم.»
++  - `NOT_UTF8` → «الملف بترميز غير مدعوم (مش UTF-8)… تنزيل بايتات الملف مش متاح حاليًا عبر Cloud V1…»
++  - `TOO_LARGE` → «الملف أكبر من حد المعاينة النصية الآمن (256 KiB)… تنزيل بايتات الملف مش متاح حاليًا…»
++- The new `browse_file` handler and the legacy `show_file` handler use this bot-specific message. The shared
++  `bot/files.py::FILE_STATUS_MESSAGES` was **not** changed, so Mini App behavior is untouched.
++- The message does **not** say ZIP is forbidden or unsupported by Telegram, does **not** imply a download or
++  delivery, and is never silent.
++- Text preview is unchanged: `FileStatus.OK` still sends a text document with the existing truncation note.
++- Security and size limits are unchanged: `FileService.read_preview` (authorization + allowlist + 256 KiB
++  bounded read) is still the only workspace-file read path. No Agent Server route, no session key, no
++  privileged proxy, no new network route.
++- Conversation export ZIP (`export_conversation`) is unchanged and still works (tested).
++- Attachment upload behavior and the approved Option B limits are unchanged.
++
++---
++
++## 3. Changed files and diff statistics
++
++**Changed by this task**
++
++| File | Change | Stat |
++|---|---|---|
++| `bot/file_browser.py` | New: tree builder, `BrowserState`, `BrowserCache` | **new, 239 lines** |
++| `bot/handlers.py` | New browser handlers, binary messages, `files_cb`, deletion cache invalidation | **+387/−8 total**; 19 additions/2 deletions are the pre-existing Option B hunk → this task ≈ **+368/−6** |
++| `bot/keyboards.py` | `files_cb` on `conversation_actions`, `files_only_menu`, `browser_menu` | **+62/−1** |
++| `bot/app.py` | Register `fbo/fbd/fbp/fbu/fbr/fbf/fbx/fbb` handlers | **+10/−0** |
++| `tests/test_file_browser.py` | New pure tree/pagination/cache tests (16) | **new, 155 lines** |
++| `tests/test_bot_file_browser.py` | New handler/binary/DEF-010 tests (20) | **new, 473 lines** |
++| `tests/test_b06_file_routing.py` | Updated legacy binary/too-large message assertions | **+6/−2** |
++| `docs/audits/OHB2-BOT-FILE-BROWSER-AND-BINARY-UX-IMPLEMENTATION-REPORT.md` | This report | new |
++
++**Pre-existing, untouched** (preserved): `bot/attachments.py`, the DEF-011-A Option B hunk in
++`bot/handlers.py`, `docs/reviews/OHB2-WP07-BATCH04-DEF011-F01-IMPLEMENTATION-REPORT.md`,
++`tests/test_doc_code_parity.py`, and all untracked DEF-011-A/F-03 artifacts and the handoff ZIP.
++
++**Mini App:** `git status --short -- bot/web/` returned **0 entries**. No HTML, JS, CSS, frontend asset,
++frontend behavior, or Mini App API contract was modified.
++
++---
++
++## 4. Regression tests added and executed
++
++**New tests — 36 total, all pass**
++
++`tests/test_file_browser.py` (16):
++root mixed dirs/files, nested paths, duplicate names, directory-only-nested, Unicode/spaces, unsafe paths,
++empty root, pagination boundaries/no duplicates, `parent_path`, token stability/length, put/get/invalidate,
++TTL expiry, LRU eviction, char budget, token LRU, snapshot replacement, token survival.
++
++`tests/test_bot_file_browser.py` (20):
++root rendering + dirs first + ≤64-byte callbacks, enter/up/root navigation, duplicate names distinct,
++previous/next/boundaries/no duplicates, snapshot stability + refresh, refresh preserving the directory,
++expired/invalid/non-owner safety, binary ZIP message (no document, no download), NOT_UTF8/TOO_LARGE,
++text preview still sends a document, 64-char conversation-ID callbacks ≤64 bytes, long-ID fallback for
++back/empty-root, back-to-chat, empty root, directory-only-nested, Unicode/spaces, conversation ZIP export,
++legacy `show_file` binary message, oversized-listing guard.
++
++**Executed commands and results**
++
++| Command | Result |
++|---|---|
++| `python3 -m pytest -q tests/test_file_browser.py tests/test_bot_file_browser.py` | **36 passed**, exit 0 |
++| `python3 -m pytest -q tests/test_b06_file_routing.py` | **25 passed**, exit 0 |
++| `python3 -m pytest -q` (full suite) | **3503 passed**, 0 failed, 74 warnings, exit 0 (166.01 s) |
++| `python3 -m pyflakes bot/ automation/ tools/ main.py tests/` | **exit 0** (no findings) |
++| `python3 -m bandit -r bot/ automation/ tools/ main.py -lll -s B613` | **High: 0**, exit 0 |
++| `python3 -m pip_audit -r requirements-dev.txt` | **No known vulnerabilities**, exit 0 |
++| `node --test tests/frontend/*.test.js` | **280 passed, 0 failed**, exit 0 |
++| `git diff --check` | my files clean; one **pre-existing** blank line at EOF in `tests/test_doc_code_parity.py` (not introduced by this task) |
++
++The full-suite increase is consistent with the 36 new tests (prior recorded baseline 3467 → 3503). I did not
++re-run the baseline before editing, so the before/after comparison uses the prior recorded baseline, not a
++freshly measured one.
++
++---
++
++## 5. Remaining risks and blockers
++
++1. **Raw workspace ZIP/binary delivery remains deferred.** Cloud V1 exposes no binary workspace-file route;
++   the Agent Server download route requires a full-privilege `X-Session-API-Key` (B1) which the bot does not
++   request or store. This task does not implement or bypass it. The unresolved security decision is recorded
++   separately.
++2. **Empty directories cannot be shown** — the Cloud V1 file listing returns only file paths.
++3. **Bounded snapshot trade-off.** The API only offers a complete flat listing. The browser retains one
++   bounded snapshot (16 entries / 50,000 chars / 30-minute TTL) and paginates locally. Listings above the
++   budget are refused with a clear message; they are not loaded unbounded.
++4. **Snapshot staleness.** Files added/removed after opening are visible after «تحديث». Old message buttons
++   remain valid until eviction/TTL; refresh replaces the snapshot and expires the old nav.
++5. **Per-file allowlist re-check.** `browse_file` still calls `FileService.read_preview`, which re-fetches the
++   listing for the security allowlist. This preserves the existing security contract at the cost of one
++   extra API call per file click.
++6. **DEF-010 breadth.** The file-browser family and the Files button are fixed and tested. The pre-existing
++   conversation-menu/list callbacks that still embed full conversation IDs are unchanged and remain tracked
++   as DEF-010 outside this task.
++7. **No live service verification.** All tests use isolated fakes; no live Telegram or OpenHands production
++   call was made.
++
++---
++
++## 6. Independent review status
++
++**`INDEPENDENCE_NOT_ESTABLISHED`**
++
++The diff was self-reviewed file by file and all gates were re-run in this same session. That is **not**
++independent review. No separate reviewer session/identity or independently provisioned reviewer environment
++was available, so no independence claim is made.
++
++---
++
++## 7. Git and publication status
++
++- Branch `openhands-workspace-11yyMvqKPjTrIZt1RRpWq9`; HEAD `30dfa0d6432cdb8f7787edde38f48fb482b6ced6`
++  (unchanged).
++- All changes are **uncommitted**. No `git add .`/`git add -A`, no commit, push, PR, merge, deployment, or
++  Autopush activation.
++- No destructive Git operation was used. All pre-existing tracked, untracked, and ignored files were
++  preserved; the DEF-011-A handoff package was not modified.
++- Mini App files were not modified.
++
++---
++
++## 8. Final status
++
++# `IMPLEMENTATION_DONE_WITH_NOTES`
++
++The three approved bot-side improvements are implemented and verified: folder-aware browsing from the
++existing flat path list, stable Previous/Next pagination with snapshot reuse and page indicators, and an
++accurate binary/ZIP explanation that preserves text preview and security limits. Raw ZIP/binary delivery
++remains explicitly deferred. The notes above record the pre-existing DEF-010 breadth, the API's empty-directory
++limitation, the bounded-snapshot trade-off, and the unestablished independent review.
+diff --git a/tests/test_b06_file_routing.py b/tests/test_b06_file_routing.py
+index d8012d5..cefca09 100644
+--- a/tests/test_b06_file_routing.py
++++ b/tests/test_b06_file_routing.py
+@@ -138,14 +138,18 @@ def test_show_file_too_large_is_safe(tmp_path):
+     client = FileFlowClient(files=["big.py"], read_error=ResponseTooLargeError())
+     update, ctx = _run_show_file(tmp_path, client, ["big.py"])
+     assert ctx.bot.documents == []
+-    assert "كبير" in update.callback_query.edits[-1]
++    message = update.callback_query.edits[-1]
++    assert "256 KiB" in message
++    assert "Cloud V1" in message
+ 
+ 
+ def test_show_file_binary_is_safe(tmp_path):
+     client = FileFlowClient(files=["bin.dat"], content="a\x00b")
+     update, ctx = _run_show_file(tmp_path, client, ["bin.dat"])
+     assert ctx.bot.documents == []
+-    assert "مش نص" in update.callback_query.edits[-1]
++    message = update.callback_query.edits[-1]
++    assert "ثنائي" in message
++    assert "Cloud V1" in message
+ 
+ 
+ def test_show_file_upstream_error_is_safe(tmp_path):
+diff --git a/tests/test_bot_file_browser.py b/tests/test_bot_file_browser.py
+new file mode 100644
+index 0000000..15d4c02
+--- /dev/null
++++ b/tests/test_bot_file_browser.py
+@@ -0,0 +1,473 @@
++"""OHB2-BOT-FILE-BROWSER: اختبارات معالجات المتصفح الهرمي + رسائل الثنائي + DEF-010."""
++from __future__ import annotations
++
++import asyncio
++from types import SimpleNamespace
++
++import bot.handlers as h
++from bot import keyboards as kb
++from bot.db import Database
++from bot.file_cache import FileCache
++
++OWNER = 1
++OWNER_UUID = "owner-uuid"
++
++
++class FakeConfig:
++    def __init__(self, allowed: int = OWNER):
++        self.allowed_telegram_ids = frozenset({allowed})
++        self.owner_id = allowed
++        self.mini_app_enabled = False
++        self.mini_app_url = ""
++
++    def is_allowed(self, user_id: int) -> bool:
++        return user_id in self.allowed_telegram_ids
++
++
++class FakeQuery:
++    def __init__(self):
++        self.edits = []
++        self.edits_markup = []
++        self.message = SimpleNamespace(chat_id=99)
++
++    async def answer(self):
++        pass
++
++    async def edit_message_text(self, text, **kw):
++        self.edits.append(text)
++        self.edits_markup.append(kw.get("reply_markup"))
++
++
++class FakeBot:
++    def __init__(self):
++        self.documents = []
++        self.sent = []
++
++    async def send_message(self, chat_id=None, text=None, **kw):
++        self.sent.append(text)
++
++    async def send_document(self, chat_id=None, document=None, **kw):
++        self.documents.append(document)
++
++
++class FakeClient:
++    OWNER_UUID = OWNER_UUID
++
++    def __init__(self, files, content="", content_map=None, cid="c1"):
++        self.files = list(files)
++        self.content = content
++        self.content_map = content_map or {}
++        self.conv = {"id": cid, "title": "شات", "created_by_user_id": OWNER_UUID}
++        self.calls = []
++
++    async def get_conversations(self, ids):
++        self.calls.append(("get_conversations", tuple(ids)))
++        return [self.conv] if self.conv else []
++
++    async def get_current_user(self):
++        self.calls.append(("get_current_user",))
++        return {"id": OWNER_UUID}
++
++    async def list_files(self, conversation_id, path=""):
++        self.calls.append(("list_files", conversation_id, path))
++        return list(self.files)
++
++    async def read_file_text_bounded(self, conversation_id, file_path, max_response_bytes=None):
++        self.calls.append(("read_file_text_bounded", conversation_id, file_path))
++        return self.content_map.get(file_path, self.content)
++
++    async def export_conversation(self, conversation_id):
++        self.calls.append(("export_conversation", conversation_id))
++        return b"PK\x03\x04zip"
++
++
++def _ctx(tmp_path, client):
++    ctx = SimpleNamespace()
++    ctx.bot_data = {
++        "config": FakeConfig(),
++        "db": Database(str(tmp_path / "t.sqlite3")),
++        "client": client,
++    }
++    ctx.bot = FakeBot()
++    return ctx
++
++
++def _cb(data, user_id=OWNER):
++    q = FakeQuery()
++    q.data = data
++    return SimpleNamespace(
++        effective_user=SimpleNamespace(id=user_id),
++        effective_chat=SimpleNamespace(id=99, type="private"),
++        message=SimpleNamespace(),
++        callback_query=q,
++        update_id=1,
++    )
++
++
++def _callbacks(markup):
++    if markup is None:
++        return []
++    return [b.callback_data for row in markup.inline_keyboard for b in row if b.callback_data]
++
++
++def _open(ctx, cid="c1"):
++    token = h._files_open_cb(ctx, cid)  # already "fbo:<token>"
++    update = _cb(token)
++    asyncio.run(h.browse_open(update, ctx))
++    return update, token
++
++
++def _nav_from(update):
++    for cb in _callbacks(update.callback_query.edits_markup[-1]):
++        if cb.startswith(("fbd:", "fbf:", "fbp:", "fbu:", "fbx:", "fbb:")):
++            return cb.split(":")[1]
++    raise AssertionError("no browser callback found")
++
++
++def _file_indices(markup, nav, dir_index=0):
++    prefix = f"fbf:{nav}:{dir_index}:"
++    return [int(cb.split(":")[3]) for cb in _callbacks(markup) if cb.startswith(prefix)]
++
++
++def test_open_root_shows_dirs_then_files_and_callbacks_fit(tmp_path):
++    client = FakeClient(["b.txt", "a/x.py", "docs/readme.md"])
++    ctx = _ctx(tmp_path, client)
++    update, token = _open(ctx)
++    assert token.startswith("fbo:")
++    assert len(token.encode()) <= 64
++    assert "📁 /" in update.callback_query.edits[-1]
++    assert "صفحة 1/1" in update.callback_query.edits[-1]
++    cbs = _callbacks(update.callback_query.edits_markup[-1])
++    nav = _nav_from(update)
++    state = ctx.bot_data["file_browser_cache"].get(nav)
++    assert cbs[0] == f"fbd:{nav}:{state.dir_index['a']}"
++    assert cbs[1] == f"fbd:{nav}:{state.dir_index['docs']}"
++    assert f"fbf:{nav}:0:0" in cbs
++    assert all(len(cb.encode()) <= 64 for cb in cbs)
++
++
++def test_navigate_into_dir_up_and_root(tmp_path):
++    client = FakeClient(["a/x.py", "a/y.py", "docs/readme.md"])
++    ctx = _ctx(tmp_path, client)
++    update, _ = _open(ctx)
++    nav = _nav_from(update)
++    state = ctx.bot_data["file_browser_cache"].get(nav)
++    a_index = state.dir_index["a"]
++
++    u = _cb(f"fbd:{nav}:{a_index}")
++    asyncio.run(h.browse_dir(u, ctx))
++    assert "📁 a" in u.callback_query.edits[-1]
++    cbs = _callbacks(u.callback_query.edits_markup[-1])
++    assert f"fbf:{nav}:{a_index}:0" in cbs
++    assert f"fbf:{nav}:{a_index}:1" in cbs
++    assert f"fbu:{nav}:{a_index}" in cbs
++    assert f"fbr:{nav}" in cbs
++
++    up = _cb(f"fbu:{nav}:{a_index}")
++    asyncio.run(h.browse_up(up, ctx))
++    assert "📁 /" in up.callback_query.edits[-1]
++
++    root = _cb(f"fbr:{nav}")
++    asyncio.run(h.browse_root(root, ctx))
++    assert "📁 /" in root.callback_query.edits[-1]
++
++
++def test_duplicate_names_in_different_dirs_are_distinct(tmp_path):
++    client = FakeClient(
++        ["a/x.py", "b/x.py"], content_map={"a/x.py": "AAA", "b/x.py": "BBB"}
++    )
++    ctx = _ctx(tmp_path, client)
++    update, _ = _open(ctx)
++    nav = _nav_from(update)
++    state = ctx.bot_data["file_browser_cache"].get(nav)
++    for name, expected in (("a", "AAA"), ("b", "BBB")):
++        index = state.dir_index[name]
++        u = _cb(f"fbd:{nav}:{index}")
++        asyncio.run(h.browse_dir(u, ctx))
++        f = _cb(f"fbf:{nav}:{index}:0")
++        asyncio.run(h.browse_file(f, ctx))
++        doc = ctx.bot.documents[-1]
++        assert doc.filename == "x.py"
++        assert doc.input_file_content.decode() == expected
++
++
++def test_pagination_previous_next_and_no_duplicates(tmp_path):
++    files = [f"f{i:02d}.txt" for i in range(25)]
++    client = FakeClient(files)
++    ctx = _ctx(tmp_path, client)
++    update, _ = _open(ctx)
++    nav = _nav_from(update)
++    assert "صفحة 1/3" in update.callback_query.edits[-1]
++    cbs = _callbacks(update.callback_query.edits_markup[-1])
++    assert f"fbp:{nav}:0:1" in cbs
++    assert f"fbp:{nav}:0:-1" not in cbs
++    seen = _file_indices(update.callback_query.edits_markup[-1], nav)
++    assert seen == list(range(0, 10))
++
++    u = _cb(f"fbp:{nav}:0:1")
++    asyncio.run(h.browse_page(u, ctx))
++    assert "صفحة 2/3" in u.callback_query.edits[-1]
++    cbs2 = _callbacks(u.callback_query.edits_markup[-1])
++    assert f"fbp:{nav}:0:0" in cbs2
++    assert f"fbp:{nav}:0:2" in cbs2
++    seen.extend(_file_indices(u.callback_query.edits_markup[-1], nav))
++    assert seen == list(range(0, 20))
++
++    u2 = _cb(f"fbp:{nav}:0:2")
++    asyncio.run(h.browse_page(u2, ctx))
++    assert "صفحة 3/3" in u2.callback_query.edits[-1]
++    cbs3 = _callbacks(u2.callback_query.edits_markup[-1])
++    assert f"fbp:{nav}:0:1" in cbs3
++    assert f"fbp:{nav}:0:3" not in cbs3
++    seen.extend(_file_indices(u2.callback_query.edits_markup[-1], nav))
++    assert seen == list(range(0, 25))
++    assert len(seen) == len(set(seen))
++
++    u3 = _cb(f"fbp:{nav}:0:99")
++    asyncio.run(h.browse_page(u3, ctx))
++    assert "صفحة 3/3" in u3.callback_query.edits[-1]
++
++
++def test_snapshot_is_stable_and_refresh_rebuilds(tmp_path):
++    client = FakeClient(["a.txt", "b.txt"])
++    ctx = _ctx(tmp_path, client)
++    update, _ = _open(ctx)
++    nav = _nav_from(update)
++    client.files.append("c.txt")
++
++    u = _cb(f"fbp:{nav}:0:0")
++    asyncio.run(h.browse_page(u, ctx))
++    assert len(_file_indices(u.callback_query.edits_markup[-1], nav)) == 2
++
++    u2 = _cb(f"fbx:{nav}:0")
++    asyncio.run(h.browse_refresh(u2, ctx))
++    new_nav = _nav_from(u2)
++    assert new_nav != nav
++    assert len(_file_indices(u2.callback_query.edits_markup[-1], new_nav)) == 3
++
++    u3 = _cb(f"fbp:{nav}:0:0")
++    asyncio.run(h.browse_page(u3, ctx))
++    assert "قديمة" in u3.callback_query.edits[-1]
++
++
++def test_refresh_preserves_current_directory(tmp_path):
++    client = FakeClient(["a/x.py"])
++    ctx = _ctx(tmp_path, client)
++    update, _ = _open(ctx)
++    nav = _nav_from(update)
++    state = ctx.bot_data["file_browser_cache"].get(nav)
++    a_index = state.dir_index["a"]
++
++    u = _cb(f"fbd:{nav}:{a_index}")
++    asyncio.run(h.browse_dir(u, ctx))
++    client.files.append("a/y.py")
++    u2 = _cb(f"fbx:{nav}:{a_index}")
++    asyncio.run(h.browse_refresh(u2, ctx))
++    assert "📁 a" in u2.callback_query.edits[-1]
++    new_nav = _nav_from(u2)
++    new_state = ctx.bot_data["file_browser_cache"].get(new_nav)
++    assert len(_file_indices(u2.callback_query.edits_markup[-1], new_nav, new_state.dir_index["a"])) == 2
++
++
++def test_expired_invalid_and_non_owner_are_safe(tmp_path):
++    client = FakeClient(["a.txt"])
++    ctx = _ctx(tmp_path, client)
++
++    u = _cb("fbd:deadbeefdeadbeef:0")
++    asyncio.run(h.browse_dir(u, ctx))
++    assert "قديمة" in u.callback_query.edits[-1]
++
++    u = _cb("fbd:not-a-nav:x")
++    asyncio.run(h.browse_dir(u, ctx))
++    assert "قديمة" in u.callback_query.edits[-1]
++
++    u = _cb("fbo:unknown")
++    asyncio.run(h.browse_open(u, ctx))
++    assert "قديمة" in u.callback_query.edits[-1]
++
++    u = _cb("fbd:deadbeefdeadbeef:0", user_id=999)
++    asyncio.run(h.browse_dir(u, ctx))
++    assert u.callback_query.edits == []
++
++
++def test_binary_zip_message_no_document_no_download(tmp_path):
++    client = FakeClient(["archive.zip"], content="PK\x03\x04\x00")
++    ctx = _ctx(tmp_path, client)
++    update, _ = _open(ctx)
++    nav = _nav_from(update)
++
++    u = _cb(f"fbf:{nav}:0:0")
++    asyncio.run(h.browse_file(u, ctx))
++    message = u.callback_query.edits[-1]
++    assert "ثنائي" in message
++    assert "Cloud V1" in message
++    assert "ZIP" in message
++    assert ctx.bot.documents == []
++    assert all("download" not in str(call) for call in client.calls)
++
++
++def test_not_utf8_and_too_large_messages(tmp_path):
++    ctx = _ctx(tmp_path, FakeClient(["bad.txt"], content="x\ufffdy"))
++    update, _ = _open(ctx)
++    nav = _nav_from(update)
++    u = _cb(f"fbf:{nav}:0:0")
++    asyncio.run(h.browse_file(u, ctx))
++    assert "ترميز" in u.callback_query.edits[-1]
++    assert ctx.bot.documents == []
++
++    ctx = _ctx(tmp_path, FakeClient(["big.txt"], content="z" * (256 * 1024 + 1)))
++    update, _ = _open(ctx)
++    nav = _nav_from(update)
++    u = _cb(f"fbf:{nav}:0:0")
++    asyncio.run(h.browse_file(u, ctx))
++    assert "256 KiB" in u.callback_query.edits[-1]
++    assert ctx.bot.documents == []
++
++
++def test_text_preview_still_sends_document(tmp_path):
++    client = FakeClient(["main.py"], content="print('hi')\n")
++    ctx = _ctx(tmp_path, client)
++    update, _ = _open(ctx)
++    nav = _nav_from(update)
++    u = _cb(f"fbf:{nav}:0:0")
++    asyncio.run(h.browse_file(u, ctx))
++    assert len(ctx.bot.documents) == 1
++    doc = ctx.bot.documents[0]
++    assert doc.filename == "main.py"
++    assert doc.input_file_content.decode() == "print('hi')\n"
++
++
++def test_long_conversation_id_callbacks_stay_within_64_bytes(tmp_path):
++    cid = "x" * 64
++    client = FakeClient([f"f{i}.txt" for i in range(15)], cid=cid)
++    ctx = _ctx(tmp_path, client)
++    token = h._files_open_cb(ctx, cid)  # already "fbo:<token>"
++    assert len(token.encode()) <= 64
++
++    update = _cb(token)
++    asyncio.run(h.browse_open(update, ctx))
++    cbs = _callbacks(update.callback_query.edits_markup[-1])
++    assert cbs and all(len(cb.encode()) <= 64 for cb in cbs)
++    nav = _nav_from(update)
++
++    u = _cb(f"fbp:{nav}:0:1")
++    asyncio.run(h.browse_page(u, ctx))
++    assert all(len(cb.encode()) <= 64 for cb in _callbacks(u.callback_query.edits_markup[-1]))
++
++    u2 = _cb(f"fbf:{nav}:0:0")
++    asyncio.run(h.browse_file(u2, ctx))
++    assert len(ctx.bot.documents) == 1
++
++    markup = kb.conversation_actions("c" * 32, files_cb=token)
++    cbs2 = _callbacks(markup)
++    assert token in cbs2
++    assert all(len(cb.encode()) <= 64 for cb in cbs2)
++
++
++def test_browse_back_returns_conversation_actions(tmp_path):
++    client = FakeClient(["a.txt"])
++    ctx = _ctx(tmp_path, client)
++    update, token = _open(ctx)
++    nav = _nav_from(update)
++    u = _cb(f"fbb:{nav}")
++    asyncio.run(h.browse_back(u, ctx))
++    assert "رجعت للشات" in u.callback_query.edits[-1]
++    assert token in _callbacks(u.callback_query.edits_markup[-1])
++
++
++def test_long_cid_browse_back_uses_short_fallback(tmp_path):
++    cid = "x" * 64
++    client = FakeClient(["a.txt"], cid=cid)
++    ctx = _ctx(tmp_path, client)
++    update, token = _open(ctx, cid=cid)
++    nav = _nav_from(update)
++    u = _cb(f"fbb:{nav}")
++    asyncio.run(h.browse_back(u, ctx))
++    cbs = _callbacks(u.callback_query.edits_markup[-1])
++    assert token in cbs
++    assert "list:0" in cbs
++    assert all(len(cb.encode()) <= 64 for cb in cbs)
++
++
++def test_long_cid_empty_root_uses_short_fallback(tmp_path):
++    cid = "x" * 64
++    client = FakeClient([], cid=cid)
++    ctx = _ctx(tmp_path, client)
++    update, token = _open(ctx, cid=cid)
++    cbs = _callbacks(update.callback_query.edits_markup[-1])
++    assert token in cbs
++    assert "list:0" in cbs
++    assert all(len(cb.encode()) <= 64 for cb in cbs)
++
++
++def test_oversized_listing_is_bounded_and_reported(tmp_path):
++    from bot.file_browser import BrowserCache
++
++    client = FakeClient([f"f{i}.txt" for i in range(10)])
++    ctx = _ctx(tmp_path, client)
++    ctx.bot_data["file_browser_cache"] = BrowserCache(max_total_chars=0)
++    update, _ = _open(ctx)
++    assert "أكبر من حد التصفح" in update.callback_query.edits[-1]
++
++
++def test_empty_root_reports_no_files(tmp_path):
++    client = FakeClient([])
++    ctx = _ctx(tmp_path, client)
++    update, token = _open(ctx)
++    assert "ما فيهاش ملفات" in update.callback_query.edits[-1]
++    assert token in _callbacks(update.callback_query.edits_markup[-1])
++
++
++def test_directory_with_only_nested_directories(tmp_path):
++    client = FakeClient(["a/b/c.txt"])
++    ctx = _ctx(tmp_path, client)
++    update, _ = _open(ctx)
++    nav = _nav_from(update)
++    state = ctx.bot_data["file_browser_cache"].get(nav)
++    a_index = state.dir_index["a"]
++
++    u = _cb(f"fbd:{nav}:{a_index}")
++    asyncio.run(h.browse_dir(u, ctx))
++    assert "📁 a" in u.callback_query.edits[-1]
++    assert f"fbd:{nav}:{state.dir_index['a/b']}" in _callbacks(u.callback_query.edits_markup[-1])
++
++    ab_index = state.dir_index["a/b"]
++    u2 = _cb(f"fbd:{nav}:{ab_index}")
++    asyncio.run(h.browse_dir(u2, ctx))
++    assert "📁 a/b" in u2.callback_query.edits[-1]
++    assert f"fbf:{nav}:{ab_index}:0" in _callbacks(u2.callback_query.edits_markup[-1])
++
++
++def test_unicode_and_space_paths(tmp_path):
++    client = FakeClient(["مجلد/ملف نصي.txt", "dir with space/a b.py"])
++    ctx = _ctx(tmp_path, client)
++    update, _ = _open(ctx)
++    nav = _nav_from(update)
++    state = ctx.bot_data["file_browser_cache"].get(nav)
++    for name in ("مجلد", "dir with space"):
++        index = state.dir_index[name]
++        u = _cb(f"fbd:{nav}:{index}")
++        asyncio.run(h.browse_dir(u, ctx))
++        assert "📁" in u.callback_query.edits[-1]
++        assert f"fbf:{nav}:{index}:0" in _callbacks(u.callback_query.edits_markup[-1])
++
++
++def test_conversation_zip_export_still_works(tmp_path):
++    client = FakeClient([])
++    ctx = _ctx(tmp_path, client)
++    u = _cb("export:c1")
++    asyncio.run(h.export_conversation(u, ctx))
++    assert len(ctx.bot.documents) == 1
++    assert ctx.bot.documents[0].filename.endswith(".zip")
++
++
++def test_legacy_show_file_binary_message(tmp_path):
++    client = FakeClient(["archive.zip"], content="PK\x03\x04\x00")
++    ctx = _ctx(tmp_path, client)
++    cache = FileCache()
++    gen = cache.put("c1", ["archive.zip"])
++    ctx.bot_data["file_cache"] = cache
++    u = _cb(f"file:c1:{gen}:0")
++    asyncio.run(h.show_file(u, ctx))
++    assert "ثنائي" in u.callback_query.edits[-1]
++    assert ctx.bot.documents == []
+diff --git a/tests/test_file_browser.py b/tests/test_file_browser.py
+new file mode 100644
+index 0000000..52ea964
+--- /dev/null
++++ b/tests/test_file_browser.py
+@@ -0,0 +1,155 @@
++"""OHB2-BOT-FILE-BROWSER: اختبارات وحدة لشجرة المجلدات والترقيم والذاكرة."""
++from __future__ import annotations
++
++from bot.file_browser import (
++    BrowserCache,
++    build_state,
++    parent_path,
++    PAGE_SIZE,
++)
++
++
++def _state(paths, *, cid="c1", owner=1, nav="n1"):
++    return build_state(nav, cid, owner, paths)
++
++
++def test_root_mixed_dirs_and_files_sorted():
++    state = _state(["b.txt", "a.txt", "src/z.py", "docs/readme.md", "src/util/h.py"])
++    assert state.dirs == ("", "docs", "src", "src/util")
++    root = state.entries("")
++    assert [kind for kind, _, _ in root] == ["dir", "dir", "file", "file"]
++    assert [path for _, path, _ in root] == ["docs", "src", "a.txt", "b.txt"]
++    assert state.entries("src") == (
++        ("dir", "src/util", state.dir_index["src/util"]),
++        ("file", "src/z.py", 0),
++    )
++    assert state.entries("src/util") == (("file", "src/util/h.py", 0),)
++
++
++def test_nested_paths_and_duplicate_names_are_distinct():
++    state = _state(["a/x.py", "b/x.py"])
++    assert state.entries("") == (
++        ("dir", "a", state.dir_index["a"]),
++        ("dir", "b", state.dir_index["b"]),
++    )
++    assert state.entries("a") == (("file", "a/x.py", 0),)
++    assert state.entries("b") == (("file", "b/x.py", 0),)
++
++
++def test_directory_with_only_nested_directories():
++    state = _state(["a/b/c.txt"])
++    assert state.entries("") == (("dir", "a", state.dir_index["a"]),)
++    assert state.entries("a") == (("dir", "a/b", state.dir_index["a/b"]),)
++    assert state.entries("a/b") == (("file", "a/b/c.txt", 0),)
++
++
++def test_unicode_and_spaces_are_supported():
++    state = _state(["مجلد/ملف نصي.txt", "dir with space/a b.py"])
++    names = {path for _, path, _ in state.entries("")}
++    assert names == {"dir with space", "مجلد"}
++    assert state.entries("dir with space") == (("file", "dir with space/a b.py", 0),)
++    assert state.entries("مجلد") == (("file", "مجلد/ملف نصي.txt", 0),)
++
++
++def test_unsafe_paths_are_dropped_fail_closed():
++    state = _state(["../etc/passwd", "/abs", "a/../b", "a//b", "ok.txt"])
++    assert state.dirs == ("",)
++    assert state.entries("") == (("file", "ok.txt", 0),)
++
++
++def test_empty_root_has_one_empty_page():
++    state = _state([])
++    assert state.dirs == ("",)
++    assert state.entries("") == ()
++    assert state.page_count("") == 1
++    assert state.page_entries("", 0) == ()
++    assert state.page_entries("", 99) == ()
++
++
++def test_pagination_boundaries_no_duplicates_or_skips():
++    paths = [f"f{i:02d}.txt" for i in range(25)]
++    state = _state(paths)
++    assert state.page_count("") == 3
++    seen = []
++    for page in range(3):
++        chunk = state.page_entries("", page)
++        assert len(chunk) == (PAGE_SIZE if page < 2 else 5)
++        seen.extend(path for _, path, _ in chunk)
++    assert seen == paths
++    assert len(set(seen)) == len(seen)
++    assert state.clamp_page("", -5) == 0
++    assert state.clamp_page("", 99) == 2
++
++
++def test_parent_path():
++    assert parent_path("a/b/c") == "a/b"
++    assert parent_path("a") == ""
++    assert parent_path("") == ""
++
++
++def test_browser_cache_token_is_stable_and_short():
++    cache = BrowserCache()
++    cid = "x" * 64
++    token = cache.token_for(cid)
++    assert len(token) == 16
++    assert cache.token_for(cid) == token
++    assert cache.conversation_for(token) == cid
++    assert cache.conversation_for("nope") is None
++
++
++def test_browser_cache_put_get_invalidate():
++    cache = BrowserCache()
++    token = cache.token_for("c1")
++    state = cache.put("c1", 1, ["a.txt"])
++    assert cache.get(state.nav) is state
++    assert len(cache) == 1
++    cache.invalidate("c1")
++    assert cache.get(state.nav) is None
++    assert len(cache) == 0
++    assert cache.conversation_for(token) is None
++
++
++def test_browser_cache_ttl_expires_state():
++    cache = BrowserCache(ttl_seconds=-1)
++    state = cache.put("c1", 1, ["a.txt"])
++    assert cache.get(state.nav) is None
++    assert len(cache) == 0
++
++
++def test_browser_cache_lru_evicts_oldest_state():
++    cache = BrowserCache(max_entries=1)
++    first = cache.put("c1", 1, ["a.txt"])
++    second = cache.put("c2", 1, ["b.txt"])
++    assert cache.get(first.nav) is None
++    assert cache.get(second.nav) is second
++
++
++def test_browser_cache_char_budget_evicts():
++    cache = BrowserCache(max_total_chars=0)
++    state = cache.put("c1", 1, ["a.txt"])
++    assert cache.get(state.nav) is None
++    assert len(cache) == 0
++
++
++def test_browser_cache_token_lru_bounds_mapping():
++    cache = BrowserCache(max_tokens=1)
++    first = cache.token_for("c1")
++    second = cache.token_for("c2")
++    assert cache.conversation_for(first) is None
++    assert cache.conversation_for(second) == "c2"
++
++
++def test_new_snapshot_invalidates_old_snapshot_for_same_conversation():
++    cache = BrowserCache()
++    first = cache.put("c1", 1, ["a.txt"])
++    second = cache.put("c1", 1, ["a.txt", "b.txt"])
++    assert first.nav != second.nav
++    assert cache.get(first.nav) is None
++    assert cache.get(second.nav) is second
++
++
++def test_conversation_token_survives_snapshot_replacement():
++    cache = BrowserCache()
++    token = cache.token_for("c1")
++    cache.put("c1", 1, ["a.txt"])
++    assert cache.conversation_for(token) == "c1"
