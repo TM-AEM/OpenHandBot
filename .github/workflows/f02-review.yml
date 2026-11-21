@@ -10,7 +10,11 @@ name: F-02 Owner Review Evidence
 
 on:
   pull_request:
-    branches: [main]
+    # Match the PR base: `main` for a direct PR, or the F-02 candidate branch
+    # when the workflow is reviewed on top of the candidate (PR #9).
+    branches:
+      - main
+      - review/ohb2-wp07-def011-f02-isolated
     paths:
       - ".github/workflows/f02-review.yml"
       - "bot/attachments.py"
