@@ -4219,3 +4219,239 @@ pyflakes **0**؛ bandit **High 0**؛ مجموعة مركّزة (config/miniapp/b
 - **تأكيدات السلامة والتحقّق النهائي:** الخادم الحي القائم (`OpenHandBot` / `Brave Grove`) لم يُمسّ أو يُفتح أو يُختبَر؛ لا SQLite على Enzonic؛ لا كود/بيانات/أسرار مرفوعة؛ `MINI_APP_ENABLED=False`؛ Autopush معطّل؛ لا بطاقة/دفع/حساب جديد/مورد دائم؛ لا تعديل كود/مخطّط/تبعيات/إعدادات ولا أوامر Git كتابية.
 
 
+
+---
+
+## OHB2-REAL-EXECUTION-AND-REVIEW-BATCH-03 (2026-11-18 — تنفيذ حقيقي + اختبارات + تحقق معزول؛ بلا commit)
+
+- **الشجرة الحقيقية:** `/workspace/project/OpenHandBot`؛ الفرع `openhands-workspace-40xxn2SbOi0tRICb3y8TE`؛ HEAD `52e7789` (== `origin/main`)؛ شجرة العمل **نظيفة** في البداية؛ `.openhands/` محفوظ. Python `3.13.15`، Node `v24.22.2`. Docker daemon غير متاح.
+- **خط الأساس:** `.venv` محلي (من `requirements-dev.txt`، git-ignored) ⇒ pytest **3285 ناجح/0 فاشل**؛ node **280/0**.
+- **المُنفَّذ (غير محجوب على قرار مالك) — `WP-07`:**
+  - `DEF-013`: فرع الحالة المنتهية في `handle_text` بقى يمسح الحالة **ويسجّل `EXPLICITLY_IGNORED` ذرّيًّا** (`db.clear_awaiting_and_record_outcome`).
+  - `NEW-DEF-03` (الاستدعاءات): `cancel_route`/`cancel_route_button` (مسح+`durable_completed`) و`reply_prompt`/`repo_search_prompt`/`pick_repo`/`new_chat_no_repo` (ضبط+`durable_completed`) بقوا في معاملة واحدة (`clear_awaiting_and_record_outcome`/`set_awaiting_and_record_outcome`). (تجديد `route` بعد فحص الفراغ كان مُنفَّذًا من قبل.)
+  - `bot/db.py`: إضافة `_set_awaiting_nocommit` (إعادة هيكلة `set_awaiting` بلا تغيير سلوك) + الدالتين الذرّيتين.
+- **الاختبارات الجديدة:** `tests/test_wp07_atomic_state_outcome.py` (9 اختبارات، **مُثبَتة بالطفرة**).
+- **التحقّق:** pytest **3294 ناجح/0 فاشل** (خط الأساس 3285 ⇒ +9)؛ pyflakes نظيف؛ bandit High **0**؛ pip-audit نظيف؛ node **280/0**. تحقق معزول في نسخة طازجة + venv جديد ⇒ **3294/0**. إعادة إنتاج طفرات مستقلة (رجوع الدالتين لغير ذرّي) ⇒ **5/9 يفشل** كما هو مقصود. فحوص حواف عدائية (لا صف حالة / نتيجة غير مؤهّلة / العنوان / بلا update_id) كلها نجحت.
+- **غير منفَّذ (بصدق):** `DEF-011` (إخراج الإدخال/الإخراج من حلقة الأحداث + سجل حجز الحصص) — يتقاطع مع `WP-01` وحصص `D-12` المحجوبة؛ تزامن `WP-07` (`OD-04`)؛ بقية مواقع `NEW-DEF-03` (مسح التنقّل + مسارات النية الدائمة). المحجوب بقرار مالك (`WP-01`/`WP-04` جزء2/`WP-06` جزء2/`WP-10`) لم يبدأ.
+- **المراجعة المستقلة:** `INDEPENDENCE_NOT_ESTABLISHED` (لا جلسة مراجع منفصلة في هذه البيئة) — تم أقوى بديل معزول وذُكر بصدق.
+- **النطاق:** 0 ملفات Mini App؛ لا ADR/قرار معماري/سجل قرارات/تبعيات/إعدادات تغيّرت؛ لا commit/push/PR/merge/نشر/تفعيل Autopush. التقرير: `docs/reviews/OHB2-REAL-EXECUTION-AND-REVIEW-BATCH-03-REPORT.md`.
+
+---
+
+## OHB2-WP07-F1-OPTION-C-IMPLEMENTATION-AND-INDEPENDENT-REVIEW (2026-11-18 — تنفيذ/تحقّق؛ بلا commit)
+
+- **الشجرة الحقيقية:** `/workspace/project/OpenHandBot`؛ الفرع `openhands-workspace-40xxn2SbOi0tRICb3y8TE`؛ HEAD `52e7789` (بلا تغيير). شجرة العمل فيها عمل مستخدم سابق غير مُودَع (PROGRESS/db.py/handlers.py + ملفان جديدان) — **لم يُلمس**؛ لم أُضِف لأي commit/stage.
+- **النتيجة (بصدق):** الخيار C **مُنفَّذ بالفعل** في الكود القائم. المسارات الستة (`cancel_route`، `cancel_route_button`، `reply_prompt`، `repo_search_prompt`، `pick_repo`، `new_chat_no_repo`) بتلتزم بحالة SQLite + `durable_completed` في معاملة واحدة، ثم ترسل/تعدّل تيليجرام **برّه** المعاملة. فشل الإرسال ينتشر ⇒ `handle_processing_error` ⇒ `record_update_failure` ⇒ صف `failed_transient`/`failed_permanent` في **`update_failures` فقط** (لا يمسّ `processed_updates`) ⇒ `durable_completed` مؤهّل ومصدر الديدَب سليم، والدليل المنفصل دائم ويبقى بعد `prune`/إعادة الفتح، والفشل بيتسجّل في اللوج (مفيش فقد صامت).
+- **القرار:** لا تغيير كود إنتاج (السلوك مطابق للخيار C بالفعل) — أصغر تغيير آمن هو إضافة **تغطية انحدار مميِّزة** وتوثيق العيب. تغيير كود شغّال لتطبيق سلوك موجود = إعادة هيكلة غير مطلوبة (ممنوعة AGENTS.md §§3/6/14).
+- **المُضاف:** `tests/test_wp07_f1_notification_failure.py` (14 اختبارًا: الستة مسارات + رفض دائم + نجاح بلا تلويث + إعادة تسليم + خطأ تسجيل الفشل + إعادة فتح + `CancelledError` + تقدّم الحدّ + **`TelegramPoller` الحقيقي**). التقرير: `docs/reviews/OHB2-WP07-F1-OPTION-C-IMPLEMENTATION-AND-INDEPENDENT-REVIEW-REPORT.md`.
+- **التحقّق:** pytest **3308 ناجح/0 فاشل** (خط الأساس 3294 ⇒ +14)؛ pyflakes نظيف؛ bandit High **0**؛ pip-audit نظيف؛ node **280/0**. نسخة معزولة طازجة (361 ملف) ⇒ **3308/0**. طفرتان مستقلّتان (M1 إسقاط ack ⇒ 7/14 يفشل؛ M2 إسقاط دليل الفشل ⇒ 11/14 يفشل) — مثبتة غير تافهة.
+- **المراجعة المستقلة:** `INDEPENDENCE_NOT_ESTABLISHED` (لا جلسة مراجع منفصلة في هذه البيئة) — تم أقوى بديل معزول وذُكر بصدق.
+- **غير منفَّذ (بصدق):** لا آلية إشعار قابلة للتعافي/إعادة محاولة (ممنوعة بلا موافقة صريحة)؛ لا سطح تشغيلي بيعرض `update_failures` (فجوة قائمة سابقة، بره النطاق)؛ تزامن `WP-07`/`OD-04` والبقية المحجوبة لم تُبدأ. **النطاق:** 0 ملفات Mini App؛ لا ADR/قرار معماري/تبعيات/إعدادات؛ لا commit/push/PR/merge/نشر/Autopush.
+
+---
+
+## OHB2-WP07-NEW-DEF03-WATCH-UNWATCH-ATOMICITY-AND-INDEPENDENT-REVIEW (2026-11-18 — تنفيذ/تحقّق؛ بلا commit)
+
+- **الشجرة:** `/workspace/project/OpenHandBot`؛ الفرع `openhands-workspace-40xxn2SbOi0tRICb3y8TE`؛ HEAD `52e7789` (بلا تغيير، بلا upstream). Python `3.13.15` (`.venv`)؛ Node `v24.22.2`؛ Docker غير متاح.
+- **خط الأساس:** pytest **3308 ناجح/0 فاشل** (شامل عمل مستخدم غير مُودَع)؛ node **280/0**.
+- **المُنفَّذ (بقية `NEW-DEF-03` غير المتزامنة — watch/unwatch):**
+  - `watch_conversation`: بقى `db.add_watched_and_record_outcome(...)` — الإضافة + `last_state` + `durable_completed` في **معاملة واحدة** (كانوا 3 commits).
+  - `unwatch_conversation`: بقى يمرّر `update_id`/`now`/`outcome` عبر `_remove_watched_with_retry` إلى `watcher.unwatch` / `db.remove_watched` — الإزالة (مع إكمال أي تسليم معلّق) + النتيجة في **معاملة واحدة**.
+  - `bot/db.py`: `_add_watched_nocommit`, `_set_last_state_nocommit`, `add_watched_and_record_outcome`, `_remove_watched_nocommit`, `_remove_watched_completing_nocommit`؛ توسيع `remove_watched`/`remove_watched_completing` بوسائط نتيجة **اختيارية** (الافتراضي يحفظ السلوك القديم حرفيًا ⇒ Mini App/tests لم تتأثّر).
+  - `bot/watcher.py`: `Watcher.unwatch(..., update_id=, now=, outcome=)` — نفس الذرّية في فرعَي التلميح/العادي؛ `_marker_pending` بيتشال بعد نجاح الكتابة بس.
+- **اختبارات جديدة:** `tests/test_wp07_watch_unwatch_atomicity.py` (**24 اختبار**، **مُثبَتة بالطفرة**: M1–M5 كلها قتلت اختبارات).
+- **تكييف ميكانيكي فقط (صفر تغيير في التأكيدات):** `tests/test_sw06_unwatch_db_failure_propagation.py` و`tests/test_handlers.py` — تواقيع الـ fakes بقت تقبل `**_kw`.
+- **التحقّق:** pytest **3332 ناجح/0 فاشل** (خط الأساس 3308 ⇒ +24)؛ pyflakes **0**؛ bandit **High 0**؛ pip-audit نظيف؛ node **280/0**. نسخة معزولة (`/tmp/review-snapshot` من `git ls-files` + الملفات المعدّلة) أعادت **3332/0**.
+- **انحدار أُصلح أثناء العمل:** تشغيل كامل أول أعطى `1 failed / 3328` (`test_d1_extended_transient_codes.py::test_handler_remove_watched_wrapper_retries_extended_busy`) لأن `_remove_watched_with_retry` بقى يمرّر وسائط مفتاحية لمُزيل بمعامل واحد ⇒ رجعت للاستدعاء بمعامل واحد لما `outcome is None` (توافق خلفي، بلا تعديل أي اختبار).
+- **المراجعة المستقلة:** `INDEPENDENCE_NOT_ESTABLISHED` (لا Docker، لا جلسة مراجع منفصلة؛ `:60000` يستضيف هذه الجلسة). البديل المعزول ذُكر كدليل تكميلي فقط.
+- **محجوب/خارج النطاق:** تزامن `WP-07` (`OD-04`) لم يُلمس؛ `_ACK_ELIGIBLE` وسياسة الإقرار بلا تغيير؛ مسارات F-1 الستة و`test_wp07_f1_notification_failure.py` بلا تغيير (14/14 ناجح).
+- **النطاق:** 0 ملفات Mini App؛ لا ADR/معمارية/تبعيات/إعدادات تغيّرت؛ لا commit/push/PR/merge/نشر/Autopush. التقرير: `docs/reviews/OHB2-WP07-NEW-DEF03-WATCH-UNWATCH-ATOMICITY-AND-INDEPENDENT-REVIEW-REPORT.md`.
+
+---
+
+## OHB2-WP07-NEW-DEF03-RECORD-EXPLICIT-OWNER-ACCEPTANCE (2026-11-19 — تسجيل قبول مالك صريح؛ بلا commit)
+
+- **قرار المالك: `ACCEPT`** — قبول صريح، مذكور في تعليمة منفصلة. النطاق **محدود** بما في حزمة القرار
+  `OHB2-WP07-NEW-DEF03-NON-CONCURRENCY-OWNER-ACCEPTANCE-GATE` (خارج المستودع:
+  `/workspace/review-packages/OHB2-WP07-NON-CONCURRENCY-OWNER-ACCEPTANCE-GATE-20261119/OWNER-DECISION-PACKAGE.md`).
+- **الحالة: `NEW-DEF-03_NON_CONCURRENCY_OWNER_ACCEPTED`** — ده **مش** `WP-07_COMPLETE` و**مش**
+  `NEW-DEF-03_COMPLETE`.
+
+### التمييز الإلزامي بين الثلاث مراحل
+
+| المرحلة | الحالة | الدليل |
+|---|---|---|
+| 1. اكتمال التنفيذ | `DONE` | كود في شجرة العمل غير المُودَعة (HEAD `52e7789` بلا تغيير) |
+| 2. المراجعة التقنية | `PASS_WITH_NOTES` — **مراجعة ذاتية تكميلية** | `INDEPENDENCE_NOT_ESTABLISHED` (مفصّل تحت) |
+| 3. قبول المالك الصريح | **`ACCEPT`** — للنطاق المحدود أدناه فقط | تعليمة المالك المنفصلة |
+
+### النطاق المقبول (حصرًا)
+
+1. **ذرّية `watch_conversation`:** صف المتابعة + `last_state` + النتيجة الدائمة في **معاملة SQLite واحدة**
+   (`db.add_watched_and_record_outcome` / `_add_watched_nocommit` / `_set_last_state_nocommit`؛ المستدعي `handlers.py:1395`).
+2. **ذرّية `unwatch_conversation`:** **الفرعان** (تلميح/عادي) — إزالة المتابعة + تسوية أي تسليم معلّق + النتيجة الدائمة
+   في **معاملة واحدة** (`db.remove_watched` / `_remove_watched_nocommit` / `remove_watched_completing` /
+   `_remove_watched_completing_nocommit`؛ `watcher.unwatch`؛ `handlers._remove_watched_with_retry`).
+3. **ذرّية حالة الانتظار:** `clear_awaiting_and_record_outcome` و`set_awaiting_and_record_outcome` — مسح/ضبط الحالة
+   + النتيجة في معاملة واحدة (دي اللي بتخلّي حماية F-1 صحيحة).
+4. **التوافق الخلفي للمستدعيين القدامى:** وسائط اختيارية keyword-only افتراضها `None`؛ النداء بمعامل واحد
+   (`remover(cid)`) محفوظ لما `outcome is None` ⇒ Mini App (`bot/web/services.py:1395`) و`bot/outbox.py` بلا تأثّر.
+5. **الحفاظ على سلوك F-1 Option C** في المسارات الستة: `cancel_route`, `cancel_route_button`, `reply_prompt`,
+   `repo_search_prompt`, `pick_repo`, `new_chat_no_repo`.
+
+### الأدلة (سابقة موثَّقة — لم تُعَد تشغيلًا لهذه المهمة)
+
+- **2026-11-19 (بوابة القبول):** pytest **3332 ناجح/0 فاشل**؛ node **280/0**؛ pyflakes **exit 0**؛ bandit **severity High: 0**.
+- **47 اختبار WP-07 مركّز:** 24 (`test_wp07_watch_unwatch_atomicity.py`) + 14 (`test_wp07_f1_notification_failure.py`)
+  + 9 (`test_wp07_atomic_state_outcome.py`).
+- **بصمات الشجرة المقبولة = الشجرة الحالية:** `sha256sum` مطابق لـ`MANIFEST.sha256` (صفر انحراف).
+- **الحكم التقني: `PASS_WITH_NOTES`.** الملاحظات F-01…F-04 موثَّقة كملاحظات **غير حاجزة**
+  (F-01 LOW موجود في HEAD قبل التغيير؛ F-02/F-03/F-04 INFO بلا أثر سلوكي).
+
+### حد المراجعة (لا يُخفَّف)
+
+- **`INDEPENDENCE_NOT_ESTABLISHED`** — المراجعة التقنية **مراجعة ذاتية تكميلية**، **مش** مراجعة مستقلة:
+  Docker غير متاح، `~/.openhands/provider-connections/` فاضي، `profiles` فيه `.profiles.lock` بس،
+  و`:60000` يستضيف نفس الجلسة (المراجع = المنفِّذ). **شرط الاستقلال لم يُلبَّ ولم يُدَّعَ لبّه.**
+
+### قيود باقية (مقبولة صراحةً، غير مُصلَحة)
+
+- عطل بعد الـcommit المحلي وقبل محاولة الإرسال قد يترك بلا سجل فشل.
+- مهلة تليجرام قد تمثّل تسليمًا **غامضًا**.
+- **لا ضمان exactly-once**، و**لا ذرّية SQLite↔تليجرام** (الإرسال دائمًا برّه المعاملة).
+- **لا سطح تشغيلي** بيعرض `update_failures` (فجوة قائمة سابقة، بره النطاق).
+
+### مفتوح صراحةً (لم يُغلق ولم يُعلَّم مكتملًا)
+
+- **تزامن `WP-07` / `DEF-006`** — **محجوب بـ`OD-04`**؛ `bot/app.py:80` ما زال يمنع التزامن داخل الدفعة.
+- **`OD-04`** — **غير محلول**.
+- **بقية مواقع `NEW-DEF-03`** (مسح التنقّل + مسارات النية الدائمة) — **مفتوحة**، غير منفَّذة.
+- **مراجعة مستقلة حقيقية** — **غير متحقّقة**؛ القبول ده **ما بيحلّش** شرط الاستقلال.
+- **`WP-07` ككل مفتوح.**
+
+### النطاق والسلامة
+
+0 ملفات Mini App؛ لا ADR/قرار معماري/تبعيات/إعدادات تغيّرت؛ لا جدول/ترحيل/عامل/طابور/نظام إشعارات جديد؛
+لا تغيير في سلوك F-1؛ **لا commit/push/PR/merge/نشر/تفعيل Autopush**؛ لا stage. التغيير الوحيد في هذه المهمة:
+هذا القسم في `.agent/PROGRESS.md` (append-only). تقرير المراجعة السابق:
+`docs/reviews/OHB2-WP07-NEW-DEF03-WATCH-UNWATCH-ATOMICITY-AND-INDEPENDENT-REVIEW-REPORT.md`.
+
+---
+
+## OHB2-WP05-COMPLETE-REMEDIATION-AND-VERIFICATION (2026-11-19)
+
+**الحالة:** تنفيذ `IMPLEMENTATION_COMPLETE` · مراجعة `REVIEW_PENDING_INDEPENDENCE`.
+
+### معايير القبول (هذه المهمة)
+1. نطاق `WP-05` مُستعاد من الوثيقة المرجعية لا من نص المهمة. ✅
+2. كل بند `WP-05` له تصريف موثّق (DEF-007، DEF-008، DEF-012، NEW-DEF-02، NEW-DEF-05). ✅
+3. كل إصلاح مُتحقَّق باختبار انحدار غير-فارغ (mutation). ✅ 8/8
+4. الحزمة الكاملة تمر: pytest 3383/0، pyflakes 0، bandit High 0، pip-audit نظيف، node 280/0. ✅
+5. النطاق المحمي (Mini App، المعمارية، الجداول، التبعيات، WP-06) دون تغيير. ✅
+6. لا commit/push/PR/نشر/Autopush. ✅
+
+**خارج النطاق:** تزامن `WP-07`/`DEF-006` (`OD-04`)، وكل `WP-06`.
+
+### النتيجة
+- **جميع بنود `WP-05` الخمسة منفَّذة ومُلتزَمة عند HEAD `52e7789`** (ليست عملًا جديدًا لهذه المهمة).
+  العلامات موجودة في `bot/watcher.py`، `bot/notifier.py`، `bot/outbox.py`، `bot/openhands_client.py`، `bot/db.py`.
+- هذه المهمة سلّمت **تحقّقًا** لا إصلاحًا جديدًا: استعادة النطاق + تأكيد كل إصلاح على مستوى المصدر +
+  إثبات أن كل اختبار انحدار غير-فارغ (8 طفرات، كلها مقتولة، مع استرجاع بصمة SHA-256) + البوابة الكاملة.
+- **لا بند محجوب**؛ الوثيقة المرجعية تسجّل `Required Owner Approvals: NONE` لـ`WP-05`.
+
+### الأدلة
+- الطفرات: M1/M2 (DEF-007a/b) 2 failed لكلٍّ · M3 (DEF-008) 2 failed · M4a/M4b/M4c (DEF-012) 2/2/1 failed
+  · M5 (NEW-DEF-02) 1 failed · M6 (NEW-DEF-05) 2 failed — **8/8 مقتولة بالاختبار المقصود**، والاسترجاع مُتحقَّق.
+- الجداول: **17** جدولًا فريدًا، متطابقة عند HEAD وفي شجرة العمل (لا انحراف مخطط).
+
+### شجرة العمل
+التعديلات غير الملتزَمة كلها **`WP-07`** (قبل هذه المهمة) وتم **الحفاظ عليها دون مساس**. لم يُغيَّر أي ملف
+إنتاجي أو اختباري بواسطة هذه المهمة؛ المُضاف الوحيد: `docs/reviews/OHB2-WP05-COMPLETE-REMEDIATION-REPORT.md`.
+
+### مفتوح
+- **مراجعة مستقلة حقيقية لـ`WP-05`** — غير متحقّقة (لا جلسة/بيئة منفصلة). القبول الرسمي **غير ممنوح**.
+- **`WP-06`** هو المرشّح التالي للتنفيذ، بشرط الانتهاء من مواصفة تصميم `callback_refs` (TTL/تنظيف/فشل-مغلق/
+  ملكية/مقاومة-التقادم) قبل أي تغيير مخطط `17 → 18`؛ جزء `STATE_LABELS` مستقل ويمكن أن يسبقها.
+
+**التقرير:** `docs/reviews/OHB2-WP05-COMPLETE-REMEDIATION-REPORT.md`
+
+---
+
+# OHB2-WP07-DEF011-IMPLEMENTATION-AND-VERIFICATION
+
+## Goal
+تنفيذ **Option 1** من `docs/audits/OHB2-WP07-DEF011-REMEDIATION-AUDIT.md` +
+`...-IMPLEMENTATION-PLAN.md` + `docs/reviews/OHB2-WP07-DEF011-AUDIT-BATCH-REPORT.md`:
+نقل **إدخال/إخراج القرص الحاجب** خارج حلقة الأحداث، مع إبقاء **كل** وصول SQLite على خيط
+مالك القاعدة، وبلا سجل حجز حصص وبلا أي تغيير مخطط (الحصص تفضل معطّلة — D-12).
+
+## Acceptance criteria
+1. الكتابة/القرص البحتة بتتنفّذ خارج خيط الحلقة (مُثبَت بخيط فعلي، مش بقراءة كود). — **متحقّق**
+2. كل نداءات SQLite أثناء المسار غير المتزامن على خيط الحلقة. — **متحقّق**
+3. `store()`/`sweep()`/`maybe_sweep()` المتزامنة تحافظ على سلوكها بالحرف (بلا إعادة كتابة اختبارات). — **متحقّق**
+4. الحصص التجميعية معطّلة افتراضيًّا، 17 جدولًا، بلا سجل حجز. — **متحقّق**
+5. المجموعة الكاملة خضراء + pyflakes/bandit/pip-audit/node بلا تراجع. — **متحقّق**
+
+## Plan / done
+- [x] Phase 1: تحقّق البداية + حدود التصريح (baseline 3385 passed).
+- [x] Phase 1b: تعارض جوهري موثَّق (158 موقع نداء متزامن) ⇒ تصميم «التوائم الإضافية».
+- [x] Phase 2: `_store_prepare`/`_store_write`/`_store_finalize` + `store_async`؛
+      `_sweep_db_phase`/`_sweep_fs_tail` + `sweep_async`؛ `_begin_attempt`/`_finish_attempt` +
+      `maybe_sweep_async`؛ `_read_local_capped` في خيط عامل؛ توصيل `watcher.tick` و`app._post_init`.
+- [x] Phase 2b: إصلاح انحدار سباق القبول بـ`anyio.Lock` (استعادة النموذج المتسلسل السابق).
+- [x] Phase 3: `tests/test_def011_fs_offload.py` — 21 اختبارًا (T-1…T-14) + 4 طفرات مقتولة.
+- [x] Phase 4/5: مراجعة الفرق + البوابة الكاملة (**3406 passed**).
+
+## Known issues / assumptions
+- الإلغاء أثناء الكتابة ممكن يسيب صف `pending` + بايتاته؛ **مش عيب جديد** — نفس حالة
+  «انهيار بين الكتابة والوسم»، والكنس بيحصده (`pending → reaped`). مُثبَت في `test_T7`.
+- `anyio.Lock` بدل قفل الحلقة القياسي عشان حرس معماري معتمَد بيمنع ظهور السلسلة `asyncio`
+  في `bot/attachments.py`؛ الحرس **ما اتضعّفش**.
+- مفيش commit/push/PR/merge/deploy. مفيش تغيير في Mini App أو ADR أو المخطط أو الاعتماديات.
+
+## Working commands
+- `python -m pytest -q`
+- `python -m pyflakes bot/ automation/ tools/ main.py tests/`
+- `python -m bandit -r bot/ automation/ tools/ main.py -lll -s B613`
+- `python -m pip_audit -r requirements-dev.txt`
+- `node --test tests/frontend/*.test.js`
+
+**التقرير:** `docs/reviews/OHB2-REAL-EXECUTION-AND-REVIEW-BATCH-03-REPORT.md` (§11)
+
+---
+
+## OHB2-WP07-BATCH03-EXTERNAL-INDEPENDENT-REVIEW-HANDOFF (2026-11-19) — حزمة مراجعة فقط، بلا مراجعة
+
+**الحالة:** `WP07_EXTERNAL_REVIEW_PACKAGE_READY_WITH_NOTES`. **المراجعة التقنية نفسها ما زالت PENDING** —
+ما تمّش ولا يُدّعى أي استقلالية (المؤلف هو نفس الوكيل على نفس المضيف).
+
+**HEAD:** `52e7789cc8cc97a7f7c09c9592226ab117db99a2` (== `origin/main`)، **بلا commit/push/PR**.
+
+**الحزمة:** `/workspace/review-packages/OHB2-WP07-BATCH03-EXTERNAL-REVIEW-HANDOFF-20261119`
++ الأرشيف `.tar.gz` (528K) + `PACKAGE.sha256` (sidecar، **مستبعَد من الـtarball** لأنه لا يقدر يهشّ نفسه).
+**تحقق:** أرشيف OK → فكّ OK → **43/43** مدخل manifest OK / **0** فشل → 45 ملفًا؛ بناء الأرشيف
+**قابل لإعادة الإنتاج بايت-ببايت**؛ **39/39** ملف snapshot مطابق للـworktree الحيّ.
+
+**تصنيف الملفات (من `git status`، لا تقدير):** 8 `modified` + 20 `untracked` + 11 `tracked-clean` + 4 artifacts.
+
+**اكتشافات جوهرية موثَّقة (لا إصلاح — read-only):**
+- `DEF-011` **مش مقفول**: A (ledger الحجز) **NOT IMPLEMENTED** (D-12/OD-04)، B (offload) **IMPLEMENTED**،
+  C (UX copy) **WP-01** ومحجوب بـOD-01/OD-03.
+- `DEF-006`/`OD-04`: مسار التعليقات فقط، السلوك متسلسل فعليًا ⇒ `BLOCKED_PENDING_OD04`.
+- `NAV-01..06` = **نطاق فرعي من NEW-DEF-03**، مش بنود register مستقلة، و**غير مقبولة**.
+- `WP-05` **مُلتزَم بالفعل في HEAD**؛ فرق `bot/db.py` في الـworktree = WP-07 فقط.
+- توثيق قديم (`OHB2-WP07-CONDITIONAL-OWNER-ACCEPTANCE-PROPOSAL.md` R9/§7) **stale**: يقول DEF-011 غير
+  منفَّذ — صُحِّح بالتوثيق فقط، **بلا تعديل الملف**.
+- `WP-09` (Python 3.11) **UNVERIFIED** محليًا (3.13 فقط، لا push ⇒ لا CI).
+
+**بوابات (تشغيل الوكيل، غير مستقل):** pytest **3406 passed/0 failed**؛ مركّزة **121 passed**؛
+pyflakes 0؛ bandit High 0؛ node **280/0**.
+
+**الملفات المضافة (3 فقط، بلا تعديل كود/اختبارات):**
+`docs/reviews/OHB2-WP07-BATCH03-EXTERNAL-REVIEW-{HANDOFF-REPORT,CHECKLIST,FINDINGS-TEMPLATE}.md`
+
+**توقيع الحزمة (SHA-256):** القيمة المرجعية في الـsidecar بجوار الأرشيف:
+`OHB2-WP07-BATCH03-EXTERNAL-REVIEW-HANDOFF-20261119.tar.gz.sha256`
+(مافيش digest مكتوب هنا عن قصد — `PROGRESS.md` جوّه الـsnapshot، فكتابة الـdigest هنا بتخلّيه دائري:
+الكتابة بتغيّر الـdigest. الـsidecar هو المصدر الوحيد.)
+(تحقّق: أرشيف OK → فكّ OK → 43/43 OK / 0 فشل → 45 ملفًا؛ إعادة البناء ⇒ نفس الـdigest.)

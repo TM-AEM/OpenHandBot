@@ -1,0 +1,771 @@
+diff --git a/bot/attachments.py b/bot/attachments.py
+index 1a61fbb..7c781fa 100644
+--- a/bot/attachments.py
++++ b/bot/attachments.py
+@@ -72,16 +72,21 @@ worker/process/مالك قاعدة تاني.
+ from __future__ import annotations
+ 
+ import os
++import threading
+ import secrets
+ import stat as _stat
+ import logging
+ import time
+ import unicodedata
+-from dataclasses import dataclass
++import functools
++from dataclasses import dataclass, field
+ from datetime import datetime, timedelta, timezone
+ from enum import Enum
+ from pathlib import Path
+ 
++import anyio
++from anyio import to_thread
++
+ from . import files
+ from .db import (
+     ATTACHMENT_BATCH_EXPIRED,
+@@ -513,6 +518,12 @@ class StagingStore:
+         self._max_bytes_per_batch = (
+             None if max_bytes_per_batch is None else int(max_bytes_per_batch)
+         )
++        # DEF-011: قفل تسلسل **إدخال المرفقات** على مستوى المخزن.
++        # المسار المتزامن القديم كان بيحجب الحلقة فبيتسلسل تلقائيًّا (فحص الحصّة ⇒ كتابة
++        # ⇒ وسم). بعد نقل الكتابة لخيط عامل بقى فيه نقطة `await` ⇒ لازم قفل صريح يحافظ
++        # على **نفس** النموذج المتسلسل (مفيش تزامن جديد، مفيش سجل حجز حصص — D-12 كما هي).
++        # `anyio.Lock` (مش قفل الحلقة القياسي) عشان ما نوسّعش اعتماديات الوحدة.
++        self._accept_lock = anyio.Lock()
+ 
+     @property
+     def root(self) -> Path:
+@@ -643,26 +654,20 @@ class StagingStore:
+             raise
+         return written
+ 
+-    def store(
++    def _store_prepare(
+         self,
+         *,
+         telegram_id: int,
+         batch_id: str,
+         item_id: str,
+-        display_name: str | None = None,
+-        chunks=None,
+-        declared_size: int | None = None,
+-        row_created: bool = False,
+-        batch_acceptance: "BatchAcceptance | None" = None,
+-        staging_token: str | None = None,
+-    ) -> StageResult:
+-        """التسلسل row-first (F5): صف `pending` ⇒ كتابة ⇒ تحقّق ⇒ `stored`.
++        display_name: str | None,
++        declared_size: int | None,
++        row_created: bool,
++        staging_token: str | None,
++    ):
++        """كل خطوات القاعدة **قبل** أي بايت (على خيط مالك القاعدة).
+ 
+-        `row_created=True` (A2): صف العنصر `pending` اتعمل **قبل** النداء (مع نتيجة
+-        التحديث ذرّيًّا) ⇒ ما نعملش INSERT تاني؛ التسلسل row-first محفوظ برضه (الصف
+-        موجود قبل أي بايت). `batch_acceptance` (A2) بيوثّق قرار الدفعة (NEW/APPEND) لكن
+-        الكتابة هنا بتعتمد على الـ `row_created` (الصف اتكتب فعلًا). `staging_token` (A2)
+-        لو اتحدّد بيُستخدم بدل توليد توكن جديد (عشان الصف الدائم يشير لبايتاته — F-1).
++        ترجّع `StageResult` عند الرفض، أو `(path, token, cap)` عند الجاهزية للكتابة.
+         """
+         # (0) حراسة الملكية/الربط: الدفعة الأب لازم تكون موجودة ومملوكة للمستخدم ومعرّف
+         #     محادثتها صالح (إعادة استخدام المدقّق القياسي). أي فشل ⇒ رفض مغلق.
+@@ -748,37 +753,18 @@ class StagingStore:
+             except Exception as exc:  # noqa: BLE001 — فشل قاعدة ⇒ رفض مغلق (مفيش ادّعاء نجاح)
+                 return StageResult(StageStatus.DB_FAILED, item_id=item_id, error=type(exc).__name__)
+ 
+-        # (2) الكتابة تحت اسم مُعتِم، مقيّدة بالحجم/السقف الكلي.
+-        try:
+-            written = self._write_to_path(path, chunks if chunks is not None else (), cap)
+-        except _TooLargeError:
+-            # تجاوز السقف: لو السقف الفعّال هو الكلي ⇒ `REJECTED_QUOTA`؛ وإلا `REJECTED_SIZE`.
+-            status = (
+-                StageStatus.REJECTED_QUOTA if cap < self._max_bytes else StageStatus.REJECTED_SIZE
+-            )
+-            return StageResult(status, item_id=item_id, staging_token=token)
+-        except _CollisionError:
+-            return StageResult(
+-                StageStatus.WRITE_FAILED, item_id=item_id, staging_token=token, error="collision"
+-            )
+-        except OSError as exc:
+-            return StageResult(
+-                StageStatus.WRITE_FAILED, item_id=item_id, staging_token=token,
+-                error=type(exc).__name__,
+-            )
++        return path, token, cap
+ 
+-        # (3) تحقّق المحتوى الفعلي المكتوب (حجم/بصمة) — مفيش `stored` قبل كده.
++    def _store_finalize(
++        self, *, item_id: str, path, token: str, cap: int, written: int, head: bytes
++    ) -> StageResult:
++        """بعد الكتابة والتحقّق: الانتقال لـ `stored` **أو** حذف البايتات والرفض.
++
++        كل خطوات القاعدة هنا (على خيط مالك القاعدة) — مفيش أي لمس للقرص من خيط عامل.
++        """
+         if written <= 0:
+             _safe_unlink(path)
+             return StageResult(StageStatus.REJECTED_EMPTY, item_id=item_id, staging_token=token)
+-        try:
+-            head = _read_head(path)
+-        except OSError as exc:
+-            _safe_unlink(path)
+-            return StageResult(
+-                StageStatus.WRITE_FAILED, item_id=item_id, staging_token=token,
+-                error=type(exc).__name__,
+-            )
+         if _is_denied_magic(head):
+             _safe_unlink(path)
+             return StageResult(StageStatus.REJECTED_TYPE, item_id=item_id, staging_token=token)
+@@ -807,6 +793,190 @@ class StagingStore:
+             StageStatus.STORED, item_id=item_id, staging_token=token, size_bytes=written
+         )
+ 
++    def _store_write(
++        self, *, path, chunks, cap: int, item_id: str, token: str
++    ):
++        """خطوة الإدخال/الإخراج البحتة: كتابة مقيّدة + قراءة البصمة.
++
++        ترجّع `StageResult` عند فشل الكتابة، أو `(written, head)` عند النجاح.
++        """
++        try:
++            written = self._write_to_path(path, chunks if chunks is not None else (), cap)
++        except _TooLargeError:
++            # تجاوز السقف: لو السقف الفعّال هو الكلي ⇒ `REJECTED_QUOTA`؛ وإلا `REJECTED_SIZE`.
++            status = (
++                StageStatus.REJECTED_QUOTA if cap < self._max_bytes else StageStatus.REJECTED_SIZE
++            )
++            return StageResult(status, item_id=item_id, staging_token=token)
++        except _CollisionError:
++            return StageResult(
++                StageStatus.WRITE_FAILED, item_id=item_id, staging_token=token, error="collision"
++            )
++        except OSError as exc:
++            return StageResult(
++                StageStatus.WRITE_FAILED, item_id=item_id, staging_token=token,
++                error=type(exc).__name__,
++            )
++
++        # (3) تحقّق المحتوى الفعلي المكتوب (حجم/بصمة) — مفيش `stored` قبل كده.
++        if written <= 0:
++            return written, b""
++        try:
++            head = _read_head(path)
++        except OSError as exc:
++            _safe_unlink(path)
++            return StageResult(
++                StageStatus.WRITE_FAILED, item_id=item_id, staging_token=token,
++                error=type(exc).__name__,
++            )
++        return written, head
++
++    def store(
++        self,
++        *,
++        telegram_id: int,
++        batch_id: str,
++        item_id: str,
++        display_name: str | None = None,
++        chunks=None,
++        declared_size: int | None = None,
++        row_created: bool = False,
++        batch_acceptance: "BatchAcceptance | None" = None,
++        staging_token: str | None = None,
++    ) -> StageResult:
++        """التسلسل row-first (F5): صف `pending` ⇒ كتابة ⇒ تحقّق ⇒ `stored`.
++
++        `row_created=True` (A2): صف العنصر `pending` اتعمل **قبل** النداء (مع نتيجة
++        التحديث ذرّيًّا) ⇒ ما نعملش INSERT تاني؛ التسلسل row-first محفوظ برضه (الصف
++        موجود قبل أي بايت). `batch_acceptance` (A2) بيوثّق قرار الدفعة (NEW/APPEND) لكن
++        الكتابة هنا بتعتمد على الـ `row_created` (الصف اتكتب فعلًا). `staging_token` (A2)
++        لو اتحدّد بيُستخدم بدل توليد توكن جديد (عشان الصف الدائم يشير لبايتاته — F-1).
++
++        **مسار متزامن (سلوك تاريخي محفوظ حرفيًّا).** في الإنتاج بيُستدعى عبر
++        `store_async` اللي بينقل الكتابة لخيط عامل.
++        """
++        prep = self._store_prepare(
++            telegram_id=telegram_id, batch_id=batch_id, item_id=item_id,
++            display_name=display_name, declared_size=declared_size,
++            row_created=row_created, staging_token=staging_token,
++        )
++        if isinstance(prep, StageResult):
++            return prep
++        path, token, cap = prep
++        wrote = self._store_write(
++            path=path, chunks=chunks, cap=cap, item_id=item_id, token=token
++        )
++        if isinstance(wrote, StageResult):
++            return wrote
++        written, head = wrote
++        return self._store_finalize(
++            item_id=item_id, path=path, token=token, cap=cap, written=written, head=head
++        )
++
++    async def store_async(
++        self,
++        *,
++        telegram_id: int,
++        batch_id: str,
++        item_id: str,
++        display_name: str | None = None,
++        chunks=None,
++        declared_size: int | None = None,
++        row_created: bool = False,
++        batch_acceptance: "BatchAcceptance | None" = None,
++        staging_token: str | None = None,
++    ) -> StageResult:
++        """نفس `store` بالحرف، لكن **الإدخال/الإخراج البحت** بيتنفّذ في خيط عامل.
++
++        **حدود السلامة (DEF-011):** كل خطوات القاعدة (`_store_prepare` /
++        `_store_finalize`) بتتنفّذ على خيط مالك القاعدة (حلقة الأحداث) — مفيش
++        `Database`/`_conn`/حالة معاملة بتعبر لخيط عامل. الخيط العامل بياخد مسار +
++        قطع بايتات + سقف **بس**، وبيرجّع عدد بايتات وبصمة.
++
++        **تسلسل القبول:** القسم الحرج (فحص الحصّة ⇒ كتابة ⇒ وسم) محمي بقفل المخزن —
++        نفس النموذج المتسلسل اللي كان موجود قبل نقل الإدخال/الإخراج (مفيش تزامن جديد).
++
++        **F-02 — الإلغاء الخام ما بيحرّرش القفل تحت كاتب شغّال:** درع `anyio` جوه
++        `to_thread.run_sync` بيغطّي نطاقات إلغاء anyio بس، مش الإلغاء الخام للمهمة. فلو
++        اتلغت المهمة الخام أثناء الكتابة، `async with` كان بيخرج فورًا والقفل بيتحرّر
++        والخيط لسه بيكتب.
++
++        **البوّابة الذرّية (atomic worker-start gate):** `anyio` بينفّذ checkpoint **قبل**
++        ما ينشئ العامل، فممكن الـfuture يتلغي والعامل ما يتنادىش خالص — وساعتها انتظار
++        إشارة الإتمام بيعلّق للأبد والقفل بيفضل محتجز. الحل بوّابة `threading.Lock` واحدة
++        بيتنافس عليها طرفان، وكل طرف بيغيّر الحالة وهو حائزها ⇒ الحالتان متنتافيتان
++        حتميًا (مفيش اعتماد على توقيت):
++
++        - العامل كسب البوّابة الأول ⇒ `started=True` ⇒ المستدعي **لازم** يستنّى العامل
++          قبل ما يخرج من نطاق القفل.
++        - المستدعي كسب البوّابة الأول ⇒ `abandoned=True` ⇒ العامل لو اتنادى بعدها يخرج
++          **بلا أي كتابة**، والمستدعي ما يستنّاش عاملًا لن يبدأ.
++
++        البوّابة **ما بتتحملش** عبر أي `await` أو عملية قرص أو قاعدة — بتلتف حول فحص/ضبط
++        العَلمين بس. الإلغاء المتكرر (إلغاء ثانٍ أثناء التصريف) **مش** مغطّى هنا (D6).
++        """
++        async with self._accept_lock:
++            prep = self._store_prepare(
++                telegram_id=telegram_id, batch_id=batch_id, item_id=item_id,
++                display_name=display_name, declared_size=declared_size,
++                row_created=row_created, staging_token=staging_token,
++            )
++            if isinstance(prep, StageResult):
++                return prep
++            path, token, cap = prep
++            # الإدخال/الإخراج البحت في خيط عامل — الخيط العامل بياخد مسار/قطع/سقف بس.
++            # F-02: بوّابة ذرّية تفصل "العامل بدأ" عن "المستدعي تخلّى". الطرفان بيغيّروا
++            # الحالة وهما حائزان نفس `_gate` ⇒ الحالتان متنتافيتان (مفيش نافذة توقيت).
++            # ممنوع تمامًا حَمل `_gate` عبر `await`/قرص/قاعدة.
++            _gate = threading.Lock()
++            _state = {"started": False, "abandoned": False}
++            _done = threading.Event()
++            _box: dict = {}
++
++            def _worker() -> None:
++                # الجسم كله (بما فيه الخروج المبكر) جوه try/finally ⇒ `_done` مضمونة
++                # لكل نداء فعلي للعامل، حتى لو رفع استثناءً غير متوقّع.
++                try:
++                    with _gate:
++                        if _state["abandoned"]:
++                            return  # المستدعي تخلّى الأول ⇒ مفيش كتابة إطلاقًا
++                        _state["started"] = True
++                    _box["wrote"] = self._store_write(
++                        path=path, chunks=chunks, cap=cap, item_id=item_id, token=token,
++                    )
++                except BaseException as exc:  # نُنقل الخطأ للمستدعي بدل ابتلاعه
++                    _box["error"] = exc
++                finally:
++                    _done.set()
++
++            try:
++                await to_thread.run_sync(_worker)
++            except anyio.get_cancelled_exc_class():
++                # `run_sync` بيعمل checkpoint قبل الدرع الداخلي ⇒ ممكن الـfuture يتلغي
++                # قبل ما العامل يبدأ، فالعامل ما يتنادىش خالص. القرار تحت البوّابة:
++                with _gate:
++                    if _state["started"]:
++                        _needs_drain = True
++                    else:
++                        _state["abandoned"] = True
++                        _needs_drain = False
++                if _needs_drain:
++                    # درع خارجي: `run_sync` بيتحقّق من الإلغاء قبل درعه الداخلي، فالدرع
++                    # الخارجي بيمنع نطاق anyio ملغى من إجهاض التصريف. الإلغاء الخام
++                    # المتكرر مش مغطّى (D6) — الدرع ما بيوقفش `Task.cancel()`.
++                    with anyio.CancelScope(shield=True):
++                        await to_thread.run_sync(_done.wait)
++                raise
++            if "error" in _box:
++                raise _box["error"]
++            wrote = _box["wrote"]
++            if isinstance(wrote, StageResult):
++                return wrote
++            written, head = wrote
++            return self._store_finalize(
++                item_id=item_id, path=path, token=token, cap=cap, written=written, head=head
++            )
++
+ 
+ # --------------------------------------------------- A2: خدمة قبول المرفقات
+ class AcceptOutcome(str, Enum):
+@@ -953,7 +1123,7 @@ class AttachmentService:
+                 AcceptOutcome.ACCEPTED, batch_id=batch_id, item_id=item_id,
+                 stage=StageStatus.REJECTED_SIZE,
+             )
+-        stage = self._store.store(
++        stage = await self._store.store_async(
+             telegram_id=int(telegram_id),
+             batch_id=batch_id,
+             item_id=item_id,
+@@ -998,6 +1168,41 @@ class BatchSweepResult:
+     reason: str | None = None
+ 
+ 
++@dataclass
++class FileCleanup:
++    """حذف بايت واحد **مقرَّر من القاعدة** ولسه ما اتنفّذش على القرص (F-01).
++
++    القرار (CAS `reaped`) بياخده خيط مالك القاعدة؛ التنفيذ (`_remove_file`) بيتنفّذ
++    على خيط العامل. `result` بيتكتب على خيط العامل ويتقرأ بعد رجوعه فقط.
++    `batch_id=None` ⇒ عنصر يتيم (بلا دفعة أب).
++    """
++
++    token: str | None
++    batch_id: str | None
++    item_id: str | None
++    result: str | None = None
++
++
++@dataclass
++class BatchPlan:
++    """قرار قاعدة لدفعة واحدة — الحصيلة النهائية بتتحسب بعد تنفيذ الحذف (F-01)."""
++
++    batch_id: str
++    status: str
++    items: int
++    retry: int = 0
++
++
++@dataclass
++class SweepPlan:
++    """خطة الكنسة: قرارات القاعدة + الحذف المقرَّر اللي لسه ما اتنفّذش."""
++
++    cleanups: list[FileCleanup] = field(default_factory=list)
++    batches: list[BatchPlan] = field(default_factory=list)
++    immediate: list[BatchSweepResult] = field(default_factory=list)
++    orphans_left: int = 0
++
++
+ @dataclass(frozen=True)
+ class SweepReport:
+     """حصيلة كنسة كاملة (A4) — مجمّعة للرصد (بلا أي محتوى/مسارات مستخدم)."""
+@@ -1060,13 +1265,57 @@ class AttachmentReaper:
+         return self._root
+ 
+     def sweep(self, *, now: datetime) -> SweepReport:
+-        """كنسة واحدة كاملة. **لا بترمي** (تُسجّل وتُرصد). تُستدعى من hook الإقلاع."""
++        """كنسة واحدة كاملة. **لا بترمي** (تُسجّل وتُرصد). تُستدعى من hook الإقلاع.
++
++        **مسار متزامن (سلوك تاريخي محفوظ حرفيًّا).** كل الحذف والمسح بيتنفّذوا على
++        **خيط المستدعي** — يعني لو المستدعي هو خيط الحلقة، الحلقة بتتحجب. الإنتاج
++        بيستدعي `sweep_async` (اللي بينقل القرص لخيط عامل) — استخدمه من أي سياق async.
++        """
+         now = _as_utc(now)
+-        now_iso = now.isoformat()
++        report, known_tokens, plan = self._new_sweep_report()
++        if not self._sweep_db_phase(now.isoformat(), report, known_tokens, plan):
++            return SweepReport(**report)
++        self._sweep_fs_tail(known_tokens, report, plan)
++        self._finalize(plan, report)
++        self._log_report(report)
++        return SweepReport(**report)
++
++    async def sweep_async(self, *, now: datetime) -> SweepReport:
++        """نفس `sweep` بالحرف، لكن **كل** الإدخال/الإخراج على القرص في خيط عامل.
++
++        **حدود السلامة (DEF-011 / F-01):** كل خطوات القاعدة (وسم `expired`, CAS `reaped`,
++        قراءة الصفوف) بتتنفّذ على خيط مالك القاعدة. الخيط العامل بيمسك
++        `iterdir`/`lstat`/`unlink` **بس** — يعني حذف البايتات المقرَّرة (`_apply_cleanups`)
++        كمان مش على الحلقة.
++        """
++        now = _as_utc(now)
++        report, known_tokens, plan = self._new_sweep_report()
++        if not self._sweep_db_phase(now.isoformat(), report, known_tokens, plan):
++            return SweepReport(**report)
++        await to_thread.run_sync(
++            functools.partial(self._sweep_fs_tail, known_tokens, report, plan)
++        )
++        self._finalize(plan, report)
++        self._log_report(report)
++        return SweepReport(**report)
++
++    @staticmethod
++    def _new_sweep_report() -> tuple[dict, set[str], SweepPlan]:
+         report = {"scanned": 0, "cleaned": 0, "partial": 0, "retry": 0,
+                   "skipped": 0, "errors": 0, "files_deleted": 0}
+-        known_tokens: set[str] = set()
++        return report, set(), SweepPlan()
+ 
++    def _sweep_db_phase(
++        self, now_iso: str, report: dict, known_tokens: set[str], plan: SweepPlan
++    ) -> bool:
++        """خطوات القاعدة (0a-3) — **على خيط مالك القاعدة حصرًا**.
++
++        **F-01:** الدالة دي بتاخد قرارات القاعدة **بس** وبتضيف الحذف المقرَّر لـ
++        `plan.cleanups` (بلا أي لمس للقرص). الحذف الفعلي بيتنفّذ في `_apply_cleanups`
++        من `_sweep_fs_tail` (خيط عامل).
++
++        ترجّع `False` لو الكنسة لازم تتوقّف (فشل جلب الدفعات المنتهية).
++        """
+         # (0a) مجموعة **كل** التوكنات المرتبطة بأي عنصر (بأي حالة) — لتمييز «غير مرتبط»
+         #      عن «يتيم» في مسح الجذر (ما نصنّفش ملف عنصر يتيم كملف غير مرتبط).
+         try:
+@@ -1109,7 +1358,7 @@ class AttachmentReaper:
+         except Exception as exc:  # noqa: BLE001 — فشل قاعدة ⇒ كنسة فاشلة (تُرصد)
+             log.warning("A4 sweep: تعذّر جلب الدفعات المنتهية (%s)", type(exc).__name__)
+             report["errors"] += 1
+-            return SweepReport(**report)
++            return False
+         for batch in expired:
+             self._mark_expired(batch, now_iso, report)
+ 
+@@ -1122,16 +1371,31 @@ class AttachmentReaper:
+                 log.warning("A4 sweep: تعذّر جلب الدفعات النهائية (%s)", type(exc).__name__)
+                 report["errors"] += 1
+         for batch in terminal_batches:
+-            self._record(self._sweep_batch(batch, known_tokens), report)
++            self._plan_batch(batch, known_tokens, plan)
+ 
+         # (3) دلاء يتيمة (عناصر بلا دفعة) — تُكنس بالتوكن، وتُرصد لو أثرت.
+         try:
+-            orphans = self._sweep_orphan_items(known_tokens, report=report)
++            plan.orphans_left = self._plan_orphan_items(known_tokens, plan, report=report)
+         except Exception as exc:  # noqa: BLE001
+             log.warning("A4 sweep: تعذّر كنس العناصر اليتيمة (%s)", type(exc).__name__)
+-            orphans = 0
++            plan.orphans_left = 0
++            report["errors"] += 1
++        return True
++
++    def _sweep_fs_tail(
++        self, known_tokens: set[str], report: dict, plan: SweepPlan
++    ) -> None:
++        """**كل** إدخال/إخراج القرص: تنفيذ الحذف المقرَّر (3) + مسح الجذر (4) + (5).
++
++        **بلا أي قاعدة** — معزولة عمدًا عشان تتقدر تتنفّذ في خيط عامل بأمان
++        (مفيش `self._db` هنا خالص).
++        """
++        # (3-تنفيذ) الحذف المقرَّر من القاعدة (F-01): البايتات بس، على خيط العامل.
++        try:
++            self._apply_cleanups(plan)
++        except Exception as exc:  # noqa: BLE001 — فشل FS غير متوقّع ⇒ يُرصد ويُعاد
++            log.warning("A4 sweep: تعذّر تنفيذ حذف البايتات (%s)", type(exc).__name__)
+             report["errors"] += 1
+-        report["orphans_left"] = orphans
+ 
+         # (4) مسح الجذر: بايتات بلا عنصر مطابق ⇒ تُرصد (بلا حذف عمياء/تبنّي).
+         try:
+@@ -1142,8 +1406,34 @@ class AttachmentReaper:
+ 
+         # (5) مخارج آمنة (symlink/مسار غير آمن) — تُرصد كحالة تحتاج تحقيق.
+         report["unsafe_left"] = self._count_unsafe_entries(report=report)
+-        self._log_report(report)
+-        return SweepReport(**report)
++
++    def _apply_cleanups(self, plan: SweepPlan) -> None:
++        """ينفّذ كل حذف مقرَّر — **خيط عامل فقط، بلا قاعدة**.
++
++        بيسجّل نتيجة كل حذف في `cleanup.result`؛ التجميع (`_finalize`) بيحصل بعد كده
++        على خيط الحلقة ⇒ مفيش تحوير متقاطع على `report` من خيطين.
++        """
++        for cleanup in plan.cleanups:
++            cleanup.result = self._remove_file(cleanup.token)
++
++    def _finalize(self, plan: SweepPlan, report: dict) -> None:
++        """تجميع الحصيلة بعد تنفيذ الحذف — بلا قاعدة وبلا قرص."""
++        by_batch: dict[str, list[FileCleanup]] = {}
++        orphan_retry = 0
++        for cleanup in plan.cleanups:
++            if cleanup.batch_id is not None:
++                by_batch.setdefault(cleanup.batch_id, []).append(cleanup)
++            elif cleanup.result == "retry":
++                # يتيم فشل حذفه ⇒ يُحتسب `orphans_left` (زي السلوك القديم) ومش `retry`.
++                orphan_retry += 1
++        for result in plan.immediate:
++            self._record(result, report)
++        for batch_plan in plan.batches:
++            self._record(
++                self._finish_batch(batch_plan, by_batch.get(batch_plan.batch_id, [])), report
++            )
++        report["orphans_left"] = plan.orphans_left + orphan_retry
++
+ 
+     # ------------------------------------------------------------------ داخلي
+     def _record(self, result: BatchSweepResult, report: dict) -> None:
+@@ -1178,48 +1468,54 @@ class AttachmentReaper:
+             )
+             report["errors"] += 1
+ 
+-    def _sweep_batch(
+-        self, batch: AttachmentBatch, known_tokens: set[str]
+-    ) -> BatchSweepResult:
++    def _plan_batch(
++        self, batch: AttachmentBatch, known_tokens: set[str], plan: SweepPlan
++    ) -> None:
++        """قرار القاعدة لدفعة نهائية (**بلا قرص** — F-01). بيضيف `BatchPlan` أو نتيجة فورية."""
+         # قرار مؤهّل: نهائي **و** `t0` صالح. غير ذلك ⇒ تُترك (بلا تخمين).
+         if batch.status not in self._TERMINAL:
+-            return BatchSweepResult(batch.batch_id, SweepOutcome.SKIPPED, batch.status,
+-                                    reason="non_terminal")
++            plan.immediate.append(
++                BatchSweepResult(batch.batch_id, SweepOutcome.SKIPPED, batch.status,
++                                 reason="non_terminal")
++            )
++            return
+         if _parse_t0(batch.t0) is None:
+             log.warning("A4 sweep: دفعة %s نهائية بـ t0 غير صالح ⇒ تُترك", batch.batch_id)
+-            return BatchSweepResult(batch.batch_id, SweepOutcome.SKIPPED, batch.status,
+-                                    reason="invalid_t0")
++            plan.immediate.append(
++                BatchSweepResult(batch.batch_id, SweepOutcome.SKIPPED, batch.status,
++                                 reason="invalid_t0")
++            )
++            return
+         try:
+             items = self._db.list_attachment_items(batch.batch_id)
+         except Exception as exc:  # noqa: BLE001
+             log.warning("A4 sweep: تعذّر جلب عناصر الدفعة %s (%s)",
+                         batch.batch_id, type(exc).__name__)
+-            return BatchSweepResult(batch.batch_id, SweepOutcome.ERROR, batch.status,
+-                                    reason=type(exc).__name__)
++            plan.immediate.append(
++                BatchSweepResult(batch.batch_id, SweepOutcome.ERROR, batch.status,
++                                 reason=type(exc).__name__)
++            )
++            return
+         if not items:
+             # حالة (2): دبوس بلا عناصر ⇒ لا شيء لکنسه (تُترك البيانات الوصفية للتحقيق).
+-            return BatchSweepResult(batch.batch_id, SweepOutcome.NOTHING, batch.status)
++            plan.immediate.append(
++                BatchSweepResult(batch.batch_id, SweepOutcome.NOTHING, batch.status)
++            )
++            return
+ 
+-        deleted = retry = reconciled = 0
++        batch_plan = BatchPlan(batch.batch_id, batch.status, items=len(items))
+         for item in items:
+             token = item.staging_token
+             if token:
+                 known_tokens.add(token)
+             if item.status == ATTACHMENT_ITEM_REAPED:
+                 # كنسة سابقة وسمت العنصر؛ بايتاته ممكن تكون لسه موجودة (فشل حذف سابق).
+-                res = self._remove_file(token)
+-                if res == "deleted":
+-                    deleted += 1
+-                elif res == "absent":
+-                    reconciled += 1
+-                elif res == "retry":
+-                    retry += 1
+-                # unsafe ⇒ يُترك ويُرصد
++                plan.cleanups.append(FileCleanup(token, batch.batch_id, item.item_id))
+                 continue
+             if item.status not in (ATTACHMENT_BATCH_PENDING, ATTACHMENT_ITEM_STORED):
+                 # حالة عنصر غير معروفة/غامضة ⇒ تُترك (بلا تخمين)، تُرصد.
+                 log.warning("A4 sweep: عنصر %s بحالة غير معروفة/غامضة ⇒ يُترك", item.item_id)
+-                retry += 1
++                batch_plan.retry += 1
+                 continue
+             # DB-أولًا: وسم العنصر `reaped` (CAS) **قبل** حذف البايتات.
+             try:
+@@ -1227,33 +1523,46 @@ class AttachmentReaper:
+             except Exception as exc:  # noqa: BLE001 — فشل قاعدة ⇒ يُعاد
+                 log.warning("A4 sweep: تعذّر وسم العنصر %s كمكنوس (%s)",
+                             item.item_id, type(exc).__name__)
+-                retry += 1
++                batch_plan.retry += 1
+                 continue
+             if not marked:
+                 # تغيّرت الحالة تحتنا (سباق) ⇒ ما نمسحش؛ إعادة محاولة لاحقة.
+-                retry += 1
++                batch_plan.retry += 1
+                 continue
+-            res = self._remove_file(token)
+-            if res == "deleted":
++            plan.cleanups.append(FileCleanup(token, batch.batch_id, item.item_id))
++        plan.batches.append(batch_plan)
++
++    def _finish_batch(
++        self, batch_plan: BatchPlan, cleanups: list[FileCleanup]
++    ) -> BatchSweepResult:
++        """يحوّل قرار الدفعة + نتائج الحذف لحصيلة — **بعد** تنفيذ الحذف (بلا قرص/قاعدة)."""
++        deleted = reconciled = 0
++        retry = batch_plan.retry
++        for cleanup in cleanups:
++            if cleanup.result == "deleted":
+                 deleted += 1
+-            elif res == "absent":
++            elif cleanup.result == "absent":
+                 reconciled += 1
+-            elif res == "retry":
++            elif cleanup.result == "retry":
+                 retry += 1
++            # unsafe ⇒ يُترك ويُرصد
+         if retry:
+             outcome = SweepOutcome.PARTIAL if (deleted or reconciled) else SweepOutcome.RETRY
+-            return BatchSweepResult(batch.batch_id, outcome, batch.status,
+-                                    items=len(items), deleted=deleted, retry=retry)
++            return BatchSweepResult(batch_plan.batch_id, outcome, batch_plan.status,
++                                    items=batch_plan.items, deleted=deleted, retry=retry)
+         if deleted or reconciled:
+-            return BatchSweepResult(batch.batch_id, SweepOutcome.CLEANED, batch.status,
+-                                    items=len(items), deleted=deleted)
+-        return BatchSweepResult(batch.batch_id, SweepOutcome.NOTHING, batch.status,
+-                                items=len(items))
++            return BatchSweepResult(batch_plan.batch_id, SweepOutcome.CLEANED, batch_plan.status,
++                                    items=batch_plan.items, deleted=deleted)
++        return BatchSweepResult(batch_plan.batch_id, SweepOutcome.NOTHING, batch_plan.status,
++                                items=batch_plan.items)
+ 
+-    def _sweep_orphan_items(
+-        self, known_tokens: set[str], *, report: dict | None = None
++    def _plan_orphan_items(
++        self, known_tokens: set[str], plan: SweepPlan, *, report: dict | None = None
+     ) -> int:
+-        """عناصر بلا دفعة أب (دبوس مفقود): وسم `reaped` + حذف بايتاتها. ترجّع المتبقّي."""
++        """عناصر بلا دفعة أب (دبوس مفقود): وسم `reaped` (**بلا قرص**) + جدولة الحذف.
++
++        ترجّع عدد المتبقّي (`orphans_left`) — نفس عقد `_sweep_orphan_items` القديم.
++        """
+         try:
+             all_batches = {b.batch_id for b in self._db.list_all_attachment_batches()}
+         except Exception as exc:  # noqa: BLE001
+@@ -1288,8 +1597,7 @@ class AttachmentReaper:
+                     # الدائم/الحصر/أمان المسار كلها في `_remove_file` ⇒ بلا حذف تخميني.
+                     log.warning("A4 sweep: عنصر يتيم %s (بلا دفعة) مكنوس سابقًا ⇒ إعادة حذف",
+                                 item.item_id)
+-                    if self._remove_file(token) == "retry":
+-                        left += 1
++                    plan.cleanups.append(FileCleanup(token, None, item.item_id))
+                     continue
+                 log.warning("A4 sweep: عنصر يتيم %s (بلا دفعة) ⇒ يُكنس", item.item_id)
+                 try:
+@@ -1297,14 +1605,13 @@ class AttachmentReaper:
+                         left += 1
+                         continue
+                 except Exception as exc:  # noqa: BLE001
+-                    log.warning("A4 sweep: تعذّر وسم العنصر اليتيم %s كمكنوس (%s)",
++                    log.warning("A4 sweep: تعذّر وسم العنصر اليتيم %s كمكنس (%s)",
+                                 item.item_id, type(exc).__name__)
+                     if report is not None:
+                         report["errors"] += 1
+                     left += 1
+                     continue
+-                if self._remove_file(token) == "retry":
+-                    left += 1
++                plan.cleanups.append(FileCleanup(token, None, item.item_id))
+         return left
+ 
+     def _scan_root_untracked(
+@@ -1507,17 +1814,9 @@ class OpportunisticSweeper:
+         ⇒ كنسة واحدة على الأكثر كل `min_interval`. الفشل المتكرّر ما بيعملش كنسة كاملة على
+         كل tick (مفيش حلقة ضيّقة)، وأول tick مؤهّل بعد الخنق بيعيد المحاولة.
+         """
+-        if self._running:
+-            return None  # كنسة شغّالة بالفعل ⇒ مفيش تداخل
+-        mono = self._clock()
+-        if (
+-            self._last_attempt_at is not None
+-            and (mono - self._last_attempt_at) < self._min_interval
+-        ):
+-            return None  # لسه بدري (خنق) ⇒ مفيش كنسة كاملة على كل tick
+-        self._running = True
+-        # أي محاولة بتخنق التالية (نجاح أو فشل) ⇒ إعادة محاولة **محدودة**، مفيش حلقة ضيّقة.
+-        self._last_attempt_at = mono
++        mono = self._begin_attempt()
++        if mono is None:
++            return None
+         try:
+             sweep_now = now if now is not None else datetime.now(timezone.utc)
+             report = self._reaper.sweep(now=sweep_now)
+@@ -1529,6 +1828,47 @@ class OpportunisticSweeper:
+             return None  # ختم النجاح **ما بيتقدّمش** ⇒ الفشل ما يتخزّنش كنجاح
+         finally:
+             self._running = False
++        return self._finish_attempt(report, mono)
++
++    async def maybe_sweep_async(self, *, now: datetime | None = None) -> SweepReport | None:
++        """نفس `maybe_sweep` بالحرف، لكن الكنسة نفسها (`sweep_async`) بتنقل **كل** قرص
++        (حذف البايتات + مسح الجذر) لخيط عامل. نفس الخنق/حرس إعادة الدخول/تمييز النجاح.
++
++        **حدود السلامة:** الخنق وحالة `_running` والوسم/القرار كلهم على خيط مالك القاعدة.
++        """
++        mono = self._begin_attempt()
++        if mono is None:
++            return None
++        try:
++            sweep_now = now if now is not None else datetime.now(timezone.utc)
++            report = await self._reaper.sweep_async(now=sweep_now)
++        except Exception as exc:  # noqa: BLE001 — فشل الكنسة ⇒ يُسجَّل، مفيش نجاح كاذب
++            log.warning(
++                "كنس LIFE-01 الانتهاكي فشل (%s) ⇒ هيتعاود على أول tick مؤهّل بعد الخنق",
++                type(exc).__name__,
++            )
++            return None
++        finally:
++            self._running = False
++        return self._finish_attempt(report, mono)
++
++    def _begin_attempt(self) -> float | None:
++        """حرس إعادة الدخول + الخنق الزمني. ترجّع الـ mono لو مسموح بالكنسة، وإلا None."""
++        if self._running:
++            return None  # كنسة شغّالة بالفعل ⇒ مفيش تداخل
++        mono = self._clock()
++        if (
++            self._last_attempt_at is not None
++            and (mono - self._last_attempt_at) < self._min_interval
++        ):
++            return None  # لسه بدري (خنق) ⇒ مفيش كنسة كاملة على كل tick
++        self._running = True
++        # أي محاولة بتخنق التالية (نجاح أو فشل) ⇒ إعادة محاولة **محدودة**، مفيش حلقة ضيّقة.
++        self._last_attempt_at = mono
++        return mono
++
++    def _finish_attempt(self, report, mono: float):
++        """يصنّف نتيجة الكنسة (نجاح كامل مقابل فشل/جزئي) — بلا ادّعاء نجاح كاذب."""
+         if report is None:  # دفاع: عقد `sweep` يرجّع تقريرًا دايمًا، لكن ما نعلنش نجاح على None
+             return None
+         if report.errors > 0:
+diff --git a/bot/handlers.py b/bot/handlers.py
+index 2307546..195acee 100644
+--- a/bot/handlers.py
++++ b/bot/handlers.py
+@@ -3,6 +3,7 @@ from __future__ import annotations
+ 
+ import asyncio
+ import errno
++import functools
+ import io
+ import logging
+ import os
+@@ -13,6 +14,7 @@ from datetime import datetime, timezone
+ from urllib.parse import urlsplit
+ 
+ import httpx
++from anyio import to_thread
+ from telegram import InputFile, Update
+ from telegram.constants import ParseMode
+ from telegram.error import (
+@@ -2009,7 +2011,10 @@ async def _download_attachment_chunks(context, file_id: str, max_bytes: int):
+             # مسار محلي (سيرفر Bot API محلي/اختبار): ملف على القرص ⇒ قراءة مقيّدة.
+             if os.path.isfile(file_path):
+                 try:
+-                    return iter([_read_local_capped(file_path, max_bytes)])
++                    data = await to_thread.run_sync(
++                        functools.partial(_read_local_capped, file_path, max_bytes)
++                    )
++                    return iter([data])
+                 except AttachmentTooLargeError:
+                     raise
+                 except OSError as exc:  # ملف غير قابل للقراءة ⇒ رفض مغلق (مش فشل صامت)

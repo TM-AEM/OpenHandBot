@@ -89,3 +89,209 @@ def test_runbook_table_count_matches_schema():
     assert f"**{len(tables)}** جدول" in RUNBOOK, (
         f"RUNBOOK لازم يذكر عدد الجداول الصحيح ({len(tables)})"
     )
+
+
+# ---------------------------------------------------------------------------
+# OHB2-WP07-DEF011-F03: عقيدة دورة حياة الوثائق (Document Supersession)
+#
+# F-03 مش عيب كود: وثيقتان تاريخيتان (اقتراح القبول + تقرير التثبيت) لسه فيهم
+# ادّعاءات بزمن المضارع عن DEF-011 بقت غلط بعد ما DEF-011-B اتنفّذ. الإصلاح
+# **إضافي فقط**: بنضيف إشعار تصحيح مؤرّخ، والنص التاريخي يفضل زي ما هو بايت-ببايت.
+#
+# الاختبارات دي بتمنع 4 أشكال انحراف:
+#   T-1  التكافؤ الحالي: الإشعار بيوصف حالة الكود الفعلية (B منفّذ، A/C لأ).
+#   T-2  الثبات التاريخي: §2.2 و§7 والادّعاءات الأصلية ما اتغيّروش.
+#   T-3  منع الادّعاء الزائد: DEF-011 لسه مفتوح، ومفيش ادّعاء إنه مقفول.
+#   T-4  اتساق الوثيقتين: نفس التاريخ ونفس الحالة ونفس النطاق.
+# ---------------------------------------------------------------------------
+
+PROPOSAL = (
+    ROOT / "docs/audits/OHB2-WP07-CONDITIONAL-OWNER-ACCEPTANCE-PROPOSAL.md"
+).read_text(encoding="utf-8")
+BATCH_REPORT = (
+    ROOT / "docs/reviews/OHB2-WP07-FINAL-STABILIZATION-BATCH-REPORT.md"
+).read_text(encoding="utf-8")
+ATTACHMENTS_SRC = (ROOT / "bot/attachments.py").read_text(encoding="utf-8")
+
+CORRECTION_MARKER = "LATER CORRECTION"
+F03_DATE = "2026-11-21"
+
+# النص التاريخي المحمي — لازم يفضل بايت-ببايت زي ما كان قبل التصحيح.
+_GOLDEN_SECTION_2_2 = (
+'### 2.2 Verification against the current tree\n\n| Item | Present? | Evidence |\n|---|---|---|\n| A-1 | **YES** | `def add_watched_and_record_outcome` ×1 in `bot/db.py` |\n| A-2 | **YES** | `def remove_watched_completing` ×1, `_remove_watched_nocommit` ×1 |\n| A-3 | **YES** | `def clear_awaiting_and_record_outcome` ×1, `def set_awaiting_and_record_outcome` ×1 |\n| A-4 | **YES** | `_remove_watched_with_retry` retains single-arg path |\n| A-5 | **YES** | all six handlers defined; 14 F-1 tests pass |\n\n**All five accepted items remain intact and unmodified in substance.**\n\n'
+)
+
+_GOLDEN_SECTION_7 = (
+'## 7. Explicit non-authorizations\n\nEven if the owner later grants acceptance:\n\n- **No Git publication** — commit, push, PR, merge, tag, or release are **not** authorized.\n- **No WP-06 Part 2 implementation** — O-7 remains a separate gate.\n- **No deployment or release.**\n- **No Autopush activation.**\n- **No schema change** — the 17-table baseline remains authoritative (O-5, C-5.7).\n- **No DEF-011 implementation.**\n- **No OD-04 resolution** — that is a separate owner decision.\n- **No scope expansion** beyond what is explicitly named.\n\n---\n\n'
+)
+
+# الادّعاءات التاريخية المتقادمة — لازم تفضل موجودة حرفيًا (ممنوع إعادة كتابتها).
+_HISTORICAL_STALE_LINES = (
+    "- an entirely **unimplemented** finding (DEF-011).",
+    "| **R9** | **DEF-011 is entirely unimplemented** while inside WP-07's authoritative "
+    "scope. | 0 `to_thread` in `attachments.py`; 0 quota ledger |",
+    "| 1 | **DEF-011 is entirely unimplemented** (no `asyncio.to_thread` in `attachments.py`, "
+    "no quota ledger) though inside WP-07's authoritative scope | WP-07 is **not** "
+    "implementation-complete |",
+)
+
+
+def _section(text: str, start: str, end: str) -> str:
+    """يقطع قسم كامل من الوثيقة بحدود نصّية صريحة (مش أرقام سطور)."""
+    begin = text.index(start)
+    return text[begin : text.index(end, begin)]
+
+
+def _correction_notice(text: str) -> str:
+    """إشعار التصحيح من بداية العلامة لحد نهاية الاقتباس (سطر فاضي)."""
+    start = text.index(CORRECTION_MARKER)
+    # الإشعار كله اقتباس Markdown (كل سطر بيبدأ بـ `>`)، فبناخد لحد أول سطر مش اقتباس.
+    lines = text[start:].splitlines()
+    body = []
+    for line in lines:
+        if body and line.strip() and not line.lstrip().startswith(">"):
+            break
+        body.append(line)
+    return "\n".join(body)
+
+
+def _sub_defect_status(notice: str, sub_defect: str) -> str:
+    """حالة تحت-عيب معيّن من صف الجدول اللي بيبدأ بـ `**`DEF-011-X`**`."""
+    for line in notice.splitlines():
+        if f"`{sub_defect}`" in line and line.lstrip().startswith(">"):
+            row = line.lstrip("> ").strip()
+            if "IMPLEMENTED" in row and "NOT IMPLEMENTED" in row:
+                return "NOT IMPLEMENTED"
+            if "NOT IMPLEMENTED" in row:
+                return "NOT IMPLEMENTED"
+            if "IMPLEMENTED" in row:
+                return "IMPLEMENTED"
+    raise AssertionError(f"مفيش صف حالة لـ {sub_defect} في إشعار التصحيح")
+
+
+# --- T-1: التكافؤ الحالي بين الإشعار والكود ---------------------------------
+
+
+def test_t1_correction_notice_matches_actual_implementation_state():
+    """T-1: الإشعار لازم يوصف حالة الكود الحقيقية: B منفّذ، A و C لأ."""
+    notice = _correction_notice(PROPOSAL)
+
+    assert _sub_defect_status(notice, "DEF-011-B") == "IMPLEMENTED", (
+        "DEF-011-B لازم يتسجّل IMPLEMENTED في الإشعار"
+    )
+    assert _sub_defect_status(notice, "DEF-011-A") == "NOT IMPLEMENTED", (
+        "DEF-011-A لازم يتسجّل NOT IMPLEMENTED في الإشعار"
+    )
+    assert _sub_defect_status(notice, "DEF-011-C") == "NOT IMPLEMENTED", (
+        "DEF-011-C لازم يتسجّل NOT IMPLEMENTED في الإشعار"
+    )
+
+    # الدليل الفعلي على إن B منفّذ: offload حقيقي بـ anyio في مسار المرفقات.
+    assert "from anyio import to_thread" in ATTACHMENTS_SRC, (
+        "DEF-011-B مفترض يكون منفّذ عبر anyio.to_thread في bot/attachments.py"
+    )
+    assert "to_thread.run_sync" in ATTACHMENTS_SRC, (
+        "DEF-011-B مفترض يكون فيه استدعاء to_thread.run_sync فعلي"
+    )
+
+    # الإشعار بيقول "خمسة" occurrences — لازم يطابق العدد الفعلي في الكود.
+    assert ATTACHMENTS_SRC.count("to_thread") == 5, (
+        "عدد to_thread في attachments.py اتغيّر؛ الإشعار لازم يتحدّث مع الكود"
+    )
+    assert "five" in notice and "to_thread" in notice, (
+        "الإشعار لازم يذكر عدد to_thread المطابق للكود"
+    )
+
+
+def test_t1_reservation_ledger_absence_still_accurate():
+    """T-1 (تكملة): ادّعاء "0 quota ledger" لسه صح، فـ A لسه مش منفّذ."""
+    assert not any(
+        token in ATTACHMENTS_SRC
+        for token in ("reserv", "in_flight", "_ledger")
+    ), "لو ظهر reservation ledger، لازم DEF-011-A يتحدّث ويخرج من حالة NOT IMPLEMENTED"
+
+
+# --- T-2: الثبات التاريخي ----------------------------------------------------
+
+
+def test_t2_protected_sections_are_byte_for_byte_unchanged():
+    """T-2: §2.2 و§7 ممنوع يتغيّروا بأي حرف."""
+    assert _section(
+        PROPOSAL,
+        "### 2.2 Verification against the current tree",
+        "### 2.3",
+    ) == _GOLDEN_SECTION_2_2, "§2.2 اتغيّر — ممنوع تعديل القسم التاريخي"
+
+    assert _section(
+        PROPOSAL,
+        "## 7. Explicit non-authorizations",
+        "## 8.",
+    ) == _GOLDEN_SECTION_7, "§7 اتغيّر — ممنوع تحويل حدود التفويض التاريخية لادّعاء تنفيذ"
+
+
+def test_t2_historical_stale_claims_are_preserved_verbatim():
+    """T-2: الادّعاءات التاريخية المتقادمة لازم تفضل موجودة، مش مُعاد كتابتها."""
+    for line in _HISTORICAL_STALE_LINES:
+        assert line in PROPOSAL or line in BATCH_REPORT, (
+            f"ادّعاء تاريخي اتمسح أو اتعاد كتابته: {line[:60]}..."
+        )
+
+    # الادّعاء الأصلي "0 to_thread" لازم يفضل حرفيًا في الاقتراح.
+    assert "0 `to_thread` in `attachments.py`; 0 quota ledger" in PROPOSAL, (
+        "الادّعاء التاريخي عن صفر to_thread اتمسح — الإصلاح لازم يكون إضافي فقط"
+    )
+
+
+# --- T-3: منع الادّعاء الزائد ------------------------------------------------
+
+
+def test_t3_both_documents_state_def011_remains_open():
+    """T-3: الوثيقتين لازم يقولوا صراحةً إن DEF-011 لسه مفتوح ومش مقفول."""
+    for name, text in (("proposal", PROPOSAL), ("batch report", BATCH_REPORT)):
+        notice = _correction_notice(text)
+        lowered = notice.lower()
+        assert "remains open" in lowered or "still open" in lowered, (
+            f"{name}: الإشعار لازم يصرّح إن DEF-011 لسه مفتوح"
+        )
+        assert "not closed" in lowered or "not** closed" in lowered, (
+            f"{name}: الإشعار لازم يصرّح إن DEF-011 مش مقفول"
+        )
+
+
+def test_t3_no_claim_that_all_sub_defects_are_implemented():
+    """T-3: ممنوع أي قراءة بتقول إن A و B و C كلهم منفّذين."""
+    for name, text in (("proposal", PROPOSAL), ("batch report", BATCH_REPORT)):
+        notice = _correction_notice(text).lower()
+        assert "not implemented" in notice, (
+            f"{name}: الإشعار لازم يوضّح إن فيه تحت-عيوب لسه NOT IMPLEMENTED"
+        )
+        # أي ذكر لـ "fully implemented" لازم يكون منفيًّا.
+        for fragment in notice.split("fully implemented")[:-1]:
+            tail = fragment.rsplit(".", 1)[-1]
+            assert "not" in tail, (
+                f"{name}: ادّعاء زائد إن DEF-011 fully implemented من غير نفي"
+            )
+
+
+# --- T-4: اتساق الوثيقتين ----------------------------------------------------
+
+
+def test_t4_both_notices_share_date_status_and_scope_language():
+    """T-4: الإشعارين بنفس التاريخ وبنفس تصنيف الحالة والنطاق."""
+    proposal_notice = _correction_notice(PROPOSAL)
+    report_notice = _correction_notice(BATCH_REPORT)
+
+    assert F03_DATE in proposal_notice, "إشعار الاقتراح لازم يحمل تاريخ التصحيح"
+    assert F03_DATE in report_notice, "إشعار تقرير التثبيت لازم يحمل نفس التاريخ"
+
+    for token in ("DEF-011-B", "DEF-011-A", "DEF-011-C"):
+        assert token in proposal_notice, f"إشعار الاقتراح لازم يذكر {token}"
+        assert token in report_notice, f"إشعار تقرير التثبيت لازم يذكر {token}"
+
+    # نفس تصنيف الحالة في الوثيقتين.
+    assert "NOT implemented" in report_notice or "NOT IMPLEMENTED" in report_notice, (
+        "تقرير التثبيت لازم يوضّح إن A/C لسه NOT implemented"
+    )
+    assert "five" in proposal_notice and "five" in report_notice, (
+        "الوثيقتين لازم يذكروا نفس العدد (خمسة) لـ to_thread"
+    )

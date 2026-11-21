@@ -238,7 +238,7 @@ def build_application(config: Config) -> Application:
             from datetime import datetime as _datetime, timezone as _timezone
             from .attachments import AttachmentReaper, OpportunisticSweeper
             reaper = AttachmentReaper(db, config.db_path)
-            reaper.sweep(now=_datetime.now(_timezone.utc))
+            await reaper.sweep_async(now=_datetime.now(_timezone.utc))
             opportunistic_sweeper = OpportunisticSweeper(reaper)
         except Exception as exc:  # noqa: BLE001 — الكنس (A4) ما يمنعش الإقلاع
             log.warning("كنس الـ staging (A4) اتخطّى (%s)", type(exc).__name__)

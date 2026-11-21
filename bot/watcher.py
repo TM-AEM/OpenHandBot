@@ -180,7 +180,7 @@ class Watcher:
         # الحرس (خنق زمني + إعادة دخول) جوه `OpportunisticSweeper` ⇒ مفيش كنسة كاملة على
         # كل tick، ومفيش كنسين متوازيين. كنس الإقلاع (A4) يفضل مسار التعافي.
         if self._opportunistic_sweeper is not None:
-            self._opportunistic_sweeper.maybe_sweep()
+            await self._opportunistic_sweeper.maybe_sweep_async()
         # OHB2-08-05 (Batch 3R): نعيد محاولة أحداث الصندوق المعلّقة **قبل** المعالجة
         # العادية. الأحداث اللي محادثاتها متابَعة بتتخطّى هنا (بتتعامل في مسار المتابعة
         # النشط)، فبنستهدف اللي اتشالت متابعتها (استنفاد/إلغاء) أو معلّقة عبر إعادة تشغيل.
@@ -714,13 +714,21 @@ class Watcher:
         else:
             self._db.record_notification_sent(conversation_id, state, now)
 
-    def unwatch(self, conversation_id: str) -> None:
+    def unwatch(
+        self, conversation_id: str, *,
+        update_id: int | None = None, now: str | None = None,
+        outcome: str | None = None,
+    ) -> None:
         """يزيل متابعة يدويًا مع الحفاظ على عدم الإرسال المكرّر (NTF-17/20).
 
         NTF-20: بنسوّي أي تسليم معلّق **دائم** الأول (نسجّله ونمسح العلامة) قبل الحذف —
         عشان إزالة المتابعة ما تفقدش دليل تسليم ممكن تيليجرام يكون قبله بالفعل. كمان
         بنسوّي التلميح in-memory لو بيطابق نفس دورة المتابعة. لو التسجيل فشل، الاستثناء
         بيطلع والصف والعلامة بيفضلوا (retry آمن، مفيش حذف صامت).
+
+        OHB2-WP-07 (NEW-DEF-03): لو `outcome` متمرّر (ومعه `update_id`)، نتيجة التحديث
+        بتتسجّل في **نفس معاملة** الحذف/التسجيل (ذرّية كاملة). الافتراضي (`None`) يحفظ
+        السلوك القديم بالحرف (مفيش كتابة نتيجة من هنا).
         """
         reconciled = self._db.reconcile_pending_delivery(conversation_id)
         w = self._db.get_watched(conversation_id)
@@ -728,12 +736,16 @@ class Watcher:
         if reconciled is None and w is not None and hint is not None and hint[1] == w.watch_seq:
             # مفيش علامة دائمة، بس فيه تلميح لنفس الدورة ⇒ نكمّل التسجيل الذرّي.
             # بنكمّل التسجيل الأول؛ لو فشل، الاستثناء بيطلع والتلميح بيفضل (retry آمن).
-            self._db.remove_watched_completing(conversation_id, hint[0])
+            self._db.remove_watched_completing(
+                conversation_id, hint[0], now=now, update_id=update_id, outcome=outcome,
+            )
             self._marker_pending.pop(conversation_id, None)
         else:
             # تسليم اتسوّى بالفعل، أو تلميح قديم/مفيش تلميح ⇒ إزالة عادية (مافيش إرسال مكرّر).
             self._marker_pending.pop(conversation_id, None)
-            self._db.remove_watched(conversation_id)
+            self._db.remove_watched(
+                conversation_id, update_id=update_id, now=now, outcome=outcome,
+            )
 
     def request_new_lifecycle(
         self, conversation_id: str, title: str = "", chat_id: int | None = None

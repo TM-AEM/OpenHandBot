@@ -120,7 +120,7 @@ def test_transient_busy_retries_then_succeeds(tmp_path, monkeypatch):
     real = db.remove_watched
     calls = {"n": 0}
 
-    def wrapper(cid):
+    def wrapper(cid, **_kw):
         calls["n"] += 1
         if calls["n"] <= 2:
             raise _busy()
@@ -144,7 +144,7 @@ def test_transient_locked_retries_then_succeeds(tmp_path, monkeypatch):
     real = db.remove_watched
     calls = {"n": 0}
 
-    def wrapper(cid):
+    def wrapper(cid, **_kw):
         calls["n"] += 1
         if calls["n"] <= 1:
             raise _locked()
@@ -167,7 +167,7 @@ def test_transient_busy_exhaustion_propagates_no_false_success(tmp_path, monkeyp
     delays = _patch_sleep(monkeypatch)
     calls = {"n": 0}
 
-    def boom(cid):
+    def boom(cid, **_kw):
         calls["n"] += 1
         raise _busy()
 
@@ -191,7 +191,7 @@ def test_permanent_failure_not_retried(tmp_path, monkeypatch):
     delays = _patch_sleep(monkeypatch)
     calls = {"n": 0}
 
-    def boom(cid):
+    def boom(cid, **_kw):
         calls["n"] += 1
         raise _permanent_closed()
 
@@ -213,7 +213,7 @@ def test_permanent_io_error_not_retried(tmp_path, monkeypatch):
     delays = _patch_sleep(monkeypatch)
     calls = {"n": 0}
 
-    def boom(cid):
+    def boom(cid, **_kw):
         calls["n"] += 1
         raise _permanent_io()
 
@@ -231,7 +231,7 @@ def test_write_failure_never_reports_success(tmp_path, monkeypatch):
     ctx = _ctx(tmp_path)
     db = ctx.bot_data["db"]
     db.add_watched("c1")
-    monkeypatch.setattr(db, "remove_watched", lambda cid: (_ for _ in ()).throw(_permanent_io()))
+    monkeypatch.setattr(db, "remove_watched", lambda cid, **_kw: (_ for _ in ()).throw(_permanent_io()))
     update = _cb_update(1, "unwatch:c1")
     with pytest.raises(sqlite3.OperationalError):
         asyncio.run(h.unwatch_conversation(update, ctx))
@@ -338,7 +338,7 @@ def test_cancelled_error_not_swallowed(tmp_path, monkeypatch):
     db = ctx.bot_data["db"]
     db.add_watched("c1")
 
-    def boom(cid):
+    def boom(cid, **_kw):
         raise asyncio.CancelledError()
 
     monkeypatch.setattr(db, "remove_watched", boom)
@@ -356,7 +356,7 @@ def test_cancellation_during_retry_sleep_propagates(tmp_path, monkeypatch):
     db.add_watched("c1")
     calls = {"n": 0}
 
-    def boom(cid):
+    def boom(cid, **_kw):
         calls["n"] += 1
         raise _busy()
 
@@ -382,7 +382,7 @@ def test_telegram_failure_after_commit_no_db_retry(tmp_path, monkeypatch):
     real = db.remove_watched
     calls = {"n": 0}
 
-    def counting(cid):
+    def counting(cid, **_kw):
         calls["n"] += 1
         return real(cid)
 
@@ -420,7 +420,7 @@ def test_retry_helper_bounded_attempts(monkeypatch):
     delays = _patch_sleep(monkeypatch)
     calls = {"n": 0}
 
-    def boom(cid):
+    def boom(cid, **_kw):
         calls["n"] += 1
         raise _busy()
 
@@ -434,7 +434,7 @@ def test_retry_helper_passes_through_success(monkeypatch):
     delays = _patch_sleep(monkeypatch)
     seen = []
 
-    def ok(cid):
+    def ok(cid, **_kw):
         seen.append(cid)
 
     asyncio.run(h._remove_watched_with_retry(ok, "c1"))

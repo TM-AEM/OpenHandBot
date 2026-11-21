@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import functools
 import io
 import logging
 import os
@@ -13,6 +14,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 import httpx
+from anyio import to_thread
 from telegram import InputFile, Update
 from telegram.constants import ParseMode
 from telegram.error import (
@@ -386,12 +388,18 @@ async def _is_deleted_with_retry(db, conversation_id: str) -> bool:
             await asyncio.sleep(delay)
 
 
-async def _remove_watched_with_retry(remover, conversation_id: str) -> None:
+async def _remove_watched_with_retry(
+    remover, conversation_id: str, update_id=None, now=None, outcome=None
+) -> None:
     """يُزيل متابعة الشات مع إعادة محاولة **محدودة** للفشل العابر بس (OHB2-SW-06).
 
     `remover` = `watcher.unwatch` (لو المراقب متاح) أو `db.remove_watched` — الاتنين
-    معاملة `BEGIN IMMEDIATE` ذرّية بتكمّل أي تسليم معلّق ثم تحذف، والاتنين **idempotent**
-    (الحذف المكرّر no-op) فإعادة المحاولة آمنة (مفيش ازدواج أثر خارجي: ما بتلمسش تليجرام).
+    معاملة `BEGIN IMMEDIATE` ذرّية بتكمّل أي تسليم معلّق ثم تحذف، والاتنين
+    **idempotent** (الحذف المكرّر no-op) فإعادة المحاولة آمنة (مفيش ازدواج أثر خارجي:
+    ما بتلمسش تليجرام).
+
+    `update_id`/`now`/`outcome` بتتمرّر كوسائط **مفتاحية** للمُزيل، فنتيجة التحديث
+    بتتسجّل في نفس معاملة الإزالة (OHB2-WP-07 / NEW-DEF-03).
 
     نفس سياسة `_is_deleted_with_retry`/`_check_update_processed_with_retry`: الفشل العابر
     (SQLite BUSY/LOCKED) بيتغطّى بمحاولات قصيرة (`_DEDUPE_RETRY_DELAYS` 0.25/0.5/1.0ث)،
@@ -402,7 +410,14 @@ async def _remove_watched_with_retry(remover, conversation_id: str) -> None:
     attempt = 0
     while True:
         try:
-            remover(conversation_id)
+            if outcome is None:
+                # توافق: مُزيل بسيط بمعامل واحد (اختبارات/استخدام مستقل).
+                remover(conversation_id)
+            else:
+                remover(
+                    conversation_id,
+                    update_id=update_id, now=now, outcome=outcome,
+                )
             return
         except Exception as exc:  # noqa: BLE001 — التصنيف بيقرّر: عابر يُعاد، دائم يُرفع
             if not _is_transient_sqlite_error(exc) or attempt >= len(_DEDUPE_RETRY_DELAYS):
@@ -877,13 +892,19 @@ HELP_TEXT = (
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _guard(update, context):
         return
-    context.bot_data["db"].clear_awaiting(update.effective_user.id)
     await update.message.reply_text(
         "أهلاً 👋\nأنا بوت تحكمك في OpenHands Cloud.\n"
         "اختار من الأزرار تحت، أو افتح شات وابعتله برومت.",
         reply_markup=kb.main_menu(_mini_app_url(context)),
     )
-    mark_explicitly_ignored(update, context)
+    # OHB2-WP-07 (NEW-DEF-03 / NAV-01): مسح حالة الانتظار + النتيجة الدائمة في **معاملة
+    # واحدة**، و**بعد** الرد عمدًا: `reply_text` الخام ممكن يرفع (شبكة/تيليجرام). لو
+    # المسح والنتيجة حصلوا قبله، كان فشل الإرسال العابر يتسجّل `explicitly_ignored`
+    # (مؤهّل للإقرار) ⇒ فشل يتحوّل لنجاح ويُحجب الحدّ. كده الفشل يرفع قبل أي كتابة.
+    context.bot_data["db"].clear_awaiting_and_record_outcome(
+        update.effective_user.id, _update_id(update), outbox.now_iso(),
+        update_outcomes.EXPLICITLY_IGNORED,
+    )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -934,11 +955,16 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
         return
-    context.bot_data["db"].clear_awaiting(update.effective_user.id)  # تنقّل = خروج من أي توجيه
     await _safe_edit_noop(
         q, "أهلاً 👋 اختار من الأزرار:", reply_markup=kb.main_menu(_mini_app_url(context))
     )
-    mark_explicitly_ignored(update, context)
+    # OHB2-WP-07 (NEW-DEF-03 / NAV-02): مسح حالة الانتظار + النتيجة الدائمة في **معاملة
+    # واحدة**. الترتيب محفوظ: المسح بيتحفظ مع النتيجة **بعد** العرض بس — لو العرض رمى
+    # استثناء غير متوقّع، مفيش حالة تُمحى ولا نتيجة تُسجّل (fail-closed، مفيش مسح بلا نتيجة).
+    context.bot_data["db"].clear_awaiting_and_record_outcome(
+        update.effective_user.id, _update_id(update), outbox.now_iso(),
+        update_outcomes.EXPLICITLY_IGNORED,
+    )
 
 
 def _notifications_text(enabled: bool) -> str:
@@ -1029,7 +1055,6 @@ async def list_conversations(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
         return
-    context.bot_data["db"].clear_awaiting(update.effective_user.id)  # تنقّل = خروج من أي توجيه
     page = int(q.data.split(":", 1)[1])
     client = context.bot_data["client"]
     # نجيب كل صفحات البحث (نتبع next_page_id بحد أقصى). `collect_conversations` بيرجّع
@@ -1050,7 +1075,12 @@ async def list_conversations(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await _safe_edit(q, error_text(exc))
             await _raise_if_operational_api_failure(exc)
             # وصلنا هنا ⇒ رفض 4xx متوقّع (الفشل التشغيلي اترفع فوق) ⇒ نتيجة مستخدم صريحة.
-            mark_explicitly_ignored(update, context)
+            # OHB2-WP-07 (NEW-DEF-03 / NAV-03): المسح + النتيجة في **معاملة واحدة**، وهنا
+            # فقط بعد استثناء الفشل التشغيلي ⇒ مستحيل يتسجّل `explicitly_ignored` لفشل 5xx.
+            context.bot_data["db"].clear_awaiting_and_record_outcome(
+                update.effective_user.id, _update_id(update), outbox.now_iso(),
+                update_outcomes.EXPLICITLY_IGNORED,
+            )
             return
         items = collected["items"]
         truncated = collected["truncated"]
@@ -1066,15 +1096,30 @@ async def list_conversations(update: Update, context: ContextTypes.DEFAULT_TYPE)
         log.exception("تعذّر فلترة الشواهد في قايمة الشاتات (%s)", type(exc).__name__)
         # OHB2-MANUAL-POLLING-OUTCOME: فشل القاعدة المُبتلَع (بنعرض رسالة ونرجع عاديًّا)
         # لازم يتسجّل كفشل ⇒ مايتقبلش كنجاح.
-        record_update_failure(update, context, exc)
         await _safe_edit(
             q, "تعذّر عرض الشاتات دلوقتي، جرّب تاني.",
             reply_markup=kb.main_menu(_mini_app_url(context)),
         )
+        # OHB2-WP-07 (NEW-DEF-03 / NAV-03): المسح + نتيجة **الفشل نفسها** في معاملة واحدة.
+        # قبل كده كان `record_update_failure` بيكتب الفشل (commit) والمسح حصل في أول
+        # المعالج (commit تانٍ). التصنيف هنا هو نفسه اللي `record_update_failure` بيستخدمه
+        # (`_classify_failure`)، فمفيش تغيير في فئة النتيجة — بس بقى في معاملة واحدة،
+        # ومستحيل تتسجّل نتيجة مؤهّلة على فشل.
+        context.bot_data["db"].clear_awaiting_and_record_outcome(
+            update.effective_user.id, _update_id(update), outbox.now_iso(),
+            _classify_failure(exc), reason=type(exc).__name__,
+        )
+        log.warning(
+            "تحديث فاشل (%s): نتيجة=%s سبب=%s — مش مؤهّل للإقرار",
+            _update_id(update), _classify_failure(exc), type(exc).__name__,
+        )
         return
     if not items:
         await _safe_edit(q, "ما فيهاش شاتات.", reply_markup=kb.main_menu(_mini_app_url(context)))
-        mark_explicitly_ignored(update, context)
+        context.bot_data["db"].clear_awaiting_and_record_outcome(
+            update.effective_user.id, _update_id(update), outbox.now_iso(),
+            update_outcomes.EXPLICITLY_IGNORED,
+        )
         return
     start = page * PAGE_SIZE
     chunk = items[start : start + PAGE_SIZE]
@@ -1091,7 +1136,10 @@ async def list_conversations(update: Update, context: ContextTypes.DEFAULT_TYPE)
         header,
         reply_markup=kb.conversations_menu(chunk, page, has_more),
     )
-    mark_explicitly_ignored(update, context)
+    context.bot_data["db"].clear_awaiting_and_record_outcome(
+        update.effective_user.id, _update_id(update), outbox.now_iso(),
+        update_outcomes.EXPLICITLY_IGNORED,
+    )
 
 
 async def open_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1150,9 +1198,15 @@ async def open_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     # القرار 1: بعد فتح الشات، رسايلك الجاية بتتوجّه له 10 دقايق من آخر نشاط (مع زر إلغاء).
     # بنفعّل التوجيه بس بعد ما العرض يظهر فعلاً، عشان فشل العرض ما يسبش توجيه مفعّل من غير
     # ما تشوف الشات (وما نلمسش أي توجيه قائم لو الفتح فشل).
+    # OHB2-WP-07 (NEW-DEF-03 / NAV-06): تفعيل نافذة التوجيه ونتيجة التحديث الدائمة في
+    # **معاملة واحدة** — قبل كده كانوا `set_awaiting` (commit) ثم `mark_explicitly_ignored`
+    # (commit تاني)، فعطل بينهم كان يفعّل نافذة توجيه 10 دقايق **بلا** سجل دائم لسببها.
     if await _edit_or_send(q, text, q.message.chat_id, context.bot, reply_markup=markup):
-        db.set_awaiting(update.effective_user.id, conversation_id, "route", title=conv.get("title") or "")
-        mark_explicitly_ignored(update, context)
+        db.set_awaiting_and_record_outcome(
+            update.effective_user.id, conversation_id, "route",
+            _update_id(update), outbox.now_iso(), update_outcomes.EXPLICITLY_IGNORED,
+            title=conv.get("title") or "",
+        )
     else:
         # OHB2-STAGE2-HIGH-ACK-BLOCKING-FIX: العرض هو المحتوى اللي المستخدم طلبه؛ فشل تسليمه
         # فشل **عابر** (قابل لإعادة المحاولة) — نفس سياسة show_status/show_cost — **مش** نجاح
@@ -1328,12 +1382,18 @@ async def list_watches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
         return
-    context.bot_data["db"].clear_awaiting(update.effective_user.id)  # تنقّل = خروج من أي توجيه
     page = int(q.data.split(":", 1)[1])
     items = context.bot_data["db"].list_watched()
     if not items:
         await _safe_edit(q, "مفيش شاتات متابَعة.", reply_markup=kb.main_menu(_mini_app_url(context)))
-        mark_explicitly_ignored(update, context)
+        # OHB2-WP-07 (NEW-DEF-03 / NAV-04): المسح + النتيجة في **معاملة واحدة**، بعد العرض.
+        # قبل كده كان `clear_awaiting` بيـcommit في أول المعالج و`mark_explicitly_ignored`
+        # في نهاية كل فرع (commit تانٍ) ⇒ عطل بينهم يسيب حالة ممسوحة بلا نتيجة، وفشل
+        # `list_watched()`/`_safe_edit` كان يمسح الحالة قبل ما يفشل (fail-open للحدّ).
+        context.bot_data["db"].clear_awaiting_and_record_outcome(
+            update.effective_user.id, _update_id(update), outbox.now_iso(),
+            update_outcomes.EXPLICITLY_IGNORED,
+        )
         return
     start = page * PAGE_SIZE
     chunk = items[start : start + PAGE_SIZE]
@@ -1346,7 +1406,10 @@ async def list_watches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"متابعاتي (صفحة {page + 1}) — {len(items)} شات:",
         reply_markup=kb.watches_menu(chunk, page, has_more),
     )
-    mark_explicitly_ignored(update, context)
+    context.bot_data["db"].clear_awaiting_and_record_outcome(
+        update.effective_user.id, _update_id(update), outbox.now_iso(),
+        update_outcomes.EXPLICITLY_IGNORED,
+    )
 
 
 async def watch_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1377,15 +1440,17 @@ async def watch_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # NTF-19: لو الشات متابَع بالفعل، الضغطة دي إعادة نداء مكرّرة (double-tap) ⇒ نحافظ على
     # المعرّف والعلامة المعلّقة (new_lifecycle=False). لو مش متابَع، الصف مش موجود فالـ INSERT
     # بيعمل دورة جديدة بمعرّف جديد تلقائيًا.
-    db.add_watched(
+    # OHB2-WP-07 (NEW-DEF-03): الإضافة + `last_state` + نتيجة `durable_completed` في
+    # **معاملة واحدة** (كانوا 3 commits منفصلة ⇒ عطل بينهم يسيب متابعة بلا نتيجة).
+    db.add_watched_and_record_outcome(
         conversation_id, conv.get("title", ""), q.message.chat_id,
+        get_status(conv), _update_id(update), outbox.now_iso(),
+        update_outcomes.DURABLE_COMPLETED,
         new_lifecycle=False, reengage=True,
     )
-    db.set_last_state(conversation_id, get_status(conv))
     await _safe_edit(
         q, "تمام، الشات اتضاف للمتابعة ✅", reply_markup=kb.conversation_actions(conversation_id, True)
     )
-    mark_durable_completed(update, context)
 
 
 async def unwatch_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1398,11 +1463,17 @@ async def unwatch_conversation(update: Update, context: ContextTypes.DEFAULT_TYP
     conversation_id = q.data.split(":", 1)[1]
     # NTF-17: نمرّ عبر المراقب (لو موجود) عشان أي تسليم معلّق في الذاكرة يتكمّل ذرّيًا،
     # ومايحصلش إرسال مكرّر بعد إزالة المتابعة.
+    # OHB2-WP-07 (NEW-DEF-03): الإزالة **و** نتيجة `durable_completed` في معاملة واحدة.
+    # السطح القابل للاستبدال (`remover`) يفضل زي ما هو (SW-06 بيعتمد عليه لإعادة المحاولة)،
+    # بس بنمرّر النتيجة كوسائط مفتاحية عشان تتسجّل في نفس المعاملة.
     watcher = context.bot_data.get("watcher")
     remover = watcher.unwatch if watcher is not None else context.bot_data["db"].remove_watched
     try:
         # OHB2-SW-06: إعادة محاولة **محدودة** للفشل العابر (SQLite BUSY/LOCKED) بس.
-        await _remove_watched_with_retry(remover, conversation_id)
+        await _remove_watched_with_retry(
+            remover, conversation_id, _update_id(update), outbox.now_iso(),
+            update_outcomes.DURABLE_COMPLETED,
+        )
     except sqlite3.Error:
         # OHB2-SW-06: الفشل الدائم (أو استنفاد إعادة المحاولات) مايتحوّلش لنجاح كاذب —
         # نعرض رسالة متنقّحة + زر المحاولة، وبعدين **نرفع الاستثناء الأصلي** (بـ traceback)
@@ -1421,7 +1492,6 @@ async def unwatch_conversation(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         raise
     await _safe_edit(q, "تمام، اتشال من المتابعة.")
-    mark_durable_completed(update, context)
 
 
 async def delete_conversation_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1786,13 +1856,15 @@ async def reply_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
         mark_explicitly_ignored(update, context)
         return
-    db.set_awaiting(update.effective_user.id, conversation_id, "reply")
+    db.set_awaiting_and_record_outcome(
+        update.effective_user.id, conversation_id, "reply",
+        _update_id(update), outbox.now_iso(), update_outcomes.DURABLE_COMPLETED,
+    )
     await _safe_edit(
         q,
         "ابعت البرومت اللي عايز تبعته للشات ده دلوقتي.",
         reply_markup=kb.conversation_actions(conversation_id),
     )
-    mark_durable_completed(update, context)
 
 
 # OHB2-UNSUPPORTED-FILE-SAFE-REJECTION: رسالة الرفض الوحيدة للمرفقات غير المدعومة.
@@ -2009,7 +2081,12 @@ async def _download_attachment_chunks(context, file_id: str, max_bytes: int):
             # مسار محلي (سيرفر Bot API محلي/اختبار): ملف على القرص ⇒ قراءة مقيّدة.
             if os.path.isfile(file_path):
                 try:
-                    return iter([_read_local_capped(file_path, max_bytes)])
+                    # DEF-011: القراءة المقيّدة إدخال/إخراج بحت ⇒ في خيط عامل بدل حجب
+                    # الحلقة. مفيش قاعدة هنا (مسار + سقف بايت بس).
+                    data = await to_thread.run_sync(
+                        functools.partial(_read_local_capped, file_path, max_bytes)
+                    )
+                    return iter([data])
                 except AttachmentTooLargeError:
                     raise
                 except OSError as exc:  # ملف غير قابل للقراءة ⇒ رفض مغلق (مش فشل صامت)
@@ -2448,13 +2525,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # `route` مستمر (مش لمرة واحدة): بنجدّد مهلته هنا فقط.
     pending, kind, title, awaiting_at = db.awaiting_state(telegram_id)
     if kind in ("reply", "newchat", "reposearch", "route") and db.awaiting_is_expired(awaiting_at):
-        # حالة منتهية: نمسحها ونبلّغ (نفس سلوك `take_awaiting` القديم، بدون استهلاك مسبق).
-        db.clear_awaiting(telegram_id)
+        # حالة منتهية: نمسحها ونسجّل «تجاهل صريح» **ذرّيًّا** (نفس سلوك `take_awaiting`
+        # القديم، بدون استهلاك مسبق). OHB2-WP-07 (DEF-013): المسح والنتيجة في معاملة واحدة
+        # (`clear_awaiting_and_record_outcome`) — قبل كده كان المسح يـcommit لوحده، فعطل بين
+        # الكتابتين كان يسيب حالة ممسوحة بلا نتيجة ⇒ إعادة التسليم تقع في الفرع العام.
+        db.clear_awaiting_and_record_outcome(
+            telegram_id, _update_id(update), outbox.now_iso(),
+            update_outcomes.EXPLICITLY_IGNORED,
+        )
         await update.message.reply_text(
             "انتهت مهلة التوجيه (10 دقايق من آخر نشاط). افتح الشات تاني وابعت برومتك."
         )
         # البرومت **مااتنفّذش** عمدًا (الحالة منتهية) ⇒ تجاهل صريح (مفيش نية دائمة معلّقة).
-        mark_explicitly_ignored(update, context)
         return
     if kind == "route" and pending and update.message.text.strip():
         # OHB2-WP-07 (DEF-013): التجديد **بعد** التحقق من أن النص غير فراغ. نص مسافات
@@ -2504,9 +2586,13 @@ async def cancel_route(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     """/cancel: يلغي أي توجيه أو انتظار معلّق."""
     if not await _guard(update, context):
         return
-    context.bot_data["db"].clear_awaiting(update.effective_user.id)
+    # OHB2-WP-07 (NEW-DEF-03): مسح حالة الانتظار + نتيجة `durable_completed` ذرّيًّا
+    # (معاملة واحدة) — بدل commitين منفصلين، فما يحصلش حالة ممسوحة بلا نتيجة لو حصل عطل.
+    context.bot_data["db"].clear_awaiting_and_record_outcome(
+        update.effective_user.id, _update_id(update), outbox.now_iso(),
+        update_outcomes.DURABLE_COMPLETED,
+    )
     await update.message.reply_text("اتلغى التوجيه. ابعت /start للقائمة.")
-    mark_durable_completed(update, context)
 
 
 async def cancel_route_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2516,9 +2602,12 @@ async def cancel_route_button(update: Update, context: ContextTypes.DEFAULT_TYPE
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
         return
-    context.bot_data["db"].clear_awaiting(update.effective_user.id)
+    # OHB2-WP-07 (NEW-DEF-03): نفس الذرّية في مسار الزر — مسح الحالة + النتيجة معًا.
+    context.bot_data["db"].clear_awaiting_and_record_outcome(
+        update.effective_user.id, _update_id(update), outbox.now_iso(),
+        update_outcomes.DURABLE_COMPLETED,
+    )
     await _safe_edit(q, "اتلغى التوجيه ✅", reply_markup=kb.main_menu(_mini_app_url(context)))
-    mark_durable_completed(update, context)
 
 
 async def _send_prompt(
@@ -2601,9 +2690,17 @@ async def start_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
         return
-    context.bot_data["db"].clear_awaiting(update.effective_user.id)  # تنقّل = خروج من أي توجيه
     await _show_repos(q, context, page=0, query="", user_id=update.effective_user.id)
-    mark_explicitly_ignored(update, context)
+    # OHB2-WP-07 (NEW-DEF-03 / NAV-05): مسح حالة الانتظار + النتيجة الدائمة في **معاملة
+    # واحدة**، **بعد** `_show_repos` عمدًا: هي بترفع `OperationalApiFailure` على فشل
+    # تشغيلي (5xx/429/بلا كود). لو المسح+النتيجة حصلوا قبلها، كان التحديث يتسجّل
+    # `explicitly_ignored` (مؤهّل للإقرار) ثم يفشل التشغيل ⇒ فشل يتحوّل لنجاح ويُحجب
+    # الحدّ. هنا: الفشل التشغيلي يرفع قبل أي كتابة ⇒ `record_update_failure` يسجّل فشلًا
+    # غير مؤهّل (fail-closed)، والقاعدة ما بتتلمسش.
+    context.bot_data["db"].clear_awaiting_and_record_outcome(
+        update.effective_user.id, _update_id(update), outbox.now_iso(),
+        update_outcomes.EXPLICITLY_IGNORED,
+    )
 
 
 _NAV_EXPIRED = "القايمة دي انتهت، افتح «شات جديد» من القائمة تاني."
@@ -2645,9 +2742,11 @@ async def repo_search_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
         return
-    context.bot_data["db"].set_awaiting(update.effective_user.id, "", "reposearch")
+    context.bot_data["db"].set_awaiting_and_record_outcome(
+        update.effective_user.id, "", "reposearch",
+        _update_id(update), outbox.now_iso(), update_outcomes.DURABLE_COMPLETED,
+    )
     await _safe_edit(q, "ابعت كلمة للبحث في المستودعات.")
-    mark_durable_completed(update, context)
 
 
 async def _show_repos(
@@ -2716,9 +2815,11 @@ async def pick_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         mark_explicitly_ignored(update, context)
         return
     repo = names[idx]
-    context.bot_data["db"].set_awaiting(update.effective_user.id, repo, "newchat")
+    context.bot_data["db"].set_awaiting_and_record_outcome(
+        update.effective_user.id, repo, "newchat",
+        _update_id(update), outbox.now_iso(), update_outcomes.DURABLE_COMPLETED,
+    )
     await _safe_edit(q, f"المستودع: {repo}\nابعت البرومت اللي عايز تبدأ بيه الشات (بعد 10 دقايق من غير رد هتتلغي).")
-    mark_durable_completed(update, context)
 
 
 async def new_chat_no_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2729,12 +2830,14 @@ async def new_chat_no_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
         return
-    context.bot_data["db"].set_awaiting(update.effective_user.id, None, "newchat")
+    context.bot_data["db"].set_awaiting_and_record_outcome(
+        update.effective_user.id, None, "newchat",
+        _update_id(update), outbox.now_iso(), update_outcomes.DURABLE_COMPLETED,
+    )
     await _safe_edit(
         q,
         "شات من غير مستودع.\nابعت البرومت اللي عايز تبدأ بيه الشات (بعد 10 دقايق من غير رد هتتلغي).",
     )
-    mark_durable_completed(update, context)
 
 
 async def _start_new_chat(
