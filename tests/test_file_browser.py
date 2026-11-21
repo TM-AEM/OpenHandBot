@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from bot.file_browser import (
     BrowserCache,
+    BrowserState,
     build_state,
     parent_path,
     PAGE_SIZE,
@@ -153,3 +154,16 @@ def test_conversation_token_survives_snapshot_replacement():
     token = cache.token_for("c1")
     cache.put("c1", 1, ["a.txt"])
     assert cache.conversation_for(token) == "c1"
+
+
+def test_public_api_names_are_canonical():
+    fields = BrowserState.__dataclass_fields__
+    assert "conversation_id" in fields
+    assert "conversaion_id" not in fields
+    for name in ("entries", "page_entries", "page_count", "clamp_page"):
+        assert callable(getattr(BrowserState, name))
+    for name in ("entires", "page_entires"):
+        assert not hasattr(BrowserState, name)
+    for name in ("token_for", "conversation_for", "put", "get", "invalidate", "clear"):
+        assert callable(getattr(BrowserCache, name))
+    assert not hasattr(BrowserCache, "conversaion_for")

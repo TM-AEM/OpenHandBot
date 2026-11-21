@@ -471,3 +471,43 @@ def test_legacy_show_file_binary_message(tmp_path):
     asyncio.run(h.show_file(u, ctx))
     assert "ثنائي" in u.callback_query.edits[-1]
     assert ctx.bot.documents == []
+
+
+def test_evicted_state_callback_is_safe(tmp_path):
+    from bot.file_browser import BrowserCache
+
+    client = FakeClient(["a.txt"])
+    ctx = _ctx(tmp_path, client)
+    ctx.bot_data["file_browser_cache"] = BrowserCache(max_entries=1)
+    update, _ = _open(ctx)
+    nav = _nav_from(update)
+    ctx.bot_data["file_browser_cache"].put("c2", 1, ["b.txt"])
+    u = _cb(f"fbp:{nav}:0:0")
+    asyncio.run(h.browse_page(u, ctx))
+    assert "قديمة" in u.callback_query.edits[-1]
+
+
+def test_confirmed_deletion_invalidates_browser_cache(tmp_path, monkeypatch):
+    client = FakeClient(["a.txt"])
+    ctx = _ctx(tmp_path, client)
+    update, token = _open(ctx)
+    nav = _nav_from(update)
+    cache = ctx.bot_data["file_browser_cache"]
+    assert cache.get(nav) is not None
+
+    async def fake_status(client, context, conversation_id, *, allow_deleted=False):
+        return {"id": conversation_id, "title": "شات"}, h.FileStatus.OK, None, None
+
+    async def fake_delete(client, db, conversation_id):
+        return h.deletion.DeletionResult(
+            status=h.deletion.STATUS_DELETED,
+            message=h.deletion.DELETED_MESSAGE,
+            conversation_id=conversation_id,
+        )
+
+    monkeypatch.setattr(h, "_authorized_conversation_status", fake_status)
+    monkeypatch.setattr(h.deletion, "delete_conversation_remote", fake_delete)
+    u = _cb("deleteok:c1")
+    asyncio.run(h.delete_conversation_confirm(u, ctx))
+    assert cache.get(nav) is None
+    assert cache.conversation_for(token.removeprefix("fbo:")) is None
