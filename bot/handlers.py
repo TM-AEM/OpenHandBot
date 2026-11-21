@@ -1893,6 +1893,7 @@ _FILES_BROWSER_TOO_LARGE = (
     "قايمة الملفات أكبر من حد التصفح المؤقت الآمن. جرّب شات أصغر أو استخدم قايمة الملفات "
     "من جديد بعد تقليل عدد الملفات."
 )
+_FILES_LISTING_FAILED = "تعذّر الوصول لقايمة الملفات دلوقتي. جرّب تاني."
 
 
 def _bot_file_status_message(status: FileStatus, error: str | None = None) -> str:
@@ -1904,6 +1905,17 @@ def _bot_file_status_message(status: FileStatus, error: str | None = None) -> st
     if status is FileStatus.TOO_LARGE:
         return _TOO_LARGE_UNAVAILABLE
     return file_status_message(status, error)
+
+
+async def _browser_list_files(update, context, q, conversation_id: str):
+    """قايمة ملفات المتصفح مع حدود خطأ واضحة؛ المستدعي يُسقط اللقطة القديمة قبل النداء."""
+    try:
+        return await _files_service(context).list_files(conversation_id)
+    except Exception as exc:  # noqa: BLE001 — حدود واجهة: نعرض فشلًا واضحًا بدل حالة قديمة
+        log.warning("تعذّر جلب قايمة الملفات (%s)", type(exc).__name__)
+        await _safe_edit(q, _FILES_LISTING_FAILED)
+        mark_ambiguous_external(update, context, "files_listing_exception")
+        return None
 
 
 def _browser_get(context: ContextTypes.DEFAULT_TYPE, nav: str):
@@ -1952,7 +1964,10 @@ async def browse_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _safe_edit(q, _FILES_EXPIRED)
         mark_explicitly_ignored(update, context)
         return
-    listing = await _files_service(context).list_files(conversation_id)
+    cache.invalidate_snapshots(conversation_id)
+    listing = await _browser_list_files(update, context, q, conversation_id)
+    if listing is None:
+        return
     if listing.status is not FileStatus.OK:
         await _safe_edit(q, file_status_message(listing.status, listing.error))
         if listing.status is FileStatus.UPSTREAM_ERROR:
@@ -2089,7 +2104,11 @@ async def browse_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         mark_explicitly_ignored(update, context)
         return
     old_dir = state.dirs[dir_index] if 0 <= dir_index < len(state.dirs) else ""
-    listing = await _files_service(context).list_files(state.conversation_id)
+    cache = _browser_cache(context)
+    cache.invalidate_snapshots(state.conversation_id)
+    listing = await _browser_list_files(update, context, q, state.conversation_id)
+    if listing is None:
+        return
     if listing.status is not FileStatus.OK:
         await _safe_edit(q, file_status_message(listing.status, listing.error))
         if listing.status is FileStatus.UPSTREAM_ERROR:
@@ -2108,7 +2127,6 @@ async def browse_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         mark_explicitly_ignored(update, context)
         return
-    cache = _browser_cache(context)
     new_state = cache.put(state.conversation_id, update.effective_user.id, listing.files)
     if new_state.nav not in cache:
         await _safe_edit(q, _FILES_BROWSER_TOO_LARGE)

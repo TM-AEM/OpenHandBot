@@ -8,6 +8,7 @@ import bot.handlers as h
 from bot import keyboards as kb
 from bot.db import Database
 from bot.file_cache import FileCache
+from bot.files import FileListing, FileStatus
 
 OWNER = 1
 OWNER_UUID = "owner-uuid"
@@ -127,6 +128,28 @@ def _nav_from(update):
 def _file_indices(markup, nav, dir_index=0):
     prefix = f"fbf:{nav}:{dir_index}:"
     return [int(cb.split(":")[3]) for cb in _callbacks(markup) if cb.startswith(prefix)]
+
+
+def _patch_listing(monkeypatch, result):
+    async def fake_list_files(conversation_id):
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    monkeypatch.setattr(
+        h, "_files_service", lambda context: SimpleNamespace(list_files=fake_list_files)
+    )
+
+
+def _assert_old_nav_rejected(ctx, nav):
+    for handler, data in (
+        (h.browse_page, f"fbp:{nav}:0:0"),
+        (h.browse_dir, f"fbd:{nav}:0"),
+        (h.browse_file, f"fbf:{nav}:0:0"),
+    ):
+        update = _cb(data)
+        asyncio.run(handler(update, ctx))
+        assert "قديمة" in update.callback_query.edits[-1]
 
 
 def test_open_root_shows_dirs_then_files_and_callbacks_fit(tmp_path):
@@ -511,3 +534,151 @@ def test_confirmed_deletion_invalidates_browser_cache(tmp_path, monkeypatch):
     asyncio.run(h.delete_conversation_confirm(u, ctx))
     assert cache.get(nav) is None
     assert cache.conversation_for(token.removeprefix("fbo:")) is None
+
+
+def test_refresh_success_invalidates_old_snapshot_and_publishes_new(tmp_path):
+    client = FakeClient(["a.txt", "b.txt"])
+    ctx = _ctx(tmp_path, client)
+    update, token = _open(ctx)
+    old_nav = _nav_from(update)
+    cache = ctx.bot_data["file_browser_cache"]
+    assert cache.get(old_nav) is not None
+
+    client.files.append("c.txt")
+    u = _cb(f"fbx:{old_nav}:0")
+    asyncio.run(h.browse_refresh(u, ctx))
+
+    new_nav = _nav_from(u)
+    assert new_nav != old_nav
+    assert cache.get(old_nav) is None
+    assert cache.get(new_nav) is not None
+    assert cache.conversation_for(token.removeprefix("fbo:")) == "c1"
+    _assert_old_nav_rejected(ctx, old_nav)
+
+    page = _cb(f"fbp:{new_nav}:0:0")
+    asyncio.run(h.browse_page(page, ctx))
+    assert "📁 /" in page.callback_query.edits[-1]
+
+
+def test_empty_refresh_invalidates_old_snapshot(tmp_path):
+    client = FakeClient(["a.txt"])
+    ctx = _ctx(tmp_path, client)
+    update, token = _open(ctx)
+    old_nav = _nav_from(update)
+    cache = ctx.bot_data["file_browser_cache"]
+
+    client.files = []
+    u = _cb(f"fbx:{old_nav}:0")
+    asyncio.run(h.browse_refresh(u, ctx))
+
+    assert "ما فيهاش ملفات" in u.callback_query.edits[-1]
+    assert cache.get(old_nav) is None
+    assert cache.conversation_for(token.removeprefix("fbo:")) == "c1"
+    callbacks = _callbacks(u.callback_query.edits_markup[-1])
+    assert token in callbacks
+    assert not any(
+        cb.startswith(("fbp:", "fbd:", "fbf:", "fbx:", "fbb:")) for cb in callbacks
+    )
+    _assert_old_nav_rejected(ctx, old_nav)
+
+
+def test_failed_refresh_invalidates_old_snapshot(tmp_path, monkeypatch):
+    client = FakeClient(["a.txt"])
+    ctx = _ctx(tmp_path, client)
+    update, token = _open(ctx)
+    old_nav = _nav_from(update)
+    cache = ctx.bot_data["file_browser_cache"]
+    _patch_listing(monkeypatch, FileListing(FileStatus.UPSTREAM_ERROR, error="boom"))
+
+    u = _cb(f"fbx:{old_nav}:0")
+    asyncio.run(h.browse_refresh(u, ctx))
+
+    assert "boom" in u.callback_query.edits[-1]
+    assert cache.get(old_nav) is None
+    assert u.callback_query.edits_markup[-1] is None
+    assert cache.conversation_for(token.removeprefix("fbo:")) == "c1"
+    _assert_old_nav_rejected(ctx, old_nav)
+
+
+def test_refresh_exception_invalidates_old_snapshot(tmp_path, monkeypatch):
+    client = FakeClient(["a.txt"])
+    ctx = _ctx(tmp_path, client)
+    update, _ = _open(ctx)
+    old_nav = _nav_from(update)
+    cache = ctx.bot_data["file_browser_cache"]
+    _patch_listing(monkeypatch, RuntimeError("boom"))
+
+    u = _cb(f"fbx:{old_nav}:0")
+    asyncio.run(h.browse_refresh(u, ctx))
+
+    assert "تعذّر" in u.callback_query.edits[-1]
+    assert cache.get(old_nav) is None
+    assert u.callback_query.edits_markup[-1] is None
+    _assert_old_nav_rejected(ctx, old_nav)
+
+
+def test_open_empty_invalidates_existing_snapshot(tmp_path):
+    client = FakeClient(["a.txt"])
+    ctx = _ctx(tmp_path, client)
+    update, token = _open(ctx)
+    old_nav = _nav_from(update)
+    cache = ctx.bot_data["file_browser_cache"]
+
+    client.files = []
+    u = _cb(token)
+    asyncio.run(h.browse_open(u, ctx))
+
+    assert "ما فيهاش ملفات" in u.callback_query.edits[-1]
+    assert cache.get(old_nav) is None
+    assert cache.conversation_for(token.removeprefix("fbo:")) == "c1"
+    callbacks = _callbacks(u.callback_query.edits_markup[-1])
+    assert token in callbacks
+    assert not any(
+        cb.startswith(("fbp:", "fbd:", "fbf:", "fbx:", "fbb:")) for cb in callbacks
+    )
+    _assert_old_nav_rejected(ctx, old_nav)
+
+    client.files = ["b.txt"]
+    retry = _cb(token)
+    asyncio.run(h.browse_open(retry, ctx))
+    new_nav = _nav_from(retry)
+    assert cache.get(new_nav) is not None
+
+
+def test_open_error_invalidates_existing_snapshot(tmp_path, monkeypatch):
+    client = FakeClient(["a.txt"])
+    ctx = _ctx(tmp_path, client)
+    update, token = _open(ctx)
+    old_nav = _nav_from(update)
+    cache = ctx.bot_data["file_browser_cache"]
+    _patch_listing(monkeypatch, FileListing(FileStatus.UPSTREAM_ERROR, error="boom"))
+
+    u = _cb(token)
+    asyncio.run(h.browse_open(u, ctx))
+
+    assert "boom" in u.callback_query.edits[-1]
+    assert cache.get(old_nav) is None
+    assert u.callback_query.edits_markup[-1] is None
+    _assert_old_nav_rejected(ctx, old_nav)
+
+
+def test_failed_refresh_leaves_other_conversation_usable(tmp_path, monkeypatch):
+    client = FakeClient(["a.txt"])
+    ctx = _ctx(tmp_path, client)
+    first, _ = _open(ctx, "c1")
+    first_nav = _nav_from(first)
+    second, second_token = _open(ctx, "c2")
+    second_nav = _nav_from(second)
+    cache = ctx.bot_data["file_browser_cache"]
+    _patch_listing(monkeypatch, FileListing(FileStatus.UPSTREAM_ERROR, error="boom"))
+
+    u = _cb(f"fbx:{first_nav}:0")
+    asyncio.run(h.browse_refresh(u, ctx))
+
+    assert cache.get(first_nav) is None
+    assert cache.get(second_nav) is not None
+    assert cache.conversation_for(second_token.removeprefix("fbo:")) == "c2"
+
+    page = _cb(f"fbp:{second_nav}:0:0")
+    asyncio.run(h.browse_page(page, ctx))
+    assert "📁 /" in page.callback_query.edits[-1]

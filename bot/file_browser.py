@@ -203,6 +203,10 @@ class BrowserCache:
         if token is not None:
             self._tokens.pop(token, None)
 
+    def invalidate_snapshots(self, conversation_id: str) -> None:
+        """يسقط لقطات الشات فقط، ويُبقي رمزه الثابت صالحًا لإعادة المحاولة."""
+        self._drop_states_for(conversation_id)
+
     def clear(self) -> None:
         self._states.clear()
         self._tokens.clear()

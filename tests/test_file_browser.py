@@ -156,6 +156,22 @@ def test_conversation_token_survives_snapshot_replacement():
     assert cache.conversation_for(token) == "c1"
 
 
+def test_invalidate_snapshots_keeps_token_and_other_conversations():
+    cache = BrowserCache()
+    token1 = cache.token_for("c1")
+    first = cache.put("c1", 1, ["a.txt"])
+    token2 = cache.token_for("c2")
+    second = cache.put("c2", 1, ["b.txt"])
+
+    cache.invalidate_snapshots("c1")
+
+    assert cache.get(first.nav) is None
+    assert cache.get(second.nav) is second
+    assert cache.conversation_for(token1) == "c1"
+    assert cache.token_for("c1") == token1
+    assert cache.conversation_for(token2) == "c2"
+
+
 def test_public_api_names_are_canonical():
     fields = BrowserState.__dataclass_fields__
     assert "conversation_id" in fields
@@ -164,6 +180,14 @@ def test_public_api_names_are_canonical():
         assert callable(getattr(BrowserState, name))
     for name in ("entires", "page_entires"):
         assert not hasattr(BrowserState, name)
-    for name in ("token_for", "conversation_for", "put", "get", "invalidate", "clear"):
+    for name in (
+        "token_for",
+        "conversation_for",
+        "put",
+        "get",
+        "invalidate",
+        "invalidate_snapshots",
+        "clear",
+    ):
         assert callable(getattr(BrowserCache, name))
     assert not hasattr(BrowserCache, "conversaion_for")

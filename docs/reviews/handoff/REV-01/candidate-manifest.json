@@ -1,0 +1,110 @@
+{
+  "task": "OHB2-REV-01-STALE-BROWSER-SNAPSHOT-INVALIDATION",
+  "package": "REV-01-INDEPENDENT-REVIEW-HANDOFF",
+  "package_version": 1,
+  "created_at": "2026-11-21",
+  "source_workspace": "/workspace/project/OpenHandBot",
+  "repository_url": "https://github.com/TM-AEM/OpenHandBot.git",
+  "branch": "main",
+  "original_head": "7cb9d7a0b37feac986e21622bfadd69a4baec978",
+  "base_commit": "7cb9d7a0b37feac986e21622bfadd69a4baec978",
+  "base_tree": "2ccdb866dce467dad55d3d83f0f757324d00409b",
+  "candidate_state": "uncommitted in the source workspace; packaged as a patch against base_commit",
+  "candidate_tree_reconstructed": "f0f254166ff7f9723f3a1f52807fa2a3363c4430",
+  "patch": {
+    "path": "REV-01-candidate.patch",
+    "bytes": 22511,
+    "lines": 511,
+    "sha256": "c9071f7141fb46f0693d9fcb0791c12ef7726ef58198be078622d3e14b12d1a1",
+    "applies_cleanly": true,
+    "source_match": true
+  },
+  "candidate_files": [
+    {
+      "path": "bot/file_browser.py",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 0,
+      "sha256": "fceea9dda7c9d9b6a238b6aa4f36ccc9d297909b22a3a68631c6ee2f4aa3925c"
+    },
+    {
+      "path": "bot/handlers.py",
+      "status": "modified",
+      "additions": 21,
+      "deletions": 3,
+      "sha256": "439be778647ee99ab9751bc93501973682d6081db77d7463d01da682f171f7ac"
+    },
+    {
+      "path": "tests/test_bot_file_browser.py",
+      "status": "modified",
+      "additions": 171,
+      "deletions": 0,
+      "sha256": "cfefd65c3bea29c3451f207163f8bbeda4fd5676072840b53bb27904786aa40f"
+    },
+    {
+      "path": "tests/test_file_browser.py",
+      "status": "modified",
+      "additions": 25,
+      "deletions": 1,
+      "sha256": "d39a1adcdfe6ad709c2f3396a64529a1a38ab5e659491b3232d99ba19a95811d"
+    },
+    {
+      "path": "docs/audits/OHB2-REV-01-STALE-BROWSER-SNAPSHOT-INVALIDATION-REPORT.md",
+      "status": "added",
+      "additions": 191,
+      "deletions": 0,
+      "sha256": "2394908a370323d702dadade77e54857fc3f0e67159ea39873c71a1f89d33ba9"
+    }
+  ],
+  "totals": {
+    "files": 5,
+    "additions": 412,
+    "deletions": 4
+  },
+  "untracked_report_included": true,
+  "unrelated_workspace_changes": [],
+  "exclusions": [
+    {
+      "path": ".openhands/",
+      "reason": "ignored agent state; not part of the REV-01 candidate"
+    },
+    {
+      "path": ".pytest_cache/",
+      "reason": "ignored test cache; not part of the REV-01 candidate"
+    },
+    {
+      "path": "__pycache__/",
+      "reason": "ignored Python bytecode; not part of the REV-01 candidate"
+    },
+    {
+      "path": "docs/reviews/handoff/REV-01/",
+      "reason": "handoff package created after the candidate patch; excluded from the candidate patch"
+    },
+    {
+      "path": "REV-01-INDEPENDENT-REVIEW-HANDOFF.zip",
+      "reason": "archive outside the source-controlled project tree; excluded from the candidate patch"
+    }
+  ],
+  "historical_test_claims": {
+    "source": "IMPLEMENTATION-REPORT.md",
+    "independently_verified_by_packaging_task": false,
+    "claims": {
+      "focused_tests_passed": 47,
+      "routing_tests_passed": 25,
+      "relevant_tests_passed": 662,
+      "full_python_suite_passed": 3514,
+      "full_python_suite_warnings": 74,
+      "pyflakes_exit": 0,
+      "bandit_high": 0,
+      "pip_audit": "no known vulnerabilities",
+      "node_tests_passed": 280,
+      "git_diff_check_exit": 0
+    }
+  },
+  "notes": [
+    "The candidate was uncommitted in the source workspace at packaging time.",
+    "The patch reconstructs the five candidate files from base 7cb9d7a; all five matched the source workspace byte-for-byte.",
+    "No implementation or test file was modified by this packaging task.",
+    "A genuinely independent review requires a new reviewer conversation and a separate fresh workspace."
+  ]
+}

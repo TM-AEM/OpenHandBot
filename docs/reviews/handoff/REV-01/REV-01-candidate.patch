@@ -1,0 +1,511 @@
+diff --git a/bot/file_browser.py b/bot/file_browser.py
+index c92abfa..5bb0c04 100644
+--- a/bot/file_browser.py
++++ b/bot/file_browser.py
+@@ -203,6 +203,10 @@ class BrowserCache:
+         if token is not None:
+             self._tokens.pop(token, None)
+ 
++    def invalidate_snapshots(self, conversation_id: str) -> None:
++        """يسقط لقطات الشات فقط، ويُبقي رمزه الثابت صالحًا لإعادة المحاولة."""
++        self._drop_states_for(conversation_id)
++
+     def clear(self) -> None:
+         self._states.clear()
+         self._tokens.clear()
+diff --git a/bot/handlers.py b/bot/handlers.py
+index 21eb0f4..434a1a8 100644
+--- a/bot/handlers.py
++++ b/bot/handlers.py
+@@ -1893,6 +1893,7 @@ _FILES_BROWSER_TOO_LARGE = (
+     "قايمة الملفات أكبر من حد التصفح المؤقت الآمن. جرّب شات أصغر أو استخدم قايمة الملفات "
+     "من جديد بعد تقليل عدد الملفات."
+ )
++_FILES_LISTING_FAILED = "تعذّر الوصول لقايمة الملفات دلوقتي. جرّب تاني."
+ 
+ 
+ def _bot_file_status_message(status: FileStatus, error: str | None = None) -> str:
+@@ -1906,6 +1907,17 @@ def _bot_file_status_message(status: FileStatus, error: str | None = None) -> st
+     return file_status_message(status, error)
+ 
+ 
++async def _browser_list_files(update, context, q, conversation_id: str):
++    """قايمة ملفات المتصفح مع حدود خطأ واضحة؛ المستدعي يُسقط اللقطة القديمة قبل النداء."""
++    try:
++        return await _files_service(context).list_files(conversation_id)
++    except Exception as exc:  # noqa: BLE001 — حدود واجهة: نعرض فشلًا واضحًا بدل حالة قديمة
++        log.warning("تعذّر جلب قايمة الملفات (%s)", type(exc).__name__)
++        await _safe_edit(q, _FILES_LISTING_FAILED)
++        mark_ambiguous_external(update, context, "files_listing_exception")
++        return None
++
++
+ def _browser_get(context: ContextTypes.DEFAULT_TYPE, nav: str):
+     if not isinstance(nav, str) or not nav:
+         return None
+@@ -1952,7 +1964,10 @@ async def browse_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
+         await _safe_edit(q, _FILES_EXPIRED)
+         mark_explicitly_ignored(update, context)
+         return
+-    listing = await _files_service(context).list_files(conversation_id)
++    cache.invalidate_snapshots(conversation_id)
++    listing = await _browser_list_files(update, context, q, conversation_id)
++    if listing is None:
++        return
+     if listing.status is not FileStatus.OK:
+         await _safe_edit(q, file_status_message(listing.status, listing.error))
+         if listing.status is FileStatus.UPSTREAM_ERROR:
+@@ -2089,7 +2104,11 @@ async def browse_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
+         mark_explicitly_ignored(update, context)
+         return
+     old_dir = state.dirs[dir_index] if 0 <= dir_index < len(state.dirs) else ""
+-    listing = await _files_service(context).list_files(state.conversation_id)
++    cache = _browser_cache(context)
++    cache.invalidate_snapshots(state.conversation_id)
++    listing = await _browser_list_files(update, context, q, state.conversation_id)
++    if listing is None:
++        return
+     if listing.status is not FileStatus.OK:
+         await _safe_edit(q, file_status_message(listing.status, listing.error))
+         if listing.status is FileStatus.UPSTREAM_ERROR:
+@@ -2108,7 +2127,6 @@ async def browse_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
+         )
+         mark_explicitly_ignored(update, context)
+         return
+-    cache = _browser_cache(context)
+     new_state = cache.put(state.conversation_id, update.effective_user.id, listing.files)
+     if new_state.nav not in cache:
+         await _safe_edit(q, _FILES_BROWSER_TOO_LARGE)
+diff --git a/docs/audits/OHB2-REV-01-STALE-BROWSER-SNAPSHOT-INVALIDATION-REPORT.md b/docs/audits/OHB2-REV-01-STALE-BROWSER-SNAPSHOT-INVALIDATION-REPORT.md
+new file mode 100644
+index 0000000..780e35b
+--- /dev/null
++++ b/docs/audits/OHB2-REV-01-STALE-BROWSER-SNAPSHOT-INVALIDATION-REPORT.md
+@@ -0,0 +1,191 @@
++# OHB2 — REV-01 Stale Browser Snapshot Invalidation Report
++
++**Task ID:** `OHB2-REV-01-STALE-BROWSER-SNAPSHOT-INVALIDATION`
++**Status:** `DONE`
++**Date:** 2026-11-21
++
++## 1. Baseline audit
++
++| Item | Value |
++|---|---|
++| Branch | `main` |
++| HEAD | `7cb9d7a0b37feac986e21622bfadd69a4baec978` |
++| `origin/main` (local info only) | `7cb9d7a0b37feac986e21622bfadd69a4baec978` |
++| Working tree before edits | clean (`git status --short` empty) |
++| Python | 3.13.15 |
++| pytest | 9.0.3 |
++
++The baseline had no pre-existing diffs. The working tree was clean before the REV-01 edits.
++
++## 2. Root cause
++
++`browse_open` and `browse_refresh` requested the new listing **before** dropping the old snapshot:
++
++- `browse_open` called `list_files` and returned on an empty or non-OK result without invalidating the
++  existing snapshot.
++- `browse_refresh` did the same.
++- A raised listing exception also left the old snapshot in place.
++- `BrowserCache.invalidate` could not be used directly for this path because it also removes the stable
++  conversation token, which is needed for the “الملفات” retry button.
++
++The old `nav` therefore remained usable through old page/folder/file callbacks until TTL or LRU eviction.
++
++## 3. Exact invalidation behavior
++
++### Before
++
++```text
++browse_open:
++    listing = await list_files(conversation_id)
++    if listing is not OK or listing.files is empty:
++        return                      # old snapshot remains cached
++    put new snapshot
++
++browse_refresh:
++    listing = await list_files(state.conversation_id)
++    if listing is not OK or listing.files is empty:
++        return                      # old snapshot remains cached
++    put new snapshot
++```
++
++### After
++
++```text
++browse_open:
++    cache.invalidate_snapshots(conversation_id)
++    listing = await _browser_list_files(...)
++    if listing is None: return      # old snapshot already gone
++    if listing is not OK: return    # old snapshot already gone
++    if listing.files is empty: show empty message with valid retry token
++    put new snapshot
++
++browse_refresh:
++    old_dir = ...
++    cache.invalidate_snapshots(state.conversation_id)
++    listing = await _browser_list_files(...)
++    if listing is None: return      # old snapshot already gone
++    if listing is not OK: return    # old snapshot already gone
++    if listing.files is empty: show empty message with valid retry token
++    put new snapshot
++```
++
++### Cache method
++
++`BrowserCache.invalidate_snapshots(conversation_id)` drops only the states for that conversation and
++keeps the conversation token valid for retry. `BrowserCache.invalidate` is unchanged and still removes
++both states and token for confirmed deletion.
++
++### Exception boundary
++
++`_browser_list_files` catches unexpected listing exceptions, edits the message to
++`_FILES_LISTING_FAILED` (“تعذّر الوصول لقايمة الملفات دلوقتي. جرّب تاني.”), records
++`mark_ambiguous_external(..., "files_listing_exception")`, and returns `None`. The caller has already
++invalidated the old snapshot, so an exception cannot leave stale callbacks usable.
++
++### Concurrency
++
++The production poller serializes updates (`bot/polling.py:13,175-178`; `bot/app.py:75-81`). It puts an
++update on `update_queue` and awaits `update_queue.join()` before the next one, so overlapping
++open/refresh handlers do not occur in the current architecture. No new lock or coordination subsystem
++was added. If a future concurrent dispatcher is introduced, a per-conversation generation check would be
++needed; that is recorded as a remaining limitation, not implemented here.
++
++## 4. Files changed and diff statistics
++
++| File | Change |
++|---|---|
++| `bot/file_browser.py` | Added `BrowserCache.invalidate_snapshots` (snapshot-only invalidation) |
++| `bot/handlers.py` | Invalidate before open/refresh listing; added `_browser_list_files` exception boundary and `_FILES_LISTING_FAILED` |
++| `tests/test_bot_file_browser.py` | 7 handler-level REV-01 regression tests |
++| `tests/test_file_browser.py` | 1 cache-level invalidation test + new API check |
++| **Total** | **4 files, +221/−4** |
++
++The report file itself is a new untracked artifact and is not included in the diff statistic above.
++
++## 5. Regression tests added
++
++1. `tests/test_file_browser.py::test_invalidate_snapshots_keeps_token_and_other_conversations`
++2. `tests/test_bot_file_browser.py::test_refresh_success_invalidates_old_snapshot_and_publishes_new`
++3. `tests/test_bot_file_browser.py::test_empty_refresh_invalidates_old_snapshot`
++4. `tests/test_bot_file_browser.py::test_failed_refresh_invalidates_old_snapshot`
++5. `tests/test_bot_file_browser.py::test_refresh_exception_invalidates_old_snapshot`
++6. `tests/test_bot_file_browser.py::test_open_empty_invalidates_existing_snapshot`
++7. `tests/test_bot_file_browser.py::test_open_error_invalidates_existing_snapshot`
++8. `tests/test_bot_file_browser.py::test_failed_refresh_leaves_other_conversation_usable`
++
++Focused result: **47 passed** (39 pre-existing + 8 new). Existing refresh/stability tests remain green.
++
++## 6. Verification results
++
++| Command | Result | Exit |
++|---|---|---|
++| `python3 -m pytest -q tests/test_file_browser.py tests/test_bot_file_browser.py` | **47 passed** in 1.69s | 0 |
++| `python3 -m pytest -q tests/test_b06_file_routing.py` | **25 passed** in 1.50s | 0 |
++| Relevant file/handler/keyboard/cache/client/bounded/attachment set | **662 passed** in 23.42s | 0 |
++| `python3 -m pytest -q` | **3514 passed, 74 warnings** in 172.06s | 0 |
++| `python3 -m pyflakes bot/ automation/ tools/ main.py tests/` | no findings | 0 |
++| `python3 -m bandit -r bot/ automation/ tools/ main.py -lll -s B613` | High **0**; Low 5, Medium 19 | 0 |
++| `python3 -m pip_audit -r requirements-dev.txt` | No known vulnerabilities found | 0 |
++| `node --test tests/frontend/*.test.js` | **280 passed, 0 failed** | 0 |
++| `git diff --check` | no whitespace errors | 0 |
++
++The 74 warnings are `PTBDeprecationWarning` messages from python-telegram-bot, not failures. No tests
++were skipped.
++
++## 7. Evidence that stale callbacks are rejected
++
++The regression tests exercise the actual handlers and `BrowserCache`:
++
++- After an empty refresh, `cache.get(old_nav) is None`; old `fbp` (page), `fbd` (folder), and `fbf`
++  (file) callbacks all return the existing “قديمة” expired response.
++- After a non-OK refresh, the old snapshot is absent, the edit has no reply markup, and old callbacks
++  return “قديمة”.
++- After a raised refresh exception, the old snapshot is absent, the user sees the clear failure message,
++  and old callbacks return “قديمة”.
++- After an empty or failed `browse_open`, the existing snapshot is absent and old callbacks return
++  “قديمة”.
++- After a successful non-empty refresh, the old snapshot is absent, the new snapshot is present, and a
++  page callback on the new `nav` works.
++- Empty-result messages contain only the conversation-action retry controls; they do not expose stale
++  `fbp`/`fbd`/`fbf`/`fbx`/`fbb` navigation.
++
++## 8. Evidence that unrelated conversations remain unaffected
++
++- `test_failed_refresh_leaves_other_conversation_usable` opens `c1` and `c2`, fails the `c1` refresh,
++  and verifies `c1`’s snapshot is gone while `c2`’s snapshot remains present and its page callback still
++  works.
++- `test_invalidate_snapshots_keeps_token_and_other_conversations` verifies that invalidating `c1`
++  leaves `c2`’s state and token intact, and that `c1`’s token remains valid for retry.
++
++## 9. Protected-work and scope checks
++
++- `git diff --name-only -- bot/web/` is empty. Mini App untouched.
++- `git diff --name-only -- bot/attachments.py tests/test_doc_code_parity.py tests/test_def011_a_option_b_limits.py docs/reviews/handoff/BOT-FILE-BROWSER docs/reviews/OHB2-WP07-DEF011-F03-INDEPENDENT-REVIEW-REPORT.md docs/audits/OHB2-WP07-DEF011-F03-STALE-REFERENCE-CORRECTION-REPORT.md` is empty.
++- An AST comparison of `_attachment_service` between `HEAD` and the working tree returned
++  `attachment_service_unchanged: True`; the DEF-011-A Option B wiring is intact.
++- No binary-download or privileged-access mechanism was added. The diff contains no
++  `application/octet-stream`, `X-Session-API-Key`, `session_api_key`, or raw workspace binary route.
++- Existing successful browsing, folder navigation, pagination, and file-preview tests remain green.
++
++## 10. Remaining limitations
++
++1. **Legacy DEF-010:** legacy callbacks that embed full conversation IDs remain unchanged and out of
++   scope.
++2. **Empty directories:** Cloud V1 returns only file paths, so empty directories remain unrepresentable.
++3. **Bounded snapshots:** the existing 16-entry / 50,000-char / 30-minute snapshot limits remain.
++4. **Concurrency:** the current poller is sequential; no new lock was added. A future concurrent
++   dispatcher would need a generation check to prevent an older request from republishing after a newer
++   one.
++5. **No live service tests:** all tests use fakes; no production Telegram/OpenHands call was made.
++6. **No independent review in this task:** this is implementation and self-verification only; a separate
++   review is still required.
++
++## 11. Git and publication status
++
++- Branch: `main`
++- HEAD before edits: `7cb9d7a0b37feac986e21622bfadd69a4baec978`
++- Working tree after edits: 4 modified files plus this new untracked report.
++- **No commit, push, PR creation/update, merge, deployment, or Autopush activation occurred.**
++- No `git add .` or `git add -A` was used.
++- No destructive Git command (reset, clean, force operation, or broad deletion) was used.
++- Pre-existing tracked, untracked, ignored, `.openhands/`, and `.agent/` content was preserved.
+diff --git a/tests/test_bot_file_browser.py b/tests/test_bot_file_browser.py
+index 6f78e40..5b35605 100644
+--- a/tests/test_bot_file_browser.py
++++ b/tests/test_bot_file_browser.py
+@@ -8,6 +8,7 @@ import bot.handlers as h
+ from bot import keyboards as kb
+ from bot.db import Database
+ from bot.file_cache import FileCache
++from bot.files import FileListing, FileStatus
+ 
+ OWNER = 1
+ OWNER_UUID = "owner-uuid"
+@@ -129,6 +130,28 @@ def _file_indices(markup, nav, dir_index=0):
+     return [int(cb.split(":")[3]) for cb in _callbacks(markup) if cb.startswith(prefix)]
+ 
+ 
++def _patch_listing(monkeypatch, result):
++    async def fake_list_files(conversation_id):
++        if isinstance(result, BaseException):
++            raise result
++        return result
++
++    monkeypatch.setattr(
++        h, "_files_service", lambda context: SimpleNamespace(list_files=fake_list_files)
++    )
++
++
++def _assert_old_nav_rejected(ctx, nav):
++    for handler, data in (
++        (h.browse_page, f"fbp:{nav}:0:0"),
++        (h.browse_dir, f"fbd:{nav}:0"),
++        (h.browse_file, f"fbf:{nav}:0:0"),
++    ):
++        update = _cb(data)
++        asyncio.run(handler(update, ctx))
++        assert "قديمة" in update.callback_query.edits[-1]
++
++
+ def test_open_root_shows_dirs_then_files_and_callbacks_fit(tmp_path):
+     client = FakeClient(["b.txt", "a/x.py", "docs/readme.md"])
+     ctx = _ctx(tmp_path, client)
+@@ -511,3 +534,151 @@ def test_confirmed_deletion_invalidates_browser_cache(tmp_path, monkeypatch):
+     asyncio.run(h.delete_conversation_confirm(u, ctx))
+     assert cache.get(nav) is None
+     assert cache.conversation_for(token.removeprefix("fbo:")) is None
++
++
++def test_refresh_success_invalidates_old_snapshot_and_publishes_new(tmp_path):
++    client = FakeClient(["a.txt", "b.txt"])
++    ctx = _ctx(tmp_path, client)
++    update, token = _open(ctx)
++    old_nav = _nav_from(update)
++    cache = ctx.bot_data["file_browser_cache"]
++    assert cache.get(old_nav) is not None
++
++    client.files.append("c.txt")
++    u = _cb(f"fbx:{old_nav}:0")
++    asyncio.run(h.browse_refresh(u, ctx))
++
++    new_nav = _nav_from(u)
++    assert new_nav != old_nav
++    assert cache.get(old_nav) is None
++    assert cache.get(new_nav) is not None
++    assert cache.conversation_for(token.removeprefix("fbo:")) == "c1"
++    _assert_old_nav_rejected(ctx, old_nav)
++
++    page = _cb(f"fbp:{new_nav}:0:0")
++    asyncio.run(h.browse_page(page, ctx))
++    assert "📁 /" in page.callback_query.edits[-1]
++
++
++def test_empty_refresh_invalidates_old_snapshot(tmp_path):
++    client = FakeClient(["a.txt"])
++    ctx = _ctx(tmp_path, client)
++    update, token = _open(ctx)
++    old_nav = _nav_from(update)
++    cache = ctx.bot_data["file_browser_cache"]
++
++    client.files = []
++    u = _cb(f"fbx:{old_nav}:0")
++    asyncio.run(h.browse_refresh(u, ctx))
++
++    assert "ما فيهاش ملفات" in u.callback_query.edits[-1]
++    assert cache.get(old_nav) is None
++    assert cache.conversation_for(token.removeprefix("fbo:")) == "c1"
++    callbacks = _callbacks(u.callback_query.edits_markup[-1])
++    assert token in callbacks
++    assert not any(
++        cb.startswith(("fbp:", "fbd:", "fbf:", "fbx:", "fbb:")) for cb in callbacks
++    )
++    _assert_old_nav_rejected(ctx, old_nav)
++
++
++def test_failed_refresh_invalidates_old_snapshot(tmp_path, monkeypatch):
++    client = FakeClient(["a.txt"])
++    ctx = _ctx(tmp_path, client)
++    update, token = _open(ctx)
++    old_nav = _nav_from(update)
++    cache = ctx.bot_data["file_browser_cache"]
++    _patch_listing(monkeypatch, FileListing(FileStatus.UPSTREAM_ERROR, error="boom"))
++
++    u = _cb(f"fbx:{old_nav}:0")
++    asyncio.run(h.browse_refresh(u, ctx))
++
++    assert "boom" in u.callback_query.edits[-1]
++    assert cache.get(old_nav) is None
++    assert u.callback_query.edits_markup[-1] is None
++    assert cache.conversation_for(token.removeprefix("fbo:")) == "c1"
++    _assert_old_nav_rejected(ctx, old_nav)
++
++
++def test_refresh_exception_invalidates_old_snapshot(tmp_path, monkeypatch):
++    client = FakeClient(["a.txt"])
++    ctx = _ctx(tmp_path, client)
++    update, _ = _open(ctx)
++    old_nav = _nav_from(update)
++    cache = ctx.bot_data["file_browser_cache"]
++    _patch_listing(monkeypatch, RuntimeError("boom"))
++
++    u = _cb(f"fbx:{old_nav}:0")
++    asyncio.run(h.browse_refresh(u, ctx))
++
++    assert "تعذّر" in u.callback_query.edits[-1]
++    assert cache.get(old_nav) is None
++    assert u.callback_query.edits_markup[-1] is None
++    _assert_old_nav_rejected(ctx, old_nav)
++
++
++def test_open_empty_invalidates_existing_snapshot(tmp_path):
++    client = FakeClient(["a.txt"])
++    ctx = _ctx(tmp_path, client)
++    update, token = _open(ctx)
++    old_nav = _nav_from(update)
++    cache = ctx.bot_data["file_browser_cache"]
++
++    client.files = []
++    u = _cb(token)
++    asyncio.run(h.browse_open(u, ctx))
++
++    assert "ما فيهاش ملفات" in u.callback_query.edits[-1]
++    assert cache.get(old_nav) is None
++    assert cache.conversation_for(token.removeprefix("fbo:")) == "c1"
++    callbacks = _callbacks(u.callback_query.edits_markup[-1])
++    assert token in callbacks
++    assert not any(
++        cb.startswith(("fbp:", "fbd:", "fbf:", "fbx:", "fbb:")) for cb in callbacks
++    )
++    _assert_old_nav_rejected(ctx, old_nav)
++
++    client.files = ["b.txt"]
++    retry = _cb(token)
++    asyncio.run(h.browse_open(retry, ctx))
++    new_nav = _nav_from(retry)
++    assert cache.get(new_nav) is not None
++
++
++def test_open_error_invalidates_existing_snapshot(tmp_path, monkeypatch):
++    client = FakeClient(["a.txt"])
++    ctx = _ctx(tmp_path, client)
++    update, token = _open(ctx)
++    old_nav = _nav_from(update)
++    cache = ctx.bot_data["file_browser_cache"]
++    _patch_listing(monkeypatch, FileListing(FileStatus.UPSTREAM_ERROR, error="boom"))
++
++    u = _cb(token)
++    asyncio.run(h.browse_open(u, ctx))
++
++    assert "boom" in u.callback_query.edits[-1]
++    assert cache.get(old_nav) is None
++    assert u.callback_query.edits_markup[-1] is None
++    _assert_old_nav_rejected(ctx, old_nav)
++
++
++def test_failed_refresh_leaves_other_conversation_usable(tmp_path, monkeypatch):
++    client = FakeClient(["a.txt"])
++    ctx = _ctx(tmp_path, client)
++    first, _ = _open(ctx, "c1")
++    first_nav = _nav_from(first)
++    second, second_token = _open(ctx, "c2")
++    second_nav = _nav_from(second)
++    cache = ctx.bot_data["file_browser_cache"]
++    _patch_listing(monkeypatch, FileListing(FileStatus.UPSTREAM_ERROR, error="boom"))
++
++    u = _cb(f"fbx:{first_nav}:0")
++    asyncio.run(h.browse_refresh(u, ctx))
++
++    assert cache.get(first_nav) is None
++    assert cache.get(second_nav) is not None
++    assert cache.conversation_for(second_token.removeprefix("fbo:")) == "c2"
++
++    page = _cb(f"fbp:{second_nav}:0:0")
++    asyncio.run(h.browse_page(page, ctx))
++    assert "📁 /" in page.callback_query.edits[-1]
+diff --git a/tests/test_file_browser.py b/tests/test_file_browser.py
+index 4f57556..81bcf1d 100644
+--- a/tests/test_file_browser.py
++++ b/tests/test_file_browser.py
+@@ -156,6 +156,22 @@ def test_conversation_token_survives_snapshot_replacement():
+     assert cache.conversation_for(token) == "c1"
+ 
+ 
++def test_invalidate_snapshots_keeps_token_and_other_conversations():
++    cache = BrowserCache()
++    token1 = cache.token_for("c1")
++    first = cache.put("c1", 1, ["a.txt"])
++    token2 = cache.token_for("c2")
++    second = cache.put("c2", 1, ["b.txt"])
++
++    cache.invalidate_snapshots("c1")
++
++    assert cache.get(first.nav) is None
++    assert cache.get(second.nav) is second
++    assert cache.conversation_for(token1) == "c1"
++    assert cache.token_for("c1") == token1
++    assert cache.conversation_for(token2) == "c2"
++
++
+ def test_public_api_names_are_canonical():
+     fields = BrowserState.__dataclass_fields__
+     assert "conversation_id" in fields
+@@ -164,6 +180,14 @@ def test_public_api_names_are_canonical():
+         assert callable(getattr(BrowserState, name))
+     for name in ("entires", "page_entires"):
+         assert not hasattr(BrowserState, name)
+-    for name in ("token_for", "conversation_for", "put", "get", "invalidate", "clear"):
++    for name in (
++        "token_for",
++        "conversation_for",
++        "put",
++        "get",
++        "invalidate",
++        "invalidate_snapshots",
++        "clear",
++    ):
+         assert callable(getattr(BrowserCache, name))
+     assert not hasattr(BrowserCache, "conversaion_for")
