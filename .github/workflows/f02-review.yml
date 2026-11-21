@@ -213,6 +213,13 @@ jobs:
         continue-on-error: true
         run: python -m pytest tests/test_def011_fs_offload.py -q 2>&1 | tee evidence/pytest-f02.txt
 
+      - name: Record named cancellation and lock-drain results
+        continue-on-error: true
+        run: |
+          python -m pytest tests/test_def011_fs_offload.py -v \
+            -k "lock or REV01 or case05 or case06 or case07 or case08 or case13 or case16" \
+            2>&1 | tee evidence/named-cancellation-tests.txt
+
       - name: Run the full test suite
         continue-on-error: true
         run: python -m pytest -q 2>&1 | tee evidence/pytest-full.txt
