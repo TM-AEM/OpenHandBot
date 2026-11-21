@@ -1,0 +1,321 @@
+name: F-02 Owner Review Evidence
+
+# Collects read-only evidence for the repository owner's technical judgment on
+# the DEF-011 / F-02 candidate. It never edits tracked source, never pushes,
+# never merges, never deploys. It produces an evidence artifact; the technical
+# judgment is made by the owner who consumes it.
+#
+# This is an OWNER REVIEW aid. It is not an independent review and does not
+# claim to be one: it contains no reviewing step and asserts no verdict.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/f02-review.yml"
+      - "bot/attachments.py"
+      - "bot/handlers.py"
+      - "tests/test_def011_fs_offload.py"
+  workflow_dispatch:
+    inputs:
+      head_sha:
+        description: "Exact review target commit (full 40-char SHA)"
+        required: true
+        default: "6a1ca2e596a26d9ae747c27f4e4361c5a85b0b18"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: f02-review-${{ github.event.pull_request.number || inputs.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  evidence:
+    name: Evidence (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+    steps:
+      - name: Record runner identity (host separation evidence)
+        run: |
+          set -euo pipefail
+          {
+            echo "runner_name=${RUNNER_NAME}"
+            echo "runner_os=${RUNNER_OS}"
+            echo "runner_arch=${RUNNER_ARCH}"
+            echo "image_os=${ImageOS:-unknown}"
+            echo "image_version=${ImageVersion:-unknown}"
+            echo "hostname=$(hostname)"
+            echo "kernel=$(uname -sr)"
+            echo "python_pre=$(python3 -V 2>&1)"
+          } | tee runner-identity.txt
+
+      - name: Resolve review target
+        id: target
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_SHA: ${{ inputs.head_sha }}
+        run: |
+          set -euo pipefail
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            HEAD_SHA="${INPUT_SHA}"
+          else
+            # The PR only carries this workflow file on top of the candidate, so
+            # the review target stays the published F-02 commit, not the PR head.
+            HEAD_SHA="6a1ca2e596a26d9ae747c27f4e4361c5a85b0b18"
+          fi
+          case "${HEAD_SHA}" in
+            (*[!0-9a-f]*|"") echo "::error::head_sha must be a full lowercase hex SHA"; exit 1 ;;
+          esac
+          if [ "${#HEAD_SHA}" -ne 40 ]; then
+            echo "::error::head_sha must be 40 characters, got ${#HEAD_SHA}"; exit 1
+          fi
+          echo "head_sha=${HEAD_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "Review target = ${HEAD_SHA}"
+
+      - name: Checkout review target
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.target.outputs.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify the checked-out commit is the review target
+        env:
+          EXPECTED: ${{ steps.target.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          ACTUAL="$(git rev-parse HEAD)"
+          echo "expected=${EXPECTED}"
+          echo "actual  =${ACTUAL}"
+          if [ "${ACTUAL}" != "${EXPECTED}" ]; then
+            echo "::error::checked-out commit does not match the review target"
+            exit 1
+          fi
+          echo "parent=$(git rev-parse HEAD^)"
+          echo "subject=$(git log -1 --format=%s)"
+
+      - name: Verify the PR adds only this workflow file
+        if: github.event_name == 'pull_request'
+        env:
+          REVIEW_SHA: ${{ steps.target.outputs.head_sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if ! git merge-base --is-ancestor "${REVIEW_SHA}" "${PR_HEAD}"; then
+            echo "::error::review target is not an ancestor of the PR head"
+            exit 1
+          fi
+          EXTRA="$(git diff --name-only "${REVIEW_SHA}" "${PR_HEAD}")"
+          echo "PR adds on top of the review target:"
+          printf '%s\n' "${EXTRA}"
+          if [ "${EXTRA}" != ".github/workflows/f02-review.yml" ]; then
+            echo "::error::PR must add only .github/workflows/f02-review.yml"
+            exit 1
+          fi
+
+      - name: Resolve stable review base
+        id: base
+        env:
+          REVIEW_SHA: ${{ steps.target.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          # merge-base is stable even if main advances, unlike pull_request.base.sha.
+          BASE="$(git merge-base origin/main "${REVIEW_SHA}")"
+          echo "merge_base=${BASE}"
+          echo "merge_base=${BASE}" >> "${GITHUB_OUTPUT}"
+          if [ "${BASE}" != "52e7789cc8cc97a7f7c09c9592226ab117db99a2" ]; then
+            echo "::warning::merge-base differs from the recorded F-02 base (52e7789)"
+          fi
+
+      - name: Verify F-02-only changed-file scope
+        env:
+          BASE: ${{ steps.base.outputs.merge_base }}
+          REVIEW_SHA: ${{ steps.target.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          git diff --name-only "${BASE}" "${REVIEW_SHA}" | tee evidence/changed-files.txt
+          git diff --stat "${BASE}" "${REVIEW_SHA}" | tee evidence/diff-stat.txt
+
+          # Expected scope: exactly these three paths, nothing else.
+          EXPECTED="$(printf '%s\n' bot/attachments.py bot/handlers.py tests/test_def011_fs_offload.py | sort)"
+          ACTUAL="$(sort evidence/changed-files.txt)"
+          if [ "${ACTUAL}" != "${EXPECTED}" ]; then
+            echo "::error::changed-file scope does not match the expected F-02-only set"
+            printf 'expected:\n%s\nactual:\n%s\n' "${EXPECTED}" "${ACTUAL}"
+            exit 1
+          fi
+
+          # No NEW-DEF-03 / NAV-01..06 markers may be introduced.
+          if git diff "${BASE}" "${REVIEW_SHA}" | grep -Eq '^\+.*(NEW-DEF-03|NAV-0[1-6])'; then
+            echo "::error::diff introduces NEW-DEF-03/NAV-01..06 content"
+            exit 1
+          fi
+
+          # Schema / Mini App / dependency / API surfaces must be untouched.
+          if git diff --name-only "${BASE}" "${REVIEW_SHA}" \
+              | grep -Eq '^(bot/db\.py|.*schema.*|migrations/|bot/web/|requirements.*|pyproject\.toml)'; then
+            echo "::error::diff touches a protected surface"
+            exit 1
+          fi
+          echo "scope=ok" | tee evidence/scope.txt
+
+      - name: Capture full diff and hashes
+        env:
+          BASE: ${{ steps.base.outputs.merge_base }}
+          REVIEW_SHA: ${{ steps.target.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          git diff "${BASE}" "${REVIEW_SHA}" > evidence/full.diff
+          sha256sum evidence/full.diff | tee evidence/diff-sha256.txt
+          git diff "${BASE}" "${REVIEW_SHA}" -- bot/ > evidence/code-only.diff
+          sha256sum evidence/code-only.diff | tee evidence/code-only-sha256.txt
+          git rev-parse "${REVIEW_SHA}" | tee evidence/review-target-sha.txt
+          git rev-parse "${BASE}" | tee evidence/review-base-sha.txt
+          sha256sum bot/attachments.py bot/handlers.py bot/db.py \
+            tests/test_def011_fs_offload.py | tee evidence/file-sha256.txt
+          echo "hunks_handlers=$(git diff "${BASE}" "${REVIEW_SHA}" -- bot/handlers.py | grep -c '^@@')" \
+            | tee evidence/hunk-counts.txt
+          echo "f02_test_count=$(grep -cE '^def test' tests/test_def011_fs_offload.py)" \
+            | tee -a evidence/hunk-counts.txt
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          python -V | tee evidence/python-version.txt
+
+      - name: Static analysis (pyflakes)
+        continue-on-error: true
+        run: python -m pyflakes bot/ automation/ tools/ main.py tests/ 2>&1 | tee evidence/pyflakes.txt
+
+      - name: Static analysis (bandit, high severity only)
+        continue-on-error: true
+        run: python -m bandit -r bot/ automation/ tools/ main.py -lll -s B613 2>&1 | tee evidence/bandit.txt
+
+      - name: Run the F-02 regression suite
+        continue-on-error: true
+        run: python -m pytest tests/test_def011_fs_offload.py -q 2>&1 | tee evidence/pytest-f02.txt
+
+      - name: Run the full test suite
+        continue-on-error: true
+        run: python -m pytest -q 2>&1 | tee evidence/pytest-full.txt
+
+      - name: Negative control (F-02 hunk reverted must fail T8b, T8c still passes)
+        env:
+          BASE: ${{ steps.base.outputs.merge_base }}
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cp bot/handlers.py /tmp/handlers.fixed.py
+          # Fail closed: a failed revert must abort, not silently test the fixed tree.
+          if ! git checkout "${BASE}" -- bot/handlers.py; then
+            echo "::error::could not revert bot/handlers.py to base; negative control invalid"
+            exit 1
+          fi
+          REVERTED_SHA="$(git hash-object bot/handlers.py)"
+          BASE_SHA="$(git rev-parse "${BASE}:bot/handlers.py")"
+          if [ "${REVERTED_SHA}" != "${BASE_SHA}" ]; then
+            echo "::error::reverted file does not match the base blob; negative control invalid"
+            exit 1
+          fi
+          set +e
+          python -m pytest tests/test_def011_fs_offload.py -q -k "T8b or T8c" \
+            > evidence/negative-control.txt 2>&1
+          rc=$?
+          set -e
+          cp /tmp/handlers.fixed.py bot/handlers.py
+          cat evidence/negative-control.txt
+          if [ "${rc}" -eq 0 ]; then
+            echo "::error::negative control passed; T8b does not discriminate the fix"
+            exit 1
+          fi
+          # T8c tests the byte cap, not the offload, so it must still pass.
+          if grep -q 'test_T8c_local_capped_read_enforces_cap' evidence/negative-control.txt \
+              && grep -qE '1 failed, 1 passed' evidence/negative-control.txt; then
+            echo "negative_control=T8b_fails_as_expected,T8c_still_passes" \
+              | tee evidence/negative-control-result.txt
+          else
+            echo "::error::negative control did not show the expected T8b-fails/T8c-passes split"
+            exit 1
+          fi
+
+      - name: Write owner review instructions
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cat > evidence/OWNER-REVIEW-INSTRUCTIONS.md <<'DOC'
+          # Owner review instructions
+
+          This artifact is evidence for YOUR judgment. It does not assert that the
+          change is correct, and a green test run is not a review.
+
+          Please:
+          1. Read `full.diff` and `code-only.diff` yourself.
+          2. Assess cancellation safety, worker lifecycle, and error propagation.
+          3. Judge whether the 45 F-02 tests are meaningful: would each fail if its
+             target defect returned? What is untested?
+          4. Confirm the scope guards in `scope.txt` and `changed-files.txt`.
+          5. Reproduce the focused suite yourself where you can:
+               pip install pytest anyio httpx python-telegram-bot
+               python -m pytest tests/test_def011_fs_offload.py -q     # expect 45 passed
+          6. Record findings with severity, file:line, and reproducible evidence.
+
+          You may reject this change even though every check above passed.
+
+          Known limitations:
+          - This is an OWNER REVIEW, not an independent external review.
+          - D6 (repeated raw cancellation) is explicitly deferred and NOT fixed.
+          - Do not infer exactly-once Telegram delivery or SQLite-Telegram atomicity.
+          DOC
+
+          cat > evidence/FINDINGS-TEMPLATE.md <<'DOC'
+          # Findings
+
+          Fill this in yourself. Leave it blank if you find nothing.
+
+          | # | File:line | Severity | Finding | Reproducible evidence |
+          |---|-----------|----------|---------|-----------------------|
+          |   |           |          |         |                       |
+
+          ## Judgment
+
+          - Does the F-02 isolation hold?
+          - Is the negative control genuine?
+          - Are the tests sufficient?
+          - Any blocking defect?
+
+          ## Decision
+
+          - [ ] Accept
+          - [ ] Accept with follow-ups
+          - [ ] Reject
+          DOC
+
+          printf 'artifact_built=%s\n' "$(date -u +%FT%TZ)" | tee evidence/manifest.txt
+          printf 'python=%s\n' "$(python -V 2>&1)" | tee -a evidence/manifest.txt
+          ls -la evidence | tee -a evidence/manifest.txt
+
+      - name: Upload review evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: f02-review-evidence-${{ steps.target.outputs.head_sha }}-py${{ matrix.python-version }}
+          path: |
+            evidence/
+            runner-identity.txt
+          retention-days: 30
+          if-no-files-found: error
