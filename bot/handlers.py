@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import functools
 import io
 import logging
 import os
@@ -13,6 +14,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 import httpx
+from anyio import to_thread
 from telegram import InputFile, Update
 from telegram.constants import ParseMode
 from telegram.error import (
@@ -2009,7 +2011,10 @@ async def _download_attachment_chunks(context, file_id: str, max_bytes: int):
             # مسار محلي (سيرفر Bot API محلي/اختبار): ملف على القرص ⇒ قراءة مقيّدة.
             if os.path.isfile(file_path):
                 try:
-                    return iter([_read_local_capped(file_path, max_bytes)])
+                    data = await to_thread.run_sync(
+                        functools.partial(_read_local_capped, file_path, max_bytes)
+                    )
+                    return iter([data])
                 except AttachmentTooLargeError:
                     raise
                 except OSError as exc:  # ملف غير قابل للقراءة ⇒ رفض مغلق (مش فشل صامت)
