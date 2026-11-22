@@ -55,7 +55,7 @@
 - 3s trade-off: رسالتان مستقلتان خلال النافذة قد تُجمعان (موافقة صريحة).
 - Mini App no-ref edge: الرسائل بدون `client_ref` قد تدخل التجميع؛ الواجهة الحالية
   ترسل `client_ref` دائمًا.
-- كل التغييرات **uncommitted** على الفرع؛ لا commit/push/PR/Autopush.
+- تم دمج NEW-04 في `main` ومزامنته مع GitHub `main` (exact sync)؛ لا PR/Autopush.
 
 
 
@@ -94,6 +94,7 @@
 - `node --test tests/frontend/*.test.js` ⇒ **280 pass / 0 fail**.
 - `python -m pyflakes ...` ⇒ exit 0؛ `bandit ... -lll -s B613` ⇒ High **0**؛ `pip_audit` ⇒ clean.
 - `compileall` و`git diff --check` ⇒ exit 0.
+- بعد الدمج: `main` المحلي = GitHub `main` (نفس commit/tree عبر API)؛ الشجرة نظيفة.
 
 ## Known / next
 - Telegram long-message splitting قد ينتج أجزاء مستقلة لو مفيش reply؛ ده آمن (رفض الدمج
