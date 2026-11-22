@@ -51,6 +51,7 @@ def test_ttl_constant_is_15_minutes_and_distinct_from_awaiting_ttl():
 
 def test_status_constants_are_the_documented_set():
     # OHB2-P0-A3/D-27: أُضيفت `intent_recorded` (نيّة محلية متينة) بجانب الحالات السبع الأصلية.
+    # OHB2-WP01 Stage 1: أُضيفت `cancelled` (إلغاء صريح لدفعة pending) كحالة غير نهائية.
     assert ATTACHMENT_BATCH_PENDING == "pending"
     assert ATTACHMENT_BATCH_INTENT_RECORDED == "intent_recorded"
     assert ATTACHMENT_BATCH_STATUSES == (
@@ -62,6 +63,7 @@ def test_status_constants_are_the_documented_set():
         "expired",
         "rejected",
         "failed",
+        "cancelled",
     )
 
 

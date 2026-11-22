@@ -7,6 +7,10 @@
 
 > This document does **not** claim WP-07 complete, NEW-DEF-03 complete, or DEF-011 closed.
 > No code was modified in this task. All measurements were performed on throwaway reconstructions.
+>
+> **Post-decision update — 2026-11-22:** NAV-01..06 were explicitly accepted by the owner under
+> `D-A′` **Option A**. The historical statements below that NAV is unaccepted are preserved as history
+> and are superseded for current status by §10. This does not make WP-07 or NEW-DEF-03 complete.
 
 ---
 
@@ -246,3 +250,36 @@ choose A′-3 (defer) and S3 still proceeds.
 - **DEF-011 is not closed** (DEF-011-A, DEF-011-C, F-02, F-03, WP-09 remain open).
 - **No independent review** of this delivery occurred in this task.
 - **No code was modified** and **no commit/push/PR** was created.
+
+---
+
+## 10. Post-decision update — D-A′ Option A (2026-11-22)
+
+**Owner decision:** **Option A — Accept all six NAV items as currently implemented.**
+**Decision date:** 2026-11-22.
+**Scope:** NAV-01..06 only; reviewed implementation; no new implementation or refactoring.
+
+| Item | Handler | Current status |
+|---|---|---|
+| NAV-01 | `start` | **ACCEPTED** by owner under D-A′ |
+| NAV-02 | `show_menu` | **ACCEPTED** by owner under D-A′ |
+| NAV-03 | `list_conversations` | **ACCEPTED** by owner under D-A′ |
+| NAV-04 | `list_watches` | **ACCEPTED** by owner under D-A′ |
+| NAV-05 | `start_new_chat` | **ACCEPTED** by owner under D-A′ |
+| NAV-06 | `open_conversation` | **ACCEPTED** by owner under D-A′ |
+
+Evidence: `docs/reviews/OHB2-WP07-NAV-OWNER-DECISION-PACKAGE.md`,
+`docs/reviews/REV-IND-01-WP-07-INDEPENDENT-REVIEW-REPORT.md` (SHA-256
+`11f7ff10e59cd964edd1d8007b83eca43f4cd1d30358285d20d7cc136a33da92`), current NAV-focused tests
+(51 passed), and the `.agent/PROGRESS.md` owner-acceptance record.
+
+This update **does not**:
+
+- broaden A-1..A-5 to unrelated `NEW-DEF-03` locations;
+- close the remaining `NEW-DEF-03` durable-intent paths;
+- close DEF-006/poller concurrency or the postponed Option A review;
+- close DEF-011 or WP-09;
+- declare WP-07 or NEW-DEF-03 complete.
+
+The historical table in §3 and the non-claims in §9 remain traceable as the pre-decision record; this
+§10 is the current NAV status.

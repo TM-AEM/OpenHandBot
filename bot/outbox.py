@@ -62,10 +62,20 @@ _SANDBOX_NOT_READY_NOTICE = "الـ sandbox مش قادر يشتغل، جرّب 
 _OUTBOX_EXHAUSTED_NOTICE = (
     "تعذّر إرسال البرومت بعد عدة محاولات. جرّب تفتح الشات من الموقع وابعت البرومت من هناك."
 )
+# هدف مختار اتأكد إنه غير موجود/اتحذف (مش خطأ عابر). لا نوجّه البرومت لشات آخر.
+_TARGET_UNAVAILABLE_NOTICE = (
+    "الشات المحدد مش موجود أو اتشال. افتح شات تاني وابعت رسالتك."
+)
 
 # OHB2-POST-PUB-01/F02: نصوص الإكمال المحلي (ثابتة ⇒ الإشعار القابل للتعافي يعيد نفس النص).
 _OUTBOX_SENT_NOTICE = "اتبعت ✅ الشات اتضاف للمتابعة."
 _CREATION_DONE_LINK_TEMPLATE = "بدأ الشات ✅\n{link}"
+
+# OHB2-TELEGRAM-MESSAGE-CLEANUP: مرحلتان متتاليتان بعد نجاح التسليم.
+CLEANUP_ORIGINAL_DELAY_SECONDS = 5.0
+CLEANUP_CONFIRMATION_DELAY_SECONDS = 5.0
+_cleanup_tasks: set[asyncio.Task] = set()
+_cleanup_keys: set[int] = set()
 
 
 def _creation_done_notice(base_url: str, conversation_id: str) -> str:
@@ -106,6 +116,20 @@ async def safe_send(bot, chat_id: int, text: str) -> None:
         log.warning("فشل إرسال رسالة تيليجرام (%s)", type(exc).__name__)
 
 
+async def safe_send_checked_message(bot, chat_id: int, text: str) -> tuple[bool, object | None]:
+    """يرسل رسالة ويحتفظ بكائن Telegram Message الناتج (لو رجع).
+
+    الفشل يُبلَّغ كـ `(False, None)`؛ النجاح `(True, message_or_None)` — بعض الاختبارات
+    والـ fake bots بترجّع None من `send_message`، فما نعتبرش None فشلًا.
+    """
+    try:
+        message = await bot.send_message(chat_id=chat_id, text=text)
+        return True, message
+    except TelegramError as exc:
+        log.warning("فشل إرسال رسالة تيليجرام (%s)", type(exc).__name__)
+        return False, None
+
+
 async def safe_send_checked(bot, chat_id: int, text: str) -> bool:
     """OHB2-POST-PUB-01/F02: زي `safe_send` بس **بترجّع** هل الإرسال نجح.
 
@@ -113,12 +137,90 @@ async def safe_send_checked(bot, chat_id: int, text: str) -> bool:
     عشان يتعافى (بدون إعادة أي عملية خارجية). عقد «مفيش exactly-once»: نجاح الإرسال هنا
     معناه إن تيليجرام قبل الرسالة، مش ضمان عدم التكرار لو انقطع بين الإرسال والتسجيل.
     """
+    delivered, _ = await safe_send_checked_message(bot, chat_id, text)
+    return delivered
+
+
+async def _safe_delete_message(bot, chat_id: int, message_id: int) -> bool:
+    """يحذف رسالة تيليجرام بأمان؛ الحذف المتكرر/الفاشل لا يغيّر نتيجة التسليم."""
     try:
-        await bot.send_message(chat_id=chat_id, text=text)
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
         return True
     except TelegramError as exc:
-        log.warning("فشل إرسال رسالة تيليجرام (%s)", type(exc).__name__)
+        # BadRequest «message to delete not found» حالة سليمة (محذوفة بالفعل).
+        log.info(
+            "تعذّر حذف رسالة تيليجرام %s/%s (%s) — لا يؤثر على التسليم",
+            chat_id, message_id, type(exc).__name__,
+        )
         return False
+    except Exception as exc:  # noqa: BLE001 — فشل الحذف لا يغيّر نجاح التسليم
+        log.warning(
+            "خطأ غير متوقّع عند حذف رسالة تيليجرام %s/%s (%s)",
+            chat_id, message_id, type(exc).__name__,
+        )
+        return False
+
+
+async def _delete_after_delivery(
+    bot,
+    chat_id: int,
+    original_message_ids: tuple[int, ...],
+    confirmation_message_id: int | None,
+    *,
+    sleep=asyncio.sleep,
+) -> None:
+    """T+5: حذف رسائل المالك الأصلية، ثم T+10: حذف رسالة التأكيد."""
+    try:
+        await sleep(CLEANUP_ORIGINAL_DELAY_SECONDS)
+        for message_id in original_message_ids:
+            await _safe_delete_message(bot, chat_id, message_id)
+        await sleep(CLEANUP_CONFIRMATION_DELAY_SECONDS)
+        if confirmation_message_id is not None:
+            await _safe_delete_message(bot, chat_id, confirmation_message_id)
+    except asyncio.CancelledError:
+        # إيقاف التطبيق/إلغاء المهمة: لا ندّعي أن الحذف اكتمل.
+        raise
+    except Exception as exc:  # noqa: BLE001 — مهمة تنظيف لا تُسقط الـ worker
+        log.warning("فشل جدولة/تنفيذ حذف رسائل بعد التسليم (%s)", type(exc).__name__)
+
+
+async def cancel_cleanup_tasks() -> None:
+    """يلغي مهام الحذف المعلّقة عند إغلاق التطبيق (بلا ادّعاء إتمام الحذف)."""
+    tasks = tuple(_cleanup_tasks)
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    _cleanup_tasks.clear()
+    _cleanup_keys.clear()
+
+
+def schedule_delivery_cleanup(
+    bot,
+    chat_id: int,
+    original_message_ids: tuple[int, ...],
+    confirmation_message_id: int | None,
+    *,
+    key: int | None = None,
+) -> None:
+    """يجدول حذف رسائل التسليم مرة واحدة لكل سجل outbox (مهمة asyncio خفيفة)."""
+    if key is not None and key in _cleanup_keys:
+        return
+    if not original_message_ids and confirmation_message_id is None:
+        return
+    if key is not None:
+        _cleanup_keys.add(key)
+    task = asyncio.create_task(
+        _delete_after_delivery(bot, chat_id, original_message_ids, confirmation_message_id)
+    )
+    _cleanup_tasks.add(task)
+
+    def _done(completed: asyncio.Task) -> None:
+        _cleanup_tasks.discard(completed)
+        if key is not None:
+            _cleanup_keys.discard(key)
+
+    task.add_done_callback(_done)
 
 
 def safe_error_label(exc: ApiError) -> str:
@@ -162,10 +264,12 @@ async def _complete_outbox(db, bot, item, base_url: str = "") -> None:
     """إكمال الأثر المحلي للـ outbox (إشعار + تسجيل متابعة) — idempotent وقابل للتعافي.
 
     بيفترض إن صف `completion_pending` (kind=outbox) مسجّل بالفعل. الترتيب:
-    1) نسجّل المتابعة/الحالة (idempotent)، 2) نبعت الإشعار عبر `safe_send_checked`،
-    3) لو الإرسال نجح **بس** نشيل العمل المعلّق. لو الإرسال فشل (TelegramError)، بنسيب
-    العمل المعلّق ⇒ تعافٍ لاحق. فشل خطوة التسجيل (1) بيطلع استثناء ويسيب العمل المعلّق
-    كمان (يتعافى). الإكمال المحلي **ما بيعملش** أي POST خارجي (at-most-once محفوظ).
+    1) نسجّل المتابعة/الحالة (idempotent)، 2) نبعت الإشعار عبر
+    `safe_send_checked_message`، 3) لو الإرسال نجح **بس** نشيل العمل المعلّق،
+    4) نجدول حذف رسائل المالك الأصلية ثم رسالة التأكيد بعد التأخيرين. لو الإرسال فشل
+    (TelegramError)، بنسيب العمل المعلّق ⇒ تعافٍ لاحق. فشل خطوة التسجيل (1) بيطلع
+    استثناء ويسيب العمل المعلّق كمان (يتعافى). الإكمال المحلي **ما بيعملش** أي POST
+    خارجي (at-most-once محفوظ).
     """
     # OHB2-C7: حرس عدم الإحياء — لو الشات اتحذف محليًا (صف الإكمال اتشال في نفس معاملة
     # الحذف)، ما نعيدش إنشاء المتابعة ولا نبعت إشعار لشات ملغي. الفحص + الكتابة في نفس
@@ -179,10 +283,40 @@ async def _complete_outbox(db, bot, item, base_url: str = "") -> None:
     db.add_watched(item.conversation_id, item.title or "", item.chat_id)
     db.set_last_state(item.conversation_id, item.last_state or "")
     db.mark_submitted(item.conversation_id, item.submitted_at or now_iso())
+    # لا نعلن «اتضاف للمتابعة» إلا بعد التحقق الفعلي من تسجيل المتابعة.
+    if not db.is_watched(item.conversation_id):
+        log.warning("إكمال %s: المتابعة لم تُسجَّل — لن نعلن النجاح", item.ref_id)
+        return
     notice = item.notice_text or _OUTBOX_SENT_NOTICE
-    delivered = await safe_send_checked(bot, item.chat_id, notice)
+    delivered, confirmation = await safe_send_checked_message(bot, item.chat_id, notice)
     if delivered:
         db.clear_completion_pending(COMPLETION_KIND_OUTBOX, item.ref_id)
+        # التنظيف يبدأ فقط الآن: بعد تأكيد POST + تسجيل المتابعة + إرسال التأكيد.
+        try:
+            outbox_item = db.get_outbox(item.ref_id)
+            original_ids = (
+                outbox_item.telegram_message_ids if outbox_item is not None else ()
+            )
+            confirmation_id = getattr(confirmation, "message_id", None)
+            if not isinstance(confirmation_id, int) or isinstance(confirmation_id, bool):
+                confirmation_id = None
+            if original_ids and confirmation_id is None:
+                log.warning(
+                    "إكمال %s: اتأكد التسليم لكن معرّف رسالة التأكيد غير متاح — "
+                    "حذف التأكيد غير مضمون", item.ref_id,
+                )
+            schedule_delivery_cleanup(
+                bot,
+                item.chat_id,
+                original_ids,
+                confirmation_id,
+                key=item.ref_id,
+            )
+        except Exception as exc:  # noqa: BLE001 — فشل الجدولة لا يغيّر نجاح التسليم
+            log.warning(
+                "تعذّر جدولة حذف رسائل التسليم للسجل %s (%s)",
+                item.ref_id, type(exc).__name__,
+            )
 
 
 async def _complete_creation(db, bot, item, base_url: str = "") -> None:
@@ -257,6 +391,39 @@ def _tombstoned(db, conversation_id: str) -> bool:
             conversation_id,
         )
         return True
+
+
+def _is_selected_target(db, chat_id: int, conversation_id: str) -> bool:
+    """هل الشات هو الهدف المحفوظ؟ فشل القراءة ⇒ False (ما نصنّفش حذفًا بلا دليل)."""
+    try:
+        return db.get_last_accessed_conversation(chat_id) == conversation_id
+    except Exception as exc:  # noqa: BLE001 — غياب الدليل لا يساوي حذفًا
+        log.warning(
+            "تعذّر قراءة هدف التوجيه المحفوظ %s (%s)",
+            conversation_id,
+            type(exc).__name__,
+        )
+        return False
+
+
+def _clear_unavailable_selection(db, chat_id: int, conversation_id: str) -> None:
+    """يمسح هدف التوجيه **فقط** لو هو نفسه الشات المؤكّد غير المتاح.
+
+    الشات/الـ chat_id هنا مالك خاص (outbox owner)، ومسح هدف آخر ممنوع. أي فشل في
+    المسح لا يغيّر نتيجة التسليم ولا يخفي الخطأ الأصلي؛ مجرد تحذير.
+    """
+    try:
+        if db.get_last_accessed_conversation(chat_id) == conversation_id:
+            db.clear_last_accessed_conversation(chat_id)
+        awaiting_target, _kind = db.get_awaiting(chat_id)
+        if awaiting_target == conversation_id:
+            db.clear_awaiting(chat_id)
+    except Exception as exc:  # noqa: BLE001 — مسح اختياري لا يغيّر حكم التسليم
+        log.warning(
+            "تعذّر مسح هدف التوجيه غير المتاح %s (%s)",
+            conversation_id,
+            type(exc).__name__,
+        )
 
 
 async def _recover_pre_cas_unexpected(db, bot, item, exc: BaseException) -> None:
@@ -358,6 +525,18 @@ async def _post_claimed(client, db, bot, item) -> None:
             return
 
         conv = await get_conversation(client, conversation_id)
+        if not conv and _is_selected_target(db, chat_id, conversation_id):
+            # استعلام الشاتات رجّع لا شيء للهدف المحفوظ ⇒ الهدف المؤكّد غير موجود.
+            # لا fallback ولا POST. لو مفيش هدف محفوظ، نسيب مسار sandbox/retry القديم
+            # زي ما هو (الغياب هنا قد يكون سباق/فشل قراءة، ومش دليلًا على حذف).
+            db.set_outbox_status_if_in(
+                outbox_id, OUTBOX_FAILED, now_iso(), {OUTBOX_CLAIMED},
+                "الشات المحدد غير موجود",
+            )
+            _clear_unavailable_selection(db, chat_id, conversation_id)
+            if not _tombstoned(db, conversation_id):
+                await safe_send(bot, chat_id, _TARGET_UNAVAILABLE_NOTICE)
+            return
         sandbox_id = conv.get("sandbox_id")
         status = str(conv.get("sandbox_status", "")).upper()
 
@@ -417,6 +596,17 @@ async def _post_claimed(client, db, bot, item) -> None:
             log.info("تخطّي الإرسال: السجل %s مش مملوك (اتشطب/اتغيّر قبل الـ POST)", outbox_id)
             return
     except ApiError as exc:
+        # 404/410 قبل الـ POST للهدف المحفوظ = غير موجود/اتحذف (مؤكّد، مش عابر).
+        # لو الهدف مش محفوظ، نرجع لسياسة retry القديمة بدل تصنيف حذف بلا دليل.
+        if exc.status_code in (404, 410) and _is_selected_target(db, chat_id, conversation_id):
+            db.set_outbox_status_if_in(
+                outbox_id, OUTBOX_FAILED, now_iso(), {OUTBOX_CLAIMED},
+                f"HTTP {exc.status_code}",
+            )
+            _clear_unavailable_selection(db, chat_id, conversation_id)
+            if not _tombstoned(db, conversation_id):
+                await safe_send(bot, chat_id, _TARGET_UNAVAILABLE_NOTICE)
+            return
         # فشل قبل الـ POST (قراءة الشات / تشغيل الـ sandbox): الإرسال مابدأش ⇒ آمن يتعاود،
         # بس بحد (TASK 53): أول محاولة بتبلّغ (مؤقّت)، وبعد استنفاد الحد نعلّمه 'failed'
         # مرة واحدة. بنزوّد attempts بس لو لسه مملوك (claimed) — عشان ما نحييش سجل اتشطب.
@@ -466,7 +656,16 @@ async def _post_claimed(client, db, bot, item) -> None:
     except ApiError as exc:
         # رفض مؤكد (4xx) ⇒ 'failed'؛ غير كده (شبكة/مهلة/5xx/429) ⇒ 'unknown' — مش إعادة
         # تلقائية. CAS من 'sending' بس: لو حالة أحدث (نهائية) حسمت السجل، ما نلخبطهاش.
-        if is_permanent(exc):
+        if exc.status_code in (404, 410) and _is_selected_target(db, chat_id, conversation_id):
+            # 404/410 بعد CAS للهدف المحفوظ = الخدمة أكّدت إنه غير موجود/اتحذف؛ لا fallback.
+            db.set_outbox_status_if_in(
+                outbox_id, OUTBOX_FAILED, now_iso(), {OUTBOX_SENDING},
+                f"HTTP {exc.status_code}",
+            )
+            _clear_unavailable_selection(db, chat_id, conversation_id)
+            if not _tombstoned(db, conversation_id):
+                await safe_send(bot, chat_id, _TARGET_UNAVAILABLE_NOTICE)
+        elif is_permanent(exc):
             db.set_outbox_status_if_in(
                 outbox_id, OUTBOX_FAILED, now_iso(), {OUTBOX_SENDING},
                 f"HTTP {exc.status_code}",

@@ -12,6 +12,10 @@
 >
 > If the owner later accepts, that acceptance **does not authorize** Git publication (commit, push, PR,
 > merge), deployment, release, Autopush activation, or any WP-06 Part 2 implementation.
+>
+> **Post-decision update — 2026-11-22:** NAV-01..06 were explicitly accepted by the owner under
+> `D-A′` **Option A**. This proposal remains the historical pre-decision document; current status is
+> recorded in `.agent/PROGRESS.md` (`OHB2-WP07-NAV-OWNER-ACCEPTANCE-RECORD`) and the reconciliation §10.
 
 ---
 
@@ -30,7 +34,7 @@
 >
 > | Sub-defect | Scope | Status as of 2026-11-21 |
 > |---|---|---|
-> | **`DEF-011-B`** — filesystem offload off the event loop | `WP-07` | **IMPLEMENTED.** `bot/attachments.py` contains **five** `to_thread` occurrences (module import, one docstring reference, and three `anyio.to_thread.run_sync` call sites); `bot/handlers.py` offloads `_read_local_capped`. |
+> | **`DEF-011-B`** — filesystem offload off the event loop | `WP-07` | **IMPLEMENTED.** `bot/attachments.py` contains **six** `to_thread` occurrences (module import, one docstring reference, and four `anyio.to_thread.run_sync` call sites); `bot/handlers.py` offloads `_read_local_capped`. |
 > | **`DEF-011-A`** — cross-download quota reservation ledger | `WP-07` | **NOT IMPLEMENTED.** No reservation/in-flight byte accounting exists. Blocked by `D-12` / `OD-04`. |
 > | **`DEF-011-C`** — attachment acceptance UX copy | `WP-01` | **NOT IMPLEMENTED.** Blocked on `OD-01` / `OD-03`. |
 >

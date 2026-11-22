@@ -79,6 +79,7 @@ import logging
 import time
 import unicodedata
 import functools
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -89,13 +90,16 @@ from anyio import to_thread
 
 from . import files
 from .db import (
+    ATTACHMENT_BATCH_CANCELLED,
     ATTACHMENT_BATCH_EXPIRED,
     ATTACHMENT_BATCH_PENDING,
+    ATTACHMENT_BATCH_REAPABLE_STATUSES,
     ATTACHMENT_BATCH_STATUSES,
     ATTACHMENT_BATCH_TTL,
     ATTACHMENT_ITEM_REAPED,
     ATTACHMENT_ITEM_STORED,
     AttachmentBatch,
+    AttachmentBatchStateChanged,
 )
 
 log = logging.getLogger(__name__)
@@ -524,10 +528,31 @@ class StagingStore:
         # على **نفس** النموذج المتسلسل (مفيش تزامن جديد، مفيش سجل حجز حصص — D-12 كما هي).
         # `anyio.Lock` (مش قفل الحلقة القياسي) عشان ما نوسّعش اعتماديات الوحدة.
         self._accept_lock = anyio.Lock()
+        # OHB2-WP01 Stage 1: المسار المتزامن `store()` لا يمرّ بـ`_accept_lock` (anyio
+        # lock لا يُكتسب متزامنًا). القفل ده يحمي نافذة prepare/write/finalize المتزامنة،
+        # والـ`cancellation_guard` بيستناه من خيط عامل ثم يستنى `_accept_lock` كذلك.
+        self._sync_lock = threading.Lock()
 
     @property
     def root(self) -> Path:
         return self._root
+
+    @asynccontextmanager
+    async def cancellation_guard(self):
+        """OHB2-WP01 Stage 1: يحمي نافذة الكتابة ضد الإلغاء في المسارين.
+
+        - `store_async` محمي بـ`_accept_lock`؛
+        - `store()` المتزامن محمي بـ`_sync_lock`؛
+        - الإلغاء يستنى الاتنين قبل ما ينفّذ `pending → cancelled`، فلا يمكن أن
+          يتحول batch إلى `cancelled` بين prepare وكتابة/وسم نفس العملية.
+        """
+        with anyio.CancelScope(shield=True):
+            await to_thread.run_sync(self._sync_lock.acquire)
+        try:
+            async with self._accept_lock:
+                yield
+        finally:
+            self._sync_lock.release()
 
     @property
     def max_bytes(self) -> int:
@@ -681,6 +706,11 @@ class StagingStore:
         except Exception as exc:  # noqa: BLE001 — فشل قاعدة ⇒ رفض مغلق
             return StageResult(StageStatus.DB_FAILED, item_id=item_id, error=type(exc).__name__)
         if batch is None or not files.is_valid_conversation_id(batch.conversation_id):
+            return StageResult(StageStatus.REJECTED_BATCH, item_id=item_id)
+        # OHB2-WP01 N1: storage is allowed only for a pending parent. Cancellation,
+        # expiry, intent, terminal, unknown, and malformed states must fail closed
+        # before item insertion or any byte write.
+        if batch.status != ATTACHMENT_BATCH_PENDING:
             return StageResult(StageStatus.REJECTED_BATCH, item_id=item_id)
 
         # (0b) الحجم المُعلَن (metadata) قبل أي استخدام للقرص.
@@ -858,25 +888,27 @@ class StagingStore:
         لو اتحدّد بيُستخدم بدل توليد توكن جديد (عشان الصف الدائم يشير لبايتاته — F-1).
 
         **مسار متزامن (سلوك تاريخي محفوظ حرفيًّا).** في الإنتاج بيُستدعى عبر
-        `store_async` اللي بينقل الكتابة لخيط عامل.
+        `store_async` اللي بينقل الكتابة لخيط عامل. المسار ده محمي بـ`_sync_lock`
+        ضد الإلغاء (Stage 1)؛ نفس فحص حالة الدفعة في `_store_prepare` مطبّق هنا كذلك.
         """
-        prep = self._store_prepare(
-            telegram_id=telegram_id, batch_id=batch_id, item_id=item_id,
-            display_name=display_name, declared_size=declared_size,
-            row_created=row_created, staging_token=staging_token,
-        )
-        if isinstance(prep, StageResult):
-            return prep
-        path, token, cap = prep
-        wrote = self._store_write(
-            path=path, chunks=chunks, cap=cap, item_id=item_id, token=token
-        )
-        if isinstance(wrote, StageResult):
-            return wrote
-        written, head = wrote
-        return self._store_finalize(
-            item_id=item_id, path=path, token=token, cap=cap, written=written, head=head
-        )
+        with self._sync_lock:
+            prep = self._store_prepare(
+                telegram_id=telegram_id, batch_id=batch_id, item_id=item_id,
+                display_name=display_name, declared_size=declared_size,
+                row_created=row_created, staging_token=staging_token,
+            )
+            if isinstance(prep, StageResult):
+                return prep
+            path, token, cap = prep
+            wrote = self._store_write(
+                path=path, chunks=chunks, cap=cap, item_id=item_id, token=token
+            )
+            if isinstance(wrote, StageResult):
+                return wrote
+            written, head = wrote
+            return self._store_finalize(
+                item_id=item_id, path=path, token=token, cap=cap, written=written, head=head
+            )
 
     async def store_async(
         self,
@@ -1081,38 +1113,57 @@ class AttachmentService:
         )
 
         # (3b) R4: الدفعة المنتهية **ترفض الملف** (مايتضمّنش)، والملف **يبدأ دفعة جديدة**.
-        #     بنوسم القديمة `expired` (بلا لمس `t0`) قبل إنشاء الجديدة.
+        #     بنوسم القديمة `expired` (بلا لمس `t0`) قبل إنشاء الجديدة. OHB2-WP01 Stage 1:
+        #     الانتقال شرطي؛ لو الإلغاء/النيّة/حالة أخرى سبقت، لا نكتب فوقها. حالة
+        #     `expired` من سباق سابق تعني أن دفعة جديدة ما زالت مسموحة؛ أي حالة أخرى
+        #     (خصوصاً `cancelled`) ترفض هذا الملف fail-closed بلا دفعة/ملف جديد.
         if acceptance.decision is BatchDecision.EXPIRED and acceptance.batch is not None:
-            self._db.mark_attachment_batch_status(
-                acceptance.batch.batch_id, ATTACHMENT_BATCH_EXPIRED, now=now_iso
+            changed = self._db.try_transition_attachment_batch_status(
+                acceptance.batch.batch_id,
+                expected_status=ATTACHMENT_BATCH_PENDING,
+                new_status=ATTACHMENT_BATCH_EXPIRED,
+                now=now_iso,
             )
+            if not changed:
+                current = self._db.get_attachment_batch(
+                    acceptance.batch.batch_id, telegram_id=int(telegram_id)
+                )
+                if current is None or current.status != ATTACHMENT_BATCH_EXPIRED:
+                    return AcceptResult(
+                        AcceptOutcome.REJECTED, stage=StageStatus.REJECTED_BATCH
+                    )
             acceptance = BatchAcceptance(BatchDecision.NEW, None)
 
         # (4) كتابة النية الدائمة (صف عنصر pending) + النتيجة، ذرّيًّا (row-first).
         #     تحديث مكرّر (`update_id` مسجّل قبل كده) ⇒ الكتابة ترجّع None ⇒ **مفيش عنصر
         #     جديد** ⇒ نرجع `DUPLICATE` **قبل** أي تنزيل/كتابة بايتات، وما نصنعش معرّف
         #     عنصر مُفبرَك (F-4). النتيجة الدائمة (duplicate_completed) اتكتبت ذرّيًّا جوّه.
-        if acceptance.decision is BatchDecision.APPEND and acceptance.batch is not None:
-            batch_id = self._db.accept_attachment_item(
-                acceptance.batch,
-                item_id=item_id,
-                display_name=safe_name,
-                now=now_iso,
-                update_id=update_id,
-                staging_token=staging_token,
-            )
-        else:
-            batch_id = self._db.accept_attachment_item_into_new_batch(
-                telegram_id=int(telegram_id),
-                conversation_id=conversation_id,
-                batch_id=new_batch_id(),
-                item_id=item_id,
-                t0=now_iso,
-                display_name=safe_name,
-                now=now_iso,
-                update_id=update_id,
-                staging_token=staging_token,
-            )
+        try:
+            if acceptance.decision is BatchDecision.APPEND and acceptance.batch is not None:
+                batch_id = self._db.accept_attachment_item(
+                    acceptance.batch,
+                    item_id=item_id,
+                    display_name=safe_name,
+                    now=now_iso,
+                    update_id=update_id,
+                    staging_token=staging_token,
+                )
+            else:
+                batch_id = self._db.accept_attachment_item_into_new_batch(
+                    telegram_id=int(telegram_id),
+                    conversation_id=conversation_id,
+                    batch_id=new_batch_id(),
+                    item_id=item_id,
+                    t0=now_iso,
+                    display_name=safe_name,
+                    now=now_iso,
+                    update_id=update_id,
+                    staging_token=staging_token,
+                )
+        except AttachmentBatchStateChanged:
+            # Lost a race after classification (cancelled/expired/intent). No item was
+            # inserted; do not create a new batch or download bytes for this file.
+            return AcceptResult(AcceptOutcome.REJECTED, stage=StageStatus.REJECTED_BATCH)
         if batch_id is None:
             return AcceptResult(AcceptOutcome.DUPLICATE)
 
@@ -1146,6 +1197,25 @@ class AttachmentService:
         return AcceptResult(
             AcceptOutcome.ACCEPTED, batch_id=batch_id, item_id=item_id, stage=stage.status
         )
+
+    async def cancel_pending_batch(
+        self,
+        *,
+        telegram_id: int,
+        batch_id: str,
+        now: str,
+        update_id: int | None = None,
+    ) -> str:
+        """OHB2-WP01 Stage 1: يلغي دفعة `pending` واحدة بعد انتظار نافذة الكتابة.
+
+        `cancellation_guard` يستنى `store_async` (`_accept_lock`) و`store()` المتزامن
+        (`_sync_lock`) قبل تنفيذ CAS؛ وبذلك لا يمكن أن تُلغى دفعة بين prepare وكتابة
+        لعملية قبول بدأت بالفعل. لا يمسح route ولا يلمس أي ملف/صف.
+        """
+        async with self._store.cancellation_guard():
+            return self._db.cancel_pending_attachment_batch(
+                telegram_id, batch_id, now=now, update_id=update_id
+            )
 
 
 # =========================================================== OHB2-P0-A4: الكنس/الانتهاء
@@ -1240,14 +1310,12 @@ class AttachmentReaper:
     """
 
     # حالات دفعة تسمح بالكنس **بس** مع قرار نهائي مؤكَّد (نهائية) أو انتهاء مؤكَّد.
-    _TERMINAL = frozenset(
-        {
-            "delivered",
-            "expired",
-            "rejected",
-            "failed",
-        }
-    )
+    # OHB2-WP01 Stage 1: `cancelled` **ممنوع** تُضاف هنا؛ هي غير نهائية وغير قابلة للكنس.
+    # OHB2-WP01 N2: the DB reaping guard imports the same set, so caller and
+    # authoritative DB operation cannot drift.
+    _TERMINAL = ATTACHMENT_BATCH_REAPABLE_STATUSES
+    # Stage 1: تُرصد وتُترك دائماً — حتى لو وصلت بالخطأ من مسار اختيار مستقبلي.
+    _NON_REAPABLE = frozenset({ATTACHMENT_BATCH_CANCELLED})
 
     def __init__(
         self, db, db_path=None, *, batch_ttl: timedelta = ATTACHMENT_BATCH_TTL, store=None
@@ -1357,6 +1425,16 @@ class AttachmentReaper:
             log.warning("A4 sweep: تعذّر جلب الدفعات غير المحسومة (%s)", type(exc).__name__)
             report["errors"] += 1
 
+        # (0d) OHB2-WP01 Stage 1: الملغاة **غير قابلة للكنس** — تُرصد وتُترك، ولا تدخل
+        #      `_plan_batch` ولا أي مسار حذف. لو ظهرت من اختيار مستقبلي، `_plan_batch`
+        #      يحرسها مرة أخرى.
+        try:
+            for _b in self._db.list_attachment_batches_by_status(ATTACHMENT_BATCH_CANCELLED):
+                report["skipped"] += 1
+        except Exception as exc:  # noqa: BLE001
+            log.warning("A4 sweep: تعذّر جلب الدفعات الملغاة (%s)", type(exc).__name__)
+            report["errors"] += 1
+
         # (1) الدفعات المنتهية: pending فاتت مهلة T0 الثابتة ⇒ وسم `expired` (DB-أولًا).
         try:
             expired = self._db.list_expired_pending_attachment_batches(now_iso=now_iso)
@@ -1460,12 +1538,36 @@ class AttachmentReaper:
     def _mark_expired(
         self, batch: AttachmentBatch, now_iso: str, report: dict
     ) -> None:
-        """يوسم الدفعة المنتهية `expired` (DB-أولًا). الكنس الفعلي يتولّاه المرور على
-        الدفعات النهائية (خطوة 2) بنفس الدورة ⇒ مفيش كنس مزدوج."""
+        """يوسم الدفعة المنتهية `expired` (DB-أولًا) عبر CAS.
+
+        OHB2-WP01 Stage 1: لا يكتب فوق `cancelled`/`intent_recorded`/أي حالة غير
+        `pending`. لو خسر السباق، يعيد قراءة الحالة ويسجّل skip بلا أي تخطيط حذف.
+        الكنس الفعلي يتولّاه المرور على الدفعات النهائية (خطوة 2) بنفس الدورة.
+        """
         try:
-            self._db.mark_attachment_batch_status(
-                batch.batch_id, ATTACHMENT_BATCH_EXPIRED, now=now_iso
+            changed = self._db.try_transition_attachment_batch_status(
+                batch.batch_id,
+                expected_status=ATTACHMENT_BATCH_PENDING,
+                new_status=ATTACHMENT_BATCH_EXPIRED,
+                now=now_iso,
             )
+            if changed:
+                return
+            try:
+                current = self._db.get_attachment_batch(batch.batch_id)
+                state = current.status if current is not None else "missing"
+            except Exception as exc:  # noqa: BLE001 — تعذّر القراءة بعد CAS فاشل
+                log.warning(
+                    "A4 sweep: تعذّر قراءة حالة الدفعة %s بعد CAS فاشل (%s)",
+                    batch.batch_id, type(exc).__name__,
+                )
+                report["errors"] += 1
+                return
+            log.info(
+                "A4 sweep: تخطّي انتهاء الدفعة %s — الحالة الحالية %s (سباق آمن)",
+                batch.batch_id, state,
+            )
+            report["skipped"] += 1
         except Exception as exc:  # noqa: BLE001 — فشل قاعدة ⇒ خطأ (يُعاد)
             log.warning(
                 "A4 sweep: تعذّر وسم الدفعة %s كمنتهية (%s)",
@@ -1477,6 +1579,13 @@ class AttachmentReaper:
         self, batch: AttachmentBatch, known_tokens: set[str], plan: SweepPlan
     ) -> None:
         """قرار القاعدة لدفعة نهائية (**بلا قرص** — F-01). بيضيف `BatchPlan` أو نتيجة فورية."""
+        # Stage 1: حارس مزدوج — `cancelled` ممنوعة حتى لو وصلت من اختيار مستقبلي.
+        if batch.status in self._NON_REAPABLE:
+            plan.immediate.append(
+                BatchSweepResult(batch.batch_id, SweepOutcome.SKIPPED, batch.status,
+                                 reason="cancelled_non_reapable")
+            )
+            return
         # قرار مؤهّل: نهائي **و** `t0` صالح. غير ذلك ⇒ تُترك (بلا تخمين).
         if batch.status not in self._TERMINAL:
             plan.immediate.append(

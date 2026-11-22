@@ -9,6 +9,12 @@
 > **[FACT]** executed/measured in this task · **[HIST]** inherited from a prior report ·
 > **[ASSUME]** stated assumption, not verified · **[REC]** recommendation.
 
+> **Post-decision update — 2026-11-22:** NAV-01..06 were explicitly accepted by the owner under
+> `D-A′` **Option A**. The historical NAV-unaccepted statements below remain as the pre-decision
+> audit record and are superseded for current status by `.agent/PROGRESS.md`
+> (`OHB2-WP07-NAV-OWNER-ACCEPTANCE-RECORD`) and the reconciliation document §10. WP-07 and
+> NEW-DEF-03 remain open.
+
 ---
 
 ## 1. Repository baseline [FACT]

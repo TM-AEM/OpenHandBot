@@ -229,7 +229,10 @@ def test_expired_attachment_absent_from_list(tmp_path):
 
 def test_reaped_item_is_not_downloadable(tmp_path):
     tc, db, *_ = build(tmp_path)
-    assert db.mark_attachment_item_reaped("i1") is True
+    # Simulate a legacy/reaped row directly: the authoritative reaping guard now
+    # refuses a pending parent, so this endpoint test must not create that state
+    # through mark_attachment_item_reaped().
+    assert db.set_attachment_item_status("i1", "reaped") is True
     login(tc)
     r = tc.get(dl_url())
     assert r.status_code == 404 and r.json()["error"] == "not_found"

@@ -5,6 +5,10 @@
   و`docs/OPERATIONS_RUNBOOK.md`.
 - جداول SQLite اللي بيعملها `bot/db.py::_init_schema` مقابل ما بتذكره الوثائق.
 
+Ownership: this module is the canonical WP-08 documentation/env/schema parity guard.
+`tests/test_deploy_manifest.py` and `tests/test_zero_touch_contract.py` own runtime/deploy
+contracts; they do not duplicate these documentation-parity assertions.
+
 قراءة ملفات المستودع فقط؛ مفيش شبكة ولا قاعدة حقيقية (نستخرج أسماء الجداول من نص
 `_init_schema` عبر `sqlite3` في الذاكرة بدون تشغيل منطق التطبيق).
 """
@@ -51,6 +55,29 @@ def _schema_tables() -> set[str]:
     return {r[0] for r in rows}
 
 
+def _doc_section(text: str, start: str, end: str) -> str:
+    begin = text.index(start)
+    return text[begin : text.index(end, begin)]
+
+
+def _runbook_env_names() -> set[str]:
+    section = _doc_section(RUNBOOK, "## 3)", "## 4)")
+    return set(re.findall(r"^\|\s*`([A-Z_]+)`\s*\|", section, re.M))
+
+
+def _readme_env_names() -> set[str]:
+    section = _doc_section(README, "متغيرات البيئة المطلوبة:", "## الاختبار")
+    return set(re.findall(r"^\|\s*`([A-Z_]+)`\s*\|", section, re.M))
+
+
+def _runbook_schema_inventory() -> tuple[int, list[str]]:
+    """عدد الجداول وأسماؤها من قائمة §4 فقط، وليس من أي ذكر آخر في الوثيقة."""
+    section = _doc_section(RUNBOOK, "## 4)", "## 5)")
+    match = re.search(r"\*\*(\d+)\*\*\s+جدول\):\s*\n(.*?)\n\s*\(\+", section, re.S)
+    assert match, "مش لاقي قائمة جداول §4 في OPERATIONS_RUNBOOK"
+    return int(match.group(1)), re.findall(r"`([a-z_]+)`", match.group(2))
+
+
 def test_env_example_covers_every_config_variable():
     config_names = _config_env_names()
     example_names = _env_example_names()
@@ -68,26 +95,47 @@ def test_config_has_no_env_var_absent_from_config_sources():
 
 def test_readme_documents_every_config_variable():
     config_names = _config_env_names()
-    missing = [n for n in config_names if f"`{n}`" not in README]
-    assert not missing, f"README ناقص متغيّرات: {sorted(missing)}"
+    readme_names = _readme_env_names()
+    missing = config_names - readme_names
+    unexpected = readme_names - config_names
+    assert not missing and not unexpected, (
+        f"README متغيّرات ناقصة: {sorted(missing)}؛ "
+        f"متغيّرات غير معرّفة في config.py: {sorted(unexpected)}"
+    )
 
 
 def test_runbook_documents_every_config_variable():
     config_names = _config_env_names()
-    missing = [n for n in config_names if f"`{n}`" not in RUNBOOK]
-    assert not missing, f"OPERATIONS_RUNBOOK ناقص متغيّرات: {sorted(missing)}"
+    runbook_names = _runbook_env_names()
+    missing = config_names - runbook_names
+    unexpected = runbook_names - config_names
+    assert not missing and not unexpected, (
+        f"OPERATIONS_RUNBOOK §3 متغيّرات ناقصة: {sorted(missing)}؛ "
+        f"متغيّرات غير معرّفة في config.py: {sorted(unexpected)}"
+    )
 
 
 def test_runbook_documents_every_schema_table():
+    _, documented = _runbook_schema_inventory()
     tables = _schema_tables()
-    missing = [t for t in tables if f"`{t}`" not in RUNBOOK]
-    assert not missing, f"OPERATIONS_RUNBOOK ناقص جداول: {sorted(missing)}"
+    missing = tables - set(documented)
+    unexpected = set(documented) - tables
+    duplicates = len(documented) - len(set(documented))
+    assert not missing and not unexpected and duplicates == 0, (
+        f"OPERATIONS_RUNBOOK §4 جداول ناقصة: {sorted(missing)}؛ "
+        f"جداول غير موجودة في المخطط: {sorted(unexpected)}؛ "
+        f"تكرارات: {duplicates}"
+    )
 
 
 def test_runbook_table_count_matches_schema():
+    documented_count, documented = _runbook_schema_inventory()
     tables = _schema_tables()
-    assert f"**{len(tables)}** جدول" in RUNBOOK, (
-        f"RUNBOOK لازم يذكر عدد الجداول الصحيح ({len(tables)})"
+    assert documented_count == len(tables), (
+        f"RUNBOOK يذكر {documented_count} جدولًا، والمخطط فيه {len(tables)}"
+    )
+    assert len(documented) == len(tables) and set(documented) == tables, (
+        "قائمة جداول §4 وعددها لازم يطابقا المخطط معًا"
     )
 
 
@@ -197,11 +245,11 @@ def test_t1_correction_notice_matches_actual_implementation_state():
         "DEF-011-B مفترض يكون فيه استدعاء to_thread.run_sync فعلي"
     )
 
-    # الإشعار بيقول "خمسة" occurrences — لازم يطابق العدد الفعلي في الكود.
-    assert ATTACHMENTS_SRC.count("to_thread") == 5, (
+    # الإشعار بيقول "ستة" occurrences — لازم يطابق العدد الفعلي في الكود.
+    assert ATTACHMENTS_SRC.count("to_thread") == 6, (
         "عدد to_thread في attachments.py اتغيّر؛ الإشعار لازم يتحدّث مع الكود"
     )
-    assert "five" in notice and "to_thread" in notice, (
+    assert "six" in notice and "to_thread" in notice, (
         "الإشعار لازم يذكر عدد to_thread المطابق للكود"
     )
 
@@ -295,8 +343,8 @@ def test_t4_both_notices_share_date_status_and_scope_language():
     assert "NOT implemented" in report_notice or "NOT IMPLEMENTED" in report_notice, (
         "تقرير التثبيت لازم يوضّح إن A/C لسه NOT implemented"
     )
-    assert "five" in proposal_notice and "five" in report_notice, (
-        "الوثيقتين لازم يذكروا نفس العدد (خمسة) لـ to_thread"
+    assert "six" in proposal_notice and "six" in report_notice, (
+        "الوثيقتين لازم يذكروا نفس العدد (ستة) لـ to_thread"
     )
 
 

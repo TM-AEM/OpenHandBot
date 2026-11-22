@@ -1,6 +1,10 @@
-"""U04: استهلاك حالة التوجيه مرة واحدة، تأكيد الحفظ سريع، والتزامن مفعّل."""
+"""U04: استهلاك حالة التوجيه مرة واحدة، تأكيد الحفظ سريع، والتزامن التسلسلي."""
 import asyncio
 import time
+
+import pytest
+from telegram import Update
+from telegram.ext import TypeHandler
 
 import bot.handlers as h
 from bot.app import build_application
@@ -9,6 +13,7 @@ from bot.db import Database
 from bot import outbox
 
 from tests.test_handlers import make_context, make_update
+from tests.test_stage2_custom_polling import _with_started_app
 
 
 def test_take_awaiting_consumes_once(tmp_path):
@@ -95,7 +100,7 @@ def test_ack_means_durably_saved(tmp_path):
     assert seen["count"] == 1
 
 
-def test_application_enables_concurrent_updates(tmp_path):
+def test_application_requires_sequential_updates(tmp_path):
     config = Config(
         telegram_bot_token="123456:ABC-test-token",
         openhands_api_key="k",
@@ -104,7 +109,97 @@ def test_application_enables_concurrent_updates(tmp_path):
         db_path=str(tmp_path / "t.sqlite3"),
     )
     app = build_application(config)
-    assert app.concurrent_updates
+    try:
+        # PTB 22.8: concurrent_updates(False) ⇒ max_concurrent_updates == 1.
+        # A truthiness check would also pass for True (256) and must not be used.
+        assert app.concurrent_updates == 1
+        assert app._update_processor.max_concurrent_updates == 1
+    finally:
+        app.bot_data["db"].close()
+
+
+def test_queue_producers_are_serialized(tmp_path, monkeypatch):
+    """Two concurrent queue producers cannot overlap handler execution.
+
+    This exercises the real PTB update_queue/fetcher path, not direct
+    Application.process_update() calls (which bypass the update processor).
+    """
+    async def run(app, install_bot):
+        events = []
+        started = []
+        active = {"n": 0, "max": 0}
+        first_started = asyncio.Event()
+        second_started = asyncio.Event()
+        release_first = asyncio.Event()
+
+        async def record(update, context):
+            active["n"] += 1
+            active["max"] = max(active["max"], active["n"])
+            started.append(update.update_id)
+            events.append(("start", update.update_id))
+            if len(started) == 1:
+                first_started.set()
+                await release_first.wait()
+            else:
+                second_started.set()
+            events.append(("end", update.update_id))
+            active["n"] -= 1
+
+        app.add_handler(TypeHandler(Update, record), group=-2)
+        updates = [Update(update_id=101), Update(update_id=102)]
+
+        async def producer(update):
+            await app.update_queue.put(update)
+
+        try:
+            await asyncio.gather(*(producer(u) for u in updates))
+            await asyncio.wait_for(first_started.wait(), timeout=2)
+            try:
+                await asyncio.wait_for(second_started.wait(), timeout=0.05)
+            except asyncio.TimeoutError:
+                pass
+            else:
+                pytest.fail("second update started before the first completed")
+            assert len(started) == 1
+            assert active["max"] == 1
+            release_first.set()
+            await asyncio.wait_for(app.update_queue.join(), timeout=2)
+            assert len(started) == 2
+            assert [e[0] for e in events] == ["start", "end", "start", "end"]
+            assert active["max"] == 1
+            assert app.update_queue._unfinished_tasks == 0
+            assert app.update_queue.qsize() == 0
+        finally:
+            release_first.set()
+
+    asyncio.run(_with_started_app(tmp_path, monkeypatch, run))
+
+
+def test_queue_continues_after_handler_exception(tmp_path, monkeypatch):
+    async def run(app, install_bot):
+        seen = []
+        errors = []
+
+        async def record(update, context):
+            seen.append(update.update_id)
+            if update.update_id == 201:
+                raise RuntimeError("boom")
+
+        async def on_error(update, context):
+            errors.append((update.update_id, type(context.error).__name__))
+
+        app.add_handler(TypeHandler(Update, record), group=-2)
+        app.add_error_handler(on_error)
+        await app.update_queue.put(Update(update_id=201))
+        await app.update_queue.put(Update(update_id=202))
+        await asyncio.wait_for(app.update_queue.join(), timeout=2)
+
+        assert seen == [201, 202]
+        assert errors == [(201, "RuntimeError")]
+        assert app.update_queue._unfinished_tasks == 0
+        assert app.update_queue.qsize() == 0
+
+    asyncio.run(_with_started_app(tmp_path, monkeypatch, run))
 
 
 def test_successful_send_records_submission_time_for_watcher(tmp_path):

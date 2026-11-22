@@ -42,6 +42,7 @@ from bot.attachments import (
 )
 from bot.config import Config
 from bot.db import (
+    ATTACHMENT_ITEM_REAPED,
     ATTACHMENT_ITEM_STORED,
     Database,
 )
@@ -274,7 +275,9 @@ def test_reaped_item_releases_capacity(tmp_path):
     stored = [it for it in db.list_attachment_items("b1") if it.status == ATTACHMENT_ITEM_STORED]
     assert len(stored) == 1
     item = stored[0]
-    assert db.mark_attachment_item_reaped(item.item_id) is True
+    # The quota test only needs an already-reaped row; the authoritative reaping
+    # guard intentionally refuses a pending parent (OHB2-WP01 N2).
+    assert db.set_attachment_item_status(item.item_id, ATTACHMENT_ITEM_REAPED) is True
     os.unlink(str(store.root / item.staging_token))
 
     async def run2():

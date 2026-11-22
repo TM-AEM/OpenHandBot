@@ -1,6 +1,6 @@
 """OHB2-LIFE-03 — مفتاح إيقاف استقبال المستندات المحلي (محلي فقط، قابل للعكس).
 
-مفتاح **مستقلّ** `ATTACHMENT_DOCUMENT_INTAKE_ENABLED` (افتراضيًا مفعّل = سلوك محفوظ):
+مفتاح **مستقلّ** `ATTACHMENT_DOCUMENT_INTAKE_ENABLED` (افتراضيًا **معطّل** = opt-in صريح):
 - **معطّل** ⇒ `handle_attachment` يرفض **قبل** أي `get_file`/تنزيل/صف/ملف/نداء OpenHands/
   سجل outbox، مع رسالة صادقة (`ATTACHMENT_INTAKE_DISABLED_TEXT`)، والتحديث يُسجَّل
   `explicitly_ignored` (مؤهّل للإقرار، بلا حجب الحدّ).
@@ -124,9 +124,9 @@ def test_disabled_intake_no_download_helper_invoked(tmp_path, monkeypatch):
 
 
 # ============================================================================
-# 2) المفعّل (الافتراضي) ⇒ السلوك السابق محفوظ
+# 2) التفعيل الصريح (opt-in) ⇒ السلوك السابق محفوظ
 # ============================================================================
-def test_enabled_by_default_stores_document(tmp_path, monkeypatch):
+def test_explicit_enable_stores_document(tmp_path, monkeypatch):
     harness = _harness(tmp_path, monkeypatch)
     assert harness.app.bot_data["config"].attachment_document_intake_enabled is True
     harness.db.set_awaiting(OWNER_ID, CID, "route", title="A")
@@ -195,11 +195,11 @@ def _env(**kw):
     return base
 
 
-def test_config_default_enabled():
+def test_config_default_disabled():
     from bot.config import load_config
 
     cfg = load_config(_env())
-    assert cfg.attachment_document_intake_enabled is True
+    assert cfg.attachment_document_intake_enabled is False
 
 
 @pytest.mark.parametrize("raw,expected", [
@@ -236,4 +236,4 @@ def test_env_example_documents_flag():
 
     root = pathlib.Path(__file__).resolve().parents[1]
     text = (root / ".env.example").read_text(encoding="utf-8")
-    assert "ATTACHMENT_DOCUMENT_INTAKE_ENABLED=" in text
+    assert "ATTACHMENT_DOCUMENT_INTAKE_ENABLED=0" in text

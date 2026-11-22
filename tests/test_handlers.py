@@ -810,7 +810,7 @@ def test_open_shows_last_prompt_and_agent_reply(tmp_path):
     asyncio.run(h.open_conversation(_t55_cb_update(q), ctx))
     assert q.edits and "آخر برومت منك:" in q.edits[0] and "برومتي" in q.edits[0]
     assert "رد الـ agent:" in q.edits[0] and "ردي" in q.edits[0]
-    assert "10 دقايق" in q.edits[0]
+    assert "لحد ما تفتح/تختار شات تاني" in q.edits[0]
     assert ctx.bot_data["db"].get_awaiting(1) == ("A", "route")
 
 

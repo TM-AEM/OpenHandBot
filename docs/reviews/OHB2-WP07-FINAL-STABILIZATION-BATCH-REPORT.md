@@ -214,7 +214,7 @@ No separate reviewer session, no Docker, `provider-connections` empty, `:60000` 
 > **⚠ LATER CORRECTION — 2026-11-21 (append-only; the historical table below is unchanged).** Row 1
 > below ("`DEF-011` is entirely unimplemented", "no `asyncio.to_thread` in `attachments.py`") was
 > accurate on 2026-11-19 and is now **superseded for sub-defect B only**. **`DEF-011-B`** (filesystem
-> offload off the event loop) is **IMPLEMENTED** — `bot/attachments.py` now contains **five**
+> offload off the event loop) is **IMPLEMENTED** — `bot/attachments.py` now contains **six**
 > `to_thread` occurrences. **`DEF-011-A`** (quota reservation ledger) and **`DEF-011-C`** (attachment
 > UX copy) are **NOT implemented**, so **`DEF-011` remains open** — it is **not** fully implemented and
 > **not** closed. Row 1 is preserved unchanged as a historical record.

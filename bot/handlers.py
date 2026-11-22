@@ -165,6 +165,36 @@ async def _edit_or_send(query, text: str, chat_id: int, bot, **kwargs) -> bool:
         return False
 
 
+async def _display_conversation_view(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    *,
+    q=None,
+    reply_markup=None,
+) -> bool:
+    """يعرض عرض الشات في مسار الكولباك (تعديل) أو مسار الأمر (رسالة جديدة)."""
+    if q is not None:
+        return await _edit_or_send(
+            q, text, q.message.chat_id, context.bot, reply_markup=reply_markup
+        )
+    try:
+        await update.message.reply_text(
+            escape_html(text), parse_mode=ParseMode.HTML, reply_markup=reply_markup
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001 — فشل العرض يُبلَّغ، لا يُخفى
+        if "too long" in str(exc).lower():
+            try:
+                await send_long(update.effective_chat.id, text, context.bot)
+                return True
+            except Exception as send_exc:  # noqa: BLE001 — فشل الإرسال البديل = فشل عرض
+                log.warning("فشل إرسال العرض البديل (%s)", type(send_exc).__name__)
+                return False
+        log.warning("فشل عرض الشات (%s)", type(exc).__name__)
+        return False
+
+
 async def _safe_send_html(bot, chat_id: int, text: str) -> bool:
     """يرسل نصًّا (يُهرَّب) عبر `send_message` **بأمان**: يرجّع True لو اتبعت، False لو فشل التسليم.
 
@@ -901,11 +931,15 @@ MINI_APP_UNAVAILABLE = (
 
 HELP_TEXT = (
     "أنا بوت تحكمك في OpenHands Cloud. الأوامر المتاحة:\n"
+    "/chat — فتح آخر محادثة تم الوصول إليها\n"
     "/start — القائمة الرئيسية\n"
     "/app — فتح التطبيق المصغّر (Mini App)\n"
     "/help — هذه المساعدة\n"
     "/notifications — ضبط الإشعارات الاستباقية\n"
     "/cancel — إلغاء التوجيه الحالي\n"
+    "/attachments — حالة دفعات المرفقات\n"
+    "/attachments_clear — إخلاء دفعة expired/rejected صراحةً\n"
+    "/attachments_cancel — إلغاء دفعة pending واحدة (يتطلب confirm)\n"
     "\n"
     "صيانة الصندوق (للمالك):\n"
     "/outbox — السجلات المعلّقة\n"
@@ -931,6 +965,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         update.effective_user.id, _update_id(update), outbox.now_iso(),
         update_outcomes.EXPLICITLY_IGNORED,
     )
+    # /start إعادة ضبط عامة: يلغي إيقاف /cancel ويترك آخر شات محفوظًا للتوجيه الافتراضي.
+    context.bot_data["db"].resume_routing(update.effective_user.id)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1168,22 +1204,36 @@ async def list_conversations(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
-async def open_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    q = update.callback_query
-    await _safe_answer(q)
-    if not _allowed(update, context.bot_data["config"]):
-        # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
-        _authorization_ignored(update, context)
-        return
-    conversation_id = q.data.split(":", 1)[1]
+async def _open_conversation_view(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    conversation_id: str,
+    *,
+    q=None,
+) -> bool:
+    """يفتح شات موجود بنفس مسار العرض/التوجيه، للكولباك أو للأمر."""
     client = context.bot_data["client"]
     # OHB2-09-06: تفويض ملكية الشات أولًا (نفس عقد FileService)، بعدين نجيب آخر تبادل طازة.
     # (فتح الشات بيقرا طازة دايماً — مش من كاش copy/full.)
-    conv, status, message, auth_exc = await _authorized_conversation_status(client, context, conversation_id)
+    conv, status, message, auth_exc = await _authorized_conversation_status(
+        client, context, conversation_id
+    )
     if conv is None:
         # OHB2-SW-05: ناخد بالنا من نتيجة العرض؛ فشل عرض رسالة الرفض يتسجّل بدل ما يتخفي.
-        if not await _edit_or_send(q, message, q.message.chat_id, context.bot):
+        if not await _display_conversation_view(update, context, message, q=q):
             log.warning("تعذّر عرض رسالة رفض فتح الشات %s (فشل تسليم تيليجرام).", conversation_id)
+        # `/chat` فقط: الرفض النهائي (مش موجود/محذوف/غير مصرّح/4xx متوقّع) يمنع بقاء
+        # مؤشر آخر شات إلى هدف غير صالح. فشل upstream العابر (5xx/429/مهلة) لا يمسح المرجع.
+        terminal_rejection = status in (
+            FileStatus.NOT_FOUND,
+            FileStatus.DELETED,
+            FileStatus.UNAUTHORIZED,
+        ) or (
+            status is FileStatus.UPSTREAM_ERROR
+            and _is_expected_upstream_rejection(auth_exc)
+        )
+        if q is None and terminal_rejection:
+            context.bot_data["db"].clear_last_accessed_conversation(update.effective_user.id)
         # OHB2-SW-07: فشل upstream **تشغيلي** (5xx/429/مهلة/انقطاع) ينتشر بعد عرض الرسالة
         # بدل ما يتحوّل لإتمام ناجح. رفض 4xx المتوقّع (401/403/404/410) + الرفض المشتقّ
         # (NOT_FOUND/DELETED/UNAUTHORIZED) يرجّع عادي — ممنوع نحوّل الرفض المصرّح لفشل عابر.
@@ -1193,16 +1243,18 @@ async def open_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         # نتيجة صريحة مؤهّلة للإقرار، وإلا كان الحدّ يتوقف عنده للأبد (حجب fail-closed بلا
         # سبب). الفشل التشغيلي فوق **بيرفع** قبل السطر ده ⇒ مستحيل يتحوّل لتجاهل كاذب.
         mark_explicitly_ignored(update, context)
-        return
+        return False
     try:
         user_text, reply = await client.get_last_exchange(conversation_id)
     except ApiError as exc:
         # نفس المسار المتسامح لرسالة الخطأ: مفيش توجيه جديد ولا انهيار في الـ callback.
-        if not await _edit_or_send(q, error_text(exc), q.message.chat_id, context.bot):
+        if not await _display_conversation_view(update, context, error_text(exc), q=q):
             log.warning("تعذّر عرض خطأ آخر تبادل للشات %s (فشل تسليم تيليجرام).", conversation_id)
+        if q is None and _is_expected_upstream_rejection(exc):
+            context.bot_data["db"].clear_last_accessed_conversation(update.effective_user.id)
         await _raise_if_operational_api_failure(exc)
         mark_explicitly_ignored(update, context)
-        return
+        return False
     _store_exchange(context, conversation_id, user_text, reply)
     db = context.bot_data["db"]
     watched = db.is_watched(conversation_id)
@@ -1213,7 +1265,7 @@ async def open_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             "(بوتات تيليجرام ما بتكتبش في الحافظة تلقائيًا) — أو انسخ بضغطة من الـ Mini App "
             "أو نزّله كـ «ملف النص» (.txt)."
         )
-    text += "\n\n✉️ رسايلك الجاية هتتبعت للشات ده (10 دقايق من آخر نشاط). للإلغاء: زر إلغاء التوجيه أو /cancel."
+    text += "\n\n✉️ رسايلك الجاية هتتبعت للشات ده لحد ما تفتح/تختار شات تاني. للإلغاء: زر إلغاء التوجيه أو /cancel."
     markup = kb.conversation_actions(
         conversation_id,
         watched,
@@ -1222,24 +1274,55 @@ async def open_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         mini_app_url=_mini_app_url(context),
         files_cb=_files_open_cb(context, conversation_id),
     )
-    # القرار 1: بعد فتح الشات، رسايلك الجاية بتتوجّه له 10 دقايق من آخر نشاط (مع زر إلغاء).
+    # بعد فتح الشات، رسايلك الجاية بتتوجّه له لحد ما تفتح/تختار شات تاني (مع زر إلغاء).
     # بنفعّل التوجيه بس بعد ما العرض يظهر فعلاً، عشان فشل العرض ما يسبش توجيه مفعّل من غير
     # ما تشوف الشات (وما نلمسش أي توجيه قائم لو الفتح فشل).
-    # OHB2-WP-07 (NEW-DEF-03 / NAV-06): تفعيل نافذة التوجيه ونتيجة التحديث الدائمة في
+    # OHB2-WP-07 (NEW-DEF-03 / NAV-06): تفعيل التوجيه ونتيجة التحديث الدائمة في
     # **معاملة واحدة** — قبل كده كانوا `set_awaiting` (commit) ثم `mark_explicitly_ignored`
-    # (commit تاني)، فعطل بينهم كان يفعّل نافذة توجيه 10 دقايق **بلا** سجل دائم لسببها.
-    if await _edit_or_send(q, text, q.message.chat_id, context.bot, reply_markup=markup):
+    # (commit تاني)، فعطل بينهم كان يفعّل توجيه **بلا** سجل دائم لسببها.
+    if await _display_conversation_view(
+        update, context, text, q=q, reply_markup=markup
+    ):
         db.set_awaiting_and_record_outcome(
             update.effective_user.id, conversation_id, "route",
             _update_id(update), outbox.now_iso(), update_outcomes.EXPLICITLY_IGNORED,
             title=conv.get("title") or "",
+            last_accessed_conversation_id=conversation_id,
         )
-    else:
-        # OHB2-STAGE2-HIGH-ACK-BLOCKING-FIX: العرض هو المحتوى اللي المستخدم طلبه؛ فشل تسليمه
-        # فشل **عابر** (قابل لإعادة المحاولة) — نفس سياسة show_status/show_cost — **مش** نجاح
-        # ومش تجاهل. بدون التسجيل كان التحديث يفضل بلا نتيجة (غير مؤهّل) بلا تمييز للسبب.
-        log.warning("تعذّر عرض الشات %s (فشل تعديل/إرسال تيليجرام).", conversation_id)
-        mark_display_failed(update, context, "open_display_failed")
+        return True
+    # OHB2-STAGE2-HIGH-ACK-BLOCKING-FIX: العرض هو المحتوى اللي المستخدم طلبه؛ فشل تسليمه
+    # فشل **عابر** (قابل لإعادة المحاولة) — نفس سياسة show_status/show_cost — **مش** نجاح
+    # ومش تجاهل. بدون التسجيل كان التحديث يفضل بلا نتيجة (غير مؤهّل) بلا تمييز للسبب.
+    log.warning("تعذّر عرض الشات %s (فشل تعديل/إرسال تيليجرام).", conversation_id)
+    mark_display_failed(update, context, "open_display_failed")
+    return False
+
+
+async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/chat — يفتح آخر شات فتحه/اختاره المالك فعلًا."""
+    if not await _guard(update, context):
+        return
+    db = context.bot_data["db"]
+    telegram_id = update.effective_user.id
+    last_conversation_id = db.get_last_accessed_conversation(telegram_id)
+    if not last_conversation_id:
+        await update.message.reply_text(
+            "مفيش شات سابق متاح. استخدم /start لاختيار شات."
+        )
+        mark_explicitly_ignored(update, context)
+        return
+    await _open_conversation_view(update, context, last_conversation_id)
+
+
+async def open_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await _safe_answer(q)
+    if not _allowed(update, context.bot_data["config"]):
+        # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
+        _authorization_ignored(update, context)
+        return
+    conversation_id = q.data.split(":", 1)[1]
+    await _open_conversation_view(update, context, conversation_id, q=q)
 
 
 async def copy_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2239,6 +2322,7 @@ async def reply_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     db.set_awaiting_and_record_outcome(
         update.effective_user.id, conversation_id, "reply",
         _update_id(update), outbox.now_iso(), update_outcomes.DURABLE_COMPLETED,
+        last_accessed_conversation_id=conversation_id,
     )
     await _safe_edit(
         q,
@@ -2250,15 +2334,27 @@ async def reply_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # OHB2-UNSUPPORTED-FILE-SAFE-REJECTION: رسالة الرفض الوحيدة للمرفقات غير المدعومة.
-# نص ثابت عربي، **ما بيوعدش** بحفظ/طابور/تسليم، وبيوجّه المستخدم للنص العادي.
+# نص ثابت عربي، **ما بيوعدش** بحفظ/طابور/تسليم، وبيوجّه المستخدم للنص العادي. نسخة
+# منفصلة تُستخدم فقط لو استقبال المستندات مفعّل صراحةً (OD-03) — من غير ما نوعد
+# بمستند وهو متوقّف.
 UNSUPPORTED_ATTACHMENT_TEXT = (
+    "نوع الوسيط ده غير مدعوم حاليًا. يمكنك إرسال رسالتك كنص عادي."
+)
+UNSUPPORTED_ATTACHMENT_DOCUMENT_ENABLED_TEXT = (
     "نوع الوسيط ده غير مدعوم حاليًا. "
-    "يمكنك إرسال رسالتك كنص، أو إرسال ملف كمستند (Document) لو محتاج."
+    "يمكنك إرسال رسالتك كنص عادي، أو إرسال ملف كمستند (Document) لو محتاج."
 )
 
 # OHB2-P0-A2: نصوص رد مسار المرفقات المدعومة (بلا وعد بإرسال — الإرسال مرحلة A3/B).
+# OHB2-WP01/DEF-011-C: لا نقول «مستلم» لمجرد الوصول؛ النص ده يُستخدم فقط بعد نجاح
+# التخزين المحلي الفعلي (AcceptOutcome.STORED)، ولا يوعد بمسار بعيد/Mini App.
 ATTACHMENT_ACCEPTED_TEXT = (
-    "استلمت الملف ✅ — ابعت أوامرك (النص المصاحب) خلال 15 دقيقة من أول ملف."
+    "تم استلام الملف وحفظه محليًا بشكل مؤقت ✅ — "
+    "ابعت أوامرك (النص المصاحب) خلال 15 دقيقة من أول ملف."
+)
+ATTACHMENT_DUPLICATE_TEXT = (
+    "الملف ده كان متسجل قبل كده ✅ — مفيش نسخة جديدة. "
+    "ابعت أوامرك (النص المصاحب) خلال 15 دقيقة من أول ملف."
 )
 ATTACHMENT_UNSUPPORTED_TYPE_TEXT = (
     "نوع الملف ده غير مسموح. ابعت ملف نصي/مستند مدعوم، أو رسالتك كنص."
@@ -2276,10 +2372,16 @@ ATTACHMENT_AUTH_FAILED_TEXT = (
 # OHB2-LIFE-03: مفتاح إيقاف استقبال المستندات المحلي (ATTACHMENT_DOCUMENT_INTAKE_ENABLED=0).
 # رسالة صادقة: استقبال الملفات متوقف، وباقي المسارات (نص/أزرار/Mini App) شغّالة.
 ATTACHMENT_INTAKE_DISABLED_TEXT = (
-    "استقبال الملفات متوقف مؤقتًا. ابعت رسالتك كنص عادي."
+    "استقبال الملفات متوقف حاليًا. مش بيتم حفظ أو إرسال أي ملف. "
+    "ابعت رسالتك كنص عادي."
 )
 ATTACHMENT_ERROR_TEXT = (
     "تعذّر استلام الملف دلوقتي. جرّب تاني."
+)
+# OHB2-WP01 Stage 1: سباق إلغاء/حالة أثناء القبول — لا نقول إن الملف اتقبل.
+ATTACHMENT_BATCH_CANCELLED_TEXT = (
+    "الدفعة دي اتلغت أو اتغيّرت، فمش هينفع نضيف ليها الملف ده. "
+    "استخدم /attachments أو ابدأ دفعة جديدة."
 )
 
 # OHB2-P0-A3/D-27..D-30: نصوص ردّ مسار النصّ المصاحب (محلي فقط — لا وعد بإرسال بعيد).
@@ -2634,15 +2736,17 @@ async def handle_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             reply = ATTACHMENT_TOO_LARGE_TEXT
         elif stage_value == "rejected_quota":
             reply = ATTACHMENT_QUOTA_TEXT
+        elif stage_value == "rejected_batch":
+            reply = ATTACHMENT_BATCH_CANCELLED_TEXT
         else:
             reply = ATTACHMENT_UNSUPPORTED_TYPE_TEXT
     elif result.outcome is AcceptOutcome.AUTH_FAILED:
         reply = ATTACHMENT_AUTH_FAILED_TEXT
     elif result.outcome is AcceptOutcome.DUPLICATE:
         # إعادة تسليم لتحديث اتقبل قبل كده (حاجز التكرار group=-1 عادةً بيوقفها قبل هنا):
-        # مفيش عنصر جديد ⇒ رد القبول نفسه (idempotent وصادق)، وبلا لمس النتيجة الدائمة
-        # (`duplicate_completed` اتكتبت ذرّيًّا جوّه الكتابة) — F-4.
-        reply = ATTACHMENT_ACCEPTED_TEXT
+        # مفيش عنصر جديد ⇒ نقول الحقيقة (متسجل قبل كده) بدل ادّعاء قبول جديد، وبلا لمس
+        # النتيجة الدائمة (`duplicate_completed` اتكتبت ذرّيًّا جوّه الكتابة) — F-4.
+        reply = ATTACHMENT_DUPLICATE_TEXT
     else:
         reply = ATTACHMENT_ERROR_TEXT
 
@@ -2675,8 +2779,17 @@ async def handle_unsupported_attachment(
     """
     if not await _guard(update, context):
         return
+    cfg = context.bot_data.get("config")
+    intake_enabled = bool(
+        cfg is not None and getattr(cfg, "attachment_document_intake_enabled", False)
+    )
+    text = (
+        UNSUPPORTED_ATTACHMENT_DOCUMENT_ENABLED_TEXT
+        if intake_enabled
+        else UNSUPPORTED_ATTACHMENT_TEXT
+    )
     try:
-        await update.message.reply_text(UNSUPPORTED_ATTACHMENT_TEXT)
+        await update.message.reply_text(text)
     except Exception as exc:  # noqa: BLE001 — فشل الرد ⇒ فشل مُسجّل، مش نجاح صامت
         record_update_failure(update, context, exc)
         raise
@@ -2804,6 +2917,11 @@ async def _handle_accompanying_text(
         )
         return True
 
+    if state is AttachmentRoutingState.CANCELLED:
+        # OHB2-WP01 Stage 1: الإلغاء الصريح لدفعة `pending` لا يحجب البرومت العادي؛
+        # لا توجد هوية رسالة مرتبطة (Stage 1 لا يلغي `intent_recorded`).
+        return False
+
     # state is AttachmentRoutingState.LIVE — دفعة حيّة واحدة بالضبط.
     batch = routing.live_batches[0]
     route_cid, route_kind, _route_title, _route_at = db.awaiting_state(telegram_id)
@@ -2905,6 +3023,19 @@ async def _reject_accompanying_text(
         )
 
 
+async def _reply_no_routing_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """يرفض نصًّا عاديًّا بدون هدف مختار — بلا إنشاء شات أو اختيار شات آخر."""
+    mark_explicitly_ignored(update, context)
+    if context.bot_data["db"].is_routing_paused(update.effective_user.id):
+        text = "التوجيه متوقف. افتح شات أو استخدم /chat الأول، وبعدها ابعت رسالتك."
+    else:
+        text = (
+            "مفيش شات محدد. افتح شات من القائمة أو استخدم /start أو /chat الأول، "
+            "وبعدها ابعت رسالتك."
+        )
+    await update.message.reply_text(text)
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _guard(update, context):
         return
@@ -2919,9 +3050,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # reposearch) بتتستهلك **ذرّيًا مع كتابة السجل الدائم** جوه
     # add_or_group_outbox/add_creation_job (أو consume_one_shot_awaiting لبحث المستودعات)
     # ⇒ مفيش نافذة بين استهلاك الحالة وكتابة العمل يضيع فيها البرومت لو العملية ماتت.
-    # `route` مستمر (مش لمرة واحدة): بنجدّد مهلته هنا فقط.
+    # `route` مستمر (مش لمرة واحدة) وما بينتهيش بالمهلة؛ بنحدّث طابعه هنا للتوافق.
     pending, kind, title, awaiting_at = db.awaiting_state(telegram_id)
-    if kind in ("reply", "newchat", "reposearch", "route") and db.awaiting_is_expired(awaiting_at):
+    last_target = db.get_last_accessed_conversation(telegram_id)
+    # الحالات لمرة واحدة (newchat/reposearch) لسه ليها مهلة. `reply` استثناء: لو انتهت
+    # مهلته، الهدف المختار المحفوظ (`last_accessed`) يفضل هو الافتراضي.
+    if kind in ("newchat", "reposearch") and db.awaiting_is_expired(awaiting_at):
         # حالة منتهية: نمسحها ونسجّل «تجاهل صريح» **ذرّيًّا** (نفس سلوك `take_awaiting`
         # القديم، بدون استهلاك مسبق). OHB2-WP-07 (DEF-013): المسح والنتيجة في معاملة واحدة
         # (`clear_awaiting_and_record_outcome`) — قبل كده كان المسح يـcommit لوحده، فعطل بين
@@ -2931,19 +3065,48 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             update_outcomes.EXPLICITLY_IGNORED,
         )
         await update.message.reply_text(
-            "انتهت مهلة التوجيه (10 دقايق من آخر نشاط). افتح الشات تاني وابعت برومتك."
+            "انتهت مهلة التوجيه. افتح الشات تاني وابعت برومتك."
         )
         # البرومت **مااتنفّذش** عمدًا (الحالة منتهية) ⇒ تجاهل صريح (مفيش نية دائمة معلّقة).
         return
-    if kind == "route" and pending and update.message.text.strip():
-        # OHB2-WP-07 (DEF-013): التجديد **بعد** التحقق من أن النص غير فراغ. نص مسافات
-        # مافيهوش برومت، فمينفعش يمدّد مهلة التوجيه (كان بيمدّدها قبل الفحص).
-        db.renew_awaiting(telegram_id)  # route مستمر: كل رسالة حقيقية بتجدّد المهلة
-    if kind in ("reply", "route") and pending:
-        consume = (telegram_id, "reply") if kind == "reply" else None
+    if kind == "reply" and pending and db.awaiting_is_expired(awaiting_at):
+        # اختيار محادثة سابقة انتهت مهلته، لكن آخر شات مختار محفوظ ⇒ نكمل عليه بدل
+        # إجبار المستخدم على /start أو إعادة الفتح.
+        if last_target:
+            await _send_prompt(update, context, last_target, update.message.text)
+        else:
+            db.clear_awaiting_and_record_outcome(
+                telegram_id, _update_id(update), outbox.now_iso(),
+                update_outcomes.EXPLICITLY_IGNORED,
+            )
+            await update.message.reply_text(
+                "انتهت مهلة التوجيه. افتح الشات تاني وابعت برومتك."
+            )
+        return
+    if kind == "route":
+        # route مستمر: لا ينتهي بالمهلة. آخر شات مفتوح/مختار محفوظ هو المرجع، ولو مش
+        # موجود (صفوف قديمة) نستخدم target الـ route نفسه. /cancel يوقف التوجيه صراحةً.
+        if db.is_routing_paused(telegram_id):
+            await _reply_no_routing_target(update, context)
+            return
+        target = last_target or pending
+        if not target:
+            await _reply_no_routing_target(update, context)
+            return
+        if target != pending:
+            # مزامنة صف الـ route مع المرجع المحفوظ (لو الاتنين اختلفوا لأي سبب قديم).
+            db.set_awaiting(telegram_id, target, "route")
+        elif update.message.text.strip():
+            # الحفاظ على تحديث طابع النشاط للتوافق/التشخيص؛ لا يؤثر على الصلاحية.
+            db.renew_awaiting(telegram_id)
+        await _send_prompt(
+            update, context, target, update.message.text,
+            title if target == pending else None,
+        )
+    elif kind == "reply" and pending:
         await _send_prompt(
             update, context, pending, update.message.text,
-            title if kind == "route" else None, consume_awaiting=consume,
+            consume_awaiting=(telegram_id, "reply"),
         )
     elif kind == "newchat":
         await _start_new_chat(
@@ -2972,11 +3135,128 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             uid = _update_id(update)
             if uid is not None and db.update_outcome(uid) is None:
                 mark_explicitly_ignored(update, context)
+    elif last_target and not db.is_routing_paused(telegram_id):
+        # الافتراضي الدائم: أي نص عادي بعد اختيار شات يروح لآخر شات مفتوح/مختار.
+        await _send_prompt(update, context, last_target, update.message.text)
     else:
-        # OHB2-MANUAL-POLLING-OUTCOME: مسار مُتجاهَل صريح (مفيش نية دائمة) ⇒ نتيجة
-        # `explicitly_ignored` (دليل دائم ⇒ مؤهّل للإقرار، مفيش إعادة معالجة لاحقة).
+        await _reply_no_routing_target(update, context)
+
+
+async def attachments_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/attachments — يعرض دفعات المرفقات الخاصة بالمالك (بيانات وصفية فقط).
+
+    OHB2-WP01/OD-01: القايمة موجودة عشان الـclearance يكون **بمعرّف دفعة محدّد**، مش
+    تخمين/أحدث دفعة. لا تعرض نصّ النيّة ولا أي مسار ملف.
+    """
+    if not await _guard(update, context):
+        return
+    db = context.bot_data["db"]
+    batches = db.list_attachment_batches_for_owner(update.effective_user.id)
+    if not batches:
+        await update.message.reply_text("مفيش دفعات مرفقات محفوظة.")
         mark_explicitly_ignored(update, context)
-        await update.message.reply_text("ابعت /start للقائمة، أو افتح شات عشان تبعتله برومت.")
+        return
+    lines = ["📎 دفعات المرفقات:"]
+    for batch in batches:
+        lines.append(
+            f"• {batch.batch_id} | الحالة: {batch.status} | المحادثة: {batch.conversation_id}"
+        )
+    lines.append("للإخلاء الصريح لدفعة expired/rejected: /attachments_clear <batch_id> confirm")
+    lines.append("لإلغاء دفعة pending واحدة: /attachments_cancel <batch_id> confirm")
+    await update.message.reply_text("\n".join(lines))
+    mark_explicitly_ignored(update, context)
+
+
+async def attachments_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/attachments_clear <batch_id> confirm — clearance صريح لدفعة واحدة.
+
+    OHB2-WP01/OD-01 Option C: لا يمسح terminal block تلقائيًا، ولا يمسّ `/cancel`.
+    فقط `expired`/`rejected` بعد فحص ملكية/حالة دائم. النجاح لا يُعلن قبل commit.
+    """
+    if not await _guard(update, context):
+        return
+    args = list(context.args or [])
+    if len(args) != 2 or args[1].strip().lower() != "confirm":
+        await update.message.reply_text(
+            "الاستخدام: /attachments_clear <batch_id> confirm\n"
+            "الإخلاء مسموح فقط لدفعة expired أو rejected."
+        )
+        mark_explicitly_ignored(update, context)
+        return
+    batch_id = args[0].strip()
+    if not batch_id:
+        await update.message.reply_text(
+            "الاستخدام: /attachments_clear <batch_id> confirm"
+        )
+        mark_explicitly_ignored(update, context)
+        return
+    db = context.bot_data["db"]
+    try:
+        result = db.clear_attachment_terminal_batch(
+            update.effective_user.id,
+            batch_id,
+            now=outbox.now_iso(),
+            update_id=_update_id(update),
+        )
+    except Exception:
+        # لا ردّ نجاح عند فشل القاعدة؛ PTB/record_update_failure يسجّل الفشل غير المؤهّل.
+        raise
+    messages = {
+        "cleared": "تم إخلاء الدفعة دي صراحةً. لو فيه دفعات نهائية تانية غير مُخلّاة، هتفضل محجوبة.",
+        "already_cleared": "الدفعة دي متخلّية بالفعل؛ مفيش تغيير.",
+        "not_found": "مفيش دفعة بالمعرّف ده لهذا المالك.",
+        "not_eligible": "الإخلاء مسموح فقط لدفعة expired أو rejected.",
+        "duplicate": "التحديث ده اتعالج قبل كده؛ مفيش تغيير.",
+    }
+    await update.message.reply_text(messages.get(result, "تعذّر إخلاء الدفعة."))
+    if result in ("not_found", "not_eligible"):
+        mark_explicitly_ignored(update, context)
+
+
+async def attachments_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/attachments_cancel <batch_id> confirm — إلغاء دفعة `pending` واحدة.
+
+    OHB2-WP01 Stage 1: لا يمسح route، ولا يحذف/ينقل أي ملف أو صف أو دليل هوية.
+    النجاح لا يُعلن قبل commit؛ الأخطاء تُرفع بلا ردّ نجاح.
+    """
+    if not await _guard(update, context):
+        return
+    args = list(context.args or [])
+    if len(args) != 2 or args[1].strip().lower() != "confirm":
+        await update.message.reply_text(
+            "الاستخدام: /attachments_cancel <batch_id> confirm\n"
+            "الإلغاء مسموح فقط لدفعة pending."
+        )
+        mark_explicitly_ignored(update, context)
+        return
+    batch_id = args[0].strip()
+    if not batch_id:
+        await update.message.reply_text(
+            "الاستخدام: /attachments_cancel <batch_id> confirm"
+        )
+        mark_explicitly_ignored(update, context)
+        return
+    service = _attachment_service(context)
+    try:
+        result = await service.cancel_pending_batch(
+            telegram_id=update.effective_user.id,
+            batch_id=batch_id,
+            now=outbox.now_iso(),
+            update_id=_update_id(update),
+        )
+    except Exception:
+        # لا ردّ نجاح عند فشل القاعدة/المخزن؛ PTB/record_update_failure يسجّل الفشل.
+        raise
+    messages = {
+        "cancelled": "اتلغت معالجة الدفعة. الملفات والبيانات محفوظة محليًا ومش هتتحذف تلقائيًا.",
+        "already_cancelled": "الدفعة دي ملغاة بالفعل؛ مفيش تغيير.",
+        "not_found": "مفيش دفعة بالمعرّف ده لهذا المالك.",
+        "not_eligible": "الإلغاء مسموح فقط لدفعة pending.",
+        "duplicate": "التحديث ده اتعالج قبل كده؛ مفيش تغيير.",
+    }
+    await update.message.reply_text(messages.get(result, "تعذّر إلغاء الدفعة."))
+    if result in ("not_found", "not_eligible"):
+        mark_explicitly_ignored(update, context)
 
 
 async def cancel_route(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2989,6 +3269,7 @@ async def cancel_route(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         update.effective_user.id, _update_id(update), outbox.now_iso(),
         update_outcomes.DURABLE_COMPLETED,
     )
+    context.bot_data["db"].pause_routing(update.effective_user.id)
     await update.message.reply_text("اتلغى التوجيه. ابعت /start للقائمة.")
 
 
@@ -3004,6 +3285,7 @@ async def cancel_route_button(update: Update, context: ContextTypes.DEFAULT_TYPE
         update.effective_user.id, _update_id(update), outbox.now_iso(),
         update_outcomes.DURABLE_COMPLETED,
     )
+    context.bot_data["db"].pause_routing(update.effective_user.id)
     await _safe_edit(q, "اتلغى التوجيه ✅", reply_markup=kb.main_menu(_mini_app_url(context)))
 
 
@@ -3031,6 +3313,14 @@ async def _send_prompt(
     # عادي كأن البرومت اتحفظ. الفشل العابر (BUSY/LOCKED) بس هو اللي بيُعاد محدودًا.
     deleted = await _is_deleted_with_retry(db, conversation_id)
     if deleted:
+        # شاهد الحذف قد يكون 'deleting' (غير مؤكّد) مش حذفًا نهائيًا. نمسح الهدف
+        # المحفوظ فقط لو الحذف البعيد مؤكّد؛ غير كده نسيب التوجيه كما هو.
+        if db.remote_deletion_state(conversation_id) == db.REMOTE_CONFIRMED:
+            if db.get_last_accessed_conversation(update.effective_user.id) == conversation_id:
+                db.clear_last_accessed_conversation(update.effective_user.id)
+            awaiting_target, _awaiting_kind = db.get_awaiting(update.effective_user.id)
+            if awaiting_target == conversation_id:
+                db.clear_awaiting(update.effective_user.id)
         await update.message.reply_text(
             "الشات ده اتحذف — مش ممكن نبعت له رسايل. افتح شات تاني."
         )
@@ -3045,6 +3335,7 @@ async def _send_prompt(
     out_id = db.add_or_group_outbox(
         conversation_id, chat_id, text, outbox.now_iso(), reengage=True,
         update_id=_update_id(update), consume_awaiting=consume_awaiting,
+        telegram_message_id=getattr(getattr(update, "message", None), "message_id", None),
     )
     if out_id == 0:
         # OHB2-WP-03 (DEF-003): `out_id == 0` ليها سببان:

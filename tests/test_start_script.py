@@ -110,6 +110,23 @@ def test_missing_dependency_off_auto_install_fails_clearly(shim):
     assert "SHIM_MAIN_RAN" not in proc.stdout  # ماوصلش للتشغيل
 
 
+def test_anyio_is_in_startup_probe_and_install_requirements():
+    """`anyio` لازم يكون في فحص التشغيل وفي requirements اللي start.sh بيثبّت منها."""
+    import re
+
+    src = START.read_text()
+    match = re.search(r"mods\s*=\s*\((.*?)\)", src, re.S)
+    assert match, "مش لاقي قائمة حزم التشغيل في start.sh"
+    mods = re.findall(r'"([^"]+)"', match.group(1))
+    assert "anyio" in mods, "start.sh لا يفحص anyio ضمن حزم التشغيل"
+
+    requirements = (ROOT / "requirements.txt").read_text()
+    assert re.search(r"^anyio==", requirements, re.M), "requirements.txt لا يثبّت anyio"
+    assert "pip install" in src and "-r requirements.txt" in src, (
+        "start.sh لا يستخدم requirements.txt كمسار التثبيت المقصود"
+    )
+
+
 def test_auto_install_pip_failure_is_reported(shim):
     (shim["bin"] / "missing.txt").write_text("telegram")
     # pip_ok مش موجود ⇒ الشيم يرجّع فشل

@@ -64,7 +64,7 @@ python -m pytest -q
 | `MINI_APP_API_RATE_PER_MINUTE` | لا | `60` | رقم صحيح موجب |
 | `MINI_APP_RATE_MAX_KEYS` | لا | `4096` | رقم صحيح موجب |
 | `MINI_APP_TRUSTED_PROXIES` | لا | — | IPs/CIDRs مفصولة بفواصل؛ قيمة غير صالحة ⇒ `ConfigError` |
-| `ATTACHMENT_DOCUMENT_INTAKE_ENABLED` | لا | `1` | `1`/`0` (مفتاح إيقاف تخزين المستندات؛ راجع `OD-03`) |
+| `ATTACHMENT_DOCUMENT_INTAKE_ENABLED` | لا | `0` | `1`/`0` (مفتاح تخزين المستندات؛ `1` تفعيل صريح لمسار التخزين المحلي — راجع `OD-03`) |
 
 ملاحظات:
 
@@ -315,6 +315,9 @@ python -m pytest -q tests/test_watcher.py tests/test_u01_watcher.py
 
 | الأمر | الاستخدام |
 | --- | --- |
+| `/attachments` | عرض دفعات المرفقات للمالك (المعرّف، الحالة، المحادثة) — بدون نص أو مسار ملف |
+| `/attachments_clear <batch_id> confirm` | إخلاء صريح لدفعة `expired`/`rejected` **واحدة فقط**. لا يزيل حجب `delivered`/`failed`/`TERMINAL_ASSOCIATED`/`TERMINAL_UNPROVEN`، ولا يحذف ملفات أو صفوف |
+| `/attachments_cancel <batch_id> confirm` | إلغاء صريح لدفعة `pending` **واحدة فقط** (Stage 1). لا يحذف/ينقل أي ملف أو صف أو دليل هوية، ولا يمسح التوجيه؛ الدفعة الملغاة غير قابلة للكنس |
 | `/outbox` | عرض محدود للسجلات **غير المنتهية** (prompt/creation): المعرّف، الحالة، المحاولات، آخر تحديث — **بدون نص البرومت** |
 | `/outbox_status <prompt:id \| creation:id>` | تفاصيل سجل واحد (الحالة، المحاولة، آخر خطأ، الطوابع الزمنية) |
 | `/outbox_discard <prompt:id \| creation:id> confirm` | تعليم سجل **غير نهائي** كـ `discarded` (نهائي). idempotent |

@@ -652,6 +652,9 @@ def make_config(tmp_path) -> Config:
         allowed_telegram_ids=frozenset({OWNER_ID}),
         owner_id=OWNER_ID,
         db_path=str(tmp_path / "t.sqlite3"),
+        # OHB2-WP01/OD-03: intake is default-off in production; these lifecycle tests
+        # explicitly opt in because they exercise the supported local intake path.
+        attachment_document_intake_enabled=True,
     )
 
 
@@ -724,10 +727,10 @@ def test_handler_duplicate_document_single_batch(tmp_path, monkeypatch):
     assert len(harness.db.list_attachment_items(batch_id)) == 1
 
 
-def test_handler_duplicate_race_replies_accepted_without_new_item(tmp_path, monkeypatch):
+def test_handler_duplicate_race_replies_duplicate_without_new_item(tmp_path, monkeypatch):
     # F-4: لو إعادة التسليم عدّت الحاجز ووصلت الـ handler (سباق)، لازم:
     #   - ما تنشئش عنصر/دفعة جديدة،
-    #   - تردّ بنص القبول نفسه (بلا رد خطأ كاذب)،
+    #   - تردّ بنص «متسجل قبل كده» (مش ادّعاء قبول جديد، ومش خطأ كاذب)،
     #   - تسيب النتيجة الدائمة `duplicate_completed` (ما تتكتبش فوقها durable_completed).
     harness = _harness(tmp_path, monkeypatch)
     harness.db.set_awaiting(OWNER_ID, CID, "route", title="A")
@@ -743,7 +746,7 @@ def test_handler_duplicate_race_replies_accepted_without_new_item(tmp_path, monk
     assert harness.db._conn.execute("SELECT COUNT(*) c FROM attachment_batches").fetchone()["c"] == 1
     assert len(harness.db.list_attachment_items(batch_id)) == 1
     assert len(harness.replies) == len(replies_before) + 1
-    assert harness.replies[-1] == replies_before[-1]  # نفس رد القبول (idempotent، مش خطأ)
+    assert harness.replies[-1] == h_mod.ATTACHMENT_DUPLICATE_TEXT
     assert harness.db.update_outcome(914) == "duplicate_completed"
 
 
@@ -760,7 +763,7 @@ def test_handler_photo_still_uses_legacy_rejection(tmp_path, monkeypatch):
     harness = _harness(tmp_path, monkeypatch)
     harness.db.set_awaiting(OWNER_ID, CID, "route", title="A")
     harness.process(harness.photo_update(905))
-    assert harness.replies == [h_mod.UNSUPPORTED_ATTACHMENT_TEXT]
+    assert harness.replies == [h_mod.UNSUPPORTED_ATTACHMENT_DOCUMENT_ENABLED_TEXT]
     assert harness.db._conn.execute("SELECT COUNT(*) c FROM attachment_batches").fetchone()["c"] == 0
 
 

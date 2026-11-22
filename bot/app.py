@@ -20,7 +20,13 @@ from .db import Database
 from . import deletion
 from .notifier import Notifier
 from .openhands_client import OpenHandsClient
-from .outbox import CompletionWorker, CreationWorker, OutboxWorker, completion_recover
+from .outbox import (
+    CompletionWorker,
+    CreationWorker,
+    OutboxWorker,
+    cancel_cleanup_tasks,
+    completion_recover,
+)
 from .watcher import Watcher
 
 log = logging.getLogger(__name__)
@@ -48,11 +54,15 @@ UNSUPPORTED_ATTACHMENT_FILTER = (
 # OHB2-03: قائمة الأوامر المعروضة في قائمة تيليجرام (وصف عربي). لازم تفضل متوافقة مع
 # تسجيل الـ CommandHandler تحت — في اختبار بيثبت عدم الانحراف.
 BOT_COMMANDS: tuple[tuple[str, str], ...] = (
+    ("chat", "فتح آخر محادثة"),
     ("start", "القائمة الرئيسية"),
     ("app", "فتح التطبيق المصغّر"),
     ("help", "المساعدة والأوامر"),
     ("notifications", "ضبط الإشعارات الاستباقية"),
     ("cancel", "إلغاء التوجيه الحالي"),
+    ("attachments", "حالة دفعات المرفقات"),
+    ("attachments_clear", "إخلاء دفعة نهائية صراحةً"),
+    ("attachments_cancel", "إلغاء دفعة pending واحدة"),
     ("outbox", "سجلات الصندوق المعلّقة"),
     ("outbox_status", "تفاصيل سجل صندوق"),
     ("outbox_discard", "شطب سجل صندوق"),
@@ -72,13 +82,14 @@ async def _register_commands(application: Application, owner_id: int) -> None:
 
 
 def build_application(config: Config) -> Application:
-    # OHB2-WP-07 (DEF-006): `concurrent_updates(True)` إعداد على `Application` بس — **مش**
-    # دليل إن الحلقة المخصّصة بتوزّع الدفعة بالتوازي. حلقة `bot.polling::TelegramPoller`
-    # بتوزّع التحديثات **تسلسليًّا** (`dispatch_and_wait`: تحطّ التحديث في الطابور وتستنّى
-    # `update_queue.join()` قبل اللي بعده) ⇒ تحديث بطيء/غير محسوم بيأخّر اللي بعده في الدفعة.
-    # الحكم على الإقرار **من البادئة المؤهّلة/النتيجة الدائمة**، مش من الإعداد ده.
-    # التزامن داخل الدفعة (`OD-04`) **ممنوع** بلا إثبات أمان على `Database._conn` وترتيب
-    # المستخدم؛ سياسة الاستطلاع المتسلسل مطابقة لـ `docs/OPERATIONS_RUNBOOK.md`.
+    # OHB2-WP-07 (DEF-006): `concurrent_updates(False)` يفرض معالجة تحديثات
+    # `update_queue` تسلسليًّا على مستوى `Application`، بدل الاعتماد فقط على أن حلقة
+    # `bot.polling::TelegramPoller` (`dispatch_and_wait`: تحطّ التحديث في الطابور وتستنّى
+    # `update_queue.join()` قبل اللي بعده) هي المنتج الوحيد. التزامن داخل الدفعة
+    # (`OD-04`) **ممنوع** بلا إثبات أمان على `Database._conn` وترتيب المستخدم؛ سياسة
+    # الاستطلاع المتسلسل مطابقة لـ `docs/OPERATIONS_RUNBOOK.md`.
+    # ملاحظة: هذا لا يسلسل النداءات المباشرة إلى `Application.process_update()` خارج
+    # `update_queue`، ولا العمليات الخلفية المنفصلة.
     # OHB2-STAGE2 (D0): نبني التطبيق **بدون Updater** (`updater(None)`) ⇒ PTB بيسييب
     # `update_queue` + `_update_fetcher` (بيوزّع على نفس الـ handlers) **بس مفيش سحب تلقائي**
     # ⇒ مفيش poller تاني؛ حلقة `bot.polling` المخصّصة هي اللي بتسحب (نفس العملية/القاعدة).
@@ -86,7 +97,7 @@ def build_application(config: Config) -> Application:
         Application.builder()
         .token(config.telegram_bot_token)
         .updater(None)
-        .concurrent_updates(True)
+        .concurrent_updates(False)
         .build()
     )
     client = OpenHandsClient(config.openhands_base_url, config.openhands_api_key)
@@ -109,8 +120,12 @@ def build_application(config: Config) -> Application:
     # أول حاجة تتشغّل وآخر حاجة في مجموعته؛ ولو التحديث مكرّر بيرمي `ApplicationHandlerStop`
     # فيوقف كل المجموعات ⇒ تحديث واحد = قرار معالجة واحد (إرسال أو إنشاء، مش الاتنين).
     app.add_handler(TypeHandler(Update, handlers.dedupe_update), group=-1)
+    app.add_handler(CommandHandler("chat", handlers.chat))
     app.add_handler(CommandHandler("start", handlers.start))
     app.add_handler(CommandHandler("cancel", handlers.cancel_route))
+    app.add_handler(CommandHandler("attachments", handlers.attachments_list))
+    app.add_handler(CommandHandler("attachments_clear", handlers.attachments_clear))
+    app.add_handler(CommandHandler("attachments_cancel", handlers.attachments_cancel))
     app.add_handler(CommandHandler("help", handlers.help_command))
     app.add_handler(CommandHandler("app", handlers.app_command))
     app.add_handler(CommandHandler("notifications", handlers.notifications_command))
@@ -332,6 +347,7 @@ def build_application(config: Config) -> Application:
         notifier: Notifier | None = application.bot_data.get("notifier")
         if notifier:
             await notifier.stop()
+        await cancel_cleanup_tasks()
         await client.aclose()
         # إغلاق نظيف: نرجّع بيانات WAL للقاعدة الرئيسية ونقصّر الـ WAL.
         try:

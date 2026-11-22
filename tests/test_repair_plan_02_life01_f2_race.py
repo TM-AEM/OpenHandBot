@@ -260,8 +260,9 @@ def test_store_into_already_expired_batch_is_rejected(tmp_path):
                                status=ATTACHMENT_BATCH_EXPIRED)
     res = store.store(telegram_id=OWNER_ID, batch_id="b1", item_id="i1",
                       display_name="a.txt", chunks=[b"data"])
-    assert res.status is StageStatus.DB_FAILED
-    assert db.get_attachment_item("i1").status == ATTACHMENT_BATCH_PENDING
+    # OHB2-WP01 N1: non-pending parent is rejected before item insertion/write.
+    assert res.status is StageStatus.REJECTED_BATCH
+    assert db.get_attachment_item("i1") is None
     assert staged_names(db_path) == []
 
 
@@ -306,9 +307,10 @@ def test_rejected_transition_removes_only_owned_artifact(tmp_path, monkeypatch):
 
     res = store.store(telegram_id=OWNER_ID, batch_id="b1", item_id="i1",
                       display_name="a.txt", chunks=[b"data"], staging_token="k" * 32)
-    assert res.status is StageStatus.DB_FAILED
-    assert not (root / ("k" * 32)).exists()  # الأثر المُملوك اتشال
-    assert unknown.exists()  # الملف المجهول ما اتلمسش
+    # OHB2-WP01 N1: rejected before write; the foreign file remains untouched.
+    assert res.status is StageStatus.REJECTED_BATCH
+    assert not (root / ("k" * 32)).exists()
+    assert unknown.exists()
     assert unknown.read_bytes() == b"unknown-not-ours"
 
 
@@ -345,7 +347,7 @@ def test_fixed_t0_and_identity_evidence_unchanged_after_rejected_store(tmp_path)
     # كتابة متأخّرة لعنصر جديد على نفس الدفعة (مش pending) ⇒ مرفوضة.
     late = store.store(telegram_id=OWNER_ID, batch_id=batch_id, item_id="late1",
                        display_name="a.txt", chunks=[b"x"])
-    assert late.status is StageStatus.DB_FAILED
+    assert late.status is StageStatus.REJECTED_BATCH
     assert db.get_attachment_batch(batch_id).t0 == t0_before  # T0 ما اتغيّرش
     assert db.message_identity_batch_id(OWNER_ID, OWNER_ID, 555) == batch_id  # الهوية باقية
 

@@ -90,6 +90,8 @@ Derived from `bot/config.py::load_config`. "Required" = startup fails cleanly if
 | `MINI_APP_COOKIE_SECURE` | `1` | bool. |
 | `MINI_APP_ALLOWED_ORIGINS` | (derived) | comma list of `scheme://host[:port]`. |
 | `MINI_APP_AUTH_RATE_PER_MINUTE` / `_PER_HOUR` / `MINI_APP_API_RATE_PER_MINUTE` / `MINI_APP_RATE_MAX_KEYS` | `10` / `30` / `60` / `4096` | positive ints. |
+| `MINI_APP_TRUSTED_PROXIES` | (empty) | Comma-separated IPs/CIDRs used by the Mini App client-IP resolution. Empty means no forwarded header is trusted (fail closed); an invalid entry raises `ConfigError`. |
+| `ATTACHMENT_DOCUMENT_INTAKE_ENABLED` | `0` | `1`/`0`. `1` explicitly enables Telegram document intake and local staging for the supported `MT-2` path; `0` disables it: no `get_file`, download, staging row, or OpenHands call. Text/buttons, Mini App behavior, and unsupported-media rejection remain unchanged. This flag is independent of `MINI_APP_ENABLED`. |
 
 ### 2.4 No backup configuration
 

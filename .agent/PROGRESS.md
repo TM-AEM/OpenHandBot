@@ -4439,6 +4439,7 @@ pyflakes **0**؛ bandit **High 0**؛ مجموعة مركّزة (config/miniapp/b
   C (UX copy) **WP-01** ومحجوب بـOD-01/OD-03.
 - `DEF-006`/`OD-04`: مسار التعليقات فقط، السلوك متسلسل فعليًا ⇒ `BLOCKED_PENDING_OD04`.
 - `NAV-01..06` = **نطاق فرعي من NEW-DEF-03**، مش بنود register مستقلة، و**غير مقبولة**.
+  - **تحديث 2026-11-22:** تم قبول NAV-01..06 صراحةً بموجب `D-A′` — Option A. السجل التاريخي أعلاه يبقى كما هو؛ الحالة الحالية موثقة في قسم `OHB2-WP07-NAV-OWNER-ACCEPTANCE-RECORD` في نهاية الملف.
 - `WP-05` **مُلتزَم بالفعل في HEAD**؛ فرق `bot/db.py` في الـworktree = WP-07 فقط.
 - توثيق قديم (`OHB2-WP07-CONDITIONAL-OWNER-ACCEPTANCE-PROPOSAL.md` R9/§7) **stale**: يقول DEF-011 غير
   منفَّذ — صُحِّح بالتوثيق فقط، **بلا تعديل الملف**.
@@ -4455,3 +4456,226 @@ pyflakes 0؛ bandit High 0؛ node **280/0**.
 (مافيش digest مكتوب هنا عن قصد — `PROGRESS.md` جوّه الـsnapshot، فكتابة الـdigest هنا بتخلّيه دائري:
 الكتابة بتغيّر الـdigest. الـsidecar هو المصدر الوحيد.)
 (تحقّق: أرشيف OK → فكّ OK → 43/43 OK / 0 فشل → 45 ملفًا؛ إعادة البناء ⇒ نفس الـdigest.)
+
+---
+
+## OHB2-WP07-NAV-OWNER-ACCEPTANCE-RECORD (2026-11-22 — D-A′ Option A؛ توثيق فقط)
+
+- **Task ID:** `OHB2-WP07-NAV-OWNER-ACCEPTANCE-RECORD-UPDATE`
+- **Owner decision:** **Option A — Accept all six NAV items as currently implemented.**
+- **Decision date:** **2026-11-22**
+- **Scope:** acceptance of the reviewed implementation only; no new implementation, refactoring, or unrelated cleanup.
+- **Status:** **`NAV-01..06_OWNER_ACCEPTED`** — وده **مش** `WP-07_COMPLETE` و**مش** `NEW-DEF-03_COMPLETE`.
+- **Evidence:**
+  - `docs/reviews/OHB2-WP07-NAV-OWNER-DECISION-PACKAGE.md`
+  - `docs/reviews/REV-IND-01-WP-07-INDEPENDENT-REVIEW-REPORT.md` — SHA-256 `11f7ff10e59cd964edd1d8007b83eca43f4cd1d30358285d20d7cc136a33da92`
+  - اختبارات NAV الحالية في clone نظيف: **51 passed** (`test_wp07_nav01_nav03_nav04_atomic.py`، `test_wp07_nav02_nav05_simple_clear_atomic.py`، `test_wp07_nav06_open_conversation_atomic.py`).
+- **Candidate identity:** المراجعة المستقلة غطّت exact candidate `30dfa0d`؛ الـNAV code موجود في `main` الحالي `0774c9c`. التغييرات اللاحقة في `bot/handlers.py` تخص REV-01/file-browser keyboard wiring وليست تغييرًا في منطق NAV الذرّي؛ ملفات اختبار WP-07 لم تتغيّر بعد `30dfa0d`.
+
+### القبول الفردي
+
+| Item | Handler | Owner decision | Scope | Evidence | Limitations / notes |
+|---|---|---|---|---|---|
+| NAV-01 | `start` | **ACCEPTED** | Reviewed implementation | `test_start_*` cases in `tests/test_wp07_nav01_nav03_nav04_atomic.py` | لا يوجد عيب معروف؛ send failure مغطّى |
+| NAV-02 | `show_menu` | **ACCEPTED** | Reviewed implementation | `test_show_menu_*` cases in `tests/test_wp07_nav02_nav05_simple_clear_atomic.py` | `_safe_edit_noop` يعتبر فشل العرض no-op ويسجّل `explicitly_ignored`؛ سلوك WP-02 قائم وموثّق |
+| NAV-03 | `list_conversations` | **ACCEPTED** | Reviewed implementation | `test_nav03_*` cases in `tests/test_wp07_nav01_nav03_nav04_atomic.py` | لا يوجد اختبار صريح لفشل عرض Telegram على مسار النجاح؛ الكود الحالي fail-closed |
+| NAV-04 | `list_watches` | **ACCEPTED** | Reviewed implementation | `test_list_watches_*` cases in `tests/test_wp07_nav01_nav03_nav04_atomic.py` | لا يوجد اختبار صريح لفشل عرض Telegram؛ الكود الحالي fail-closed |
+| NAV-05 | `start_new_chat` | **ACCEPTED** | Reviewed implementation | `test_start_new_chat_*` cases in `tests/test_wp07_nav02_nav05_simple_clear_atomic.py` | لا يوجد اختبار صريح لفشل عرض Telegram؛ الفشل التشغيلي مغطّى |
+| NAV-06 | `open_conversation` | **ACCEPTED** | Reviewed implementation | `test_wp07_nav06_open_conversation_atomic.py` (12) | لا يوجد عيب معروف؛ display failure وrollback مغطّيان |
+
+### ما لم يتغيّر
+
+- **A-1..A-5:** القبول السابق محفوظ كما هو؛ لم يُوسَّع إلى مواقع `NEW-DEF-03` غير المقبولة.
+- **NEW-DEF-03:** ما زال **جزئيًا**؛ A-1..A-5 + NAV-01..06 مقبولة، لكن **durable-intent paths** المتبقية ما زالت مفتوحة. لا يُعلَن `NEW-DEF-03_COMPLETE`.
+- **F-1 Option C:** يحتفظ بحكم `PASS_WITH_NOTES` وملاحظاته.
+- **Poller-concurrency Option A review:** يبقى **مؤجّلًا ومنفصلًا**؛ لا يُعلَن مكتملًا.
+- **DEF-006 / OD-04:** يبقى مفتوحًا/محجوبًا.
+- **DEF-011:** يبقى مفتوحًا (A/C مفتوحان؛ B منفّذ) حسب السجلات القائمة.
+- **WP-09 (Python 3.11):** يبقى غير متحقق محليًا.
+- **WP-07:** يبقى **مفتوحًا**؛ لا يُعلَن مكتملًا.
+
+### القيود والملاحظات المحفوظة
+
+- المراجعة المستقلة `REV-IND-01` كانت `BLOCKED` بسبب غياب قبول المالك لـNAV؛ هذا القبول يحلّ عائق القبول فقط، ولا يغيّر ملاحظاتها التقنية.
+- فجوات اختبار فشل العرض في NAV-03/04/05 تبقى ملاحظات غير حاجزة.
+- سياسة `show_menu` الخاصة بفشل العرض تبقى سلوك WP-02 القائم.
+- `30dfa0d` commit تجميعي واسع؛ الـNAV ليس في commit مستقل.
+
+### السلامة
+
+- لم يتم تعديل أي كود تطبيق أو اختبار أو dependency أو runtime configuration.
+- لم يتم تعديل سجل القبول السابق A-1..A-5؛ تمت إضافة سجل جديد فقط.
+- لا stage، ولا commit، ولا push، ولا merge، ولا PR، ولا deployment، ولا Autopush.
+- لا اتصالات Telegram أو OpenHands إنتاجية.
+- لم يتم اختلاق توقيع أو هوية مالك؛ الأساس هو التفويض الصريح في مهمة `OHB2-WP07-NAV-OWNER-ACCEPTANCE-RECORD-UPDATE`.
+
+---
+
+## OHB2-WP08-OWNER-ACCEPTANCE (2026-11-22 — خمسة بنود فقط؛ توثيق فقط)
+
+- **Task ID:** `OHB2-WP08-OWNER-ACCEPTANCE`
+- **Owner decision:** **`ACCEPT_WITH_NOTES`** — قبول صريح للبنود الخمسة المكتملة غير المحجوبة فقط.
+- **Decision date:** **2026-11-22**
+- **Implementation report:** `docs/reviews/OHB2-WP08-UNBLOCKED-PARITY-HARDENING-IMPLEMENTATION-REPORT.md` — SHA-256 `945c35d66dcd5d1b89f8c579c8ef9ac260183fb5f562f6488635aeba58543e07`
+- **Acceptance record:** `docs/audits/OHB2-WP08-OWNER-ACCEPTANCE-RECORD.md`
+
+### النطاق المقبول (خمسة بنود فقط)
+
+1. `docs/ZERO_TOUCH_STARTUP.md` §2.3: `MINI_APP_TRUSTED_PROXIES` و`ATTACHMENT_DOCUMENT_INTAKE_ENABLED`.
+2. `tests/test_start_script.py`: حماية تعاقدية لـ`anyio`.
+3. `tests/test_doc_code_parity.py`: فحص env ضمن Runbook §3 وفحص schema ضمن §4 مع اتساق القائمة والعدد.
+4. `tests/test_doc_code_parity.py` هو الموقع canonical لتكافؤ الوثائق.
+5. `README.md`: توضيح `DEFERRED_FEATURES_HIDDEN=False` وسلوكه.
+
+### الحالة والقيود
+
+- **WP-08 ككل يبقى `INCOMPLETE`**؛ هذا القبول **لا** يعني `WP-08_COMPLETE`.
+- التنفيذ يبقى **`DONE_WITH_NOTES`**.
+- **المجموعة الكاملة لم تُشغّل** في مهمة التنفيذ؛ الاعتماد على 44 اختبارًا مركّزًا + 31 + 62 اختبارًا متأثرًا.
+- اختبار `anyio` **تعاقدي/ثابت**، وليس اختبار تثبيت شبكي حي.
+- **لا مراجعة مستقلة** ولم يتم ادّعاؤها.
+- لا يُغلق أي بند محجوب أو مؤجل بموجب هذا القبول.
+
+### المحجوب/المؤجل الباقي
+
+`OD-01`، `OD-02`، `OD-03`، `OD-04`، WP-04 Part 2 (`/updates_*`)، WP-06 Part 2 / `callback_refs`،
+الافتراضي النهائي لـ`ATTACHMENT_DOCUMENT_INTAKE_ENABLED`، توثيق poller النهائي، وMini App freeze
+(`docs/MINI_APP.md`، `bot/web/*`، `Config.mini_app_*`). كما تبقى أي بنود WP-08 أخرى خارج النطاق.
+
+### الحفاظ على السجلات
+
+- لم يُعدّل تقرير التنفيذ.
+- لم يُعدّل تقرير التدقيق `OHB2-WP08-SCOPE-RECOVERY-AND-STATUS-AUDIT-REPORT.md`؛ حكمه التاريخي `INCOMPLETE`
+  وبصمته `0a7322e214326b9078fae827b639c32fd7ac204d3ee3d36de1541273747722e3` محفوظان.
+- هذا القسم **append-only**؛ لم تُعد كتابة أي أحكام تاريخية.
+
+### السلامة
+
+- لا تغيير في كود التطبيق أو الاختبارات أو dependencies أو lockfiles أو CI أو Docker أو runtime configuration أو Mini App.
+- لا stage، ولا commit، ولا push، ولا PR، ولا merge، ولا deployment، ولا Autopush.
+- لا reset/clean/force، ولا حذف واسع، ولا اتصالات إنتاجية.
+
+---
+
+## OHB2-WP01-ATTACHMENT-LIFECYCLE-IMPLEMENTATION (2026-11-22 — تنفيذ معتمد؛ لا commit)
+
+- **Task ID:** `OHB2-WP01-ATTACHMENT-LIFECYCLE-IMPLEMENTATION`
+- **Owner decisions:** `OD-01 = Option C` (explicit per-batch terminal clearance; `expired`/`rejected`
+  only) and `OD-03 = Option A` (`ATTACHMENT_DOCUMENT_INTAKE_ENABLED=False` by default).
+- **Decision record:** `docs/decisions/OHB2-WP01-OD01-OD03-OWNER-DECISION-RECORD.md`
+- **Authorization:** explicit owner task authorization; this is implementation authorization, not
+  WP-01 closure or independent review.
+- **Mandatory inventory:** completed read-only before edits; no irreversible cleanup authorized.
+- **Acceptance criteria:**
+  1. New installs default to disabled document intake; explicit `=1` remains opt-in.
+  2. Terminal clearance is explicit, per-batch, durable, idempotent, and limited to verified
+     `expired`/`rejected`.
+  3. `delivered`, `failed`, `TERMINAL_ASSOCIATED`, `TERMINAL_UNPROVEN`, unknown, unresolved, live,
+     expired-pending, corrupt, and ambiguous states remain fail-closed.
+  4. `/cancel` does not silently clear terminal blocks; active-batch cancellation does not delete
+     files or records.
+  5. Attachment messaging is truthful and policy-aware.
+  6. No Mini App, dependency, CI, concurrency, or unrelated work-package change.
+- **Status at start:** implementation not complete; tests not yet run in this environment.
+- **Safety:** no stage/commit/push/PR/merge/deploy/Autopush; no fetch/pull; preserve all pre-existing
+  changes.
+
+### Completion — 2026-11-22
+
+- **Status:** implementation complete for the authorized WP-01 scope; **not** WP-01 closure and **not**
+  an independent review.
+- **OD-03:** `Config.attachment_document_intake_enabled` and `load_config` now default to `False`;
+  `ATTACHMENT_DOCUMENT_INTAKE_ENABLED=1` is the explicit opt-in. Env/docs updated.
+- **OD-01 Option C:** added durable per-batch clearance in `settings` (owner-scoped, `expired`/`rejected`
+  only), transactionally with the durable update outcome. Classification ignores only explicitly cleared
+  clearable terminal batches; `delivered`/`failed` and `TERMINAL_ASSOCIATED` stay fail-closed.
+- **Commands:** `/attachments` (owner-scoped metadata) and `/attachments_clear <batch_id> confirm`.
+- **`/cancel`:** intentionally unchanged; active-batch abandonment remains BLOCKED because marking a
+  batch terminal would let the existing reaper unlink files (no irreversible cleanup authorization).
+- **Tests:** new `tests/test_wp01_attachment_lifecycle.py` (28 cases), plus updated intake/lifecycle
+  expectations for the new default and truthful messages.
+- **Verification:** full suite `3545 passed`; focused `101 passed`; pyflakes 0; bandit High 0;
+  pip-audit clean; Node `280 passed`; `git diff --check` clean.
+- **Safety:** no commit/stage/push/PR/merge/deploy/Autopush; pre-existing workspace changes preserved.
+
+---
+
+## OHB2-WP01-STAGE1-SAFE-ACTIVE-BATCH-CANCELLATION-IMPLEMENTATION (2026-11-21)
+
+### Goal
+تنفيذ **Stage 1** المعتمد صراحةً من المالك: إلغاء آمن لدفعة مرفقات **واحدة مملوكة** حالتها
+`pending` فقط، بحالة `cancelled` دائمة، مع حماية مسارات التخزين والكنس من سباقات الإلغاء،
+و**الحفاظ الكامل** على كل ملف/صف/دليل هوية موجود. **خارج النطاق:** Stage 2، Mini App/outbox،
+تغييرات CI/سياسة التزامن، DEF-011-A/C، D6.
+
+### Acceptance criteria
+1. `/attachments_cancel <batch_id> confirm` يلغي دفعة `pending` مملوكة فقط، ويرفض غير المملوكة/غير المؤهّلة.
+2. الحالة `cancelled` دائمة/متسقة، وإعادة المحاولة/التحديث المكرّر آمنان.
+3. لا حذف/نقل/تعديل لأي ملف أو صف أو دليل هوية، ولا مسح لـ route/user_state.
+4. الكنس لا يمس الدفعات الملغاة؛ ولا يعلن العنصر `reaped` لو الدفعة الأب `cancelled`.
+5. مسارا التخزين `store_async` و`store()` لا يكتبان/يثبّتان بيانات في دفعة ملغاة، وسباقات الإلغاء مغطاة باختبارات حتمية.
+6. البوابة كاملة خضراء (pytest/node/pyflakes/bandit High 0)، بلا commit/push/PR/نشر/Autopush.
+
+### Done
+- `bot/db.py`: أُضيفت `ATTACHMENT_BATCH_CANCELLED` إلى مجموعة الحالات، `AttachmentRoutingState.CANCELLED`،
+  CAS `try_transition_attachment_batch_status`, `cancel_pending_attachment_batch` (BEGIN IMMEDIATE + owner scope +
+  update_id idempotency)، إدراج عنصر append مشروط بـ`pending`/owner/conversation، وحارس `cancelled` في
+  `mark_attachment_item_reaped`.
+- `bot/attachments.py`: `StagingStore.cancellation_guard` (يقفل `_sync_lock` + `_accept_lock`)، حماية `store()`
+  المتزامن، رفض `_store_prepare` للدفعة الملغاة، CAS للانتهاء، رفض قبول الملف عند سباق الحالة، واستبعاد
+  `cancelled` من الكنس مع حارس مزدوج في `_plan_batch`.
+- `bot/handlers.py` + `bot/app.py`: أمر `/attachments_cancel` (تأكيد صريح، رسائل صادقة، owner-scoped)،
+  معالجة `CANCELLED` في توجيه النصّ كغير حاجب، ورسالة سباق التخزين.
+- `tests/test_wp01_stage1_cancellation.py`: 39 اختبارًا يغطي العقد، الملكية، الحالات غير المؤهّلة، التكرار،
+  فشل القاعدة/rollback، إعادة الفتح، سباقات الإلغاء المتزامنة، `store_async`/`store()`، الكنس، والـhandler.
+- تحديث `docs/OPERATIONS_RUNBOOK.md` بالأمر الجديد، وتحديث عدّاد `to_thread` في إشعارَي F-03
+  (`6` occurrences) واختبارات parity المقابلة.
+
+### Verification
+- `python -m pytest -q tests/test_wp01_stage1_cancellation.py` ⇒ **39 passed**.
+- الاختبارات ذات الصلة (attachments/reaper/app/handlers/Mini App + parity) ⇒ **518 passed**.
+- `python -m pyflakes bot/ automation/ tools/ main.py tests/` ⇒ exit **0**.
+- `git diff --check` ⇒ exit **0**.
+- Full suite (بعد تحديث parity): **3584 passed / 0 failed**، node **280/0**، pyflakes **0**، bandit High **0**،
+  pip-audit **clean**، `git diff --check` **0**. التفاصيل في
+  `docs/reviews/OHB2-WP01-STAGE1-CANCELLATION-IMPLEMENTATION-REPORT.md`.
+
+### Next
+- لا شيء مطلوب داخل Stage 1. أي عمل لاحق (مثل Stage 2) يحتاج قرارًا/تفويضًا منفصلًا.
+- أي بند غير محسوم (مثل Stage 2) يظل خارج النطاق ومُسجَّلًا، بلا ادّعاء تنفيذ.
+
+---
+
+## OHB2-PERSISTENT-READY-STATE-AND-STICKY-CONVERSATION-ROUTING (2026-11-21)
+
+### Status
+DONE — implementation and local verification. No commit/push/PR/merge/deploy/Autopush.
+
+### Goal / acceptance
+- Remove the 10-minute route inactivity cutoff.
+- Route eligible ordinary text and prompts to the persisted
+  `last_accessed_conversation:<telegram_id>` target across inactivity/restart.
+- Opening/selecting B changes the target; sending does not.
+- No fallback/auto-creation for missing targets; confirmed unavailable targets are
+  handled truthfully; transient errors preserve the target.
+- Preserve `/start`, `/chat`, outbox, grouping, confirmation/cleanup, and Mini App.
+
+### Done
+- `bot/db.py`: route no longer expires in `take_awaiting`; `AWAITING_TTL` retained for
+  one-shot states; added `routing_paused:<telegram_id>` settings helpers; opening/selecting
+  clears the pause atomically with the saved target.
+- `bot/handlers.py`: `handle_text` resolves the persisted target as authoritative; removed
+  route TTL cutoff; expired `reply` falls back to persisted target; no-target Arabic reply;
+  `/start` resumes routing; `/cancel` pauses it; UI hint updated.
+- `bot/outbox.py`: targeted confirmed-missing handling (empty result/404/410) only for the
+  saved target; transient errors keep target/retry behavior.
+- Tests: `tests/test_persistent_ready_sticky_routing.py` (28 cases), plus updated old
+  expiry/UI assertions.
+
+### Verification
+- `python -m pytest -q` => **3688 passed / 0 failed**.
+- New module => **28 passed**; focused routing suite => **290 passed**.
+- Outbox/delivery batch => **255 passed**.
+- pyflakes **0**; bandit High **0**; Node **280/0**; pip-audit clean; `git diff --check` **0**.
+- Full report:
+  `docs/reviews/OHB2-PERSISTENT-READY-STATE-AND-STICKY-CONVERSATION-ROUTING-IMPLEMENTATION-REPORT.md`.

@@ -185,7 +185,7 @@ def test_display_failure_activates_nothing_and_records_transient(tmp_path):
 
 
 def test_telegram_display_text_unchanged(tmp_path):
-    """نص العرض للمستخدم ما اتغيّرش (تلميح الـ10 دقايق + زر الإلغاء)."""
+    """نص العرض للمستخدم يعكس التوجيه الدائم + زر الإلغاء."""
     ctx = _open_ctx(tmp_path)
     q = Q("open:A")
     update = cb_update(q)
@@ -194,7 +194,7 @@ def test_telegram_display_text_unchanged(tmp_path):
     asyncio.run(h.open_conversation(update, ctx))
 
     shown = "".join(q.edits)
-    assert "10 دقايق" in shown
+    assert "لحد ما تفتح/تختار شات تاني" in shown
     assert q.markups and q.markups[0] is not None
     ctx.bot_data["db"].close()
 

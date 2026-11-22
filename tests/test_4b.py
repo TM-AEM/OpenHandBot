@@ -415,14 +415,17 @@ def test_route_is_sticky_refreshes_and_shows_chat_name(tmp_path):
     assert db.get_awaiting(1) == ("conv-A", "route")  # لسه شغال (اتجدّد وقته)
 
 
-def test_route_expires_after_ten_minutes_of_inactivity(tmp_path):
+def test_route_survives_ten_minutes_of_inactivity(tmp_path):
     ctx = make_context(1, tmp_path)
     db = ctx.bot_data["db"]
-    db.set_awaiting(1, "conv-A", "route", title="t", now=aged(10) - timedelta(seconds=5))
+    db.set_last_accessed_conversation(1, "conv-A")
+    db.set_awaiting(1, "conv-A", "route", title="t", now=aged(30))
     update = make_update(1, "متأخر")
     asyncio.run(h.handle_text(update, ctx))
-    assert db.count_outbox() == 0
-    assert "انتهت مهلة" in update.message.replies[0]
+    items = db.list_outbox_by_status("pending")
+    assert len(items) == 1
+    assert items[0].conversation_id == "conv-A"
+    assert "انتهت مهلة" not in update.message.replies[0]
 
 
 def test_route_with_activity_does_not_expire_while_in_use(tmp_path):
@@ -432,7 +435,7 @@ def test_route_with_activity_does_not_expire_while_in_use(tmp_path):
     for minutes in (6, 12, 18, 24):  # كل رسالة بعد 6 دقايق من اللي قبلها
         conv, kind, _ = db.take_awaiting(1, now=t0 + timedelta(minutes=minutes))
         assert (conv, kind) == ("A", "route")
-    assert db.take_awaiting(1, now=t0 + timedelta(minutes=40))[1] == "expired"
+    assert db.take_awaiting(1, now=t0 + timedelta(minutes=40))[1] == "route"
 
 
 def test_cancel_command_and_button_clear_route(tmp_path):
@@ -507,7 +510,7 @@ def test_opening_a_chat_routes_following_messages_to_it_and_replaces_previous(tm
     q = Q("open:A")
     asyncio.run(h.open_conversation(cb_update(q), ctx))
     assert db.get_awaiting(1) == ("A", "route")
-    assert "10 دقايق" in q.edits[0] or "10 دقايق" in "".join(q.edits)
+    assert "لحد ما تفتح/تختار شات تاني" in "".join(q.edits)
 
     ctx.bot_data["client"] = OpenClient({"id": "B", "title": "شات B", "execution_status": "finished"})
     asyncio.run(h.open_conversation(cb_update(Q("open:B")), ctx))

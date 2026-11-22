@@ -1,6 +1,7 @@
 """قاعدة بيانات SQLite لحفظ الشاتات المتابَعة وحالة الحوار وصندوق الصادر."""
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 import time
@@ -126,6 +127,10 @@ ATTACHMENT_BATCH_DELIVERED = "delivered"
 ATTACHMENT_BATCH_EXPIRED = "expired"
 ATTACHMENT_BATCH_REJECTED = "rejected"
 ATTACHMENT_BATCH_FAILED = "failed"
+# OHB2-WP01 Stage 1: durable local cancellation. This is a non-terminal, non-reapable
+# state; it is intentionally not in ATTACHMENT_BATCH_CLEARABLE_STATUSES and must never
+# be added to AttachmentReaper._TERMINAL.
+ATTACHMENT_BATCH_CANCELLED = "cancelled"
 ATTACHMENT_BATCH_STATUSES = (
     ATTACHMENT_BATCH_PENDING,
     ATTACHMENT_BATCH_INTENT_RECORDED,
@@ -135,6 +140,19 @@ ATTACHMENT_BATCH_STATUSES = (
     ATTACHMENT_BATCH_EXPIRED,
     ATTACHMENT_BATCH_REJECTED,
     ATTACHMENT_BATCH_FAILED,
+    ATTACHMENT_BATCH_CANCELLED,
+)
+
+# OHB2-WP01 N2: item reaping is allowed only for a terminal parent. Orphan items
+# (no parent row) keep their existing separate cleanup policy; every other parent
+# state, including pending/unresolved/cancelled/unknown, must fail closed.
+ATTACHMENT_BATCH_REAPABLE_STATUSES = frozenset(
+    {
+        ATTACHMENT_BATCH_DELIVERED,
+        ATTACHMENT_BATCH_EXPIRED,
+        ATTACHMENT_BATCH_REJECTED,
+        ATTACHMENT_BATCH_FAILED,
+    }
 )
 
 # OHB2-P0-A3/D-32 (F1-1a/F1-1b)، محدَّث بـD-34: تصنيف **صريح** لحالات الدفعة عند حدّ توجيه النصّ في A3.
@@ -154,6 +172,15 @@ ATTACHMENT_BATCH_UNRESOLVED_STATUSES = frozenset(
     }
 )
 
+# OHB2-WP01/OD-01 Option C: clearance is deliberately narrower than "terminal".
+# Only locally verified expired/rejected batches may be explicitly cleared.
+ATTACHMENT_BATCH_CLEARABLE_STATUSES = frozenset(
+    {ATTACHMENT_BATCH_EXPIRED, ATTACHMENT_BATCH_REJECTED}
+)
+# Durable, per-batch clearance marker stored in the existing settings table. Keeping the
+# marker outside attachment_message_identity preserves D-35 identity evidence untouched.
+ATTACHMENT_TERMINAL_CLEARANCE_KEY_PREFIX = "attachment_terminal_clearance:"
+
 
 class AttachmentBatchIntegrityError(RuntimeError):
     """OHB2-P0-A3/F2: حالة دفعة مرفقات **غير معروفة/غير صالحة** ⇒ رفض مغلق.
@@ -163,6 +190,14 @@ class AttachmentBatchIntegrityError(RuntimeError):
     الحالة المجهولة `NONE` وتسقط بصمت لمسار البرومت/`outbox` (fail-open)، بينتشر
     الاستثناء للمعالج ⇒ يُسجَّل **فشلًا تقنيًّا غير مؤهّل للإقرار** (`failed_*`)، بلا أي
     صفّ `outbox` وبلا أي نداء بعيد. مفيش كتم للاستثناء ولا تحويله لنجاح/رفض مؤهّل.
+    """
+
+
+class AttachmentBatchStateChanged(RuntimeError):
+    """OHB2-WP01 Stage 1: سباق حالة عند إضافة عنصر لدفعة لم تبقَ `pending`.
+
+    يُرفع داخل معاملة الإضافة عندما يخسر الطلب سباقاً مع الإلغاء/الانتهاء/النيّة؛
+    المستدعي يحوّله إلى رفض مغلق (بلا كتابة عنصر ولا ملف)، لا إلى نجاح.
     """
 
 
@@ -251,7 +286,9 @@ INBOX_DELIVERY_MAX_ATTEMPTS = 5
 INBOX_CLAIM_LEASE = timedelta(minutes=5)
 
 
-# مهلة أي حالة توجيه (من آخر نشاط). القرار 1: توجيه 10 دقايق.
+# مهلة الحالات لمرة واحدة (reply/newchat/reposearch) من آخر نشاط.
+# `route` (الشات المختار) **ما بتنتهيش** بالمهلة دي؛ التوجيه الافتراضي بيستمر لحد ما
+# المستخدم يفتح/يختار شات تاني أو الهدف يتأكد إنه غير متاح/محذوف.
 AWAITING_TTL = timedelta(minutes=10)
 
 
@@ -274,6 +311,29 @@ def _parse_iso(value: str | None) -> datetime | None:
     except (ValueError, TypeError):
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _decode_telegram_message_ids(raw: str | None) -> tuple[int, ...]:
+    """يفكّ JSON معرّفات رسائل المالك؛ أي تلف/قيمة غير صالحة ⇒ لا معرّفات."""
+    if not raw:
+        return ()
+    try:
+        values = json.loads(raw)
+    except (TypeError, ValueError):
+        return ()
+    if not isinstance(values, list):
+        return ()
+    out: list[int] = []
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            return ()
+        if value not in out:
+            out.append(value)
+    return tuple(out)
+
+
+def _encode_telegram_message_ids(ids: tuple[int, ...]) -> str:
+    return json.dumps(list(ids), separators=(",", ":"))
 
 
 def _attachment_batch_deadline(t0: str | None) -> datetime | None:
@@ -372,6 +432,9 @@ class OutboxItem:
     # العملية الخارجية (`status`). "" = لسه محتاج إكمال، "pending" = بدأ ولسه ماتأكدش
     # (يتعافى)، "sent" = خلص.
     notify_state: str = NOTIFY_NONE
+    # معرّفات رسائل المالك الأصلية (قد تكون أكثر من واحدة لو اتجمّعت في نفس السجل).
+    # محفوظة للتنظيف بعد نجاح التسليم فقط؛ الصفوف القديمة/غير تيليجرام تفضل ().
+    telegram_message_ids: tuple[int, ...] = ()
 
 
 @dataclass
@@ -517,6 +580,9 @@ class AttachmentRoutingState(str, Enum):
     # OHB2-P0-A3/D-34: تمييز الحالة النهائية بحسب دليل هوية الرسالة الواردة.
     TERMINAL_ASSOCIATED = "terminal_associated"   # النصّ **مُثبَت** ارتباطه بدفعة نهائية ⇒ حجب
     TERMINAL_UNPROVEN = "terminal_unproven"       # دفعة نهائية + **لا** دليل هوية ⇒ فشل مغلق (D-34)
+    # OHB2-WP01 Stage 1: دفعة ملغاة صراحةً؛ لا تحجب البرومت العادي لأن Stage 1 لا يلغي
+    # إلا `pending` (بلا دليل هوية رسالة).
+    CANCELLED = "cancelled"
 
 
 @dataclass(frozen=True)
@@ -616,7 +682,8 @@ class Database:
                 updated_at      TEXT NOT NULL,
                 attempts        INTEGER NOT NULL DEFAULT 0,
                 client_ref      TEXT,
-                notify_state    TEXT NOT NULL DEFAULT ''
+                notify_state    TEXT NOT NULL DEFAULT '',
+                telegram_message_ids TEXT NOT NULL DEFAULT '[]'
             );
             CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox(status);
             CREATE TABLE IF NOT EXISTS creation_jobs (
@@ -872,6 +939,12 @@ class Database:
         if outbox_cols and "notify_state" not in outbox_cols:
             self._conn.execute(
                 "ALTER TABLE outbox ADD COLUMN notify_state TEXT NOT NULL DEFAULT ''"
+            )
+        # OHB2-TELEGRAM-MESSAGE-CLEANUP: معرّفات رسائل المالك الأصلية المرتبطة بالسجل.
+        # JSON إضافي بقيمة افتراضية [] للصفوف القديمة (مفيش حذف رسائل قديمة غير معروفة).
+        if outbox_cols and "telegram_message_ids" not in outbox_cols:
+            self._conn.execute(
+                "ALTER TABLE outbox ADD COLUMN telegram_message_ids TEXT NOT NULL DEFAULT '[]'"
             )
         creation_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(creation_jobs)")}
         if creation_cols and "client_ref" not in creation_cols:
@@ -1309,6 +1382,102 @@ class Database:
         self._conn.commit()
         return cur.rowcount == 1
 
+    def try_transition_attachment_batch_status(
+        self,
+        batch_id: str,
+        *,
+        expected_status: str,
+        new_status: str,
+        now: str,
+    ) -> bool:
+        """CAS لحالة دفعة: ينجح فقط لو الحالة الحالية = `expected_status`.
+
+        OHB2-WP01 Stage 1: يستخدمه الإلغاء (pending → cancelled) والانتهاء
+        (pending → expired). التحديث نفسه ذرّي في SQLite، و`rowcount` هو دليل الفوز.
+        """
+        cur = self._conn.execute(
+            "UPDATE attachment_batches SET status=?, updated_at=? "
+            "WHERE batch_id=? AND status=?",
+            (new_status, now, batch_id, expected_status),
+        )
+        self._conn.commit()
+        return cur.rowcount == 1
+
+    def cancel_pending_attachment_batch(
+        self,
+        telegram_id: int,
+        batch_id: str,
+        *,
+        now: str,
+        update_id: int | None = None,
+    ) -> str:
+        """OHB2-WP01 Stage 1: إلغاء دفعة `pending` واحدة بمالكها وبمعرّف صريح.
+
+        - الملكية جزء من شرط الـ SELECT والـ UPDATE؛ لا كشف لدفعة مالك آخر.
+        - الانتقال `pending → cancelled` شرطي داخل `BEGIN IMMEDIATE` (CAS).
+        - `update_id` مكرّر ⇒ `duplicate` بلا تغيير (نفس نمط clearance).
+        - الحالة `cancelled` ⇒ `already_cancelled` بلا انتقال جديد.
+        - أي حالة أخرى ⇒ `not_eligible` بلا تغيير.
+        - لا يمسح route/user_state، ولا يحذف/ينقل ملفات أو صفوفاً أو دليل هوية.
+        """
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if update_id is not None and self.update_is_processed(update_id):
+                conn.rollback()
+                return "duplicate"
+            row = conn.execute(
+                "SELECT status FROM attachment_batches "
+                "WHERE batch_id=? AND telegram_id=?",
+                (batch_id, int(telegram_id)),
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return "not_found"
+            status = row["status"]
+            if status == ATTACHMENT_BATCH_CANCELLED:
+                if update_id is not None:
+                    self.mark_update_outcome(
+                        update_id, now, update_outcomes.EXPLICITLY_IGNORED, commit=False
+                    )
+                conn.commit()
+                return "already_cancelled"
+            if status != ATTACHMENT_BATCH_PENDING:
+                conn.rollback()
+                return "not_eligible"
+            cur = conn.execute(
+                "UPDATE attachment_batches SET status=?, updated_at=? "
+                "WHERE batch_id=? AND telegram_id=? AND status=?",
+                (ATTACHMENT_BATCH_CANCELLED, now, batch_id, int(telegram_id),
+                 ATTACHMENT_BATCH_PENDING),
+            )
+            if cur.rowcount != 1:
+                # Lost a race between the ownership read and the CAS. Re-read once
+                # to distinguish idempotent cancellation from another transition.
+                current = conn.execute(
+                    "SELECT status FROM attachment_batches "
+                    "WHERE batch_id=? AND telegram_id=?",
+                    (batch_id, int(telegram_id)),
+                ).fetchone()
+                if current is not None and current["status"] == ATTACHMENT_BATCH_CANCELLED:
+                    if update_id is not None:
+                        self.mark_update_outcome(
+                            update_id, now, update_outcomes.EXPLICITLY_IGNORED, commit=False
+                        )
+                    conn.commit()
+                    return "already_cancelled"
+                conn.rollback()
+                return "not_eligible"
+            if update_id is not None:
+                self.mark_update_outcome(
+                    update_id, now, update_outcomes.DURABLE_COMPLETED, commit=False
+                )
+            conn.commit()
+            return "cancelled"
+        except Exception:
+            conn.rollback()
+            raise
+
     # ---------------------------------------------- OHB2-P0-A3: النية المحلية المتينة (D-27/D-29/D-30)
     def list_live_pending_attachment_batches(
         self, telegram_id: int, *, now_iso: str
@@ -1376,6 +1545,19 @@ class Database:
         ).fetchall()
         return [self._row_to_attachment_batch(row) for row in rows]
 
+    def list_cancelled_attachment_batches(self, telegram_id: int) -> list[AttachmentBatch]:
+        """الدفعات الملغاة صراحةً للمستخدم (Stage 1) — قراءة فقط.
+
+        `cancelled` ليست نهائية ولا قابلة للكنس/الـclearance؛ وجودها وحده لا يحجب
+        البرومت العادي (Stage 1 لا يلغي إلا `pending` بلا دليل هوية رسالة).
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM attachment_batches WHERE telegram_id=? AND status=? "
+            "ORDER BY rowid DESC",
+            (int(telegram_id), ATTACHMENT_BATCH_CANCELLED),
+        ).fetchall()
+        return [self._row_to_attachment_batch(row) for row in rows]
+
     def has_terminal_attachment_batch(self, telegram_id: int) -> bool:
         """هل فيه أي دفعة **نهائية** (`delivered`/`expired`/`rejected`/`failed`) للمستخدم؟
         (D-32/F1-1a؛ سلوك الحجب محدَّث بـ D-34.)
@@ -1384,7 +1566,9 @@ class Database:
         دفعة نهائية **بيحجب** الآن (مش بيسقط لمسار البرومت) — التصنيف بيرجّع `TERMINAL_ASSOCIATED`
         (دليل هوية مُثبَت) أو `TERMINAL_UNPROVEN` (بلا دليل هوية)، و**مش** `NONE`. (ده ألغى سلوك
         D-32 بند 2 القديم اللي كان يقول الدفعة النهائية ما بتحجبش بذاتها.) نطاق **المالك** إلزامي
-        (`telegram_id`) ⇒ عزل بين المستخدمين. قراءة فقط.
+        (`telegram_id`) ⇒ عزل بين المستخدمين. قراءة فقط. **OHB2-WP01:** الدالة دي ترجّع
+        وجود أي دفعة نهائية خام (حتى لو expired/rejected مُبرَّأة)؛ التصنيف هو اللي يطبّق
+        استثناء الـclearance الصريح.
         """
         row = self._conn.execute(
             "SELECT 1 FROM attachment_batches WHERE telegram_id=? "
@@ -1392,6 +1576,112 @@ class Database:
             (int(telegram_id),),
         ).fetchone()
         return row is not None
+
+    def list_terminal_attachment_batches(self, telegram_id: int) -> list[AttachmentBatch]:
+        """كل الدفعات النهائية للمستخدم (قراءة فقط) — للتصنيف والفحص الدقيق.
+
+        OHB2-WP01/OD-01: وجود صفّ نهائي لا يكفي وحده للحجب؛ التصنيف يفحص هل الصفّ
+        `expired`/`rejected` ومُبرَّأ صراحةً (clearance) أم لا. `delivered`/`failed`
+        لا يُبرَّآن أبدًا.
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM attachment_batches WHERE telegram_id=? "
+            "AND status IN ('delivered','expired','rejected','failed') "
+            "ORDER BY rowid DESC",
+            (int(telegram_id),),
+        ).fetchall()
+        return [self._row_to_attachment_batch(row) for row in rows]
+
+    def list_attachment_batches_for_owner(self, telegram_id: int) -> list[AttachmentBatch]:
+        """كل دفعات المرفقات للمستخدم (قراءة فقط، بلا نصّ النيّة) — لعرض الحالة فقط."""
+        rows = self._conn.execute(
+            "SELECT * FROM attachment_batches WHERE telegram_id=? ORDER BY rowid DESC",
+            (int(telegram_id),),
+        ).fetchall()
+        return [self._row_to_attachment_batch(row) for row in rows]
+
+    def is_attachment_terminal_cleared(self, telegram_id: int, batch_id: str) -> bool:
+        """هل الدفعة النهائية دي عندها clearance صريح للمالك ده؟ (قراءة فقط)
+
+        العلامة مخزّنة في `settings` بمفتاح خاص بالدفعة، والقيمة = `telegram_id` لمنع
+        إعادة استخدام علامة مالك آخر. غياب العلامة/قيمتها غير الصالحة ⇒ False (fail-closed).
+        """
+        row = self._conn.execute(
+            "SELECT value FROM settings WHERE key=?",
+            (f"{ATTACHMENT_TERMINAL_CLEARANCE_KEY_PREFIX}{batch_id}",),
+        ).fetchone()
+        if row is None:
+            return False
+        try:
+            return int(row["value"]) == int(telegram_id)
+        except (TypeError, ValueError):
+            return False
+
+    def clear_attachment_terminal_batch(
+        self,
+        telegram_id: int,
+        batch_id: str,
+        *,
+        now: str,
+        update_id: int | None = None,
+    ) -> str:
+        """OHB2-WP01/OD-01 Option C: clearance صريح لدفعة واحدة فقط.
+
+        القواعد (fail-closed):
+        - الملكية إلزامية (`batch_id` + `telegram_id`).
+        - فقط `expired`/`rejected` قابلتان للـclearance.
+        - `delivered`/`failed`/أي حالة أخرى ⇒ `not_eligible`، بلا أي كتابة.
+        - العلامة تُكتب في نفس معاملة فحص الحالة، والنتيجة الدائمة (`durable_completed`)
+          تُكتب معها. لا ردّ نجاح قبل الـcommit (المستدعي يردّ بعد الإرجاع).
+        - idempotent: إعادة نفس الدفعة ترجّع `already_cleared` بلا تغيير.
+        - `update_id` مكرّر ⇒ `duplicate` بلا تغيير (لا يعيد العملية).
+        - لا يمسّ `attachment_message_identity` ولا أي ملفات/صفوف أخرى.
+
+        Return values: `cleared`, `already_cleared`, `not_found`, `not_eligible`, `duplicate`.
+        """
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if update_id is not None and self.update_is_processed(update_id):
+                conn.rollback()
+                return "duplicate"
+            row = conn.execute(
+                "SELECT status FROM attachment_batches "
+                "WHERE batch_id=? AND telegram_id=?",
+                (batch_id, int(telegram_id)),
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return "not_found"
+            status = row["status"]
+            if status not in ATTACHMENT_BATCH_CLEARABLE_STATUSES:
+                conn.rollback()
+                return "not_eligible"
+            key = f"{ATTACHMENT_TERMINAL_CLEARANCE_KEY_PREFIX}{batch_id}"
+            existing = conn.execute(
+                "SELECT value FROM settings WHERE key=?", (key,)
+            ).fetchone()
+            if existing is not None and str(existing["value"]) == str(int(telegram_id)):
+                if update_id is not None:
+                    self.mark_update_outcome(
+                        update_id, now, update_outcomes.EXPLICITLY_IGNORED, commit=False
+                    )
+                conn.commit()
+                return "already_cleared"
+            conn.execute(
+                "INSERT INTO settings(key, value) VALUES(?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, str(int(telegram_id))),
+            )
+            if update_id is not None:
+                self.mark_update_outcome(
+                    update_id, now, update_outcomes.DURABLE_COMPLETED, commit=False
+                )
+            conn.commit()
+            return "cleared"
+        except Exception:
+            conn.rollback()
+            raise
 
     def has_unknown_attachment_batch_status(self, telegram_id: int) -> bool:
         """هل فيه صفّ دفعة للمستخدم بحالة **خارج** `ATTACHMENT_BATCH_STATUSES` (أو NULL)؟
@@ -1466,17 +1756,30 @@ class Database:
         يُنادى **فقط بعد** قرار نهائي/انتهاء مؤكَّد للدفعة (تسلسل DB-أولًا قبل حذف البايتات).
         True لو صف واحد اتحدّث. ما بيمسّش `attachment_message_identity` (دليل الهوية مستقل —
         D-35). عنصر مش موجود أو مش في الحالة المؤهّلة ⇒ False (المستدعي مايعلنش نجاح).
+
+        **OHB2-WP01 N2:** الدفعة الأب لازم تكون في
+        `ATTACHMENT_BATCH_REAPABLE_STATUSES` (delivered/expired/rejected/failed). أي حالة
+        أخرى — بما فيها pending/intent_recorded/dispatching/uncertain/cancelled/unknown/NULL —
+        تُرفض. العنصر اليتيم (بلا صف دفعة أب) يبقى مؤهّلاً لمسار الكنس اليتيم القائم.
+        الشرط داخل نفس `UPDATE` ⇒ لا نافذة قراءة-ثم-كتابة بين فحص الأب وتغيير العنصر.
         """
         stamp = datetime.now(timezone.utc).isoformat()
+        reapable = tuple(sorted(ATTACHMENT_BATCH_REAPABLE_STATUSES))
         cur = self._conn.execute(
             "UPDATE attachment_items SET status=?, updated_at=? "
-            "WHERE item_id=? AND status IN (?, ?)",
+            "WHERE item_id=? AND status IN (?, ?) "
+            "AND (NOT EXISTS (SELECT 1 FROM attachment_batches b "
+            "WHERE b.batch_id=attachment_items.batch_id) "
+            "OR EXISTS (SELECT 1 FROM attachment_batches b "
+            "WHERE b.batch_id=attachment_items.batch_id "
+            "AND b.status IN (?, ?, ?, ?)))",
             (
                 ATTACHMENT_ITEM_REAPED,
                 stamp,
                 item_id,
                 ATTACHMENT_BATCH_PENDING,
                 ATTACHMENT_ITEM_STORED,
+                *reapable,
             ),
         )
         self._conn.commit()
@@ -1509,10 +1812,11 @@ class Database:
         3. **دفعة `pending` حيّة واحدة** ⇒ `LIVE` (مسار النصّ المصاحب؛ يبقى ربط route/الملكية
            والتحقّق النهائي للمعالج).
         4. **لا حيّة** لكن فيه دفعة `pending` **منتهية** ⇒ `EXPIRED_PENDING` (لا إحياء/لا تحويل).
-        5. **لا حيّة ولا منتهية** لكن فيه دفعة **نهائية** ⇒ لا `NONE`: إمّا `TERMINAL_ASSOCIATED`
-           (دليل هوية يُثبت ارتباط الرسالة بدفعة نهائية) أو `TERMINAL_UNPROVEN` (بلا دليل هوية).
-           **كلاهما يحجب** برومتًا جديدًا (fail-closed — D-34، ألغى سلوك D-32 بند 2). العضو
-           `TERMINAL` محفوظ للتوافق فقط و**لا يُنتجه** هذا التصنيف.
+        5. **لا حيّة ولا منتهية** لكن فيه دفعة **نهائية** ⇒ `TERMINAL_ASSOCIATED` لو دليل
+           الهوية يُثبت الارتباط، أو `TERMINAL_UNPROVEN` بلا دليل. كلاهما يحجب (D-34).
+           **استثناء WP-01/OD-01 Option C:** دفعة `expired`/`rejected` عليها clearance صريح
+           للمالك تُستثنى من الحجب؛ `delivered`/`failed` لا تُستثنى أبدًا، و`TERMINAL_ASSOCIATED`
+           يظل يفوز حتى لو الدفعة مُبرَّأة. العضو `TERMINAL` محفوظ للتوافق فقط.
         6. غير ذلك ⇒ `NONE` (مسار البرومت العادي كما هو).
 
         **F2 (fail-closed):** لو وُجد أي صفّ بحالة **خارج** `ATTACHMENT_BATCH_STATUSES`
@@ -1524,13 +1828,11 @@ class Database:
 
         **D-34 (تعريف `NONE` الصريح — P-1):** `NONE` يُعاد **فقط** بعد تصنيف **ناجح ومكتمل
         ومقيَّد بالمالك** يُثبت أنّه **لا توجد أي حالة دفعة ذات صلة** تربط الرسالة الواردة بدفعة
-        قائمة. `NONE` **لا يُعاد أبدًا** عند: وجود دفعة نهائية في نطاق المالك (`TERMINAL_*`)؛
-        دفعة نهائية بلا دليل هوية؛ دفعة نهائية تاريخية غير مُثبَتة؛ دفعات متعدّدة تجعل الإسناد
-        غامضًا (`MULTI_LIVE`)؛ فشل الاستعلام/نتائج ناقصة/سجلات تالفة (يرفع استثناء). **فقط**
-        نتيجة `NONE` مُتحقَّق منها قد تدخل تصنيف البرومت العادي، ورَهينة بكل فحوص المالك/route/
-        المحادثة المستقلة. الدفعات النهائية **تحجب** الآن (`TERMINAL_ASSOCIATED`/
-        `TERMINAL_UNPROVEN`) بدل السقوط لمسار البرومت (D-34؛ ألغى سلوك D-32 بند 2 القديم
-        «TERMINAL وNONE متطابقتان»).
+        قائمة. `NONE` **لا يُعاد أبدًا** عند: وجود دفعة نهائية غير مُبرَّأة في نطاق المالك
+        (`TERMINAL_*`)؛ دفعة نهائية بلا دليل هوية؛ دفعة نهائية تاريخية غير مُثبَتة؛ دفعات
+        متعدّدة تجعل الإسناد غامضًا (`MULTI_LIVE`)؛ فشل الاستعلام/نتائج ناقصة/سجلات تالفة
+        (يرفع استثناء). **WP-01/OD-01:** clearance صريح لدفعة `expired`/`rejected` هو الاستثناء
+        الوحيد؛ `delivered`/`failed` لا تُبرَّآن، و`TERMINAL_ASSOCIATED` يظل fail-closed.
         """
         # F2: فحص سلامة الحالات **أولًا** (fail-closed) — حالة مجهولة ⇒ رفض مغلق صريح.
         if self.has_unknown_attachment_batch_status(telegram_id):
@@ -1554,11 +1856,12 @@ class Database:
             )
         if self.has_expired_pending_attachment_batch(telegram_id, now_iso=now_iso):
             return AttachmentRouting(AttachmentRoutingState.EXPIRED_PENDING)
-        if self.has_terminal_attachment_batch(telegram_id):
-            # OHB2-P0-A3/D-34: دفعة نهائية في نطاق المالك ⇒ **فشل مغلق**. غياب دليل الهوية
-            # **ليس** دليلًا على رسالة جديدة ⇒ `TERMINAL_UNPROVEN`. وجود دليل هوية ⇒ النصّ
-            # **مُثبَت** الارتباط بدفعة نهائية ⇒ `TERMINAL_ASSOCIATED`. الحالتان **تحجبان**
-            # (لا برومت عادي/لا `_send_prompt`/لا `outbox`)؛ الفرق دلالي (تتبّع/تدقيق).
+        terminal_batches = self.list_terminal_attachment_batches(telegram_id)
+        if terminal_batches:
+            # OHB2-P0-A3/D-34: دفعة نهائية في نطاق المالك ⇒ **فشل مغلق**، إلا في
+            # OHB2-WP01/OD-01 Option C: دفعة `expired`/`rejected` عليها clearance صريح
+            # للمالك. `delivered`/`failed` لا تُبرَّأ أبدًا. `TERMINAL_ASSOCIATED` يفوز
+            # دائمًا حتى لو الدفعة مُبرَّأة، لأن دليل الهوية نفسه يمنع السقوط لمسار البرومت.
             identity = (
                 normalize_message_identity(telegram_id, chat_id, message_id)
                 if chat_id is not None and message_id is not None
@@ -1566,7 +1869,22 @@ class Database:
             )
             if identity is not None and self.message_identity_batch_id(*identity) is not None:
                 return AttachmentRouting(AttachmentRoutingState.TERMINAL_ASSOCIATED)
-            return AttachmentRouting(AttachmentRoutingState.TERMINAL_UNPROVEN)
+            uncleared = [
+                batch
+                for batch in terminal_batches
+                if not (
+                    batch.status in ATTACHMENT_BATCH_CLEARABLE_STATUSES
+                    and self.is_attachment_terminal_cleared(telegram_id, batch.batch_id)
+                )
+            ]
+            if uncleared:
+                return AttachmentRouting(AttachmentRoutingState.TERMINAL_UNPROVEN)
+            # All terminal batches are explicitly cleared expired/rejected batches.
+            if self.list_cancelled_attachment_batches(telegram_id):
+                return AttachmentRouting(AttachmentRoutingState.CANCELLED)
+            return AttachmentRouting(AttachmentRoutingState.NONE)
+        if self.list_cancelled_attachment_batches(telegram_id):
+            return AttachmentRouting(AttachmentRoutingState.CANCELLED)
         return AttachmentRouting(AttachmentRoutingState.NONE)
 
     def record_attachment_intent(
@@ -1766,10 +2084,37 @@ class Database:
                 )
                 conn.commit()
                 return None
-            self._insert_attachment_item_nocommit(
-                item_id, batch.batch_id, staging_token, display_name, None,
-                ATTACHMENT_BATCH_PENDING, now,
+            # OHB2-WP01 Stage 1: the batch may have been cancelled/expired/intent-recorded
+            # after classification. Re-check ownership + `pending` atomically in the
+            # INSERT itself; a lost race must not create an item in a non-pending batch.
+            cur = conn.execute(
+                "INSERT INTO attachment_items"
+                "(item_id, batch_id, staging_token, display_name, size_bytes, status, "
+                "created_at, updated_at) "
+                "SELECT ?, ?, ?, ?, ?, ?, ?, ? "
+                "WHERE EXISTS (SELECT 1 FROM attachment_batches b "
+                "WHERE b.batch_id=? AND b.telegram_id=? AND b.conversation_id=? "
+                "AND b.status=?)",
+                (
+                    item_id,
+                    batch.batch_id,
+                    staging_token,
+                    display_name,
+                    None,
+                    ATTACHMENT_BATCH_PENDING,
+                    now,
+                    now,
+                    batch.batch_id,
+                    int(batch.telegram_id),
+                    batch.conversation_id,
+                    ATTACHMENT_BATCH_PENDING,
+                ),
             )
+            if cur.rowcount != 1:
+                conn.rollback()
+                raise AttachmentBatchStateChanged(
+                    "attachment batch is no longer pending"
+                )
             self._mark_processed_nocommit(
                 update_id, now, update_outcomes.DURABLE_INTENT_RECORDED
             )
@@ -2818,10 +3163,10 @@ class Database:
         return True
 
     # -------------------------------------------------------------- user state
-    # حالة توجيه الرسالة الجاية. كل حالة ليها وقت (awaiting_at) وتنتهي بعد AWAITING_TTL.
-    #   reply / newchat / reposearch : لمرة واحدة (بتتستهلك أول رسالة).
-    #   route : توجيه مستمر لشات معيّن؛ كل رسالة بتجدّد المهلة، وبينتهي بعد AWAITING_TTL
-    #           من آخر نشاط أو بالإلغاء.
+    # حالة توجيه الرسالة الجاية.
+    #   reply / newchat / reposearch : لمرة واحدة (بتتستهلك أول رسالة) وتنتهي بعد AWAITING_TTL.
+    #   route : توجيه مستمر لشات معيّن؛ **ما بينتهيش بالمهلة**؛ بيتغيّر بفتح/اختيار شات
+    #           تاني أو يتشال صراحةً. `awaiting_at` لسه بيتحدّث للتوافق/التشخيص.
     def set_awaiting(
         self,
         telegram_id: int,
@@ -2872,7 +3217,7 @@ class Database:
 
     @staticmethod
     def awaiting_is_expired(since: datetime | None, now: datetime | None = None) -> bool:
-        """هل انتهت مهلة حالة الانتظار؟ (نفس معيار `take_awaiting` بالحرف)."""
+        """هل انتهت مهلة حالة **لمرة واحدة**؟ (route مستمر لا يستخدمها)."""
         if since is None:
             return True
         return (now or datetime.now(timezone.utc)) - since > AWAITING_TTL
@@ -2951,6 +3296,7 @@ class Database:
         *,
         title: str | None = None,
         reason: str | None = None,
+        last_accessed_conversation_id: str | None = None,
     ) -> bool:
         """OHB2-WP-07 (NEW-DEF-03): يضبط حالة انتظار **ويسجّل نتيجة التحديث ذرّيًّا**.
 
@@ -2959,11 +3305,20 @@ class Database:
         (`mark_durable_completed`) — commit تانٍ. عطل بين الكتابتين كان يسيب حالة توجيه
         مضبوطة **بلا** نتيجة ⇒ حجب حدّ الإقرار بلا سبب. هنا الاتنين في **معاملة واحدة**.
         الإرسال لتليجرام يفضل **برّه** المعاملة. ترجّع True لو اتسجّلت نتيجة.
+
+        `last_accessed_conversation_id` اختياري: لما المستخدم يفتح/يختار شات فعلًا،
+        بنحفظ آخر شات في نفس المعاملة عشان `/chat` يفضل صادق حتى بعد `/start` أو restart.
         """
         conn = self._conn
         conn.execute("BEGIN IMMEDIATE")
         try:
             self._set_awaiting_nocommit(telegram_id, conversation_id, kind, title)
+            if last_accessed_conversation_id is not None:
+                self._set_setting_nocommit(
+                    self._last_accessed_key(telegram_id), last_accessed_conversation_id
+                )
+                # فتح/اختيار شات صريح يلغي أي إيقاف سابق من /cancel.
+                self._delete_setting_nocommit(self._routing_paused_key(telegram_id))
             if update_id is not None:
                 self.mark_update_outcome(update_id, now, outcome, reason=reason, commit=False)
             conn.commit()
@@ -3267,8 +3622,8 @@ class Database:
     ) -> tuple[str | None, str | None, str | None]:
         """يقرأ حالة التوجيه ويستهلكها (أو يجدّدها لو route) في معاملة ذرّية واحدة.
 
-        بيرجّع (conversation_id, kind, title). لو الحالة انتهت مهلتها بيمسحها ويرجّع
-        kind="expired". الحالات اللي لمرة واحدة بتتمسح، وrouting المستمر بيتجدّد وقته.
+        بيرجّع (conversation_id, kind, title). الحالات اللي لمرة واحدة لو انتهت مهلتها
+        بتتمسح ويرجّع kind="expired". `route` المستمر لا ينتهي بالمهلة وبيتجدّد وقته فقط.
         BEGIN IMMEDIATE بياخد قفل الكتابة قبل القراءة، فرسالتين متزامنتين ما يقدروش
         ياخدوا نفس الحالة المستهلكة.
         """
@@ -3285,20 +3640,20 @@ class Database:
             if row and row["awaiting_kind"]:
                 kind = row["awaiting_kind"]
                 since = _parse_iso(row["awaiting_at"])
-                expired = since is None or now - since > AWAITING_TTL
-                if expired:
+                if kind == "route":
+                    # التوجيه المستمر ما بينتهيش بالمهلة؛ بنحدّث الطابع للتوافق/التشخيص.
+                    conn.execute(
+                        "UPDATE user_state SET awaiting_at=? WHERE telegram_id=?",
+                        (now.isoformat(), telegram_id),
+                    )
+                    result = (row["awaiting_conversation_id"], kind, row["awaiting_title"])
+                elif since is None or now - since > AWAITING_TTL:
                     conn.execute(
                         "UPDATE user_state SET awaiting_conversation_id=NULL, awaiting_kind=NULL, "
                         "awaiting_at=NULL, awaiting_title=NULL WHERE telegram_id=?",
                         (telegram_id,),
                     )
                     result = (None, "expired", None)
-                elif kind == "route":
-                    conn.execute(
-                        "UPDATE user_state SET awaiting_at=? WHERE telegram_id=?",
-                        (now.isoformat(), telegram_id),
-                    )
-                    result = (row["awaiting_conversation_id"], kind, row["awaiting_title"])
                 else:
                     conn.execute(
                         "UPDATE user_state SET awaiting_conversation_id=NULL, awaiting_kind=NULL, "
@@ -3322,12 +3677,30 @@ class Database:
         return row["awaiting_conversation_id"], row["awaiting_kind"]
 
     # ------------------------------------------------------------------- outbox
-    def add_outbox(self, conversation_id: str, chat_id: int, text: str, now: str) -> int:
+    def add_outbox(
+        self,
+        conversation_id: str,
+        chat_id: int,
+        text: str,
+        now: str,
+        telegram_message_id: int | None = None,
+    ) -> int:
         """يسجّل البرومت في الصندوق (status='pending') قبل أي محاولة إرسال."""
+        message_ids = (
+            (telegram_message_id,)
+            if isinstance(telegram_message_id, int)
+            and not isinstance(telegram_message_id, bool)
+            and telegram_message_id > 0
+            else ()
+        )
         cur = self._conn.execute(
-            "INSERT INTO outbox(conversation_id, chat_id, text, status, created_at, updated_at) "
-            "VALUES(?, ?, ?, ?, ?, ?)",
-            (conversation_id, chat_id, text, OUTBOX_PENDING, now, now),
+            "INSERT INTO outbox"
+            "(conversation_id, chat_id, text, status, created_at, updated_at,"
+            " telegram_message_ids) VALUES(?, ?, ?, ?, ?, ?, ?)",
+            (
+                conversation_id, chat_id, text, OUTBOX_PENDING, now, now,
+                _encode_telegram_message_ids(message_ids),
+            ),
         )
         self._conn.commit()
         return int(cur.lastrowid)
@@ -3343,6 +3716,7 @@ class Database:
         reengage: bool = False,
         update_id: int | None = None,
         consume_awaiting: tuple[int, str] | None = None,
+        telegram_message_id: int | None = None,
     ) -> int:
         """تجميع (القرار 2): لو فيه برومت 'pending' لنفس الوجهة اتحدّث خلال `window`،
 
@@ -3369,6 +3743,9 @@ class Database:
         السجل الدائم. لو الحالة اتغيّرت/انتهت/مستهلكة، بنرجّع 0 من غير أي كتابة (ما
         نستهلكش حالة مش متوقّعة). لو العملية فشلت، الاتنين يتراجعوا معًا ⇒ مفيش نافذة فقد
         (الحالة تفضل قائمة فإعادة التسليم تنفّذ).
+
+        `telegram_message_id` اختياري: معرّف رسالة المالك الأصلية المطلوب حذفها بعد نجاح
+        التسليم. عند التجميع بنضمّه لقائمة السجل بدل ما نضيّع رسالة من دفعة سريعة.
         """
         window = window if window is not None else GROUP_WINDOW
         conn = self._conn
@@ -3418,7 +3795,7 @@ class Database:
                     conn.commit()
                     return int(existing["id"])
             row = conn.execute(
-                "SELECT id, text, updated_at, client_ref FROM outbox "
+                "SELECT id, text, updated_at, client_ref, telegram_message_ids FROM outbox "
                 "WHERE conversation_id=? AND chat_id=? AND status=? ORDER BY id DESC LIMIT 1",
                 (conversation_id, chat_id, OUTBOX_PENDING),
             ).fetchone()
@@ -3441,17 +3818,42 @@ class Database:
                 # نطبع معرّف العملية على الصف لو كان فاضي، عشان إعادة إرسال نفس
                 # العملية تلاقيه وما تكرّرش.
                 stamped = row["client_ref"] or client_ref
+                merged_message_ids = list(
+                    _decode_telegram_message_ids(row["telegram_message_ids"])
+                )
+                if (
+                    isinstance(telegram_message_id, int)
+                    and not isinstance(telegram_message_id, bool)
+                    and telegram_message_id > 0
+                    and telegram_message_id not in merged_message_ids
+                ):
+                    merged_message_ids.append(telegram_message_id)
                 conn.execute(
-                    "UPDATE outbox SET text=?, updated_at=?, client_ref=? WHERE id=?",
-                    (merged, now, stamped, row["id"]),
+                    "UPDATE outbox SET text=?, updated_at=?, client_ref=?, "
+                    "telegram_message_ids=? WHERE id=?",
+                    (
+                        merged, now, stamped,
+                        _encode_telegram_message_ids(tuple(merged_message_ids)),
+                        row["id"],
+                    ),
                 )
                 out_id = int(row["id"])
             else:
+                message_ids = (
+                    (telegram_message_id,)
+                    if isinstance(telegram_message_id, int)
+                    and not isinstance(telegram_message_id, bool)
+                    and telegram_message_id > 0
+                    else ()
+                )
                 cur = conn.execute(
                     "INSERT INTO outbox"
-                    "(conversation_id, chat_id, text, status, created_at, updated_at, client_ref) "
-                    "VALUES(?, ?, ?, ?, ?, ?, ?)",
-                    (conversation_id, chat_id, text, OUTBOX_PENDING, now, now, client_ref),
+                    "(conversation_id, chat_id, text, status, created_at, updated_at, client_ref,"
+                    " telegram_message_ids) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        conversation_id, chat_id, text, OUTBOX_PENDING, now, now, client_ref,
+                        _encode_telegram_message_ids(message_ids),
+                    ),
                 )
                 out_id = int(cur.lastrowid)
             # P1: استهلاك حالة الانتظار (لمرة واحدة) **في نفس المعاملة** مع الكتابة الدائمة
@@ -3689,6 +4091,9 @@ class Database:
             attempts=row["attempts"],
             client_ref=row["client_ref"],
             notify_state=row["notify_state"],
+            telegram_message_ids=_decode_telegram_message_ids(
+                row["telegram_message_ids"] if "telegram_message_ids" in row.keys() else None
+            ),
         )
 
     # ----------------------------------------------------------- creation jobs
@@ -4457,18 +4862,62 @@ class Database:
     NOTIFICATIONS_KEY = "notifications_enabled"
     # OHB2-MANUAL-POLLING-OUTCOME: مفتاح الحدّ المحلي للإقرار (مش إقرار تيليجرام).
     ACK_BOUNDARY_KEY = "acknowledgment_boundary"
+    # آخر شات فتحه/اختاره المالك فعلًا. المفتاح لكل telegram_id عشان العزل.
+    LAST_ACCESSED_CONVERSATION_KEY_PREFIX = "last_accessed_conversation:"
+    # إيقاف صريح للتوجيه الافتراضي عبر /cancel أو زر الإلغاء. منفصل عن آخر شات محفوظ
+    # عشان `/chat` يفضل قادرًا على إعادة فتحه لاحقًا.
+    ROUTING_PAUSED_KEY_PREFIX = "routing_paused:"
     _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+
+    @classmethod
+    def _last_accessed_key(cls, telegram_id: int) -> str:
+        return f"{cls.LAST_ACCESSED_CONVERSATION_KEY_PREFIX}{int(telegram_id)}"
+
+    @classmethod
+    def _routing_paused_key(cls, telegram_id: int) -> str:
+        return f"{cls.ROUTING_PAUSED_KEY_PREFIX}{int(telegram_id)}"
 
     def get_setting(self, key: str, default: str | None = None) -> str | None:
         row = self._conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
         return row["value"] if row else default
 
-    def set_setting(self, key: str, value: str) -> None:
+    def _set_setting_nocommit(self, key: str, value: str) -> None:
         self._conn.execute(
             "INSERT INTO settings(key, value) VALUES(?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, value),
         )
+
+    def _delete_setting_nocommit(self, key: str) -> None:
+        self._conn.execute("DELETE FROM settings WHERE key=?", (key,))
+
+    def set_setting(self, key: str, value: str) -> None:
+        self._set_setting_nocommit(key, value)
+        self._conn.commit()
+
+    def get_last_accessed_conversation(self, telegram_id: int) -> str | None:
+        """آخر شات فتحه/اختاره المالك ده، أو None لو مفيش سجل صالح."""
+        return self.get_setting(self._last_accessed_key(telegram_id))
+
+    def set_last_accessed_conversation(self, telegram_id: int, conversation_id: str) -> None:
+        self.set_setting(self._last_accessed_key(telegram_id), conversation_id)
+
+    def clear_last_accessed_conversation(self, telegram_id: int) -> None:
+        """يمسح مرجع آخر شات فقط (مش أي شات/ملف/صفوف أخرى)."""
+        self._conn.execute(
+            "DELETE FROM settings WHERE key=?", (self._last_accessed_key(telegram_id),)
+        )
+        self._conn.commit()
+
+    def is_routing_paused(self, telegram_id: int) -> bool:
+        return self.get_setting(self._routing_paused_key(telegram_id)) == "1"
+
+    def pause_routing(self, telegram_id: int) -> None:
+        """إيقاف التوجيه الافتراضي صراحةً مع الإبقاء على آخر شات محفوظ لـ /chat."""
+        self.set_setting(self._routing_paused_key(telegram_id), "1")
+
+    def resume_routing(self, telegram_id: int) -> None:
+        self._delete_setting_nocommit(self._routing_paused_key(telegram_id))
         self._conn.commit()
 
     def get_notifications_enabled(self) -> bool:

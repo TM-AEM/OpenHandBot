@@ -37,10 +37,11 @@ class Config:
     # ما بنصدّقش أي هيدر تحويل، وبنستخدم IP الاتصال الفعلي (fail closed).
     mini_app_trusted_proxies: tuple[str, ...] = ()
     # OHB2-LIFE-03: مفتاح إيقاف **مستقلّ** لاستقبال المستندات المحلي (Document intake).
-    # True افتراضيًا (سلوك المنتج الحالي محفوظ). False ⇒ تعطيل استقبال المستندات فقط:
+    # OHB2-WP01/OD-03: الافتراضي **False** (opt-in صريح). True عبر
+    # `ATTACHMENT_DOCUMENT_INTAKE_ENABLED=1` فقط؛ False ⇒ تعطيل استقبال المستندات فقط:
     # مفيش get_file/تنزيل/صف/ملف/نداء OpenHands/سجل outbox، مع رسالة صادقة. ما بيعطّلش
     # النصوص/الأزرار/Mini App ولا مسار رفض الوسائط غير المدعومة (اللي يفضل شغّالًا).
-    attachment_document_intake_enabled: bool = True
+    attachment_document_intake_enabled: bool = False
 
     @property
     def secrets(self) -> tuple[str, str]:
@@ -311,9 +312,9 @@ def load_config(env: dict | None = None) -> Config:
     # ما نتجاهله بصمت، وإلا نفتح باب تزوير IP).
     mini_app_trusted_proxies = _parse_trusted_proxies(env)
 
-    # OHB2-LIFE-03: مفتاح إيقاف استقبال المستندات المحلي (افتراضيًا مفعّل ⇒ سلوك محفوظ).
+    # OHB2-WP01/OD-03: افتراضي **False** (opt-in صريح عبر =1)؛ القيمة غير الصالحة ترفض.
     attachment_document_intake_enabled = _parse_bool(
-        env, "ATTACHMENT_DOCUMENT_INTAKE_ENABLED", True
+        env, "ATTACHMENT_DOCUMENT_INTAKE_ENABLED", False
     )
 
     return Config(
