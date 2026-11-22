@@ -2,6 +2,65 @@
 
 ---
 
+# PROGRESS — OHB2-NEW04-AUTOMATIC-MULTI-MESSAGE-PROMPT-GROUPING (2026-11-22)
+
+## Goal
+تجميع رسائل البرومت المتتالية تلقائيًا بنافذة خمول **3 ثوانٍ**، مع إعادة تشغيل
+العدّاد بعد كل جزء، وإرسال الدفعة كاملة مرة واحدة بعد آخر جزء. المستخدم وافق صراحةً
+على احتمال تجميع رسالتين مستقلتين داخل نفس النافذة.
+
+## Baseline
+- الفرع: `agent/ohb2-new01-cancel-race`.
+- HEAD عند البدء: `efa1f02` (NEW-02 committed) — الشجرة كانت **clean**.
+- NEW-01/NEW-02 محفوظان؛ لم يُلمس DEF-011 أو Mini App files.
+
+## Design (ملخص)
+- **السجل نفسه هو الدفعة:** أول رسالة تُنشئ `outbox` status=`pending`؛ كل رسالة تالية
+  داخل النافذة تُضاف لنفس السجل وتُحدّث `updated_at` (عدّاد الخمول). لا جدول/worker/process جديد.
+- **الدمج:** رسالة عادية + نفس `(conversation_id, chat_id)` + `updated_at` خلال 3s
+  + `client_ref=None` ⇒ نفس السجل. ردّ صريح (`reply_to_message_id`) يستمر في سجل
+  الرسالة الأصلية حتى خارج النافذة (NEW-02)؛ ردّ لا يطابق هدفًا لا يُدمج بالوقت.
+- **التنفيذ:** الـ worker الحالي يحجز فقط عندما `updated_at <= now - GROUP_WINDOW`
+  عبر `claim_outbox` الذرّي؛ لا توجد نافذة في الذاكرة.
+- **الترتيب/الهوية:** عمود إضافي `telegram_message_parts` JSON يحفظ `(message_id,text)`
+  ويرتّب حسب `message_id` عند توفره؛ `telegram_message_ids` يظل مرجع cleanup.
+- **التكرار:** نفس `update_id` محجوب؛ نفس `message_id` في أي سجل pending لا يُضاف
+  محتواه مرة ثانية. `created_at` أول جزء، `updated_at` آخر جزء.
+- **الاستعادة:** `pending` يبقى بعد restart؛ `claimed` يعود `pending`؛ `sending`
+  يتحول `unknown` (at-most-once) — نفس سلوك outbox القائم.
+- **الإلغاء:** فحص `routing_paused` داخل `BEGIN IMMEDIATE` كما في NEW-01؛ الرسالة
+  المقبولة قبل `/cancel` تبقى، والرسالة اللاحقة تُرفض.
+
+## Done
+- `bot/db.py`: `GROUP_WINDOW=3s`، دمج زمني/ردّ، `telegram_message_parts` + migration،
+  dedupe حسب message identity، ترتيب الأجزاء.
+- `bot/handlers.py` + `bot/outbox.py`: تحديث التوثيق/السلوك فقط، بدون worker جديد.
+- `tests/test_grouping.py`: تحديث لـ NEW-04 (النافذة، الحدّ، الترتيب، العزل، worker).
+- `tests/test_new04_prompt_grouping_debounce.py`: 11 اختبارات restart/recovery/dedupe/
+  isolation/cancel/concurrency/debounce.
+- تحديث `test_new02`, `test_4b`, `test_existing...`, sticky routing, Mini App no-ref tests
+  للسلوك المعتمد الجديد مع الحفاظ على cleanup identity.
+
+## Verification (آخر تشغيل فعلي)
+- `python -m pytest -q` ⇒ **3754 passed**, 0 failed.
+- Focused NEW-04/NEW-01/NEW-02/outbox/handlers ⇒ **275 passed**.
+- `node --test tests/frontend/*.test.js` ⇒ **280 pass / 0 fail**.
+- `pyflakes` ⇒ exit 0؛ `bandit -lll -s B613` ⇒ High **0**؛ `pip_audit` ⇒ clean؛
+  `compileall` و`git diff --check` ⇒ exit 0.
+
+## Known / next
+- **Independent review NOT PERFORMED** (no genuinely separate reviewer session available);
+  this is implementation + self-review only.
+- لا exactly-once Telegram delivery (سلوك قائم، at-most-once).
+- 3s trade-off: رسالتان مستقلتان خلال النافذة قد تُجمعان (موافقة صريحة).
+- Mini App no-ref edge: الرسائل بدون `client_ref` قد تدخل التجميع؛ الواجهة الحالية
+  ترسل `client_ref` دائمًا.
+- كل التغييرات **uncommitted** على الفرع؛ لا commit/push/PR/Autopush.
+
+
+
+---
+
 # PROGRESS — OHB2-NEW02-TELEGRAM-PROMPT-GROUPING-IDENTITY-SAFETY (2026-11-22)
 
 ## Goal

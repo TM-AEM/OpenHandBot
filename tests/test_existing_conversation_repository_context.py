@@ -221,7 +221,7 @@ def _ctx(tmp_path, api: RecordingAPI) -> SimpleNamespace:
 
 
 def _deliver(ctx, outbox_id: int) -> None:
-    """تشغيل مسار التسليم المباشر (بدون نافذة تجميع 1.5 ثانية غير حتمية)."""
+    """تشغيل مسار التسليم المباشر (بدون الاعتماد على نافذة تجميع 3 ثوانٍ غير حتمية)."""
     asyncio.run(
         h._deliver_outbox(ctx.bot_data["client"], ctx.bot_data["db"], ctx.bot, outbox_id)
     )
@@ -446,7 +446,11 @@ def test_concurrent_prompts_preserve_conversation_identity(tmp_path):
     ctx = _ctx(tmp_path, api)
 
     asyncio.run(h.open_conversation(_callback_update(OWNER_ID, f"open:{CID}"), ctx))
-    updates = [_text_update(OWNER_ID, f"م{i}") for i in range(10)]
+    updates = []
+    for i in range(10):
+        update = _text_update(OWNER_ID, f"م{i}")
+        update.message.message_id = 900 + i
+        updates.append(update)
 
     async def go():
         await asyncio.gather(*(h.handle_text(u, ctx) for u in updates))
@@ -455,6 +459,7 @@ def test_concurrent_prompts_preserve_conversation_identity(tmp_path):
 
     rows = ctx.bot_data["db"].list_outbox_by_status("pending")
     assert {r.conversation_id for r in rows} == {CID}  # كلها لنفس الشات
-    assert len(rows) == 10  # NEW-02: رسائل مستقلة ⇒ سجلات مستقلة
-    assert [r.text for r in rows] == [f"م{i}" for i in range(10)]
+    assert len(rows) == 1  # NEW-04: نافذة الخمول تجمع الأجزاء في سجل واحد
+    assert rows[0].text.split("\n") == [f"م{i}" for i in range(10)]
+    assert rows[0].telegram_message_ids == tuple(900 + i for i in range(10))
     assert api.create_calls() == []

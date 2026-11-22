@@ -309,9 +309,10 @@ AWAITING_TTL = timedelta(minutes=10)
 ATTACHMENT_BATCH_TTL = timedelta(minutes=15)
 
 
-# NEW-02: مدة نضج سجل 'pending' قبل ما الـ worker يحجزه (مش معيار تجميع). التجميع
-# بيحتاج علاقة Telegram صريحة (`reply_to_message_id`)، والوقت لوحده مايجمّعش رسائل.
-GROUP_WINDOW = timedelta(seconds=1.5)
+# NEW-04: نافذة خمول 3 ثوانٍ لتجميع رسائل البرومت المتتالية. كل رسالة مقبولة تُحدّث
+# `updated_at`، والـ worker لا يحجز السجل قبل مرور 3 ثوانٍ من آخر جزء. الردّ الصريح
+# (`reply_to_message_id`) يظل دليلًا أقوى ويُجمّع حتى خارج النافذة (NEW-02).
+GROUP_WINDOW = timedelta(seconds=3)
 
 
 def _parse_iso(value: str | None) -> datetime | None:
@@ -345,6 +346,53 @@ def _decode_telegram_message_ids(raw: str | None) -> tuple[int, ...]:
 
 def _encode_telegram_message_ids(ids: tuple[int, ...]) -> str:
     return json.dumps(list(ids), separators=(",", ":"))
+
+
+def _decode_telegram_message_parts(
+    raw: str | None,
+) -> tuple[tuple[int | None, str], ...]:
+    """يفكّ أجزاء الدفعة [(message_id, text)]؛ أي تلف ⇒ لا أجزاء (fallback آمن)."""
+    if not raw:
+        return ()
+    try:
+        values = json.loads(raw)
+    except (TypeError, ValueError):
+        return ()
+    if not isinstance(values, list):
+        return ()
+    parts: list[tuple[int | None, str]] = []
+    for value in values:
+        if not isinstance(value, list) or len(value) != 2:
+            return ()
+        message_id, text = value
+        if message_id is not None and (
+            isinstance(message_id, bool)
+            or not isinstance(message_id, int)
+            or message_id <= 0
+        ):
+            return ()
+        if not isinstance(text, str):
+            return ()
+        parts.append((message_id, text))
+    return tuple(parts)
+
+
+def _encode_telegram_message_parts(
+    parts: tuple[tuple[int | None, str], ...],
+) -> str:
+    return json.dumps(
+        [[message_id, text] for message_id, text in parts],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _valid_telegram_message_id(value: object) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value > 0
+    )
 
 
 def _attachment_batch_deadline(t0: str | None) -> datetime | None:
@@ -446,6 +494,9 @@ class OutboxItem:
     # معرّفات رسائل المالك الأصلية (قد تكون أكثر من واحدة لو اتجمّعت في نفس السجل).
     # محفوظة للتنظيف بعد نجاح التسليم فقط؛ الصفوف القديمة/غير تيليجرام تفضل ().
     telegram_message_ids: tuple[int, ...] = ()
+    # NEW-04: أجزاء النص بترتيبها ومُعرّف كل جزء (None لو مش متاح)، عشان الدمج يحافظ
+    # على ترتيب Telegram message_id بدل ترتيب الوصول وحده.
+    telegram_message_parts: tuple[tuple[int | None, str], ...] = ()
     # OHB2-TELEGRAM-PROMPT-CLEANUP: acknowledgement message IDs returned by
     # Telegram for this logical outbox batch. They are deleted with the original
     # prompt messages after the delivery confirmation, never before.
@@ -704,6 +755,7 @@ class Database:
                 client_ref      TEXT,
                 notify_state    TEXT NOT NULL DEFAULT '',
                 telegram_message_ids TEXT NOT NULL DEFAULT '[]',
+                telegram_message_parts TEXT NOT NULL DEFAULT '[]',
                 ack_message_ids TEXT NOT NULL DEFAULT '[]',
                 cleanup_state TEXT NOT NULL DEFAULT '',
                 cleanup_confirmation_message_id INTEGER,
@@ -971,6 +1023,12 @@ class Database:
         if outbox_cols and "telegram_message_ids" not in outbox_cols:
             self._conn.execute(
                 "ALTER TABLE outbox ADD COLUMN telegram_message_ids TEXT NOT NULL DEFAULT '[]'"
+            )
+        # NEW-04: أجزاء النص المرتّبة حسب Telegram message_id. إضافي وغير مدمّر؛ الصفوف
+        # القديمة بتاخد [] ⇒ fallback لترتيب الوصول والنص الحالي.
+        if outbox_cols and "telegram_message_parts" not in outbox_cols:
+            self._conn.execute(
+                "ALTER TABLE outbox ADD COLUMN telegram_message_parts TEXT NOT NULL DEFAULT '[]'"
             )
         # OHB2-TELEGRAM-PROMPT-CLEANUP: additive columns for the logical batch's
         # acknowledgements and durable cleanup progress. Old rows get safe defaults
@@ -3760,13 +3818,15 @@ class Database:
             and telegram_message_id > 0
             else ()
         )
+        parts = ((telegram_message_id, text),) if message_ids else ((None, text),)
         cur = self._conn.execute(
             "INSERT INTO outbox"
             "(conversation_id, chat_id, text, status, created_at, updated_at,"
-            " telegram_message_ids) VALUES(?, ?, ?, ?, ?, ?, ?)",
+            " telegram_message_ids, telegram_message_parts) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 conversation_id, chat_id, text, OUTBOX_PENDING, now, now,
                 _encode_telegram_message_ids(message_ids),
+                _encode_telegram_message_parts(parts),
             ),
         )
         self._conn.commit()
@@ -3788,9 +3848,15 @@ class Database:
         expected_routing: tuple[int, str] | None = None,
         consume_expired: bool = False,
     ) -> int:
-        """تجميع (NEW-02): لو فيه برومت 'pending' لنفس الوجهة والرسالة الجديدة ردّ
-        (`reply_to_message_id`) على رسالة موجودة في نفس السجل، نضيف النص عليه. غير كده
-        نسجّل سجل 'pending' جديد. الوقت وحده مابيجمّعش رسائل مستقلة.
+        """تجميع (NEW-04): سجل 'pending' واحد يمثّل دفعة البرومت المعلّقة.
+
+        - رسالة عادية (بدون `reply_to_message_id`) تنضم لأحدث سجل 'pending' لنفس
+          `(conversation_id, chat_id)` إذا كان آخر تحديث له خلال `GROUP_WINDOW` (3s)،
+          وبشرط أن يكون السجل من نفس مصدر البوت (`client_ref=None`). كل انضمام يُحدّث
+          `updated_at` ⇒ يعيد تشغيل عدّاد الخمول.
+        - رسالة ردّ صريح (`reply_to_message_id`) تنضم للسجل الذي يحتوي الرسالة الأصلية
+          حتى خارج النافذة (NEW-02)، ولا تُدمج بالوقت في سجل لا يحتوي هدف الردّ.
+        - بدون هذه الشروط: سجل 'pending' جديد.
 
         الوجهة = (conversation_id, chat_id). العملية كلها جوه BEGIN IMMEDIATE عشان
         القبول والتحقق من العلاقة والتحديث/الإدراج يحصلوا ذرّيًّا. بنرجّع id السجل.
@@ -3817,16 +3883,14 @@ class Database:
         `telegram_message_id` اختياري: معرّف رسالة المالك الأصلية المطلوب حذفها بعد نجاح
         التسليم. عند التجميع بنضمّه لقائمة السجل بدل ما نضيّع رسالة من دفعة سريعة.
 
-        NEW-02: التجميع مش بيستند على الوقت. رسالة جديدة تنضم لسجل pending فقط لو
-        `reply_to_message_id` بتاعها موجود فعلًا في `telegram_message_ids` للسجل؛ ده دليل
-        Telegram صريح على أنها جزء من نفس المحادثة. رسالتان مستقلتان، حتى لو وصلوا في نفس
-        اللحظة، بيفضلوا سجلين منفصلين (وكل cleanup بيحذف IDs بتاعته بس).
+        NEW-02 safety: كل جزء له `telegram_message_id` فريد، والتكرار لا يضيف نصًا أو
+        معرّفًا ثانيًا. تنظيف السجل يظل مقيّدًا بـ IDs الخاصة به فقط.
 
         NEW-01: عند `expected_routing`، فحص الإيقاف داخل نفس معاملة القبول. `/cancel`
         بيثبّت الإيقاف ويمسح الانتظار في معاملة واحدة؛ أي برومت بدأ قبل الإلغاء لكنه وصل
         للقبول بعده لازم يُرفض (0) بلا صف outbox، وأي قبول سبق الإلغاء يظل قائمًا.
         """
-        _ = window  # kept for API compatibility; grouping no longer uses time
+        effective_window = window if window is not None else GROUP_WINDOW
         conn = self._conn
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -3914,55 +3978,112 @@ class Database:
                     )
                     conn.commit()
                     return int(existing["id"])
+            valid_message_id = _valid_telegram_message_id(telegram_message_id)
+            if valid_message_id:
+                # NEW-02/NEW-04: a Telegram message identity is unique per chat. If a
+                # redelivery arrives under a new update_id while the batch is still
+                # pending, never append its content twice or create a second row.
+                for existing in conn.execute(
+                    "SELECT id, telegram_message_ids FROM outbox "
+                    "WHERE conversation_id=? AND chat_id=? AND status=? ORDER BY id DESC",
+                    (conversation_id, chat_id, OUTBOX_PENDING),
+                ).fetchall():
+                    if telegram_message_id in _decode_telegram_message_ids(
+                        existing["telegram_message_ids"]
+                    ):
+                        self._mark_processed_nocommit(
+                            update_id, now, update_outcomes.DUPLICATE_COMPLETED
+                        )
+                        conn.commit()
+                        return int(existing["id"])
             pending_rows = conn.execute(
-                "SELECT id, text, updated_at, client_ref, telegram_message_ids FROM outbox "
+                "SELECT id, text, updated_at, client_ref, telegram_message_ids, "
+                "telegram_message_parts FROM outbox "
                 "WHERE conversation_id=? AND chat_id=? AND status=? ORDER BY id DESC",
                 (conversation_id, chat_id, OUTBOX_PENDING),
             ).fetchall()
             row = None
-            valid_reply = (
-                isinstance(reply_to_message_id, int)
-                and not isinstance(reply_to_message_id, bool)
-                and reply_to_message_id > 0
-            )
+            valid_reply = _valid_telegram_message_id(reply_to_message_id)
             if valid_reply:
-                # Find the exact pending batch containing the replied-to message, even
-                # if another independent prompt arrived later.
+                # NEW-02: an explicit reply is the strongest identity signal. It can
+                # continue its batch even outside the inactivity window, but never
+                # pulls in a pending row that does not contain the replied-to message.
                 for candidate in pending_rows:
                     ids = _decode_telegram_message_ids(candidate["telegram_message_ids"])
                     if reply_to_message_id not in ids:
                         continue
-                    # Do not merge bot prompts into a Mini App row (and vice versa).
                     if client_ref is None and candidate["client_ref"] is None:
                         row = candidate
                         break
                     if client_ref is not None and candidate["client_ref"] in (None, client_ref):
                         row = candidate
                         break
-            # NEW-02: only an explicit Telegram reply to a message already in this
-            # pending batch is evidence of continuation. Temporal proximity is not.
+            elif client_ref is None and pending_rows:
+                # NEW-04: ordinary consecutive messages join the newest bot-originated
+                # pending batch only while its persisted inactivity window is open.
+                latest = pending_rows[0]
+                if latest["client_ref"] is None:
+                    now_dt = _parse_iso(now)
+                    row_dt = _parse_iso(latest["updated_at"])
+                    if now_dt is not None and row_dt is not None:
+                        elapsed = now_dt - row_dt
+                        if timedelta(0) <= elapsed <= effective_window:
+                            row = latest
             mergeable = row is not None
             if mergeable:
-                merged = row["text"] + "\n" + text
                 # نطبع معرّف العملية على الصف لو كان فاضي، عشان إعادة إرسال نفس
                 # العملية تلاقيه وما تكرّرش.
                 stamped = row["client_ref"] or client_ref
-                merged_message_ids = list(
+                existing_ids = list(
                     _decode_telegram_message_ids(row["telegram_message_ids"])
                 )
-                if (
-                    isinstance(telegram_message_id, int)
-                    and not isinstance(telegram_message_id, bool)
-                    and telegram_message_id > 0
-                    and telegram_message_id not in merged_message_ids
-                ):
-                    merged_message_ids.append(telegram_message_id)
+                if valid_message_id and telegram_message_id in existing_ids:
+                    # Duplicate Telegram message identity (possibly redelivered under a
+                    # new update_id): never append its content twice or extend the timer.
+                    self._mark_processed_nocommit(
+                        update_id, now, update_outcomes.DURABLE_INTENT_RECORDED
+                    )
+                    conn.commit()
+                    return int(row["id"])
+                existing_parts = _decode_telegram_message_parts(
+                    row["telegram_message_parts"]
+                )
+                if existing_parts:
+                    parts = list(existing_parts)
+                    if valid_message_id:
+                        parts.append((telegram_message_id, text))
+                    else:
+                        parts.append((None, text))
+                    if all(
+                        isinstance(message_id, int)
+                        and not isinstance(message_id, bool)
+                        and message_id > 0
+                        for message_id, _part_text in parts
+                    ):
+                        parts.sort(key=lambda part: part[0])
+                    merged = "\n".join(part_text for _message_id, part_text in parts)
+                    merged_message_ids = [
+                        message_id
+                        for message_id, _part_text in parts
+                        if isinstance(message_id, int)
+                        and not isinstance(message_id, bool)
+                        and message_id > 0
+                    ]
+                else:
+                    # Legacy rows have no per-part mapping: preserve their text and
+                    # existing IDs, then append in arrival order.
+                    merged = row["text"] + "\n" + text
+                    merged_message_ids = list(existing_ids)
+                    if valid_message_id:
+                        merged_message_ids.append(telegram_message_id)
+                    parts = []
                 conn.execute(
                     "UPDATE outbox SET text=?, updated_at=?, client_ref=?, "
-                    "telegram_message_ids=? WHERE id=?",
+                    "telegram_message_ids=?, telegram_message_parts=? WHERE id=?",
                     (
                         merged, now, stamped,
                         _encode_telegram_message_ids(tuple(merged_message_ids)),
+                        _encode_telegram_message_parts(tuple(parts)),
                         row["id"],
                     ),
                 )
@@ -3970,18 +4091,23 @@ class Database:
             else:
                 message_ids = (
                     (telegram_message_id,)
-                    if isinstance(telegram_message_id, int)
-                    and not isinstance(telegram_message_id, bool)
-                    and telegram_message_id > 0
+                    if _valid_telegram_message_id(telegram_message_id)
                     else ()
+                )
+                parts = (
+                    ((telegram_message_id, text),)
+                    if message_ids
+                    else ((None, text),)
                 )
                 cur = conn.execute(
                     "INSERT INTO outbox"
                     "(conversation_id, chat_id, text, status, created_at, updated_at, client_ref,"
-                    " telegram_message_ids) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                    " telegram_message_ids, telegram_message_parts) "
+                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         conversation_id, chat_id, text, OUTBOX_PENDING, now, now, client_ref,
                         _encode_telegram_message_ids(message_ids),
+                        _encode_telegram_message_parts(parts),
                     ),
                 )
                 out_id = int(cur.lastrowid)
@@ -4412,6 +4538,11 @@ class Database:
             notify_state=row["notify_state"],
             telegram_message_ids=_decode_telegram_message_ids(
                 row["telegram_message_ids"] if "telegram_message_ids" in row.keys() else None
+            ),
+            telegram_message_parts=_decode_telegram_message_parts(
+                row["telegram_message_parts"]
+                if "telegram_message_parts" in row.keys()
+                else None
             ),
             ack_message_ids=_decode_telegram_message_ids(
                 row["ack_message_ids"] if "ack_message_ids" in row.keys() else None

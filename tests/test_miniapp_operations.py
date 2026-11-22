@@ -69,15 +69,15 @@ def test_outbox_different_ref_creates_new_row(tmp_path):
     assert db.count_outbox("pending") == 2
 
 
-def test_outbox_no_ref_does_not_group_independent_messages(tmp_path):
-    """NEW-02: من غير علاقة صريحة، رسالتان مستقلتان مايتجمّعوش بالوقت."""
+def test_outbox_no_ref_groups_within_window(tmp_path):
+    """NEW-04: الرسائل العادية داخل نافذة الخمول تتجمّع في سجل واحد."""
     db = Database(str(tmp_path / "d.sqlite3"))
     a = db.add_or_group_outbox("c1", 1, "أ", "2026-01-01T00:00:00+00:00")
     b = db.add_or_group_outbox("c1", 1, "ب", "2026-01-01T00:00:00+00:00")
-    assert a != b
-    assert db.get_outbox(a).text == "أ"
-    assert db.get_outbox(b).text == "ب"
-    assert db.count_outbox("pending") == 2
+    assert a == b
+    item = db.get_outbox(a)
+    assert item.text == "أ\nب"
+    assert db.count_outbox("pending") == 1
 
 
 def test_find_outbox_by_ref(tmp_path):

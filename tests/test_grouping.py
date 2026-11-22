@@ -1,8 +1,8 @@
-"""NEW-02: التجميع بعلاقة ردّ صريحة، والرسائل المستقلة تفضل منفصلة.
+"""NEW-04: تجميع تلقائي بنافذة خمول 3 ثوانٍ، مع الحفاظ على هوية NEW-02.
 
-بنغطّي: عزل الرسائل المستقلة حتى داخل النافذة، تجميع الأجزاء المترابطة بـ
-`reply_to_message_id`، تأخير نضج الـ worker، حفظ الترتيب/المحتوى، عزل المجموعات
-(مستخدم/شات/وجهة)، عدم الإرسال المزدوج، واستمرار الإرسال عند الإلغاء/الانتهاء.
+بنغطّي: التجميع داخل النافذة، إعادة ضبط العدّاد مع كل جزء، الحدّ عند 3 ثوانٍ،
+الترتيب حسب Telegram message_id، منع تكرار نفس الرسالة، عزل المستخدم/الشات/الوجهة،
+تأخير نضج الـ worker، وعدم الإرسال المزدوج أو إعادة إرسال حالة غامضة.
 """
 import asyncio
 from datetime import datetime, timedelta, timezone
@@ -22,18 +22,27 @@ def _iso(dt):
 
 
 # ------------------------------------------------------------------ window const
-def test_group_window_is_one_and_a_half_seconds():
-    assert GROUP_WINDOW == timedelta(seconds=1.5)
+def test_group_window_is_three_seconds():
+    assert GROUP_WINDOW == timedelta(seconds=3)
 
 
 # ------------------------------------------------------------------ DAO semantics
-def test_independent_messages_within_window_stay_separate():
+def test_messages_within_window_group_into_one_row():
     db = Database(":memory:")
-    db.add_or_group_outbox("c1", 99, "أول", _iso(T0))
-    db.add_or_group_outbox("c1", 99, "تاني", _iso(T0 + timedelta(seconds=1.0)))
+    db.add_or_group_outbox("c1", 99, "أول", _iso(T0), telegram_message_id=11)
+    db.add_or_group_outbox(
+        "c1", 99, "تاني", _iso(T0 + timedelta(seconds=2.5)),
+        telegram_message_id=12,
+    )
+    db.add_or_group_outbox(
+        "c1", 99, "تالت", _iso(T0 + timedelta(seconds=5.0)),
+        telegram_message_id=13,
+    )
     items = db.list_outbox_by_status("pending")
-    assert len(items) == 2
-    assert [item.text for item in items] == ["أول", "تاني"]
+    assert len(items) == 1
+    assert items[0].text == "أول\nتاني\nتالت"
+    assert items[0].telegram_message_ids == (11, 12, 13)
+    assert items[0].updated_at == _iso(T0 + timedelta(seconds=5.0))
     db.close()
 
 
@@ -56,10 +65,26 @@ def test_reply_linked_messages_group_into_one_row():
 
 def test_message_after_window_creates_new_row():
     db = Database(":memory:")
-    db.add_or_group_outbox("c1", 99, "أول", _iso(T0))
-    db.add_or_group_outbox("c1", 99, "تاني", _iso(T0 + timedelta(seconds=2.0)))  # > 1.5
+    db.add_or_group_outbox("c1", 99, "أول", _iso(T0), telegram_message_id=11)
+    db.add_or_group_outbox(
+        "c1", 99, "تاني", _iso(T0 + GROUP_WINDOW + timedelta(milliseconds=1)),
+        telegram_message_id=12,
+    )
     items = db.list_outbox_by_status("pending")
     assert len(items) == 2
+    assert [item.text for item in items] == ["أول", "تاني"]
+    db.close()
+
+
+def test_exact_window_boundary_groups():
+    db = Database(":memory:")
+    db.add_or_group_outbox("c1", 99, "أول", _iso(T0), telegram_message_id=11)
+    db.add_or_group_outbox(
+        "c1", 99, "تاني", _iso(T0 + GROUP_WINDOW), telegram_message_id=12
+    )
+    items = db.list_outbox_by_status("pending")
+    assert len(items) == 1
+    assert items[0].text == "أول\nتاني"
     db.close()
 
 
@@ -73,11 +98,44 @@ def test_reply_relationship_groups_regardless_of_window():
     assert len(db.list_outbox_by_status("pending")) == 1
     db.close()
 
-    db2 = Database(":memory:")
-    db2.add_or_group_outbox("c1", 99, "أ", _iso(T0))
-    db2.add_or_group_outbox("c1", 99, "ب", _iso(T0 + GROUP_WINDOW))
-    assert len(db2.list_outbox_by_status("pending")) == 2
-    db2.close()
+
+def test_duplicate_message_id_does_not_duplicate_content():
+    db = Database(":memory:")
+    oid = db.add_or_group_outbox("c1", 99, "أول", _iso(T0), telegram_message_id=11)
+    again = db.add_or_group_outbox(
+        "c1", 99, "أول-مكرر", _iso(T0 + timedelta(seconds=1)),
+        telegram_message_id=11, update_id=9001,
+    )
+    assert again == oid
+    item = db.get_outbox(oid)
+    assert item.text == "أول"
+    assert item.telegram_message_ids == (11,)
+    db.close()
+
+
+def test_out_of_order_message_ids_are_sorted_for_display():
+    db = Database(":memory:")
+    oid = db.add_or_group_outbox("c1", 99, "ثاني", _iso(T0), telegram_message_id=12)
+    db.add_or_group_outbox(
+        "c1", 99, "أول", _iso(T0 + timedelta(seconds=1)), telegram_message_id=11
+    )
+    item = db.get_outbox(oid)
+    assert item.text == "أول\nثاني"
+    assert item.telegram_message_ids == (11, 12)
+    db.close()
+
+
+def test_client_ref_rows_are_not_time_grouped():
+    db = Database(":memory:")
+    first = db.add_or_group_outbox(
+        "c1", 99, "أ", _iso(T0), client_ref="r1"
+    )
+    second = db.add_or_group_outbox(
+        "c1", 99, "ب", _iso(T0 + timedelta(seconds=1)), client_ref="r2"
+    )
+    assert first != second
+    assert len(db.list_outbox_by_status("pending")) == 2
+    db.close()
 
 
 def test_grouping_isolated_by_conversation_and_chat():
@@ -101,7 +159,7 @@ def test_only_pending_rows_are_grouped_not_sent():
 
 
 # ------------------------------------------------------------------ handler level
-def test_handler_keeps_independent_messages_separate(tmp_path):
+def test_handler_groups_rapid_messages_into_one_row(tmp_path):
     ctx = make_context(1, tmp_path)
     db = ctx.bot_data["db"]
     db.set_awaiting(1, "A", "route")
@@ -111,9 +169,34 @@ def test_handler_keeps_independent_messages_separate(tmp_path):
         update.message.message_id = 200 + i
         asyncio.run(h.handle_text(update, ctx))
     items = db.list_outbox_by_status("pending")
-    assert len(items) == 3
-    assert [item.text for item in items] == ["سطر1", "سطر2", "سطر3"]
-    assert [item.telegram_message_ids for item in items] == [(201,), (202,), (203,)]
+    assert len(items) == 1
+    assert items[0].text == "سطر1\nسطر2\nسطر3"
+    assert items[0].telegram_message_ids == (201, 202, 203)
+
+
+def test_handler_new_row_after_window(tmp_path, monkeypatch):
+    ctx = make_context(1, tmp_path)
+    db = ctx.bot_data["db"]
+    db.set_awaiting(1, "A", "route")
+    clock = ["2026-01-01T00:00:00+00:00"]
+    monkeypatch.setattr("bot.outbox.now_iso", lambda: clock[0])
+    for i, (when, text) in enumerate(
+        (
+            ("2026-01-01T00:00:00+00:00", "أول"),
+            ("2026-01-01T00:00:02+00:00", "تاني"),
+            ("2026-01-01T00:00:05.100000+00:00", "تالت"),
+        ),
+        start=1,
+    ):
+        clock[0] = when
+        update = make_update(1, text)
+        update.update_id = 150 + i
+        update.message.message_id = 250 + i
+        asyncio.run(h.handle_text(update, ctx))
+    items = db.list_outbox_by_status("pending")
+    assert len(items) == 2
+    assert [item.text for item in items] == ["أول\nتاني", "تالت"]
+    assert [item.telegram_message_ids for item in items] == [(251, 252), (253,)]
 
 
 def test_handler_groups_explicit_reply_parts(tmp_path):
@@ -147,7 +230,7 @@ def test_handler_isolates_two_conversations(tmp_path):
     assert len(items) == 2
 
 
-def test_concurrent_handler_messages_stay_independent(tmp_path):
+def test_concurrent_handler_messages_group_without_loss(tmp_path):
     ctx = make_context(1, tmp_path)
     db = ctx.bot_data["db"]
     db.set_awaiting(1, "A", "route")
@@ -163,11 +246,9 @@ def test_concurrent_handler_messages_stay_independent(tmp_path):
 
     asyncio.run(go())
     items = db.list_outbox_by_status("pending")
-    assert len(items) == 12
-    assert [item.text for item in items] == [f"m{i}" for i in range(12)]
-    assert [item.telegram_message_ids for item in items] == [
-        (500 + i,) for i in range(12)
-    ]
+    assert len(items) == 1
+    assert items[0].text.split("\n") == [f"m{i}" for i in range(12)]
+    assert items[0].telegram_message_ids == tuple(500 + i for i in range(12))
 
 
 # ------------------------------------------------------------------ worker gating
@@ -209,7 +290,7 @@ def test_next_delay_sleeps_until_maturity(tmp_path):
 
 def test_idle_delay_waits_for_group_not_long_idle(tmp_path):
     # انحدار: الدفعة الطازة بتنام لحد نافذة التجميع (مش الخمول الطويل)، عشان الإرسال
-    # يحصل بعد ~1.5 ثانية مش بعد 30 ثانية.
+    # يحصل بعد ~3 ثوانٍ مش بعد 30 ثانية.
     db = make_db(tmp_path)
     now = datetime.now(timezone.utc).isoformat()
     db.add_or_group_outbox("c1", 99, "أول", now)
@@ -341,7 +422,7 @@ def test_seconds_until_mature_at_matches_string_variant():
     db.add_or_group_outbox("c1", 99, "أ", _iso(T0))
     from_str = db.seconds_until_mature(_iso(T0 + timedelta(seconds=0.5)), GROUP_WINDOW)
     from_dt = db.seconds_until_mature_at(T0 + timedelta(seconds=0.5), GROUP_WINDOW)
-    assert from_str == from_dt == 1.0
+    assert from_str == from_dt == 2.5
     db.close()
 
 
@@ -394,8 +475,8 @@ def test_maturing_row_is_claimed_on_next_schedule(tmp_path):
 
     import bot.outbox as ob
 
-    before = T0 + timedelta(seconds=1.0)
-    after = T0 + timedelta(seconds=2.0)
+    before = T0 + timedelta(seconds=2.5)
+    after = T0 + timedelta(seconds=3.0)
     orig = ob._utcnow
 
     ob._utcnow = lambda: before  # type: ignore[assignment]

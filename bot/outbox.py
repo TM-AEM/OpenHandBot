@@ -104,11 +104,11 @@ def _iso(dt: datetime) -> str:
 
 
 def grouping_mature_before(window: timedelta | None = None, now: datetime | None = None) -> str:
-    """حدّ نضج سجل 'pending' قبل الحجز (مش حدّ تجميع رسائل).
+    """حدّ نضج سجل 'pending' قبل الحجز = نهاية نافذة الخمول الحالية.
 
-    التجميع بقى محتاج علاقة Telegram صريحة (`reply_to_message_id`)؛ النافذة دي مجرد
-    تأخير الحجز الموجود أصلًا. بنقرأ db_module.GROUP_WINDOW وقت النداء (مش كقيمة
-    افتراضية متثبّتة) عشان الاختبارات تقدر تصغّر النافذة بشكل حتمي.
+    السجل يمثّل دفعة NEW-04؛ `updated_at` بيتحدّث مع كل جزء، والنافذة دي بتضمن إن الـ
+    worker ما يحجزش قبل مرور 3 ثوانٍ من آخر جزء. بنقرأ db_module.GROUP_WINDOW وقت
+    النداء (مش كقيمة افتراضية متثبّتة) عشان الاختبارات تقدر تصغّر النافذة بشكل حتمي.
     """
     current = now or datetime.now(timezone.utc)
     return _iso(current - (window if window is not None else db_module.GROUP_WINDOW))
@@ -1022,9 +1022,9 @@ class OutboxWorker(_BaseWorker):
       يفضل مؤهّل وتتطبق عليه الـ backoff — لحد MAX_OUTBOX_ATTEMPTS محاولات، وبعدها
       نعلّمه 'failed' (نهائي) بإشعار واحد (TASK 53). 'unknown'/'failed'/'sent' مش مؤهّلة
       أصلاً، فمستحيل يتعاودوا تلقائياً.
-    - NEW-02: ما بيحجزش سجل 'pending' قبل ما يعدّي تأخير النضج (db_module.GROUP_WINDOW)،
-      لكن ده **مش** تجميع: كل رسالة مستقلة سجلها مستقل. التجميع بيحصل وقت القبول فقط
-      لما رسالة تكون ردّ صريح على رسالة موجودة في نفس السجل.
+    - NEW-04: ما بيحجزش سجل 'pending' قبل ما يعدّي تأخير النضج (db_module.GROUP_WINDOW).
+      الرسائل المتتالية بتتجمّع وقت القبول في نفس السجل وبتحدّث updated_at، فالـ worker
+      بيستنى 3 ثوانٍ من آخر جزء قبل ما يبعت الدفعة كاملة مرة واحدة.
     """
 
     def _claim(self):

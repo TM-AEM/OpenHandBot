@@ -1,4 +1,4 @@
-"""NEW-02: Telegram prompt grouping must use explicit reply identity, not time."""
+"""NEW-02 identity/cleanup safety, updated for NEW-04 approved time-window grouping."""
 from __future__ import annotations
 
 import asyncio
@@ -81,7 +81,7 @@ def _async(coro):
     return asyncio.run(coro)
 
 
-def test_new02_r1_temporal_proximity_does_not_group_independent_messages(tmp_path, monkeypatch):
+def test_new02_r1_temporal_window_groups_approved_new04(tmp_path, monkeypatch):
     fixed = "2026-11-22T00:00:00+00:00"
     monkeypatch.setattr(outbox, "now_iso", lambda: fixed)
 
@@ -101,11 +101,13 @@ def test_new02_r1_temporal_proximity_does_not_group_independent_messages(tmp_pat
         await h.handle_text(second, ctx)
 
         rows = db.list_outbox_by_status(OUTBOX_PENDING)
-        assert len(rows) == 2
-        assert [row.text for row in rows] == ["رسالة مستقلة أولى", "رسالة مستقلة ثانية"]
-        assert [row.telegram_message_ids for row in rows] == [(101,), (102,)]
-        assert [row.ack_message_ids for row in rows] == [(201,), (202,)]
-        assert [row.created_at for row in rows] == [fixed, fixed]
+        # NEW-04 explicitly approves time-window grouping: both messages share one
+        # durable batch, while each original/ack identity remains tracked for cleanup.
+        assert len(rows) == 1
+        assert rows[0].text == "رسالة مستقلة أولى\nرسالة مستقلة ثانية"
+        assert rows[0].telegram_message_ids == (101, 102)
+        assert rows[0].ack_message_ids == (201, 202)
+        assert rows[0].created_at == fixed
 
     _async(scenario())
 
@@ -180,7 +182,16 @@ def test_new02_r4_interleaved_prompts_keep_membership(tmp_path):
         db.close()
 
 
-def test_new02_r4_reply_can_target_older_pending_batch(tmp_path):
+def test_new02_r4_reply_can_target_older_pending_batch(tmp_path, monkeypatch):
+    clock = iter(
+        [
+            "2026-11-22T00:00:00+00:00",
+            "2026-11-22T00:00:04+00:00",
+            "2026-11-22T00:00:05+00:00",
+        ]
+    )
+    monkeypatch.setattr(outbox, "now_iso", lambda: next(clock))
+
     async def scenario():
         ctx = make_context(OWNER, tmp_path)
         db = _route(ctx)
@@ -272,7 +283,7 @@ def test_new02_r7_restart_preserves_each_batch_membership(tmp_path):
         reopened.close()
 
 
-def test_new02_r8_concurrent_prompts_keep_independent_membership(tmp_path):
+def test_new02_r8_concurrent_prompts_group_without_lost_membership(tmp_path):
     async def scenario():
         ctx = make_context(OWNER, tmp_path)
         db = _route(ctx)
@@ -287,13 +298,10 @@ def test_new02_r8_concurrent_prompts_keep_independent_membership(tmp_path):
         await asyncio.gather(*(h.handle_text(update, ctx) for update in updates))
 
         rows = db.list_outbox_by_status(OUTBOX_PENDING)
-        assert len(rows) == 4
-        assert [row.telegram_message_ids for row in rows] == [
-            (300 + i,) for i in range(4)
-        ]
-        assert [row.ack_message_ids for row in rows] == [
-            (400 + i,) for i in range(4)
-        ]
+        assert len(rows) == 1
+        assert rows[0].telegram_message_ids == tuple(300 + i for i in range(4))
+        assert sorted(rows[0].ack_message_ids) == [400 + i for i in range(4)]
+        assert rows[0].text.split("\n") == [f"مستقل {i}" for i in range(4)]
 
     _async(scenario())
 
