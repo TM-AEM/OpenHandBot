@@ -4679,3 +4679,42 @@ DONE — implementation and local verification. No commit/push/PR/merge/deploy/A
 - pyflakes **0**; bandit High **0**; Node **280/0**; pip-audit clean; `git diff --check` **0**.
 - Full report:
   `docs/reviews/OHB2-PERSISTENT-READY-STATE-AND-STICKY-CONVERSATION-ROUTING-IMPLEMENTATION-REPORT.md`.
+
+---
+
+## OHB2-DEF011-REVIEW-REMEDIATION-AND-RECENT-TELEGRAM-FEATURES-FIX (2026-11-22)
+
+### Status
+PARTIAL / INDEPENDENCE_NOT_ESTABLISHED for the final review gate. Implementation and local
+verification are green; no commit/push/PR/merge/deploy/Autopush.
+
+### Done
+- F-01: `/chat` terminal rejection clears `last_accessed` + matching `awaiting` atomically and
+  records the outcome; process-restart test added.
+- F-02: immediate reply is an explicit queue acknowledgement (`تم حفظ طلبك، ولسه هيتبعت`) and its
+  Telegram message ID is persisted in `outbox.ack_message_ids`.
+- F-03/F-09: proposal/batch notices and the F-03 implementation report now record `DEF-011-C` as
+  IMPLEMENTED (local-only copy), `DEF-011-A` as NOT IMPLEMENTED, and `DEF-011` open.
+- F-04/F-05: sandbox-resume 404 is transient; empty metadata is ambiguous (retry, no target clear);
+  only conversation-metadata 404/410 is confirmed missing.
+- F-06: `/cancel` clears awaiting + records outcome + pauses routing in one transaction.
+- F-07: outbox insertion verifies the routing target at the acceptance boundary (CAS); a changed
+  selection is rejected without an outbox row or success ack.
+- F-08: expired `reply` is consumed when routing continues and rejected when routing is paused.
+- Prompt cleanup: durable `cleanup_state`/`cleanup_next_at`/`cleanup_confirmation_message_id` in
+  `outbox`; originals + acks deleted at T+5, confirmation at T+10; retries persisted; restart resumes;
+  missing IDs are never guessed.
+- New tests: `tests/test_def011_review_remediation.py`, `tests/test_telegram_prompt_cleanup_durable.py`;
+  updated routing/cleanup/parity tests.
+
+### Verification
+- `python -m pytest -q` => 3714 passed / 0 failed.
+- Node 280/0; pyflakes 0; bandit High 0; pip-audit clean.
+- F-03 parity 15/15; five mutation checks caught on a scratch copy.
+- Full independent review NOT established; see
+  `docs/reviews/OHB2-WP07-DEF011-F03-GENUINELY-INDEPENDENT-REVIEW-REPORT.md` §12.
+
+### Next
+- Run a genuinely separate reviewer session/clone for the current tree.
+- Follow up the still-stale `OHB2-WP07-BATCH04-DEF011-F01-IMPLEMENTATION-REPORT.md` C status and
+  the proposal diagnosis-hash drift.

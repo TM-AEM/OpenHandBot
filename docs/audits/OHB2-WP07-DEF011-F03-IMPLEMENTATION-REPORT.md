@@ -271,3 +271,20 @@ sha256sum bot/attachments.py   # b98d561f0ba0ab27dea4e6bedee7955f68f1f6fa85a39fa
 The core question for closure is settled: the stale present-tense claims are corrected **without
 altering a single byte of the historical record**, and a regression guard now prevents both silent
 re-drift and overclaiming.
+
+---
+
+## LATER CORRECTION — 2026-11-22 (append-only; historical evidence above is unchanged)
+
+This implementation report was correct for its original snapshot, but two evidence statements are
+now stale and must not be read as current-state claims:
+
+1. **`to_thread` count:** the current `bot/attachments.py` contains **six** `to_thread` occurrences
+   (module import, one docstring reference, and four `await anyio.to_thread.run_sync` call sites),
+   not five. The current proposal/batch notices and `tests/test_doc_code_parity.py` assert six.
+2. **`DEF-011-C`:** the current `ATTACHMENT_ACCEPTED_TEXT` explicitly states the file is stored
+   locally and is **not uploaded to OpenHands**, and is emitted only after `AcceptOutcome.STORED`.
+   The F-03 notices now mark `DEF-011-C` **IMPLEMENTED** (2026-11-22).
+
+`DEF-011-A` (quota reservation ledger) remains **NOT IMPLEMENTED**; therefore `DEF-011` as a whole
+remains **OPEN**. No historical sentence above was deleted or rewritten.

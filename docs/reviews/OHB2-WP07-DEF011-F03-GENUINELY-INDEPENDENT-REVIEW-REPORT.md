@@ -329,3 +329,84 @@ This review closes **F-03 documentation remediation** only.
 - **Suggested next step:** open a separate, scoped task to append a dated supersession notice to
   `docs/reviews/OHB2-WP07-BATCH04-DEF011-F01-IMPLEMENTATION-REPORT.md:300` (the last known stale
   F-03-class reference), or explicitly accept it as historical.
+
+---
+
+## 12. CURRENT TASK UPDATE — 2026-11-22 (remediation session; NOT an independent review)
+
+### 12.1 Phase 1 — independence verdict for the current tree
+
+**`INDEPENDENCE_NOT_ESTABLISHED` for the current working tree.**
+
+- The prior review in §2 ran in conversation `de819568-6590-47d2-906a-e4b94a4ddc7c`, which is distinct
+  from the implementation conversation `6715bb35bff4420d9802ed649c3cc2ea`. That evidence remains valid
+  **only for the snapshot it reviewed** (`HEAD 30dfa0d`).
+- This current remediation task was executed in the same live session that edited the F-03 notices and
+  implemented F-01..F-12. A reviewer cannot independently certify code/docs it authored in the same
+  conversation. No separate reviewer conversation, independently obtained clone, or second agent
+  identity is available in this environment.
+- Consequently the top `F03_REVIEW_PASS` verdict **must not** be read as a pass for the current working
+  tree. It is a historical verdict on `30dfa0d`, not on the current delta.
+
+No evidence was manufactured. The technical checks below are reported as **non-independent
+implementation verification**, not as an independent review.
+
+### 12.2 Current state and F-03 verification (non-independent)
+
+- Current `HEAD`: `9d1e13d72ed7dca8ffd2c6eebff1c6a36400ab17`; `main == origin/main`.
+- F-03 notices now mark `DEF-011-B` **IMPLEMENTED**, `DEF-011-A` **NOT IMPLEMENTED**, and
+  `DEF-011-C` **IMPLEMENTED (2026-11-22)** after the explicit local-only acceptance copy was added.
+  `DEF-011` as a whole remains **OPEN**; no reservation ledger exists; `D6` is untouched.
+- `bot/attachments.py` is **not modified in the current working tree** (`git status` clean for it).
+  Its current hash is `0c52d04bfc7a461a0d8ca0a92476faa91a00ef9ebe7becb1e00fb12a76126d9b`; it differs
+  from the diagnosis hash `b98d561f…` because of later non-F-03 `to_thread` work, not because F-03
+  changed it.
+- Removing the F-03 notice from the batch report reproduces the diagnosis original exactly:
+  `2cce88dd4290a285dc383b9c4ada43a9fe9ce36b3141a0369a7065f7a171512c`.
+- Removing the F-03 notice from the proposal reproduces `b636a7a8…`, the **immediate pre-notice
+  parent**, not the diagnosis hash `82fbf986…`. The difference is the pre-existing
+  `Post-decision update — 2026-11-22` block, which F-03 did not add. This is recorded as a separate
+  documentation-drift follow-up, not claimed as an F-03 hash match.
+- The F-03 parity guard passes **15/15** (`tests/test_doc_code_parity.py`), including the new
+  implementation-report correction test.
+- Five documented mutation checks were reproduced on a scratch copy of the tree:
+  control 15 passed; M1 (rewrite historical `0 to_thread`) 1 failed; M2 (delete proposal notice)
+  4 failed; M3 (flip `DEF-011-A` to IMPLEMENTED) 2 failed; M4 (tamper §2.2) 1 failed; M5 (diverge
+  notice date) 1 failed. Every mutation was caught by the intended parity guard.
+
+### 12.3 Broader remediation verification (non-independent)
+
+The task also required F-01..F-12 remediation. The implementation changed routing/outbox/cleanup code
+and tests; it is **not** an F-03-only diff. Actual results from this session:
+
+| Check | Result |
+|---|---|
+| `python -m pytest -q` | **3714 passed**, 0 failed, 74 warnings |
+| `node --test tests/frontend/*.test.js` | **280 passed**, 0 failed |
+| `python -m pyflakes bot automation tools main.py tests/` | exit 0, no findings |
+| `python -m bandit -r bot/ automation/ tools/ main.py -lll -s B613` | exit 0; **High: 0** |
+| `python -m pip_audit -r requirements-dev.txt` | exit 0, no known vulnerabilities |
+
+### 12.4 Follow-up issues (not modified in this task)
+
+1. `docs/reviews/OHB2-WP07-BATCH04-DEF011-F01-IMPLEMENTATION-REPORT.md` is **still stale**: its
+   correction notice (lines ~298, ~312-314) says `DEF-011-C` remains `NOT IMPLEMENTED`, while the
+   current code and F-03 notices mark C implemented. It was intentionally left untouched to keep
+   this task's scope bounded.
+2. The proposal's diagnosis hash `82fbf986…` is not reproducible from current `HEAD` because of the
+   pre-existing post-decision update described in §12.2. A future documentation-only task should
+   either re-record the intended baseline or add an explicit correction notice.
+
+### 12.5 Scope and safety
+
+- No commit, push, PR, merge, deployment, release, or Autopush activation occurred.
+- No destructive Git operation was used. Pre-existing uncommitted `bot/db.py` work and the untracked
+  prior review report were preserved.
+- No changes were made to `DEF-011-A`, `DEF-011-C` semantics beyond the explicit local-only copy, or
+  `D6`; no reservation ledger was implemented.
+
+### 12.6 Final verdict
+
+**`INDEPENDENCE_NOT_ESTABLISHED`** for the current working tree. The implementation checks are green,
+but a genuinely separate reviewer session was not available in this environment, so this report does
+**not** issue a current passing verdict and does not close `DEF-011` or the F-03 review.

@@ -83,6 +83,17 @@ NOTIFY_NONE = ""
 NOTIFY_PENDING = "pending"
 NOTIFY_SENT = "sent"
 
+# OHB2-TELEGRAM-PROMPT-CLEANUP: durable cleanup state for prompt/ack/confirmation
+# message deletion. This is not delivery state; `status` remains authoritative for
+# whether the prompt POST was accepted. Cleanup is only scheduled after a confirmed
+# `sent` row and a confirmed completion notice.
+CLEANUP_NONE = ""
+CLEANUP_AWAITING_CONFIRMATION = "awaiting_confirmation"
+CLEANUP_ORIGINALS_PENDING = "originals_pending"
+CLEANUP_CONFIRMATION_PENDING = "confirmation_pending"
+CLEANUP_DONE = "done"
+CLEANUP_FAILED = "failed"
+
 # حالات طلب الشات الجديد (creation job) — الجدول منفصل عن outbox عشان الطلب
 # مالوش conversation_id لسه وقت التسجيل. نفس منطق الحجز/الغموض:
 #   pending   : اتسجّل بثبات ولسه POST البدء مابدأش. آمن يتعاود بعد restart.
@@ -435,6 +446,15 @@ class OutboxItem:
     # معرّفات رسائل المالك الأصلية (قد تكون أكثر من واحدة لو اتجمّعت في نفس السجل).
     # محفوظة للتنظيف بعد نجاح التسليم فقط؛ الصفوف القديمة/غير تيليجرام تفضل ().
     telegram_message_ids: tuple[int, ...] = ()
+    # OHB2-TELEGRAM-PROMPT-CLEANUP: acknowledgement message IDs returned by
+    # Telegram for this logical outbox batch. They are deleted with the original
+    # prompt messages after the delivery confirmation, never before.
+    ack_message_ids: tuple[int, ...] = ()
+    cleanup_state: str = CLEANUP_NONE
+    cleanup_confirmation_message_id: int | None = None
+    cleanup_next_at: str | None = None
+    cleanup_attempts: int = 0
+    cleanup_last_error: str | None = None
 
 
 @dataclass
@@ -683,7 +703,13 @@ class Database:
                 attempts        INTEGER NOT NULL DEFAULT 0,
                 client_ref      TEXT,
                 notify_state    TEXT NOT NULL DEFAULT '',
-                telegram_message_ids TEXT NOT NULL DEFAULT '[]'
+                telegram_message_ids TEXT NOT NULL DEFAULT '[]',
+                ack_message_ids TEXT NOT NULL DEFAULT '[]',
+                cleanup_state TEXT NOT NULL DEFAULT '',
+                cleanup_confirmation_message_id INTEGER,
+                cleanup_next_at TEXT,
+                cleanup_attempts INTEGER NOT NULL DEFAULT 0,
+                cleanup_last_error TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox(status);
             CREATE TABLE IF NOT EXISTS creation_jobs (
@@ -946,6 +972,29 @@ class Database:
             self._conn.execute(
                 "ALTER TABLE outbox ADD COLUMN telegram_message_ids TEXT NOT NULL DEFAULT '[]'"
             )
+        # OHB2-TELEGRAM-PROMPT-CLEANUP: additive columns for the logical batch's
+        # acknowledgements and durable cleanup progress. Old rows get safe defaults
+        # (no ack IDs, no cleanup requested) and are never guessed/deleted.
+        if outbox_cols and "ack_message_ids" not in outbox_cols:
+            self._conn.execute(
+                "ALTER TABLE outbox ADD COLUMN ack_message_ids TEXT NOT NULL DEFAULT '[]'"
+            )
+        if outbox_cols and "cleanup_state" not in outbox_cols:
+            self._conn.execute(
+                "ALTER TABLE outbox ADD COLUMN cleanup_state TEXT NOT NULL DEFAULT ''"
+            )
+        if outbox_cols and "cleanup_confirmation_message_id" not in outbox_cols:
+            self._conn.execute(
+                "ALTER TABLE outbox ADD COLUMN cleanup_confirmation_message_id INTEGER"
+            )
+        if outbox_cols and "cleanup_next_at" not in outbox_cols:
+            self._conn.execute("ALTER TABLE outbox ADD COLUMN cleanup_next_at TEXT")
+        if outbox_cols and "cleanup_attempts" not in outbox_cols:
+            self._conn.execute(
+                "ALTER TABLE outbox ADD COLUMN cleanup_attempts INTEGER NOT NULL DEFAULT 0"
+            )
+        if outbox_cols and "cleanup_last_error" not in outbox_cols:
+            self._conn.execute("ALTER TABLE outbox ADD COLUMN cleanup_last_error TEXT")
         creation_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(creation_jobs)")}
         if creation_cols and "client_ref" not in creation_cols:
             self._conn.execute("ALTER TABLE creation_jobs ADD COLUMN client_ref TEXT")
@@ -3261,6 +3310,9 @@ class Database:
         outcome: str,
         *,
         reason: str | None = None,
+        clear_last_accessed_conversation_id: str | None = None,
+        clear_awaiting_conversation_id: str | None = None,
+        pause_routing: bool = False,
     ) -> bool:
         """OHB2-WP-07 (DEF-013/NEW-DEF-03): يمسح حالة انتظار **ويسجّل نتيجة التحديث ذرّيًّا**.
 
@@ -3276,7 +3328,22 @@ class Database:
         conn = self._conn
         conn.execute("BEGIN IMMEDIATE")
         try:
-            self._clear_awaiting_nocommit(telegram_id)
+            if clear_awaiting_conversation_id is None:
+                self._clear_awaiting_nocommit(telegram_id)
+            else:
+                row = conn.execute(
+                    "SELECT awaiting_conversation_id FROM user_state WHERE telegram_id=?",
+                    (telegram_id,),
+                ).fetchone()
+                if row is not None and row["awaiting_conversation_id"] == clear_awaiting_conversation_id:
+                    self._clear_awaiting_nocommit(telegram_id)
+            if clear_last_accessed_conversation_id is not None:
+                key = self._last_accessed_key(telegram_id)
+                row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+                if row is not None and row["value"] == clear_last_accessed_conversation_id:
+                    self._delete_setting_nocommit(key)
+            if pause_routing:
+                self._set_setting_nocommit(self._routing_paused_key(telegram_id), "1")
             if update_id is not None:
                 self.mark_update_outcome(update_id, now, outcome, reason=reason, commit=False)
             conn.commit()
@@ -3717,6 +3784,8 @@ class Database:
         update_id: int | None = None,
         consume_awaiting: tuple[int, str] | None = None,
         telegram_message_id: int | None = None,
+        expected_routing: tuple[int, str] | None = None,
+        consume_expired: bool = False,
     ) -> int:
         """تجميع (القرار 2): لو فيه برومت 'pending' لنفس الوجهة اتحدّث خلال `window`،
 
@@ -3769,8 +3838,39 @@ class Database:
                     conn.rollback()
                     return 0
                 if self.awaiting_is_expired(_parse_iso(arow["awaiting_at"]), _parse_iso(now)):
+                    if not consume_expired:
+                        self._clear_awaiting_nocommit(tg_id)
+                        conn.commit()
+                        return 0
                     self._clear_awaiting_nocommit(tg_id)
-                    conn.commit()
+            if expected_routing is not None:
+                # F-07: the target was read before this transaction. Verify that the
+                # persisted routing reference still points at it at the acceptance
+                # boundary. A concurrent selection of B must not silently receive an
+                # A prompt; reject without writing an outbox row.
+                routing_tg, expected_target = expected_routing
+                last = conn.execute(
+                    "SELECT value FROM settings WHERE key=?",
+                    (self._last_accessed_key(routing_tg),),
+                ).fetchone()
+                route = conn.execute(
+                    "SELECT awaiting_conversation_id, awaiting_kind FROM user_state "
+                    "WHERE telegram_id=?",
+                    (routing_tg,),
+                ).fetchone()
+                route_target = (
+                    route["awaiting_conversation_id"]
+                    if route is not None and route["awaiting_kind"] == "route"
+                    else None
+                )
+                last_target = last["value"] if last is not None else None
+                matches = (
+                    last_target == expected_target
+                    if last_target is not None
+                    else route_target == expected_target
+                )
+                if not matches:
+                    conn.rollback()
                     return 0
             if self.is_deleted(conversation_id):
                 # شات متشاهد: مفيش إحياء. عمليات `client_ref` (Mini App) مرفوضة دايمًا،
@@ -3948,6 +4048,196 @@ class Database:
         self._conn.commit()
         return int(row["attempts"]) if row else 0
 
+    # ------------------------------------------------ prompt cleanup (durable)
+    def add_outbox_ack_message_id(
+        self, outbox_id: int, message_id: int, now: str | None = None
+    ) -> bool:
+        """Record an acknowledgement message returned by Telegram for this batch.
+
+        The acknowledgement is already sent when this is called. If the DB write fails,
+        the caller must not delete an unknown message; an untracked ack is simply left
+        visible. The write is idempotent and does not touch `updated_at` (which is used
+        by the grouping window).
+        """
+        if isinstance(message_id, bool) or not isinstance(message_id, int) or message_id <= 0:
+            return False
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT ack_message_ids FROM outbox WHERE id=?", (int(outbox_id),)
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return False
+            ids = list(_decode_telegram_message_ids(row["ack_message_ids"]))
+            if message_id not in ids:
+                ids.append(message_id)
+            conn.execute(
+                "UPDATE outbox SET ack_message_ids=? WHERE id=?",
+                (_encode_telegram_message_ids(tuple(ids)), int(outbox_id)),
+            )
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+
+    def begin_outbox_cleanup(
+        self,
+        outbox_id: int,
+        confirmation_message_id: int | None,
+        now: str,
+        *,
+        delay_seconds: float,
+    ) -> bool:
+        """Persist the cleanup plan after the completion notice was accepted.
+
+        Only a confirmed `sent` row is eligible. The original prompt IDs are already in
+        `telegram_message_ids`; acknowledgement IDs are in `ack_message_ids`. If both
+        sets are empty, only the confirmation can be deleted. The caller schedules the
+        task; a restart can reschedule from this durable state.
+        """
+        if (
+            confirmation_message_id is not None
+            and (
+                isinstance(confirmation_message_id, bool)
+                or not isinstance(confirmation_message_id, int)
+                or confirmation_message_id <= 0
+            )
+        ):
+            return False
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT status, telegram_message_ids, ack_message_ids, cleanup_state "
+                "FROM outbox WHERE id=?",
+                (int(outbox_id),),
+            ).fetchone()
+            if row is None or row["status"] != OUTBOX_SENT:
+                conn.rollback()
+                return False
+            if row["cleanup_state"] in (CLEANUP_DONE, CLEANUP_FAILED):
+                conn.rollback()
+                return False
+            originals = _decode_telegram_message_ids(row["telegram_message_ids"])
+            acks = _decode_telegram_message_ids(row["ack_message_ids"])
+            base = _parse_iso(now) or datetime.now(timezone.utc)
+            if originals or acks:
+                state = CLEANUP_ORIGINALS_PENDING
+                next_at = (base + timedelta(seconds=delay_seconds)).isoformat()
+            elif confirmation_message_id is not None:
+                state = CLEANUP_CONFIRMATION_PENDING
+                next_at = (base + timedelta(seconds=delay_seconds)).isoformat()
+            else:
+                state = CLEANUP_DONE
+                next_at = None
+            conn.execute(
+                "UPDATE outbox SET cleanup_state=?, cleanup_confirmation_message_id=?, "
+                "cleanup_next_at=?, cleanup_attempts=0, cleanup_last_error=NULL WHERE id=?",
+                (state, confirmation_message_id, next_at, int(outbox_id)),
+            )
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+
+    def list_outbox_cleanup_pending(self) -> list[OutboxItem]:
+        rows = self._conn.execute(
+            "SELECT * FROM outbox WHERE cleanup_state IN (?, ?) ORDER BY id",
+            (CLEANUP_ORIGINALS_PENDING, CLEANUP_CONFIRMATION_PENDING),
+        ).fetchall()
+        return [self._row_to_outbox(r) for r in rows]
+
+    def mark_outbox_cleanup_originals_done(
+        self, outbox_id: int, now: str, *, delay_seconds: float
+    ) -> bool:
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            base = _parse_iso(now) or datetime.now(timezone.utc)
+            next_at = (base + timedelta(seconds=delay_seconds)).isoformat()
+            cur = conn.execute(
+                "UPDATE outbox SET cleanup_state=?, cleanup_next_at=?, "
+                "cleanup_attempts=0, cleanup_last_error=NULL "
+                "WHERE id=? AND cleanup_state=?",
+                (
+                    CLEANUP_CONFIRMATION_PENDING,
+                    next_at,
+                    int(outbox_id),
+                    CLEANUP_ORIGINALS_PENDING,
+                ),
+            )
+            ok = cur.rowcount == 1
+            conn.commit()
+            return ok
+        except Exception:
+            conn.rollback()
+            raise
+
+    def mark_outbox_cleanup_done(self, outbox_id: int) -> bool:
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = conn.execute(
+                "UPDATE outbox SET cleanup_state=?, cleanup_next_at=NULL, "
+                "cleanup_last_error=NULL WHERE id=? AND cleanup_state IN (?, ?)",
+                (
+                    CLEANUP_DONE,
+                    int(outbox_id),
+                    CLEANUP_ORIGINALS_PENDING,
+                    CLEANUP_CONFIRMATION_PENDING,
+                ),
+            )
+            ok = cur.rowcount == 1
+            conn.commit()
+            return ok
+        except Exception:
+            conn.rollback()
+            raise
+
+    def mark_outbox_cleanup_failed(self, outbox_id: int, error: str) -> None:
+        self._conn.execute(
+            "UPDATE outbox SET cleanup_state=?, cleanup_next_at=NULL, cleanup_last_error=? "
+            "WHERE id=? AND cleanup_state IN (?, ?)",
+            (
+                CLEANUP_FAILED,
+                error,
+                int(outbox_id),
+                CLEANUP_ORIGINALS_PENDING,
+                CLEANUP_CONFIRMATION_PENDING,
+            ),
+        )
+        self._conn.commit()
+
+    def record_outbox_cleanup_retry(
+        self, outbox_id: int, now: str, *, delay_seconds: float, error: str
+    ) -> int:
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            base = _parse_iso(now) or datetime.now(timezone.utc)
+            next_at = (base + timedelta(seconds=delay_seconds)).isoformat()
+            row = conn.execute(
+                "UPDATE outbox SET cleanup_attempts=cleanup_attempts+1, "
+                "cleanup_next_at=?, cleanup_last_error=? WHERE id=? "
+                "AND cleanup_state IN (?, ?) RETURNING cleanup_attempts",
+                (
+                    next_at,
+                    error,
+                    int(outbox_id),
+                    CLEANUP_ORIGINALS_PENDING,
+                    CLEANUP_CONFIRMATION_PENDING,
+                ),
+            ).fetchone()
+            conn.commit()
+            return int(row["cleanup_attempts"]) if row else 0
+        except Exception:
+            conn.rollback()
+            raise
+
     def claim_outbox(self, now: str, mature_before: str | None = None) -> OutboxItem | None:
         """ياخد ذرّياً أقدم عنصر 'pending' ويحوّله 'claimed' (atomic claim).
 
@@ -4093,6 +4383,31 @@ class Database:
             notify_state=row["notify_state"],
             telegram_message_ids=_decode_telegram_message_ids(
                 row["telegram_message_ids"] if "telegram_message_ids" in row.keys() else None
+            ),
+            ack_message_ids=_decode_telegram_message_ids(
+                row["ack_message_ids"] if "ack_message_ids" in row.keys() else None
+            ),
+            cleanup_state=(
+                row["cleanup_state"]
+                if "cleanup_state" in row.keys() and row["cleanup_state"] is not None
+                else CLEANUP_NONE
+            ),
+            cleanup_confirmation_message_id=(
+                int(row["cleanup_confirmation_message_id"])
+                if "cleanup_confirmation_message_id" in row.keys()
+                and row["cleanup_confirmation_message_id"] is not None
+                else None
+            ),
+            cleanup_next_at=(
+                row["cleanup_next_at"] if "cleanup_next_at" in row.keys() else None
+            ),
+            cleanup_attempts=(
+                int(row["cleanup_attempts"])
+                if "cleanup_attempts" in row.keys() and row["cleanup_attempts"] is not None
+                else 0
+            ),
+            cleanup_last_error=(
+                row["cleanup_last_error"] if "cleanup_last_error" in row.keys() else None
             ),
         )
 
@@ -4587,9 +4902,16 @@ class Database:
         conn.execute("BEGIN IMMEDIATE")
         try:
             cur = conn.execute(
-                "UPDATE outbox SET status=?, error=?, updated_at=? "
+                "UPDATE outbox SET status=?, error=?, updated_at=?, cleanup_state=? "
                 "WHERE id=? AND status=?",
-                (OUTBOX_SENT, None, now, outbox_id, OUTBOX_SENDING),
+                (
+                    OUTBOX_SENT,
+                    None,
+                    now,
+                    CLEANUP_AWAITING_CONFIRMATION,
+                    outbox_id,
+                    OUTBOX_SENDING,
+                ),
             )
             if cur.rowcount != 1:
                 conn.rollback()

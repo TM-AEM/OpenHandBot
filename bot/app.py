@@ -26,6 +26,7 @@ from .outbox import (
     OutboxWorker,
     cancel_cleanup_tasks,
     completion_recover,
+    resume_outbox_cleanup,
 )
 from .watcher import Watcher
 
@@ -228,6 +229,9 @@ def build_application(config: Config) -> Application:
         # 1.1) OHB2-STABILIZATION-F02: تسوية/تعافي الإكمال المحلي (صفوف قديمة sent/done من
         #      غير intent + إعادة تأهيل العناصر منتهية الإجارة). بدون أي POST خارجي.
         await completion_recover(application)
+        # 1.1a) استئناف حذف رسائل البرومت/الإقرار/التأكيد من الحالة الدائمة في outbox.
+        #      مفيش worker جديد: نفس مهام التنظيف الخفيفة، مع إعادة جدولة بعد restart.
+        resume_outbox_cleanup(application)
         # 1.1b) OHB2-DUPLICATE-TELEGRAM-PROMPT-DISPATCH: تقليم سجل التحديثات المعالَجة
         #      (إضافي/غير حرج — نافذة احتفاظ ضخمة). مايمنعش الإقلاع لو فشل.
         #      OHB2-PLAN-01-STAGE3: التقليم بقى **واعيًا بحدّ الإقرار** — بنشيل بس الصفوف

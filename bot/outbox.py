@@ -66,6 +66,10 @@ _OUTBOX_EXHAUSTED_NOTICE = (
 _TARGET_UNAVAILABLE_NOTICE = (
     "الشات المحدد مش موجود أو اتشال. افتح شات تاني وابعت رسالتك."
 )
+# Empty/ambiguous metadata is not deletion proof. Keep the target and retry safely.
+_TARGET_UNCERTAIN_NOTICE = (
+    "مش قادرين نتأكد إن الشات المحدد موجود. جرّب تاني، ولو استمرت المشكلة افتحه من الموقع."
+)
 
 # OHB2-POST-PUB-01/F02: نصوص الإكمال المحلي (ثابتة ⇒ الإشعار القابل للتعافي يعيد نفس النص).
 _OUTBOX_SENT_NOTICE = "اتبعت ✅ الشات اتضاف للمتابعة."
@@ -74,6 +78,8 @@ _CREATION_DONE_LINK_TEMPLATE = "بدأ الشات ✅\n{link}"
 # OHB2-TELEGRAM-MESSAGE-CLEANUP: مرحلتان متتاليتان بعد نجاح التسليم.
 CLEANUP_ORIGINAL_DELAY_SECONDS = 5.0
 CLEANUP_CONFIRMATION_DELAY_SECONDS = 5.0
+CLEANUP_RETRY_DELAY_SECONDS = 5.0
+MAX_CLEANUP_ATTEMPTS = 3
 _cleanup_tasks: set[asyncio.Task] = set()
 _cleanup_keys: set[int] = set()
 
@@ -195,6 +201,113 @@ async def cancel_cleanup_tasks() -> None:
     _cleanup_keys.clear()
 
 
+def _cleanup_delay_seconds(next_at: str | None) -> float:
+    due = db_module._parse_iso(next_at)
+    if due is None:
+        return 0.0
+    return max(0.0, (due - datetime.now(timezone.utc)).total_seconds())
+
+
+async def _delete_message_for_cleanup(bot, chat_id: int, message_id: int) -> bool:
+    """Delete one tracked message; treat Telegram's already-absent reply as success."""
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        return True
+    except TelegramError as exc:
+        text = str(exc).lower()
+        if "not found" in text or "message to delete not found" in text:
+            return True
+        log.info(
+            "تعذّر حذف رسالة تيليجرام %s/%s (%s) — سيُعاد المحاولة",
+            chat_id, message_id, type(exc).__name__,
+        )
+        return False
+    except Exception as exc:  # noqa: BLE001 — cleanup failure never changes delivery
+        log.warning(
+            "خطأ غير متوقّع عند حذف رسالة تيليجرام %s/%s (%s)",
+            chat_id, message_id, type(exc).__name__,
+        )
+        return False
+
+
+async def _delete_cleanup_ids(bot, chat_id: int, ids: tuple[int, ...]) -> bool:
+    ok = True
+    for message_id in ids:
+        if not await _delete_message_for_cleanup(bot, chat_id, message_id):
+            ok = False
+    return ok
+
+
+async def _run_persisted_cleanup(db, bot, outbox_id: int, *, sleep=asyncio.sleep) -> None:
+    """Resume the durable two-stage cleanup from the outbox row.
+
+    Stage 1: originals + tracked acknowledgements at T+5.
+    Stage 2: the final completion notice at T+10.
+    A partial deletion is persisted and retried; it is never reported as complete.
+    """
+    while True:
+        item = db.get_outbox(outbox_id)
+        if item is None:
+            return
+        if item.cleanup_state == db_module.CLEANUP_ORIGINALS_PENDING:
+            delay = _cleanup_delay_seconds(item.cleanup_next_at)
+            if delay > 0:
+                await sleep(delay)
+            item = db.get_outbox(outbox_id)
+            if item is None or item.cleanup_state != db_module.CLEANUP_ORIGINALS_PENDING:
+                continue
+            ids = tuple(dict.fromkeys(item.telegram_message_ids + item.ack_message_ids))
+            if not await _delete_cleanup_ids(bot, item.chat_id, ids):
+                attempts = db.record_outbox_cleanup_retry(
+                    outbox_id, now_iso(),
+                    delay_seconds=CLEANUP_RETRY_DELAY_SECONDS,
+                    error="تعذّر حذف رسائل البرومت الأصلية/الإقرار",
+                )
+                if attempts >= MAX_CLEANUP_ATTEMPTS:
+                    db.mark_outbox_cleanup_failed(
+                        outbox_id, "استنفد محاولات حذف رسائل البرومت/الإقرار"
+                    )
+                    return
+                continue
+            if item.cleanup_confirmation_message_id is None:
+                db.mark_outbox_cleanup_failed(
+                    outbox_id, "معرّف رسالة التأكيد غير متاح — لا ندّعي اكتمال التنظيف"
+                )
+                return
+            db.mark_outbox_cleanup_originals_done(
+                outbox_id, now_iso(), delay_seconds=CLEANUP_CONFIRMATION_DELAY_SECONDS
+            )
+            continue
+        if item.cleanup_state == db_module.CLEANUP_CONFIRMATION_PENDING:
+            delay = _cleanup_delay_seconds(item.cleanup_next_at)
+            if delay > 0:
+                await sleep(delay)
+            item = db.get_outbox(outbox_id)
+            if item is None or item.cleanup_state != db_module.CLEANUP_CONFIRMATION_PENDING:
+                continue
+            confirmation_id = item.cleanup_confirmation_message_id
+            if confirmation_id is None:
+                db.mark_outbox_cleanup_failed(
+                    outbox_id, "معرّف رسالة التأكيد غير متاح — لا ندّعي اكتمال التنظيف"
+                )
+                return
+            if await _delete_message_for_cleanup(bot, item.chat_id, confirmation_id):
+                db.mark_outbox_cleanup_done(outbox_id)
+                return
+            attempts = db.record_outbox_cleanup_retry(
+                outbox_id, now_iso(),
+                delay_seconds=CLEANUP_RETRY_DELAY_SECONDS,
+                error="تعذّر حذف رسالة التأكيد",
+            )
+            if attempts >= MAX_CLEANUP_ATTEMPTS:
+                db.mark_outbox_cleanup_failed(
+                    outbox_id, "استنفد محاولات حذف رسالة التأكيد"
+                )
+                return
+            continue
+        return
+
+
 def schedule_delivery_cleanup(
     bot,
     chat_id: int,
@@ -202,17 +315,34 @@ def schedule_delivery_cleanup(
     confirmation_message_id: int | None,
     *,
     key: int | None = None,
+    ack_message_ids: tuple[int, ...] = (),
+    db=None,
+    outbox_id: int | None = None,
+    sleep=asyncio.sleep,
 ) -> None:
-    """يجدول حذف رسائل التسليم مرة واحدة لكل سجل outbox (مهمة asyncio خفيفة)."""
+    """Schedule cleanup once per outbox row.
+
+    With `db`/`outbox_id`, the durable row state is authoritative and a restart can
+    resume the same cleanup. Without them, the legacy one-shot task is kept for
+    existing callers/tests that do not have a persisted outbox row.
+    """
     if key is not None and key in _cleanup_keys:
         return
-    if not original_message_ids and confirmation_message_id is None:
-        return
+    if db is not None and outbox_id is not None:
+        task_coro = _run_persisted_cleanup(db, bot, outbox_id, sleep=sleep)
+    else:
+        if not original_message_ids and not ack_message_ids and confirmation_message_id is None:
+            return
+        task_coro = _delete_after_delivery(
+            bot,
+            chat_id,
+            tuple(original_message_ids) + tuple(ack_message_ids),
+            confirmation_message_id,
+            sleep=sleep,
+        )
     if key is not None:
         _cleanup_keys.add(key)
-    task = asyncio.create_task(
-        _delete_after_delivery(bot, chat_id, original_message_ids, confirmation_message_id)
-    )
+    task = asyncio.create_task(task_coro)
     _cleanup_tasks.add(task)
 
     def _done(completed: asyncio.Task) -> None:
@@ -221,6 +351,22 @@ def schedule_delivery_cleanup(
             _cleanup_keys.discard(key)
 
     task.add_done_callback(_done)
+
+
+def resume_outbox_cleanup(app) -> None:
+    """Reschedule durable cleanup rows after restart using existing cleanup tasks."""
+    db = app.bot_data["db"]
+    for item in db.list_outbox_cleanup_pending():
+        schedule_delivery_cleanup(
+            app.bot,
+            item.chat_id,
+            item.telegram_message_ids,
+            item.cleanup_confirmation_message_id,
+            key=item.id,
+            ack_message_ids=item.ack_message_ids,
+            db=db,
+            outbox_id=item.id,
+        )
 
 
 def safe_error_label(exc: ApiError) -> str:
@@ -290,13 +436,13 @@ async def _complete_outbox(db, bot, item, base_url: str = "") -> None:
     notice = item.notice_text or _OUTBOX_SENT_NOTICE
     delivered, confirmation = await safe_send_checked_message(bot, item.chat_id, notice)
     if delivered:
-        db.clear_completion_pending(COMPLETION_KIND_OUTBOX, item.ref_id)
         # التنظيف يبدأ فقط الآن: بعد تأكيد POST + تسجيل المتابعة + إرسال التأكيد.
         try:
             outbox_item = db.get_outbox(item.ref_id)
             original_ids = (
                 outbox_item.telegram_message_ids if outbox_item is not None else ()
             )
+            ack_ids = outbox_item.ack_message_ids if outbox_item is not None else ()
             confirmation_id = getattr(confirmation, "message_id", None)
             if not isinstance(confirmation_id, int) or isinstance(confirmation_id, bool):
                 confirmation_id = None
@@ -305,12 +451,24 @@ async def _complete_outbox(db, bot, item, base_url: str = "") -> None:
                     "إكمال %s: اتأكد التسليم لكن معرّف رسالة التأكيد غير متاح — "
                     "حذف التأكيد غير مضمون", item.ref_id,
                 )
+            # Persist the plan before clearing the completion intent, so a restart can
+            # resume. If this write fails, completion_pending stays and is recovered.
+            db.begin_outbox_cleanup(
+                item.ref_id,
+                confirmation_id,
+                now_iso(),
+                delay_seconds=CLEANUP_ORIGINAL_DELAY_SECONDS,
+            )
+            db.clear_completion_pending(COMPLETION_KIND_OUTBOX, item.ref_id)
             schedule_delivery_cleanup(
                 bot,
                 item.chat_id,
                 original_ids,
                 confirmation_id,
                 key=item.ref_id,
+                ack_message_ids=ack_ids,
+                db=db,
+                outbox_id=item.ref_id,
             )
         except Exception as exc:  # noqa: BLE001 — فشل الجدولة لا يغيّر نجاح التسليم
             log.warning(
@@ -475,6 +633,30 @@ async def _recover_pre_cas_unexpected(db, bot, item, exc: BaseException) -> None
         )
 
 
+async def _retry_pre_cas(db, bot, item, reason: str, notice: str | None) -> None:
+    """Safe pre-POST retry without clearing the selected target.
+
+    Used for transient sandbox/metadata failures and for ambiguous empty metadata.
+    A 404/410 from conversation metadata is handled separately as confirmed missing.
+    """
+    attempts = db.bump_outbox_attempt(item.id, now_iso(), reason)
+    if attempts == 0:
+        return
+    if attempts >= MAX_OUTBOX_ATTEMPTS:
+        db.set_outbox_status_if_in(
+            item.id, OUTBOX_FAILED, now_iso(), {OUTBOX_CLAIMED},
+            f"استنفد {attempts} محاولات ({reason})",
+        )
+        if not _tombstoned(db, item.conversation_id):
+            await safe_send(bot, item.chat_id, _OUTBOX_EXHAUSTED_NOTICE)
+        return
+    db.set_outbox_status_if_in(
+        item.id, OUTBOX_PENDING, now_iso(), {OUTBOX_CLAIMED}, reason
+    )
+    if attempts == 1 and notice and not _tombstoned(db, item.conversation_id):
+        await safe_send(bot, item.chat_id, notice)
+
+
 async def _post_claimed(client, db, bot, item) -> None:
     """يحاول الـ POST لعنصر محجوز (claimed) ولسه الإرسال مابدأش.
 
@@ -524,53 +706,50 @@ async def _post_claimed(client, db, bot, item) -> None:
             log.info("تخطّي الإرسال: الشات %s عليه شاهد حذف (قبل أي نداء بعيد)", conversation_id)
             return
 
-        conv = await get_conversation(client, conversation_id)
-        if not conv and _is_selected_target(db, chat_id, conversation_id):
-            # استعلام الشاتات رجّع لا شيء للهدف المحفوظ ⇒ الهدف المؤكّد غير موجود.
-            # لا fallback ولا POST. لو مفيش هدف محفوظ، نسيب مسار sandbox/retry القديم
-            # زي ما هو (الغياب هنا قد يكون سباق/فشل قراءة، ومش دليلًا على حذف).
-            db.set_outbox_status_if_in(
-                outbox_id, OUTBOX_FAILED, now_iso(), {OUTBOX_CLAIMED},
-                "الشات المحدد غير موجود",
+        try:
+            conv = await get_conversation(client, conversation_id)
+        except ApiError as exc:
+            # Only the conversation metadata call can prove the selected conversation is
+            # missing. A 404 from sandbox resume is a sandbox failure, not deletion.
+            if exc.status_code in (404, 410) and _is_selected_target(
+                db, chat_id, conversation_id
+            ):
+                db.set_outbox_status_if_in(
+                    outbox_id, OUTBOX_FAILED, now_iso(), {OUTBOX_CLAIMED},
+                    f"HTTP {exc.status_code}",
+                )
+                _clear_unavailable_selection(db, chat_id, conversation_id)
+                if not _tombstoned(db, conversation_id):
+                    await safe_send(bot, chat_id, _TARGET_UNAVAILABLE_NOTICE)
+                return
+            await _retry_pre_cas(
+                db, bot, item, safe_error_label(exc), f"فشل الإرسال: {error_text(exc)}"
             )
-            _clear_unavailable_selection(db, chat_id, conversation_id)
-            if not _tombstoned(db, conversation_id):
-                await safe_send(bot, chat_id, _TARGET_UNAVAILABLE_NOTICE)
+            return
+        if not conv and _is_selected_target(db, chat_id, conversation_id):
+            # Empty metadata is ambiguous, not deletion proof. Preserve the target and
+            # retry; never fall back to another conversation.
+            await _retry_pre_cas(
+                db, bot, item, "بيانات الشات فارغة/غامضة", _TARGET_UNCERTAIN_NOTICE
+            )
             return
         sandbox_id = conv.get("sandbox_id")
         status = str(conv.get("sandbox_status", "")).upper()
 
-        if status != "RUNNING" and sandbox_id:
-            await client.resume_sandbox(sandbox_id)
-            status = await wait_running(client, conversation_id, interval=3.0, timeout=120.0)
+        try:
+            if status != "RUNNING" and sandbox_id:
+                await client.resume_sandbox(sandbox_id)
+                status = await wait_running(
+                    client, conversation_id, interval=3.0, timeout=120.0
+                )
+        except ApiError as exc:
+            # Sandbox resume/wait failures (including 404) are transient for routing:
+            # the conversation may still exist. Keep the selected target.
+            await _retry_pre_cas(db, bot, item, safe_error_label(exc), _SANDBOX_NOT_READY_NOTICE)
+            return
 
         if status != "RUNNING":
-            # البرومت ماتبعتش خالص ⇒ آمن يتعاود — بس بحد (TASK 53). بنزوّد attempts
-            # ذرّياً (بس لو لسه 'claimed'، ما نحييش سجل اتشطب)؛ أول محاولة بتبلّغ (مؤقّت)،
-            # وبعد استنفاد الحد نعلّمه 'failed' مرة واحدة (CAS من 'claimed').
-            attempts = db.bump_outbox_attempt(outbox_id, now_iso(), "sandbox غير جاهز")
-            if attempts == 0:
-                # السجل مش مملوك لينا دلوقتي (اتشطب/اتغيّر) ⇒ ما نلمسش حاجة.
-                return
-            if attempts >= MAX_OUTBOX_ATTEMPTS:
-                db.set_outbox_status_if_in(
-                    outbox_id, OUTBOX_FAILED, now_iso(), {OUTBOX_CLAIMED},
-                    f"استنفد {attempts} محاولات (sandbox غير جاهز)",
-                )
-                # F-1 (فرض الشاهد على مسار إشعار المستخدم): لو الشات اتشاهد **أثناء**
-                # التحضير (شاهد اتكتب بعد حرس المدخل)، مانبعتش إشعارًا لشات محذوف — حتى
-                # لو النص خالٍ من المحتوى. fail-closed: أي خطأ قراءة ⇒ نتخطّى الإرسال.
-                if not _tombstoned(db, conversation_id):
-                    await safe_send(bot, chat_id, _OUTBOX_EXHAUSTED_NOTICE)
-            else:
-                # محاولة آمنة فاشلة (قبل الـ POST) ⇒ نرجّع السجل مؤهّل 'pending' بـ CAS
-                # (الـ worker ياخده تاني بعد backoff). CAS من 'claimed' بس.
-                db.set_outbox_status_if_in(
-                    outbox_id, OUTBOX_PENDING, now_iso(), {OUTBOX_CLAIMED},
-                    "sandbox غير جاهز",
-                )
-                if attempts == 1 and not _tombstoned(db, conversation_id):
-                    await safe_send(bot, chat_id, _SANDBOX_NOT_READY_NOTICE)
+            await _retry_pre_cas(db, bot, item, "sandbox غير جاهز", _SANDBOX_NOT_READY_NOTICE)
             return
 
         # الإرسال هيبدأ حالاً: CAS 'claimed'⇒'sending' بثبات قبل الـ POST مباشرة (الـ commit
@@ -596,43 +775,11 @@ async def _post_claimed(client, db, bot, item) -> None:
             log.info("تخطّي الإرسال: السجل %s مش مملوك (اتشطب/اتغيّر قبل الـ POST)", outbox_id)
             return
     except ApiError as exc:
-        # 404/410 قبل الـ POST للهدف المحفوظ = غير موجود/اتحذف (مؤكّد، مش عابر).
-        # لو الهدف مش محفوظ، نرجع لسياسة retry القديمة بدل تصنيف حذف بلا دليل.
-        if exc.status_code in (404, 410) and _is_selected_target(db, chat_id, conversation_id):
-            db.set_outbox_status_if_in(
-                outbox_id, OUTBOX_FAILED, now_iso(), {OUTBOX_CLAIMED},
-                f"HTTP {exc.status_code}",
-            )
-            _clear_unavailable_selection(db, chat_id, conversation_id)
-            if not _tombstoned(db, conversation_id):
-                await safe_send(bot, chat_id, _TARGET_UNAVAILABLE_NOTICE)
-            return
-        # فشل قبل الـ POST (قراءة الشات / تشغيل الـ sandbox): الإرسال مابدأش ⇒ آمن يتعاود،
-        # بس بحد (TASK 53): أول محاولة بتبلّغ (مؤقّت)، وبعد استنفاد الحد نعلّمه 'failed'
-        # مرة واحدة. بنزوّد attempts بس لو لسه مملوك (claimed) — عشان ما نحييش سجل اتشطب.
-        attempts = db.bump_outbox_attempt(outbox_id, now_iso(), safe_error_label(exc))
-        if attempts == 0:
-            return
-        if attempts >= MAX_OUTBOX_ATTEMPTS:
-            db.set_outbox_status_if_in(
-                outbox_id, OUTBOX_FAILED, now_iso(), {OUTBOX_CLAIMED},
-                f"استنفد {attempts} محاولات",
-            )
-            # F-1: نفس حرس الإشعار — لو الشات أخد شاهد حذف أثناء التحضير (شاهد اتكتب
-            # خلال `await` النداء البعيد اللي رمى ApiError)، ما نبلّغش شات محذوف.
-            if not _tombstoned(db, conversation_id):
-                await safe_send(bot, chat_id, _OUTBOX_EXHAUSTED_NOTICE)
-        else:
-            # محاولة آمنة فاشلة (قبل الـ POST) ⇒ نرجّع السجل 'pending' بـ CAS من 'claimed'.
-            db.set_outbox_status_if_in(
-                outbox_id, OUTBOX_PENDING, now_iso(), {OUTBOX_CLAIMED},
-                safe_error_label(exc),
-            )
-            if attempts == 1 and not _tombstoned(db, conversation_id):
-                await safe_send(bot, chat_id, f"فشل الإرسال: {error_text(exc)}")
-        # ⚠️ `return` إلزامي: كتلة POST-CAS تحت الكتلة دي، فأي سقوط هنا (تعافي pre-CAS
-        # ناجح) كان هيوصل لـ `client.send_message` رغم إن السجل ماوصلش 'sending' ⇒ POST
-        # مكرّر/خاطئ. تعافي pre-CAS **لازم** يقفل الدالة.
+        # Any remaining ApiError here is pre-POST and not a confirmed metadata deletion.
+        # Keep the target and retry safely.
+        await _retry_pre_cas(
+            db, bot, item, safe_error_label(exc), f"فشل الإرسال: {error_text(exc)}"
+        )
         return
     except Exception as exc:  # noqa: BLE001 — F-01: خطأ غير متوقّع **قبل** CAS الإرسال
         # أي استثناء غير `ApiError` (خطأ برمجي/فكّ ترميز/قاعدة بيانات محلية...) قبل CAS

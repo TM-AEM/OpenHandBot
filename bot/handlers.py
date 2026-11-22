@@ -1232,17 +1232,26 @@ async def _open_conversation_view(
             status is FileStatus.UPSTREAM_ERROR
             and _is_expected_upstream_rejection(auth_exc)
         )
-        if q is None and terminal_rejection:
-            context.bot_data["db"].clear_last_accessed_conversation(update.effective_user.id)
         # OHB2-SW-07: فشل upstream **تشغيلي** (5xx/429/مهلة/انقطاع) ينتشر بعد عرض الرسالة
-        # بدل ما يتحوّل لإتمام ناجح. رفض 4xx المتوقّع (401/403/404/410) + الرفض المشتقّ
-        # (NOT_FOUND/DELETED/UNAUTHORIZED) يرجّع عادي — ممنوع نحوّل الرفض المصرّح لفشل عابر.
+        # قبل تسجيل أي نتيجة. رفض 4xx المتوقّع (401/403/404/410) يرجّع عادي.
         if status is FileStatus.UPSTREAM_ERROR and not _is_expected_upstream_rejection(auth_exc):
             await _raise_if_operational_api_failure(auth_exc)
-        # OHB2-STAGE2-HIGH-ACK-BLOCKING-FIX: رفض نهائي مؤكّد (مش موجود/متشاهد/غير مصرّح) ⇒
-        # نتيجة صريحة مؤهّلة للإقرار، وإلا كان الحدّ يتوقف عنده للأبد (حجب fail-closed بلا
-        # سبب). الفشل التشغيلي فوق **بيرفع** قبل السطر ده ⇒ مستحيل يتحوّل لتجاهل كاذب.
-        mark_explicitly_ignored(update, context)
+        if q is None and terminal_rejection:
+            # F-01: clearing only the setting leaves the persistent `route` row alive;
+            # the next text then goes to the unavailable conversation. Clear the
+            # matching routing state and record the outcome in one transaction.
+            context.bot_data["db"].clear_awaiting_and_record_outcome(
+                update.effective_user.id,
+                _update_id(update),
+                outbox.now_iso(),
+                update_outcomes.EXPLICITLY_IGNORED,
+                clear_last_accessed_conversation_id=conversation_id,
+                clear_awaiting_conversation_id=conversation_id,
+            )
+        else:
+            # OHB2-STAGE2-HIGH-ACK-BLOCKING-FIX: رفض نهائي مؤكّد (مش موجود/متشاهد/غير مصرّح)
+            # ⇒ نتيجة صريحة مؤهّلة للإقرار.
+            mark_explicitly_ignored(update, context)
         return False
     try:
         user_text, reply = await client.get_last_exchange(conversation_id)
@@ -1250,10 +1259,19 @@ async def _open_conversation_view(
         # نفس المسار المتسامح لرسالة الخطأ: مفيش توجيه جديد ولا انهيار في الـ callback.
         if not await _display_conversation_view(update, context, error_text(exc), q=q):
             log.warning("تعذّر عرض خطأ آخر تبادل للشات %s (فشل تسليم تيليجرام).", conversation_id)
-        if q is None and _is_expected_upstream_rejection(exc):
-            context.bot_data["db"].clear_last_accessed_conversation(update.effective_user.id)
+        # Operational upstream failures must propagate before any outcome is recorded.
         await _raise_if_operational_api_failure(exc)
-        mark_explicitly_ignored(update, context)
+        if q is None and _is_expected_upstream_rejection(exc):
+            context.bot_data["db"].clear_awaiting_and_record_outcome(
+                update.effective_user.id,
+                _update_id(update),
+                outbox.now_iso(),
+                update_outcomes.EXPLICITLY_IGNORED,
+                clear_last_accessed_conversation_id=conversation_id,
+                clear_awaiting_conversation_id=conversation_id,
+            )
+        else:
+            mark_explicitly_ignored(update, context)
         return False
     _store_exchange(context, conversation_id, user_text, reply)
     db = context.bot_data["db"]
@@ -2350,7 +2368,7 @@ UNSUPPORTED_ATTACHMENT_DOCUMENT_ENABLED_TEXT = (
 # التخزين المحلي الفعلي (AcceptOutcome.STORED)، ولا يوعد بمسار بعيد/Mini App.
 ATTACHMENT_ACCEPTED_TEXT = (
     "تم استلام الملف وحفظه محليًا بشكل مؤقت ✅ — "
-    "ابعت أوامرك (النص المصاحب) خلال 15 دقيقة من أول ملف."
+    "مش مرفوع لـ OpenHands. ابعت أوامرك (النص المصاحب) خلال 15 دقيقة من أول ملف."
 )
 ATTACHMENT_DUPLICATE_TEXT = (
     "الملف ده كان متسجل قبل كده ✅ — مفيش نسخة جديدة. "
@@ -3072,8 +3090,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if kind == "reply" and pending and db.awaiting_is_expired(awaiting_at):
         # اختيار محادثة سابقة انتهت مهلته، لكن آخر شات مختار محفوظ ⇒ نكمل عليه بدل
         # إجبار المستخدم على /start أو إعادة الفتح.
-        if last_target:
-            await _send_prompt(update, context, last_target, update.message.text)
+        if db.is_routing_paused(telegram_id):
+            db.clear_awaiting_and_record_outcome(
+                telegram_id, _update_id(update), outbox.now_iso(),
+                update_outcomes.EXPLICITLY_IGNORED,
+            )
+            await _reply_no_routing_target(update, context)
+        elif last_target:
+            await _send_prompt(
+                update, context, last_target, update.message.text,
+                consume_awaiting=(telegram_id, "reply"),
+                consume_expired=True,
+                routing_target_required=True,
+            )
         else:
             db.clear_awaiting_and_record_outcome(
                 telegram_id, _update_id(update), outbox.now_iso(),
@@ -3102,6 +3131,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _send_prompt(
             update, context, target, update.message.text,
             title if target == pending else None,
+            routing_target_required=True,
         )
     elif kind == "reply" and pending:
         await _send_prompt(
@@ -3137,7 +3167,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 mark_explicitly_ignored(update, context)
     elif last_target and not db.is_routing_paused(telegram_id):
         # الافتراضي الدائم: أي نص عادي بعد اختيار شات يروح لآخر شات مفتوح/مختار.
-        await _send_prompt(update, context, last_target, update.message.text)
+        await _send_prompt(
+            update, context, last_target, update.message.text,
+            routing_target_required=True,
+        )
     else:
         await _reply_no_routing_target(update, context)
 
@@ -3268,8 +3301,8 @@ async def cancel_route(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     context.bot_data["db"].clear_awaiting_and_record_outcome(
         update.effective_user.id, _update_id(update), outbox.now_iso(),
         update_outcomes.DURABLE_COMPLETED,
+        pause_routing=True,
     )
-    context.bot_data["db"].pause_routing(update.effective_user.id)
     await update.message.reply_text("اتلغى التوجيه. ابعت /start للقائمة.")
 
 
@@ -3284,8 +3317,8 @@ async def cancel_route_button(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.bot_data["db"].clear_awaiting_and_record_outcome(
         update.effective_user.id, _update_id(update), outbox.now_iso(),
         update_outcomes.DURABLE_COMPLETED,
+        pause_routing=True,
     )
-    context.bot_data["db"].pause_routing(update.effective_user.id)
     await _safe_edit(q, "اتلغى التوجيه ✅", reply_markup=kb.main_menu(_mini_app_url(context)))
 
 
@@ -3296,8 +3329,15 @@ async def _send_prompt(
     text: str,
     title: str | None = None,
     consume_awaiting: tuple[int, str] | None = None,
+    *,
+    routing_target_required: bool = False,
+    consume_expired: bool = False,
 ) -> None:
-    """يسجّل البرومت في الصندوق (بثبات) قبل أي إرسال، ويرد 'وصل' فوراً."""
+    """يسجّل البرومت في الصندوق (بثبات) قبل أي إرسال.
+
+    F-02: the immediate reply is an acceptance/queue acknowledgement, not a delivery
+    claim. The actual delivery confirmation remains the completion notice.
+    """
     if not text.strip():
         # نص فاضي/مسافات ⇒ مفيش نية دائمة ⇒ تجاهل صريح (مفيش إعادة معالجة لاحقة).
         mark_explicitly_ignored(update, context)
@@ -3332,27 +3372,54 @@ async def _send_prompt(
     # المعاملة) ⇒ لو العملية ماتت قبل الكتابة، الحاجز مايتسجّلش ⇒ إعادة التسليم بتنفّذ (مفيش
     # فقد)؛ ولو اتكتب، إعادة التسليم مكرّرة ⇒ تتخطّى (مفيش ازدواج). القيمة 0 معناها إن
     # التحديث ده اتسجّل للتوّ (فوز بسباق تزامن) ⇒ مانبعثش تأكيد كاذب، اللي فاز بيتأكد.
+    expected_routing = (
+        (update.effective_user.id, conversation_id)
+        if routing_target_required
+        else None
+    )
     out_id = db.add_or_group_outbox(
         conversation_id, chat_id, text, outbox.now_iso(), reengage=True,
         update_id=_update_id(update), consume_awaiting=consume_awaiting,
         telegram_message_id=getattr(getattr(update, "message", None), "message_id", None),
+        expected_routing=expected_routing,
+        consume_expired=consume_expired,
     )
     if out_id == 0:
-        # OHB2-WP-03 (DEF-003): `out_id == 0` ليها سببان:
-        # (أ) سباق تزامن: تحديث مكرّر — الفائز سجّل النتيجة الدائمة **ذرّيًّا** مع السجل
-        #     ⇒ مفيش حاجة هنا (نسيب نتيجة الفائز).
-        # (ب) حالة انتظار اتغيّرت/انتهت/مستهلكة ⇒ مااتكتبش أي نيّة دائمة، ومااتسجّلتش أي
-        #     نتيجة ⇒ `outcome=None` كان بيعمل `PARTIAL_OR_UNKNOWN` ويحجب حدّ الإقرار.
-        #     فنسجّل «تجاهل صريح» (مفيش نيّة دائمة، وإعادة التسليم مش مفيدة — الحالة اتغيّرت).
+        # OHB2-WP-03 (DEF-003): `out_id == 0` may mean a duplicate update, an expired/
+        # consumed one-shot state, a deleted target, or (F-07) a routing target that
+        # changed at the acceptance boundary. Never report acceptance for the latter.
+        routing_changed = False
+        if routing_target_required:
+            last = db.get_last_accessed_conversation(update.effective_user.id)
+            route_target, route_kind = db.get_awaiting(update.effective_user.id)
+            routing_changed = (
+                (last is not None and last != conversation_id)
+                or (last is None and route_kind == "route" and route_target != conversation_id)
+            )
         uid = _update_id(update)
         if uid is not None and db.update_outcome(uid) is None:
             mark_explicitly_ignored(update, context)
+        if routing_changed:
+            await update.message.reply_text(
+                "تغيّر الشات المختار قبل حفظ رسالتك. ابعتها تاني للشات الجديد."
+            )
         return
     # TASK 55 (C): ترتيب القايمة بيتغيّر بعد البرومت ⇒ نبطّل كاش القايمة.
     context.bot_data.pop("list_cache", None)
-    # تأكيد الحفظ بيذكر الشات المستهدف (القرار 1) عشان رسالة ماتروحش لشات غلط من غير ما تلاحظ.
-    ack = "وصل ✅" if not title else f"وصل ✅ ← «{title[:40]}»"
-    await update.message.reply_text(ack)
+    # F-02: this says "saved/queued", not "delivered". The later `اتبعت ✅` notice is
+    # the delivery confirmation. The target title remains visible for misroute detection.
+    ack = (
+        "وصل ✅ — تم حفظ طلبك، ولسه هيتبعت."
+        if not title
+        else f"وصل ✅ ← «{title[:40]}» — تم حفظ طلبك، ولسه هيتبعت."
+    )
+    ack_message = await update.message.reply_text(ack)
+    ack_id = getattr(ack_message, "message_id", None)
+    if isinstance(ack_id, int) and not isinstance(ack_id, bool) and ack_id > 0:
+        try:
+            db.add_outbox_ack_message_id(out_id, ack_id)
+        except Exception:  # noqa: BLE001 — untracked ack stays visible; never delete blindly
+            log.warning("تعذّر حفظ معرّف رسالة الإقرار للسجل %s", out_id)
     worker = context.bot_data.get("outbox_worker")
     if worker is not None:
         # worker واحد مالك؛ بنوقّظه بدل ما نعمل task جديد لكل برومت.

@@ -440,5 +440,6 @@ def test_unsupported_message_offers_documents_only_when_intake_enabled(tmp_path)
 def test_accepted_and_duplicate_messages_are_distinct_and_truthful():
     assert h.ATTACHMENT_ACCEPTED_TEXT != h.ATTACHMENT_DUPLICATE_TEXT
     assert "حفظه محليًا" in h.ATTACHMENT_ACCEPTED_TEXT
+    assert "مش مرفوع" in h.ATTACHMENT_ACCEPTED_TEXT
     assert "مفيش نسخة جديدة" in h.ATTACHMENT_DUPLICATE_TEXT
     assert "Mini App" not in h.ATTACHMENT_ACCEPTED_TEXT

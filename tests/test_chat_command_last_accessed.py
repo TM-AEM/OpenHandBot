@@ -80,8 +80,12 @@ def test_chat_clears_inaccessible_last_conversation(tmp_path):
     assert update.message.replies
     assert "مش موجود" in update.message.replies[0]
     assert ctx.bot_data["db"].get_last_accessed_conversation(OWNER) is None
-    # لا نبدّل التوجيه الحالي ولا نختار شاتًا آخر بصمت.
-    assert ctx.bot_data["db"].get_awaiting(OWNER) == ("A", "route")
+    # F-01: لا نبدّل التوجيه ولا نترك route قديمًا؛ الرسالة التالية لا تُسجّل outbox.
+    assert ctx.bot_data["db"].get_awaiting(OWNER) == (None, None)
+    update2 = make_update(OWNER, "بعد هدف غير متاح")
+    asyncio.run(h.handle_text(update2, ctx))
+    assert ctx.bot_data["db"].count_outbox() == 0
+    assert "مفيش شات محدد" in update2.message.replies[0]
 
 
 def test_chat_owner_isolation(tmp_path):
@@ -185,3 +189,37 @@ def test_chat_help_text_and_existing_commands_intact():
         "/outbox_mark_sent",
     ):
         assert command in h.HELP_TEXT
+
+
+def test_chat_cleared_state_survives_restart_and_next_text_creates_nothing(tmp_path):
+    db_path = str(tmp_path / "chat-restart.sqlite3")
+    ctx = make_context(OWNER, tmp_path)
+    ctx.bot_data["db"] = Database(db_path)
+    try:
+        _open(ctx, "A")
+        ctx.bot_data["client"] = OpenClient(None)
+        _chat(ctx)
+        ctx.bot_data["db"].close()
+
+        reopened = Database(db_path)
+        ctx.bot_data["db"] = reopened
+        assert reopened.get_last_accessed_conversation(OWNER) is None
+        assert reopened.get_awaiting(OWNER) == (None, None)
+        update = make_update(OWNER, "بعد إعادة التشغيل")
+        asyncio.run(h.handle_text(update, ctx))
+        assert reopened.count_outbox() == 0
+    finally:
+        ctx.bot_data["db"].close()
+
+
+def test_chat_failure_preserves_unrelated_awaiting_state(tmp_path):
+    ctx = make_context(OWNER, tmp_path)
+    db = ctx.bot_data["db"]
+    db.set_last_accessed_conversation(OWNER, "A")
+    db.set_awaiting(OWNER, "OTHER", "newchat", title="OTHER")
+    ctx.bot_data["client"] = OpenClient(None)
+
+    _chat(ctx)
+
+    assert db.get_last_accessed_conversation(OWNER) is None
+    assert db.get_awaiting(OWNER) == ("OTHER", "newchat")

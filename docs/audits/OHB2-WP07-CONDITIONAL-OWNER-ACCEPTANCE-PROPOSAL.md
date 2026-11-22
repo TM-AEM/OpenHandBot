@@ -36,7 +36,7 @@
 > |---|---|---|
 > | **`DEF-011-B`** — filesystem offload off the event loop | `WP-07` | **IMPLEMENTED.** `bot/attachments.py` contains **six** `to_thread` occurrences (module import, one docstring reference, and four `anyio.to_thread.run_sync` call sites); `bot/handlers.py` offloads `_read_local_capped`. |
 > | **`DEF-011-A`** — cross-download quota reservation ledger | `WP-07` | **NOT IMPLEMENTED.** No reservation/in-flight byte accounting exists. Blocked by `D-12` / `OD-04`. |
-> | **`DEF-011-C`** — attachment acceptance UX copy | `WP-01` | **NOT IMPLEMENTED.** Blocked on `OD-01` / `OD-03`. |
+> | **`DEF-011-C`** — attachment acceptance UX copy | `WP-01` | **IMPLEMENTED (2026-11-22).** `ATTACHMENT_ACCEPTED_TEXT` now states that the file is stored locally and is **not uploaded to OpenHands**; it is emitted only after local `STORED`. |
 >
 > **Reading rules:**
 >
@@ -44,9 +44,9 @@
 >   **no longer true**. It is a historical observation, **not** a current-state claim.
 > - The second half of R9 — "0 quota ledger" — **remains accurate**: no reservation ledger exists, so
 >   `DEF-011-A` is still open.
-> - Because `DEF-011-A` and `DEF-011-C` remain unimplemented, `DEF-011` **remains open**. Reading the
->   superseded lines as proof that `DEF-011` is closed, or that A, B and C are all implemented, would be
->   incorrect.
+> - Because `DEF-011-A` remains unimplemented, `DEF-011` **remains open**. `DEF-011-C` is now
+>   implemented. Reading the superseded lines as proof that `DEF-011` is closed, or that A, B and C
+>   are all implemented, would be incorrect.
 >
 > **Unaffected sections.** §2.2 ("Verification against the current tree") remains accurate for items
 > A-1…A-5 and is unchanged. §7 ("Explicit non-authorizations") is a **normative** statement of the

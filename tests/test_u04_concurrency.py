@@ -75,7 +75,7 @@ def test_ack_stays_under_one_second_while_slow_export_runs(tmp_path):
 
     elapsed = asyncio.run(go())
 
-    assert update.message.replies == ["وصل ✅"]
+    assert update.message.replies == ["وصل ✅ — تم حفظ طلبك، ولسه هيتبعت."]
     assert elapsed < 1.0
     assert ctx.bot_data["db"].count_outbox("pending") == 1  # اتحفظ بثبات قبل التأكيد
 

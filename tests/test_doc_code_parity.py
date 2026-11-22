@@ -162,6 +162,9 @@ BATCH_REPORT = (
 F01_REPORT = (
     ROOT / "docs/reviews/OHB2-WP07-BATCH04-DEF011-F01-IMPLEMENTATION-REPORT.md"
 ).read_text(encoding="utf-8")
+F03_IMPLEMENTATION_REPORT = (
+    ROOT / "docs/audits/OHB2-WP07-DEF011-F03-IMPLEMENTATION-REPORT.md"
+).read_text(encoding="utf-8")
 ATTACHMENTS_SRC = (ROOT / "bot/attachments.py").read_text(encoding="utf-8")
 
 CORRECTION_MARKER = "LATER CORRECTION"
@@ -233,8 +236,8 @@ def test_t1_correction_notice_matches_actual_implementation_state():
     assert _sub_defect_status(notice, "DEF-011-A") == "NOT IMPLEMENTED", (
         "DEF-011-A لازم يتسجّل NOT IMPLEMENTED في الإشعار"
     )
-    assert _sub_defect_status(notice, "DEF-011-C") == "NOT IMPLEMENTED", (
-        "DEF-011-C لازم يتسجّل NOT IMPLEMENTED في الإشعار"
+    assert _sub_defect_status(notice, "DEF-011-C") == "IMPLEMENTED", (
+        "DEF-011-C لازم يتسجّل IMPLEMENTED بعد إضافة النص المحلي الصريح"
     )
 
     # الدليل الفعلي على إن B منفّذ: offload حقيقي بـ anyio في مسار المرفقات.
@@ -341,7 +344,7 @@ def test_t4_both_notices_share_date_status_and_scope_language():
 
     # نفس تصنيف الحالة في الوثيقتين.
     assert "NOT implemented" in report_notice or "NOT IMPLEMENTED" in report_notice, (
-        "تقرير التثبيت لازم يوضّح إن A/C لسه NOT implemented"
+        "تقرير التثبيت لازم يوضّح إن A لسه NOT implemented"
     )
     assert "six" in proposal_notice and "six" in report_notice, (
         "الوثيقتين لازم يذكروا نفس العدد (ستة) لـ to_thread"
@@ -375,3 +378,15 @@ def test_t5_batch04_f01_report_correction_notice():
     assert "remains open" in lowered, "الإشعار لازم يصرّح إن DEF-011 لسه مفتوح"
     assert "not close" in lowered, "الإشعار لازم يوضّح إنه ما بيقفلش DEF-011"
 
+
+
+# --- T-6: تصحيح تقرير تنفيذ F-03 المتقادم ------------------------------------
+
+
+def test_t6_f03_implementation_report_correction_matches_current_count():
+    """F-09: تقرير التنفيذ لازم يحمل تصحيحًا مؤرّخًا للعدد والحالة الحالية."""
+    assert "LATER CORRECTION" in F03_IMPLEMENTATION_REPORT
+    assert "six" in F03_IMPLEMENTATION_REPORT
+    assert "DEF-011-C" in F03_IMPLEMENTATION_REPORT
+    assert "IMPLEMENTED" in F03_IMPLEMENTATION_REPORT
+    assert ATTACHMENTS_SRC.count("to_thread") == 6

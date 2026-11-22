@@ -71,7 +71,7 @@ def test_message_immediately_after_open_routes_to_opened_conversation(tmp_path):
     items = _pending(ctx)
     assert len(items) == 1
     assert items[0].conversation_id == "A"
-    assert update.message.replies == ["وصل ✅ ← «شات»"]
+    assert update.message.replies == ["وصل ✅ ← «شات» — تم حفظ طلبك، ولسه هيتبعت."]
 
 
 def test_message_after_more_than_ten_minutes_routes_without_start(tmp_path):
@@ -223,10 +223,16 @@ def test_transient_upstream_errors_do_not_clear_selected_target(tmp_path, status
 
 
 class _OutboxClient:
-    def __init__(self, *, empty=False, get_error=None, send_error=None):
+    def __init__(
+        self, *, empty=False, get_error=None, send_error=None,
+        sandbox_status="RUNNING", resume_error=None,
+    ):
         self.empty = empty
         self.get_error = get_error
         self.send_error = send_error
+        self.sandbox_status = sandbox_status
+        self.resume_error = resume_error
+        self.resume_calls = []
         self.sent = []
 
     async def get_conversations(self, ids):
@@ -236,8 +242,14 @@ class _OutboxClient:
             return []
         return [{
             "id": "A", "title": "A", "execution_status": "running",
-            "sandbox_status": "RUNNING",
+            "sandbox_status": self.sandbox_status,
+            "sandbox_id": "sandbox-A",
         }]
+
+    async def resume_sandbox(self, sandbox_id):
+        self.resume_calls.append(sandbox_id)
+        if self.resume_error is not None:
+            raise self.resume_error
 
     async def send_message(self, conversation_id, text):
         if self.send_error is not None:
@@ -267,13 +279,9 @@ def _prepare_unavailable_case(tmp_path):
     return db, _claimed_outbox(db), _OutboxBot()
 
 
-@pytest.mark.parametrize("mode", ["empty", "404"])
-def test_outbox_confirmed_missing_target_fails_without_fallback(tmp_path, mode):
+def test_outbox_confirmed_404_target_fails_without_fallback(tmp_path):
     db, item, bot = _prepare_unavailable_case(tmp_path)
-    client = _OutboxClient(
-        empty=(mode == "empty"),
-        get_error=None if mode == "empty" else ApiError("missing", 404),
-    )
+    client = _OutboxClient(get_error=ApiError("missing", 404))
 
     asyncio.run(outbox._post_claimed(client, db, bot, item))
 
@@ -281,6 +289,36 @@ def test_outbox_confirmed_missing_target_fails_without_fallback(tmp_path, mode):
     assert db.get_last_accessed_conversation(OWNER) is None
     assert db.get_awaiting(OWNER) == (None, None)
     assert outbox._TARGET_UNAVAILABLE_NOTICE in bot.sent
+    assert client.sent == []
+
+
+def test_outbox_empty_metadata_is_ambiguous_and_preserves_target(tmp_path):
+    db, item, bot = _prepare_unavailable_case(tmp_path)
+    client = _OutboxClient(empty=True)
+
+    asyncio.run(outbox._post_claimed(client, db, bot, item))
+
+    assert db.get_outbox(item.id).status == outbox.OUTBOX_PENDING
+    assert db.get_last_accessed_conversation(OWNER) == "A"
+    assert db.get_awaiting(OWNER) == ("A", "route")
+    assert outbox._TARGET_UNCERTAIN_NOTICE in bot.sent
+    assert client.sent == []
+
+
+def test_outbox_sandbox_resume_404_is_not_conversation_deletion(tmp_path):
+    db, item, bot = _prepare_unavailable_case(tmp_path)
+    client = _OutboxClient(
+        sandbox_status="STOPPED",
+        resume_error=ApiError("sandbox missing", 404),
+    )
+
+    asyncio.run(outbox._post_claimed(client, db, bot, item))
+
+    assert db.get_outbox(item.id).status == outbox.OUTBOX_PENDING
+    assert db.get_last_accessed_conversation(OWNER) == "A"
+    assert db.get_awaiting(OWNER) == ("A", "route")
+    assert outbox._TARGET_UNAVAILABLE_NOTICE not in bot.sent
+    assert client.resume_calls == ["sandbox-A"]
     assert client.sent == []
 
 
@@ -417,3 +455,20 @@ def test_start_is_not_required_after_inactivity(tmp_path):
 
     assert [i.conversation_id for i in _pending(ctx)] == ["A"]
     assert ctx.bot_data["db"].get_last_accessed_conversation(OWNER) == "A"
+
+
+def test_outbox_empty_metadata_exhaustion_fails_without_clearing_target(tmp_path):
+    db, item, bot = _prepare_unavailable_case(tmp_path)
+    client = _OutboxClient(empty=True)
+
+    claimed = item
+    for _ in range(outbox.MAX_OUTBOX_ATTEMPTS):
+        assert claimed is not None and claimed.id == item.id
+        asyncio.run(outbox._post_claimed(client, db, bot, claimed))
+        claimed = db.claim_outbox(outbox.now_iso())
+
+    assert db.get_outbox(item.id).status == outbox.OUTBOX_FAILED
+    assert db.get_last_accessed_conversation(OWNER) == "A"
+    assert db.get_awaiting(OWNER) == ("A", "route")
+    assert outbox._TARGET_UNAVAILABLE_NOTICE not in bot.sent
+    assert client.sent == []

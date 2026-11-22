@@ -98,7 +98,7 @@ def test_reply_acks_instantly_then_background(tmp_path, monkeypatch):
     monkeypatch.setattr(asyncio, "create_task", fake_create_task)
     asyncio.run(h.handle_text(update, ctx))
 
-    assert update.message.replies == ["وصل ✅"]
+    assert update.message.replies == ["وصل ✅ — تم حفظ طلبك، ولسه هيتبعت."]
     # مفيش task جديد لكل برومت: الـ worker الواحد هو اللي بياخد السجل.
     assert scheduled == []
     assert ctx.bot_data["db"].count_outbox("pending") == 1
@@ -603,7 +603,7 @@ def test_send_prompt_persists_outbox_then_wakes_worker(tmp_path, monkeypatch):
     ctx.bot_data["outbox_worker"] = worker
     asyncio.run(h.handle_text(update, ctx))
 
-    assert update.message.replies == ["وصل ✅"]
+    assert update.message.replies == ["وصل ✅ — تم حفظ طلبك، ولسه هيتبعت."]
     assert scheduled == []  # مفيش task لكل برومت — الـ worker الواحد هو المسؤول
     assert worker.woken == 1  # اتوقّظ بدل ما نعمل task جديد
     assert db.count_outbox("pending") == 1  # اتسجّل قبل ما التسليم يبدأ
