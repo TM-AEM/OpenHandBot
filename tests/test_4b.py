@@ -406,11 +406,11 @@ def test_route_is_sticky_refreshes_and_shows_chat_name(tmp_path):
     u2 = make_update(1, "تاني")
     asyncio.run(h.handle_text(u2, ctx))
 
-    # القرار 2: الرسالتين خلال 1.5 ثانية بتتجمّعوا في سجل واحد لنفس الوجهة.
+    # NEW-02: رسالتان مستقلتان (بدون ردّ صريح) تفضلان سجلين منفصلين.
     items = db.list_outbox_by_status("pending")
-    assert len(items) == 1
-    assert items[0].conversation_id == "conv-A"
-    assert items[0].text == "أول\nتاني"  # الترتيب والمحتوى محفوظين
+    assert len(items) == 2
+    assert [item.conversation_id for item in items] == ["conv-A", "conv-A"]
+    assert [item.text for item in items] == ["أول", "تاني"]
     assert "مشروع الموقع" in u1.message.replies[0]  # اسم الشات المستهدف ظاهر
     assert db.get_awaiting(1) == ("conv-A", "route")  # لسه شغال (اتجدّد وقته)
 
@@ -530,11 +530,11 @@ def test_concurrent_messages_on_route_all_reach_the_same_chat(tmp_path):
 
     asyncio.run(go())
     items = db.list_outbox_by_status("pending")
-    # القرار 2 + القرار 1: كل الرسايل بتتجمّع في سجل واحد لنفس الوجهة (مفيش توجيه غلط).
+    # NEW-02: كل رسالة مستقلة بسجل مستقل، لكن كلها لنفس الوجهة (مفيش توجيه غلط).
     assert {i.conversation_id for i in items} == {"A"}
-    assert len(items) == 1
+    assert len(items) == 10
     # كل الرسايل موجودة بالترتيب (مفيش نص ضايع).
-    assert items[0].text.split("\n") == [f"m{i}" for i in range(10)]
+    assert [item.text for item in items] == [f"m{i}" for i in range(10)]
 
 
 # =====================================================================

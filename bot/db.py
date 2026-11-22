@@ -309,8 +309,8 @@ AWAITING_TTL = timedelta(minutes=10)
 ATTACHMENT_BATCH_TTL = timedelta(minutes=15)
 
 
-# نافذة تجميع الرسايل المتتالية (القرار 2): أي رسالة جاية خلال 1.5 ثانية من آخر تحديث
-# لبرومت لسه 'pending' لنفس الوجهة بتتجمّع معاه في سجل واحد (مش إرسال منفصل).
+# NEW-02: مدة نضج سجل 'pending' قبل ما الـ worker يحجزه (مش معيار تجميع). التجميع
+# بيحتاج علاقة Telegram صريحة (`reply_to_message_id`)، والوقت لوحده مايجمّعش رسائل.
 GROUP_WINDOW = timedelta(seconds=1.5)
 
 
@@ -3784,15 +3784,16 @@ class Database:
         update_id: int | None = None,
         consume_awaiting: tuple[int, str] | None = None,
         telegram_message_id: int | None = None,
+        reply_to_message_id: int | None = None,
         expected_routing: tuple[int, str] | None = None,
         consume_expired: bool = False,
     ) -> int:
-        """تجميع (القرار 2): لو فيه برومت 'pending' لنفس الوجهة اتحدّث خلال `window`،
-
-        نضيف النص عليه بدل ما نعمل سجل جديد. غير كده نسجّل سجل 'pending' جديد.
+        """تجميع (NEW-02): لو فيه برومت 'pending' لنفس الوجهة والرسالة الجديدة ردّ
+        (`reply_to_message_id`) على رسالة موجودة في نفس السجل، نضيف النص عليه. غير كده
+        نسجّل سجل 'pending' جديد. الوقت وحده مابيجمّعش رسائل مستقلة.
 
         الوجهة = (conversation_id, chat_id). العملية كلها جوه BEGIN IMMEDIATE عشان
-        رسالتين متزامنتين مايعملوش سجلين منفصلين لنفس الدفعة. بنرجّع id السجل.
+        القبول والتحقق من العلاقة والتحديث/الإدراج يحصلوا ذرّيًّا. بنرجّع id السجل.
 
         OHB2-07 (idempotency): لو `client_ref` اتزوّد وفيه سجل موجود بنفس
         (conversation_id, chat_id, client_ref)، بنرجّع الـ id بتاعه من غير أي كتابة —
@@ -3815,8 +3816,17 @@ class Database:
 
         `telegram_message_id` اختياري: معرّف رسالة المالك الأصلية المطلوب حذفها بعد نجاح
         التسليم. عند التجميع بنضمّه لقائمة السجل بدل ما نضيّع رسالة من دفعة سريعة.
+
+        NEW-02: التجميع مش بيستند على الوقت. رسالة جديدة تنضم لسجل pending فقط لو
+        `reply_to_message_id` بتاعها موجود فعلًا في `telegram_message_ids` للسجل؛ ده دليل
+        Telegram صريح على أنها جزء من نفس المحادثة. رسالتان مستقلتان، حتى لو وصلوا في نفس
+        اللحظة، بيفضلوا سجلين منفصلين (وكل cleanup بيحذف IDs بتاعته بس).
+
+        NEW-01: عند `expected_routing`، فحص الإيقاف داخل نفس معاملة القبول. `/cancel`
+        بيثبّت الإيقاف ويمسح الانتظار في معاملة واحدة؛ أي برومت بدأ قبل الإلغاء لكنه وصل
+        للقبول بعده لازم يُرفض (0) بلا صف outbox، وأي قبول سبق الإلغاء يظل قائمًا.
         """
-        window = window if window is not None else GROUP_WINDOW
+        _ = window  # kept for API compatibility; grouping no longer uses time
         conn = self._conn
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -3864,6 +3874,16 @@ class Database:
                     else None
                 )
                 last_target = last["value"] if last is not None else None
+                # NEW-01: `/cancel` commits the pause and clears awaiting atomically.
+                # The target read above may predate that commit; reject at the actual
+                # acceptance boundary if cancellation is already durable.
+                paused = conn.execute(
+                    "SELECT value FROM settings WHERE key=?",
+                    (self._routing_paused_key(routing_tg),),
+                ).fetchone()
+                if paused is not None and paused["value"] == "1":
+                    conn.rollback()
+                    return 0
                 matches = (
                     last_target == expected_target
                     if last_target is not None
@@ -3894,25 +3914,34 @@ class Database:
                     )
                     conn.commit()
                     return int(existing["id"])
-            row = conn.execute(
+            pending_rows = conn.execute(
                 "SELECT id, text, updated_at, client_ref, telegram_message_ids FROM outbox "
-                "WHERE conversation_id=? AND chat_id=? AND status=? ORDER BY id DESC LIMIT 1",
+                "WHERE conversation_id=? AND chat_id=? AND status=? ORDER BY id DESC",
                 (conversation_id, chat_id, OUTBOX_PENDING),
-            ).fetchone()
-            now_dt = _parse_iso(now)
-            row_dt = _parse_iso(row["updated_at"]) if row else None
-            within = (
-                row is not None
-                and now_dt is not None
-                and row_dt is not None
-                and now_dt - row_dt <= window
+            ).fetchall()
+            row = None
+            valid_reply = (
+                isinstance(reply_to_message_id, int)
+                and not isinstance(reply_to_message_id, bool)
+                and reply_to_message_id > 0
             )
-            # بنسمح بالتجميع مع صف لسه 'pending' لو مالوش معرّف عملية، أو معرّفه نفس
-            # معرّفنا. لو الصف ليه معرّف تاني ⇒ ما ندمجش (نعمل صف مستقل) عشان
-            # الـ idempotency بتاعة العملية التانية ما تتلغيش.
-            mergeable = within and (
-                not client_ref or row["client_ref"] in (None, client_ref)
-            )
+            if valid_reply:
+                # Find the exact pending batch containing the replied-to message, even
+                # if another independent prompt arrived later.
+                for candidate in pending_rows:
+                    ids = _decode_telegram_message_ids(candidate["telegram_message_ids"])
+                    if reply_to_message_id not in ids:
+                        continue
+                    # Do not merge bot prompts into a Mini App row (and vice versa).
+                    if client_ref is None and candidate["client_ref"] is None:
+                        row = candidate
+                        break
+                    if client_ref is not None and candidate["client_ref"] in (None, client_ref):
+                        row = candidate
+                        break
+            # NEW-02: only an explicit Telegram reply to a message already in this
+            # pending batch is evidence of continuation. Temporal proximity is not.
+            mergeable = row is not None
             if mergeable:
                 merged = row["text"] + "\n" + text
                 # نطبع معرّف العملية على الصف لو كان فاضي، عشان إعادة إرسال نفس
@@ -4057,7 +4086,7 @@ class Database:
         The acknowledgement is already sent when this is called. If the DB write fails,
         the caller must not delete an unknown message; an untracked ack is simply left
         visible. The write is idempotent and does not touch `updated_at` (which is used
-        by the grouping window).
+        for the existing claim-maturity delay).
         """
         if isinstance(message_id, bool) or not isinstance(message_id, int) or message_id <= 0:
             return False
@@ -4297,7 +4326,7 @@ class Database:
         return self._row_to_outbox(row) if row else None
 
     def seconds_until_mature(self, now: str, window: timedelta) -> float | None:
-        """كم ثانية فاضلة لحد ما أقدم عنصر 'pending' يستوفي نافذة التجميع؟
+        """كم ثانية فاضلة لحد ما أقدم عنصر 'pending' يستوفي تأخير النضج؟
 
         None لو مفيش 'pending' خالص. 0.0 لو أقدم عنصر مستوفي بالفعل (جاهز للحجز).
         """

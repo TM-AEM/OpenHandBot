@@ -94,7 +94,8 @@ def _sent_item(db, *, message_ids=(11, 12)):
     )
     for message_id in message_ids[1:]:
         assert db.add_or_group_outbox(
-            CID, OWNER, TEXT, outbox.now_iso(), telegram_message_id=message_id
+            CID, OWNER, TEXT, outbox.now_iso(),
+            telegram_message_id=message_id, reply_to_message_id=message_ids[0],
         ) == oid
     db.set_outbox_status(oid, OUTBOX_SENT, outbox.now_iso())
     db.add_completion_pending(
@@ -316,7 +317,8 @@ def test_multiple_rapid_messages_keep_independent_ids(tmp_path):
         CID, OWNER, "أول", outbox.now_iso(), telegram_message_id=11
     )
     assert db.add_or_group_outbox(
-        CID, OWNER, "تاني", outbox.now_iso(), telegram_message_id=12
+        CID, OWNER, "تاني", outbox.now_iso(),
+        telegram_message_id=12, reply_to_message_id=11,
     ) == oid
     other = db.add_or_group_outbox(
         "other-conversation", OWNER, "تالت", outbox.now_iso(), telegram_message_id=13

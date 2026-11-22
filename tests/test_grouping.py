@@ -1,11 +1,12 @@
-"""TASK 04B-09: تجميع الرسايل المتتالية خلال 1.5 ثانية (القرار 2).
+"""NEW-02: التجميع بعلاقة ردّ صريحة، والرسائل المستقلة تفضل منفصلة.
 
-بنغطّي: حدود النافذة، سلوك التدفّق (flush)، حفظ الترتيب/المحتوى، عزل المجموعات
-(مستخدم/شات/وجهة)، عدم الإرسال المزدوج، واستمرار الإرسال عند الإلغاء/الانتهاء،
-مع دمج صحيح مع concurrent_updates(True).
+بنغطّي: عزل الرسائل المستقلة حتى داخل النافذة، تجميع الأجزاء المترابطة بـ
+`reply_to_message_id`، تأخير نضج الـ worker، حفظ الترتيب/المحتوى، عزل المجموعات
+(مستخدم/شات/وجهة)، عدم الإرسال المزدوج، واستمرار الإرسال عند الإلغاء/الانتهاء.
 """
 import asyncio
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from bot.db import Database, GROUP_WINDOW
 from tests.test_handlers import make_context, make_update
@@ -26,13 +27,30 @@ def test_group_window_is_one_and_a_half_seconds():
 
 
 # ------------------------------------------------------------------ DAO semantics
-def test_messages_within_window_group_into_one_row():
+def test_independent_messages_within_window_stay_separate():
     db = Database(":memory:")
     db.add_or_group_outbox("c1", 99, "أول", _iso(T0))
     db.add_or_group_outbox("c1", 99, "تاني", _iso(T0 + timedelta(seconds=1.0)))
     items = db.list_outbox_by_status("pending")
+    assert len(items) == 2
+    assert [item.text for item in items] == ["أول", "تاني"]
+    db.close()
+
+
+def test_reply_linked_messages_group_into_one_row():
+    db = Database(":memory:")
+    first = db.add_or_group_outbox(
+        "c1", 99, "أول", _iso(T0), telegram_message_id=11
+    )
+    second = db.add_or_group_outbox(
+        "c1", 99, "تاني", _iso(T0 + timedelta(seconds=1.0)),
+        telegram_message_id=12, reply_to_message_id=11,
+    )
+    assert second == first
+    items = db.list_outbox_by_status("pending")
     assert len(items) == 1
     assert items[0].text == "أول\nتاني"
+    assert items[0].telegram_message_ids == (11, 12)
     db.close()
 
 
@@ -45,18 +63,19 @@ def test_message_after_window_creates_new_row():
     db.close()
 
 
-def test_window_boundary_is_inclusive():
-    # بالظبط 1.5 ثانية ⇒ لسه جوّه النافذة (<=).
+def test_reply_relationship_groups_regardless_of_window():
     db = Database(":memory:")
-    db.add_or_group_outbox("c1", 99, "أ", _iso(T0))
-    db.add_or_group_outbox("c1", 99, "ب", _iso(T0 + GROUP_WINDOW))
+    db.add_or_group_outbox("c1", 99, "أ", _iso(T0), telegram_message_id=11)
+    db.add_or_group_outbox(
+        "c1", 99, "ب", _iso(T0 + GROUP_WINDOW + timedelta(seconds=5)),
+        telegram_message_id=12, reply_to_message_id=11,
+    )
     assert len(db.list_outbox_by_status("pending")) == 1
     db.close()
 
-    # 1.5 ثانية + جزء بسيط من أول رسالة ⇒ سجل جديد.
     db2 = Database(":memory:")
     db2.add_or_group_outbox("c1", 99, "أ", _iso(T0))
-    db2.add_or_group_outbox("c1", 99, "ب", _iso(T0 + GROUP_WINDOW + timedelta(milliseconds=1)))
+    db2.add_or_group_outbox("c1", 99, "ب", _iso(T0 + GROUP_WINDOW))
     assert len(db2.list_outbox_by_status("pending")) == 2
     db2.close()
 
@@ -82,16 +101,38 @@ def test_only_pending_rows_are_grouped_not_sent():
 
 
 # ------------------------------------------------------------------ handler level
-def test_handler_groups_consecutive_messages_one_row(tmp_path):
+def test_handler_keeps_independent_messages_separate(tmp_path):
     ctx = make_context(1, tmp_path)
     db = ctx.bot_data["db"]
-    # route (مستمر) عشان كل رسالة تستهلك الحالة وتتجّم مع اللي قبلها.
     db.set_awaiting(1, "A", "route")
-    for text in ("سطر1", "سطر2", "سطر3"):
-        asyncio.run(h.handle_text(make_update(1, text), ctx))
+    for i, text in enumerate(("سطر1", "سطر2", "سطر3"), start=1):
+        update = make_update(1, text)
+        update.update_id = 100 + i
+        update.message.message_id = 200 + i
+        asyncio.run(h.handle_text(update, ctx))
+    items = db.list_outbox_by_status("pending")
+    assert len(items) == 3
+    assert [item.text for item in items] == ["سطر1", "سطر2", "سطر3"]
+    assert [item.telegram_message_ids for item in items] == [(201,), (202,), (203,)]
+
+
+def test_handler_groups_explicit_reply_parts(tmp_path):
+    ctx = make_context(1, tmp_path)
+    db = ctx.bot_data["db"]
+    db.set_awaiting(1, "A", "route")
+    first = make_update(1, "سطر1")
+    first.update_id = 301
+    first.message.message_id = 11
+    second = make_update(1, "سطر2")
+    second.update_id = 302
+    second.message.message_id = 12
+    second.message.reply_to_message = SimpleNamespace(message_id=11)
+    asyncio.run(h.handle_text(first, ctx))
+    asyncio.run(h.handle_text(second, ctx))
     items = db.list_outbox_by_status("pending")
     assert len(items) == 1
-    assert items[0].text == "سطر1\nسطر2\nسطر3"
+    assert items[0].text == "سطر1\nسطر2"
+    assert items[0].telegram_message_ids == (11, 12)
 
 
 def test_handler_isolates_two_conversations(tmp_path):
@@ -106,20 +147,27 @@ def test_handler_isolates_two_conversations(tmp_path):
     assert len(items) == 2
 
 
-def test_concurrent_handler_messages_never_split_one_batch(tmp_path):
+def test_concurrent_handler_messages_stay_independent(tmp_path):
     ctx = make_context(1, tmp_path)
     db = ctx.bot_data["db"]
     db.set_awaiting(1, "A", "route")
-    updates = [make_update(1, f"m{i}") for i in range(12)]
+    updates = []
+    for i in range(12):
+        update = make_update(1, f"m{i}")
+        update.update_id = 400 + i
+        update.message.message_id = 500 + i
+        updates.append(update)
 
     async def go():
         await asyncio.gather(*(h.handle_text(u, ctx) for u in updates))
 
     asyncio.run(go())
     items = db.list_outbox_by_status("pending")
-    # BEGIN IMMEDIATE بيمنع سجلين لنفس الدفعة؛ كل النصوص موجودة بالترتيب.
-    assert len(items) == 1
-    assert items[0].text.split("\n") == [f"m{i}" for i in range(12)]
+    assert len(items) == 12
+    assert [item.text for item in items] == [f"m{i}" for i in range(12)]
+    assert [item.telegram_message_ids for item in items] == [
+        (500 + i,) for i in range(12)
+    ]
 
 
 # ------------------------------------------------------------------ worker gating
@@ -135,8 +183,10 @@ def test_worker_does_not_claim_until_window_matures(tmp_path):
 def test_worker_waits_for_fresh_batch_then_sends_once(tmp_path, monkeypatch):
     db = make_db(tmp_path)
     now = datetime.now(timezone.utc).isoformat()
-    db.add_or_group_outbox("c1", 99, "أول", now)
-    db.add_or_group_outbox("c1", 99, "تاني", now)  # نفس الدفعة
+    db.add_or_group_outbox("c1", 99, "أول", now, telegram_message_id=11)
+    db.add_or_group_outbox(
+        "c1", 99, "تاني", now, telegram_message_id=12, reply_to_message_id=11
+    )
     client = Client()
     worker = make_worker(db, client=client)
     # لسه جوّه النافذة ⇒ مفيش حجز.
@@ -184,10 +234,18 @@ def test_run_loop_flushes_group_without_manual_tick(tmp_path, monkeypatch):
     worker = make_worker(db, client=client, poll_interval=0.01, max_idle=0.05)
 
     async def scenario():
-        # نضيف 3 رسايل بسرعة (جوّه النافذة) قبل ما نبدأ الـ loop.
-        db.add_or_group_outbox("c1", 99, "أ", datetime.now(timezone.utc).isoformat())
-        db.add_or_group_outbox("c1", 99, "ب", datetime.now(timezone.utc).isoformat())
-        db.add_or_group_outbox("c1", 99, "ج", datetime.now(timezone.utc).isoformat())
+        # ثلاثة أجزاء مرتبطة بردّ صريح قبل ما نبدأ الـ loop.
+        db.add_or_group_outbox(
+            "c1", 99, "أ", datetime.now(timezone.utc).isoformat(), telegram_message_id=11
+        )
+        db.add_or_group_outbox(
+            "c1", 99, "ب", datetime.now(timezone.utc).isoformat(),
+            telegram_message_id=12, reply_to_message_id=11,
+        )
+        db.add_or_group_outbox(
+            "c1", 99, "ج", datetime.now(timezone.utc).isoformat(),
+            telegram_message_id=13, reply_to_message_id=11,
+        )
         worker.start()
         # نستنى لحد ما يبعت (نافذة 50ms + هامش).
         for _ in range(100):
@@ -209,11 +267,16 @@ def test_wake_during_sleep_still_flushes_single_group(tmp_path, monkeypatch):
     worker = make_worker(db, client=client, poll_interval=0.01, max_idle=0.05)
 
     async def scenario():
-        db.add_or_group_outbox("c1", 99, "أ", datetime.now(timezone.utc).isoformat())
+        db.add_or_group_outbox(
+            "c1", 99, "أ", datetime.now(timezone.utc).isoformat(), telegram_message_id=11
+        )
         worker.start()
         await asyncio.sleep(0.02)  # أثناء النافذة
-        # رسالة جديدة ⇒ wake + تجميع مع الأولى.
-        db.add_or_group_outbox("c1", 99, "ب", datetime.now(timezone.utc).isoformat())
+        # ردّ صريح على الجزء الأول ⇒ wake + تجميع مع الأولى.
+        db.add_or_group_outbox(
+            "c1", 99, "ب", datetime.now(timezone.utc).isoformat(),
+            telegram_message_id=12, reply_to_message_id=11,
+        )
         worker.wake()
         for _ in range(100):
             if client.sent:
@@ -228,8 +291,13 @@ def test_wake_during_sleep_still_flushes_single_group(tmp_path, monkeypatch):
 def test_cancelled_group_is_flushed_after_restart(tmp_path, monkeypatch):
     """لو البوت قفل والدفعة لسه 'pending'، التشغيل الجديد بيبعت النص المجمّع مرة واحدة."""
     db = make_db(tmp_path)
-    db.add_or_group_outbox("c1", 99, "أ", datetime.now(timezone.utc).isoformat())
-    db.add_or_group_outbox("c1", 99, "ب", datetime.now(timezone.utc).isoformat())
+    db.add_or_group_outbox(
+        "c1", 99, "أ", datetime.now(timezone.utc).isoformat(), telegram_message_id=11
+    )
+    db.add_or_group_outbox(
+        "c1", 99, "ب", datetime.now(timezone.utc).isoformat(),
+        telegram_message_id=12, reply_to_message_id=11,
+    )
     # restart: نفس قاعدة البيانات، worker جديد.
     client = Client()
     worker = make_worker(db, client=client)
@@ -244,8 +312,13 @@ def test_grouped_batch_is_sent_at_most_once_after_ambiguous(tmp_path, monkeypatc
     from bot.errors import ApiError
 
     db = make_db(tmp_path)
-    db.add_or_group_outbox("c1", 99, "أ", datetime.now(timezone.utc).isoformat())
-    db.add_or_group_outbox("c1", 99, "ب", datetime.now(timezone.utc).isoformat())  # نفس الدفعة
+    db.add_or_group_outbox(
+        "c1", 99, "أ", datetime.now(timezone.utc).isoformat(), telegram_message_id=11
+    )
+    db.add_or_group_outbox(
+        "c1", 99, "ب", datetime.now(timezone.utc).isoformat(),
+        telegram_message_id=12, reply_to_message_id=11,
+    )
     client = Client(send_error=ApiError("timeout", None))
     worker = make_worker(db, client=client)
     monkeypatch.setattr("bot.db.GROUP_WINDOW", timedelta(0))  # نافذة عدّت ⇒ الدفعة جاهزة

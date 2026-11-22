@@ -455,5 +455,6 @@ def test_concurrent_prompts_preserve_conversation_identity(tmp_path):
 
     rows = ctx.bot_data["db"].list_outbox_by_status("pending")
     assert {r.conversation_id for r in rows} == {CID}  # كلها لنفس الشات
-    assert len(rows) == 1  # تجميع في سجل واحد (القرار 2)
+    assert len(rows) == 10  # NEW-02: رسائل مستقلة ⇒ سجلات مستقلة
+    assert [r.text for r in rows] == [f"م{i}" for i in range(10)]
     assert api.create_calls() == []

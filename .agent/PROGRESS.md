@@ -1,5 +1,49 @@
 # PROGRESS — OHB2-PLAN-01-APPROVE-DEFERRED-P0-AND-CONTINUE-STAGES-0-5
 
+---
+
+# PROGRESS — OHB2-NEW02-TELEGRAM-PROMPT-GROUPING-IDENTITY-SAFETY (2026-11-22)
+
+## Goal
+منع دمج رسائل تيليجرام المستقلة في برومت واحد (وحذفها مع بعض) لمجرد وصولها خلال
+`GROUP_WINDOW = 1.5s`. الدمج مسموح فقط عند وجود علاقة ردّ صريحة
+(`reply_to_message_id`) لرسالة موجودة في نفس سجل `outbox` المعلّق.
+
+## Acceptance criteria
+1. رسائل مستقلة (بدون reply) ⇒ سجلات `outbox` منفصلة، IDs/ACKs منفصلة، وcleanup كل سجل
+   يحذف IDs بتاعته فقط.
+2. الأجزاء المترابطة بردّ صريح ⇒ سجل واحد، النص بالترتيب، IDs/ACKs محفوظة، وcleanup واحد.
+3. لا حذف لرسالة غير معروفة/غير مملوكة، ولا اعتماد على الوقت وحده.
+4. فشل/إعادة تشغيل/تزامن/تكرار update لا يفسد membership ولا يكرّر الحذف/الإرسال.
+5. NEW-01 (إلغاء أثناء قبول البرومت) يفضل شغّال.
+6. مفيش push/PR/نشر/Autopush، ومفيش تغييرات في DEF-011-A/C أو D6.
+
+## Done
+- `bot/db.py`: `add_or_group_outbox` بيجمّع فقط لو `reply_to_message_id` موجود في
+  `telegram_message_ids` لسجل pending (يدوّر في كل السجلات المعلّقة، مش الأحدث فقط)؛
+  الوقت ما بقاش معيار دمج. `window` محفوظ للتوافق.
+- `bot/handlers.py`: تمرير `reply_to_message_id` من `update.message.reply_to_message`.
+- `bot/outbox.py` + تعليقات: `GROUP_WINDOW` بقى تأخير نضج الحجز فقط، مش تجميع.
+- اختبارات: `tests/test_new02_prompt_grouping_identity.py` (13 اختبار NEW-02) + تحديث
+  `tests/test_grouping.py`, `test_prompt_cleanup.py`, `test_telegram_prompt_cleanup_durable.py`,
+  `test_miniapp_operations.py`, `test_persistent_ready_sticky_routing.py`, `test_4b.py`,
+  `test_existing_conversation_repository_context.py` للسلوك الجديد.
+- NEW-01: `tests/test_new01_cancel_prompt_atomicity.py` + guard موجودان، 53 اختبار مرتبط يعدّي.
+
+## Verification (آخر تشغيل فعلي)
+- `python -m pytest -q` ⇒ **3738 passed**، 0 failed (كان 3723 قبل NEW-02).
+- `node --test tests/frontend/*.test.js` ⇒ **280 pass / 0 fail**.
+- `python -m pyflakes ...` ⇒ exit 0؛ `bandit ... -lll -s B613` ⇒ High **0**؛ `pip_audit` ⇒ clean.
+- `compileall` و`git diff --check` ⇒ exit 0.
+
+## Known / next
+- Telegram long-message splitting قد ينتج أجزاء مستقلة لو مفيش reply؛ ده آمن (رفض الدمج
+  بالوقت) لكن UX قد يحتاج تعليم المستخدم بالردّ على الجزء الأول لتجميع صريح.
+- NEW-01 + NEW-02 اتعملهم **commit محلي** على `agent/ohb2-new01-cancel-race`؛ مفيش push/PR.
+- تقرير NEW-02 مطلوب تحت `docs/reviews/` قبل الإغلاق.
+
+
+
 ## Goal
 تنفيذ قرار المستخدم الصريح (**Option D**): تأجيل ميزة تسليم المرفقات العامة (P0) **مؤقّتًا**،
 مع الحفاظ على **الرفض الآمن** للمرفقات غير المدعومة، والسماح بمتابعة **Stages 0–5** من خطة

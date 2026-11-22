@@ -142,7 +142,7 @@ def test_inactivity_does_not_change_selected_target(tmp_path):
     ctx.bot_data["db"].set_awaiting(OWNER, "A", "route", title="A", now=_aged(90))
     _send(ctx, "بعد الانتظار")
 
-    assert [i.conversation_id for i in _pending(ctx)] == ["A"]
+    assert [i.conversation_id for i in _pending(ctx)] == ["A", "A"]
     assert ctx.bot_data["db"].get_last_accessed_conversation(OWNER) == "A"
 
 
@@ -164,7 +164,7 @@ def test_sending_does_not_silently_change_selected_target(tmp_path):
         _send(ctx, text)
 
     assert ctx.bot_data["db"].get_last_accessed_conversation(OWNER) == "A"
-    assert [i.conversation_id for i in _pending(ctx)] == ["A"]
+    assert [i.conversation_id for i in _pending(ctx)] == ["A", "A", "A"]
 
 
 def test_last_accessed_is_isolated_per_telegram_user(tmp_path):
@@ -402,16 +402,16 @@ def test_commands_remain_registered_as_commands(tmp_path):
     assert {"start", "chat", "help"} <= commands
 
 
-def test_rapid_messages_group_without_duplicate_outbox_work(tmp_path):
+def test_rapid_independent_messages_keep_separate_outbox_work(tmp_path):
     ctx = make_context(OWNER, tmp_path)
     _open(ctx, "A")
     for text in ("سريع 1", "سريع 2", "سريع 3"):
         _send(ctx, text)
 
     items = _pending(ctx)
-    assert len(items) == 1
-    assert items[0].conversation_id == "A"
-    assert items[0].text == "سريع 1\nسريع 2\nسريع 3"
+    assert len(items) == 3
+    assert [item.conversation_id for item in items] == ["A", "A", "A"]
+    assert [item.text for item in items] == ["سريع 1", "سريع 2", "سريع 3"]
 
 
 # ------------------------------------------------------- command compatibility

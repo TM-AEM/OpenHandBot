@@ -57,7 +57,8 @@ def _sent_batch(db, originals=(11, 12), acks=(21, 22)):
     )
     for message_id in originals[1:]:
         assert db.add_or_group_outbox(
-            CID, OWNER, "جزء تاني", outbox.now_iso(), telegram_message_id=message_id
+            CID, OWNER, "جزء تاني", outbox.now_iso(),
+            telegram_message_id=message_id, reply_to_message_id=originals[0],
         ) == oid
     for message_id in acks:
         assert db.add_outbox_ack_message_id(oid, message_id) is True

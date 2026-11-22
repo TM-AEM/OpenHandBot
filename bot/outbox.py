@@ -104,11 +104,11 @@ def _iso(dt: datetime) -> str:
 
 
 def grouping_mature_before(window: timedelta | None = None, now: datetime | None = None) -> str:
-    """حدّ النضج: أي برومت updated_at <= النتيجة دي بقى مستوفي نافذة التجميع.
+    """حدّ نضج سجل 'pending' قبل الحجز (مش حدّ تجميع رسائل).
 
-    بنستخدمه في الحجز عشان ما ناخدش دفعة لسه بتتجمع. لو `now` مابيتزوّدش، بنستخدم
-    الساعة الحقيقية. بنقرأ db_module.GROUP_WINDOW وقت النداء (مش كقيمة افتراضية متثبّتة) عشان
-    الاختبارات تقدر تصغّر النافذة بشكل حتمي.
+    التجميع بقى محتاج علاقة Telegram صريحة (`reply_to_message_id`)؛ النافذة دي مجرد
+    تأخير الحجز الموجود أصلًا. بنقرأ db_module.GROUP_WINDOW وقت النداء (مش كقيمة
+    افتراضية متثبّتة) عشان الاختبارات تقدر تصغّر النافذة بشكل حتمي.
     """
     current = now or datetime.now(timezone.utc)
     return _iso(current - (window if window is not None else db_module.GROUP_WINDOW))
@@ -515,7 +515,7 @@ async def deliver_outbox(client, db, bot, outbox_id: int) -> None:
     """مسار مباشر: نحجز **السجل المطلوب نفسه** ذرّياً ثم نرسله عبر _post_claimed.
 
     OHB2-WP-05 (DEF-008): كان بيستدعي `claim_outbox` غير المُقيَّد بالمعرّف، فيمكن أن
-    يحجز ويرسل سجلًا آخر (أقدم) غير المطلوب، ويتخطّى نافذة التجميع (`GROUP_WINDOW`).
+    يحجز ويرسل سجلًا آخر (أقدم) غير المطلوب، ويتخطّى تأخير النضج (`GROUP_WINDOW`).
     دلوقتي بنحجز `outbox_id` نفسه ذرّياً (`claim_outbox_by_id`) عشان ما نلمسش سجلًا
     تاني، ونكمل عبر `_post_claimed` (نفس مسار الـ worker).
     """
@@ -1022,8 +1022,9 @@ class OutboxWorker(_BaseWorker):
       يفضل مؤهّل وتتطبق عليه الـ backoff — لحد MAX_OUTBOX_ATTEMPTS محاولات، وبعدها
       نعلّمه 'failed' (نهائي) بإشعار واحد (TASK 53). 'unknown'/'failed'/'sent' مش مؤهّلة
       أصلاً، فمستحيل يتعاودوا تلقائياً.
-    - القرار 2: ما بيحجزش سجل 'pending' غير لما يستوفي نافذة التجميع (db_module.GROUP_WINDOW)،
-      فكل الرسايل اللي وصلت خلال النافذة بتتجمّع في سجل واحد وبتتبعت مرة واحدة.
+    - NEW-02: ما بيحجزش سجل 'pending' قبل ما يعدّي تأخير النضج (db_module.GROUP_WINDOW)،
+      لكن ده **مش** تجميع: كل رسالة مستقلة سجلها مستقل. التجميع بيحصل وقت القبول فقط
+      لما رسالة تكون ردّ صريح على رسالة موجودة في نفس السجل.
     """
 
     def _claim(self):
@@ -1040,7 +1041,7 @@ class OutboxWorker(_BaseWorker):
         return after is not None and after.status == OUTBOX_PENDING
 
     def _next_delay(self) -> float:
-        # فيه 'pending' لسه في نافذة التجميع ⇒ ننام بالظبط لحد ما يستوفي (بدل لفّ فاضي).
+        # فيه 'pending' لسه في تأخير النضج ⇒ ننام بالظبط لحد ما يستوفي (بدل لفّ فاضي).
         # الحالات المؤقّتة (backoff) وأي حالة تانية زي ما هي.
         if self._consecutive_failures:
             return super()._next_delay()
@@ -1050,8 +1051,7 @@ class OutboxWorker(_BaseWorker):
         return min(remaining, self._max_idle)
 
     def _idle_delay(self) -> float:
-        # مفيش حجز (الدفعة لسه بتتجمّع): ننام لحد ما تستوفي النافذة، مش خمول طويل،
-        # عشان الإرسال يحصل بعد ~1.5 ثانية من آخر رسالة (القرار 2).
+        # مفيش حجز (السجل لسه في تأخير النضج): ننام لحد ما يستوفي، مش خمول طويل.
         remaining = self._remaining_until_mature()
         if remaining is None:
             return self._max_idle

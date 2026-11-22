@@ -3367,7 +3367,7 @@ async def _send_prompt(
         mark_explicitly_ignored(update, context)
         return
     # نسجّل 'pending' قبل ما نبدأ أي إرسال، عشان البرومت مايضيعش لو العملية اتقطعت.
-    # القرار 2: لو فيه برومت لنفس الوجهة اتسجّل خلال 1.5 ثانية، بيتجمّع معاه في سجل واحد.
+    # NEW-02: الوقت لوحده مايجمّعش؛ التجميع يحتاج `reply_to_message` صريح.
     # P1: بنمرّر `update_id` عشان تسجيل «معالَج» يحصل **ذرّيًا مع** كتابة السجل الدائم (نفس
     # المعاملة) ⇒ لو العملية ماتت قبل الكتابة، الحاجز مايتسجّلش ⇒ إعادة التسليم بتنفّذ (مفيش
     # فقد)؛ ولو اتكتب، إعادة التسليم مكرّرة ⇒ تتخطّى (مفيش ازدواج). القيمة 0 معناها إن
@@ -3377,10 +3377,13 @@ async def _send_prompt(
         if routing_target_required
         else None
     )
+    message = getattr(update, "message", None)
+    reply_to = getattr(message, "reply_to_message", None)
     out_id = db.add_or_group_outbox(
         conversation_id, chat_id, text, outbox.now_iso(), reengage=True,
         update_id=_update_id(update), consume_awaiting=consume_awaiting,
-        telegram_message_id=getattr(getattr(update, "message", None), "message_id", None),
+        telegram_message_id=getattr(message, "message_id", None),
+        reply_to_message_id=getattr(reply_to, "message_id", None),
         expected_routing=expected_routing,
         consume_expired=consume_expired,
     )
