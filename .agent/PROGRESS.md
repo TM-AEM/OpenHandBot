@@ -4855,3 +4855,68 @@ verification are green; no commit/push/PR/merge/deploy/Autopush.
 ## Status
 - **INDEPENDENT REVIEW NOT PERFORMED** (لا توجد جلسة مراجع منفصلة متاحة).
 - تم دمج NEW-03 في `main` ومزامنته مع GitHub `main` (exact sync)؛ لا PR/merge/deploy/Autopush.
+
+
+---
+
+# PROGRESS — OHB2-NEW03-PROGRESS-RECORD-UPDATE (2026-11-23)
+
+## Scope
+تحديث توثيقي فقط لسجل NEW-03 وحالة القبول؛ السجلات التاريخية أعلاه محفوظة كما هي.
+لا تغييرات في production code أو tests أو Mini App أو القرارات المعمارية.
+
+## Audited baseline
+- الفرع: `main`.
+- HEAD = `main` = `origin/main` = GitHub `main` = `302e583598af749182a01cb07d09a132d7e305c2`.
+- Tree: `ba86aa97da4d122c451b112bd90ae00603aaf02a`.
+- Working tree كان **clean** أثناء التدقيق.
+- commit تنفيذ NEW-03: `7d91f683047ae8bac8bb2000e90dab38532ef1ba`.
+- `git diff --stat 7d91f68..302e583 -- bot` أعاد فراغًا: كود `bot/` لم يتغيّر بين التنفيذ والـmain المدقّق.
+- `302e583` أضاف اختبارات F1/F2 وتقارير الأدلة/المراجعة فقط.
+
+## F1/F2 test coverage
+- `test_clear_unavailable_selection_holds_begin_immediate_write_lock`
+- `test_handler_cleanup_failure_logs_and_preserves_routing`
+
+Latest verified results:
+- Full Python: **3771 passed**, 0 failed, 74 warnings.
+- NEW-03 focused (15 existing + 2 F1/F2): **17 passed**.
+- Parity (`tests/test_doc_code_parity.py`): **15 passed**.
+- Node: **280 passed**, 0 failed.
+- `pyflakes`: **0**.
+- `bandit` High: **0**.
+- `pip-audit`: **clean**.
+- Both expected mutation failures were reproduced in isolated temporary copies:
+  F1 (`BEGIN IMMEDIATE` → `BEGIN`) failed at the lock assertion; F2 (removed
+  `try/except`) failed with the injected `sqlite3.OperationalError` propagating.
+
+## S02 evidence limitation
+- A previous Notion record describes S02 as a technically successful review in a
+  separate OpenHands conversation.
+- The latest acceptance audit could not locate the S02 report as a local repository
+  or workspace artifact.
+- Reviewer identity/model/host distinction remains unverified.
+- S02 is **not** described as a third-party review.
+- The additional S02 mutations are **not** claimed as independently reproduced in
+  the latest audit.
+
+## NEW-03 acceptance status
+**`ELIGIBLE_FOR_OWNER_ACCEPTANCE_WITH_NOTES`**
+
+This is a technical readiness recommendation only. It is **not** owner acceptance,
+final closure, or release approval.
+
+## DEF-011 status
+- F-03 is considered closed under the documented interpretation of F-03 as the
+  DEF-011 documentation/legacy-acceptance-text issue.
+- `DEF-011` as a whole remains **OPEN**.
+- `DEF-011-A` remains **unimplemented**.
+- `D6` remains **deferred**.
+- Closing F-03 does **not** close DEF-011.
+
+## NEW-04
+- Independent review remains **deferred**; NEW-04 was not reactivated or changed.
+
+## Safety
+- لا commit/push/PR/merge/deploy/Autopush في هذه المهمة.
+- لم يتم تعديل Notion.
