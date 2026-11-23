@@ -3410,6 +3410,32 @@ class Database:
             raise
         return update_id is not None
 
+    def clear_unavailable_selection(self, telegram_id: int, conversation_id: str) -> None:
+        """يمسح هدف التوجيه غير المتاح ذرّيًّا، فقط لو ما زال هو الهدف الحالي.
+
+        `last_accessed` و`awaiting` ممكن يكونوا اتغيّروا لمستخدم/وجهة أحدث قبل ما نوصل
+        هنا. الفحص والمسح الاتنين جوه `BEGIN IMMEDIATE` واحدة: إما الحالتين المتطابقتين
+        يتمسحوا مع بعض، أو يتراجعوا مع بعض عند أي فشل. الحالة الأحدث لا تُمسح، والحالات
+        غير المرتبطة (repository selection، pending outbox، pause flag) لا تُلمس.
+        """
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            key = self._last_accessed_key(telegram_id)
+            row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+            if row is not None and row["value"] == conversation_id:
+                self._delete_setting_nocommit(key)
+            row = conn.execute(
+                "SELECT awaiting_conversation_id FROM user_state WHERE telegram_id=?",
+                (telegram_id,),
+            ).fetchone()
+            if row is not None and row["awaiting_conversation_id"] == conversation_id:
+                self._clear_awaiting_nocommit(telegram_id)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
     def set_awaiting_and_record_outcome(
         self,
         telegram_id: int,

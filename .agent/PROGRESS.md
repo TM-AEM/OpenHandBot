@@ -4822,3 +4822,36 @@ verification are green; no commit/push/PR/merge/deploy/Autopush.
 - Run a genuinely separate reviewer session/clone for the current tree.
 - Follow up the still-stale `OHB2-WP07-BATCH04-DEF011-F01-IMPLEMENTATION-REPORT.md` C status and
   the proposal diagnosis-hash drift.
+
+---
+
+# PROGRESS — OHB2-NEW03-UNAVAILABLE-SELECTION-ATOMICITY (2026-11-22)
+
+## Goal
+مسح حالة التوجيه عند اكتشاف هدف غير متاح/محذوف داخل معاملة SQLite واحدة، بدون
+حالة جزئية أو إعلان نجاح كاذب.
+
+## Baseline
+- `main` عند `de17463` وكان clean.
+- NEW-04 كان **مُدمجًا ومدفوعًا مسبقًا** (`0769234`/`de17463`)، لا توجد تغييرات
+  uncommitted خاصة به في بداية المهمة.
+- الفرع: `agent/ohb2-new03-unavailable-selection-atomicity`.
+
+## Done
+- `bot/db.py`: `Database.clear_unavailable_selection()` بمعاملة `BEGIN IMMEDIATE`
+  ومسح شرطي لـ`last_accessed` و`awaiting` مع rollback كامل.
+- `bot/outbox.py`: `_clear_unavailable_selection()` ترجع نجاح الـcommit فقط،
+  وإشعار الهدف غير المتاح لا يُرسل عند فشل المعاملة.
+- `bot/handlers.py`: مسار الحذف المؤكّد في `_send_prompt()` يستخدم نفس المعاملة.
+- `tests/test_new03_unavailable_selection_atomicity.py`: 15 اختبارًا للنجاح والفشل
+  والـrollback والسباقات والحالة الأحدث.
+
+## Verification
+- Focused NEW-03 + routing/NEW-01/NEW-02/NEW-04/outbox/handlers/F-1: **334 passed**.
+- Full Python: **3769 passed**, 0 failed.
+- Node: **280 pass / 0 fail**.
+- `pyflakes=0`؛ `bandit` High **0**؛ `pip_audit` clean؛ `compileall` و`git diff --check` = 0.
+
+## Status
+- **INDEPENDENT REVIEW NOT PERFORMED** (لا توجد جلسة مراجع منفصلة متاحة).
+- تم دمج NEW-03 في `main` ومزامنته مع GitHub `main` (exact sync)؛ لا PR/merge/deploy/Autopush.

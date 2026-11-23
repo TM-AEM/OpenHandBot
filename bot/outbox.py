@@ -564,24 +564,22 @@ def _is_selected_target(db, chat_id: int, conversation_id: str) -> bool:
         return False
 
 
-def _clear_unavailable_selection(db, chat_id: int, conversation_id: str) -> None:
-    """يمسح هدف التوجيه **فقط** لو هو نفسه الشات المؤكّد غير المتاح.
+def _clear_unavailable_selection(db, chat_id: int, conversation_id: str) -> bool:
+    """يمسح هدف التوجيه غير المتاح **ذرّيًّا**، فقط لو ما زال هو الهدف الحالي.
 
-    الشات/الـ chat_id هنا مالك خاص (outbox owner)، ومسح هدف آخر ممنوع. أي فشل في
-    المسح لا يغيّر نتيجة التسليم ولا يخفي الخطأ الأصلي؛ مجرد تحذير.
+    الشات/الـ chat_id هنا مالك خاص (outbox owner)، ومسح هدف آخر ممنوع. العملية كلها
+    في معاملة واحدة: أي فشل يرجع False، والحالة القديمة تفضل كما هي. الفشل لا يغيّر
+    نتيجة التسليم، لكنه يمنع إرسال إشعار «تم التعامل مع الهدف» على أنه نجاح.
     """
     try:
-        if db.get_last_accessed_conversation(chat_id) == conversation_id:
-            db.clear_last_accessed_conversation(chat_id)
-        awaiting_target, _kind = db.get_awaiting(chat_id)
-        if awaiting_target == conversation_id:
-            db.clear_awaiting(chat_id)
-    except Exception as exc:  # noqa: BLE001 — مسح اختياري لا يغيّر حكم التسليم
-        log.warning(
-            "تعذّر مسح هدف التوجيه غير المتاح %s (%s)",
+        db.clear_unavailable_selection(chat_id, conversation_id)
+        return True
+    except Exception:  # noqa: BLE001 — مسح اختياري لا يغيّر حكم التسليم
+        log.exception(
+            "تعذّر مسح هدف التوجيه غير المتاح %s",
             conversation_id,
-            type(exc).__name__,
         )
+        return False
 
 
 async def _recover_pre_cas_unexpected(db, bot, item, exc: BaseException) -> None:
@@ -718,8 +716,8 @@ async def _post_claimed(client, db, bot, item) -> None:
                     outbox_id, OUTBOX_FAILED, now_iso(), {OUTBOX_CLAIMED},
                     f"HTTP {exc.status_code}",
                 )
-                _clear_unavailable_selection(db, chat_id, conversation_id)
-                if not _tombstoned(db, conversation_id):
+                cleared = _clear_unavailable_selection(db, chat_id, conversation_id)
+                if cleared and not _tombstoned(db, conversation_id):
                     await safe_send(bot, chat_id, _TARGET_UNAVAILABLE_NOTICE)
                 return
             await _retry_pre_cas(
@@ -809,8 +807,8 @@ async def _post_claimed(client, db, bot, item) -> None:
                 outbox_id, OUTBOX_FAILED, now_iso(), {OUTBOX_SENDING},
                 f"HTTP {exc.status_code}",
             )
-            _clear_unavailable_selection(db, chat_id, conversation_id)
-            if not _tombstoned(db, conversation_id):
+            cleared = _clear_unavailable_selection(db, chat_id, conversation_id)
+            if cleared and not _tombstoned(db, conversation_id):
                 await safe_send(bot, chat_id, _TARGET_UNAVAILABLE_NOTICE)
         elif is_permanent(exc):
             db.set_outbox_status_if_in(

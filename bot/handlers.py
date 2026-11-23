@@ -3356,11 +3356,12 @@ async def _send_prompt(
         # شاهد الحذف قد يكون 'deleting' (غير مؤكّد) مش حذفًا نهائيًا. نمسح الهدف
         # المحفوظ فقط لو الحذف البعيد مؤكّد؛ غير كده نسيب التوجيه كما هو.
         if db.remote_deletion_state(conversation_id) == db.REMOTE_CONFIRMED:
-            if db.get_last_accessed_conversation(update.effective_user.id) == conversation_id:
-                db.clear_last_accessed_conversation(update.effective_user.id)
-            awaiting_target, _awaiting_kind = db.get_awaiting(update.effective_user.id)
-            if awaiting_target == conversation_id:
-                db.clear_awaiting(update.effective_user.id)
+            try:
+                db.clear_unavailable_selection(update.effective_user.id, conversation_id)
+            except Exception:  # noqa: BLE001 — الحذف مؤكّد؛ فشل المسح لا يُعلن نجاحًا
+                log.exception(
+                    "تعذّر مسح هدف التوجيه المحذوف %s ذرّيًّا", conversation_id
+                )
         await update.message.reply_text(
             "الشات ده اتحذف — مش ممكن نبعت له رسايل. افتح شات تاني."
         )
