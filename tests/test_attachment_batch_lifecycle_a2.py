@@ -81,9 +81,11 @@ def make_db(tmp_path) -> Database:
 def make_service(tmp_path, *, client=None, db=None, max_bytes=None):
     db = db if db is not None else make_db(tmp_path)
     store = (
-        StagingStore(db, str(tmp_path / "t.sqlite3"), max_bytes=max_bytes)
+        StagingStore(
+            db, str(tmp_path / "t.sqlite3"), max_bytes=max_bytes, clock=lambda: T0
+        )
         if max_bytes is not None
-        else StagingStore(db, str(tmp_path / "t.sqlite3"))
+        else StagingStore(db, str(tmp_path / "t.sqlite3"), clock=lambda: T0)
     )
     client = client if client is not None else FakeClient(conversations={CID: _conv()})
     service = AttachmentService(
@@ -219,7 +221,9 @@ def test_deadline_is_exactly_15_minutes(tmp_path):
 
 def test_batch_is_expired_boundaries(tmp_path):
     t0 = T0.isoformat()
-    assert batch_is_expired(t0, T0 + timedelta(minutes=15)) is False  # على الحد بالظبط
+    # A4-F5: الحدّ بالظبط منتهٍ (`now >= deadline`)، لا حيّ.
+    assert batch_is_expired(t0, T0 + timedelta(minutes=15)) is True
+    assert batch_is_expired(t0, T0 + timedelta(minutes=14, seconds=59)) is False
     assert batch_is_expired(t0, T0 + timedelta(minutes=15, microseconds=1)) is True
     assert batch_is_expired("not-a-timestamp", T0) is True  # fail closed
 

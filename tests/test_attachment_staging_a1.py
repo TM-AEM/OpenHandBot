@@ -10,6 +10,7 @@
 import os
 import re
 import sqlite3
+from datetime import datetime, timezone
 
 import pytest
 
@@ -24,12 +25,15 @@ from bot.attachments import (
 from bot.db import ATTACHMENT_BATCH_PENDING, ATTACHMENT_ITEM_STORED, Database
 
 _TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
+_TEST_NOW = datetime(2026, 11, 11, 0, 5, tzinfo=timezone.utc)
 
 
 def make_store(tmp_path, *, max_bytes=MAX_ATTACHMENT_BYTES):
     db_path = str(tmp_path / "state.sqlite3")
     db = Database(db_path)
-    store = StagingStore(db, db_path, max_bytes=max_bytes)
+    store = StagingStore(
+        db, db_path, max_bytes=max_bytes, clock=lambda: _TEST_NOW
+    )
     return db, store, db_path
 
 

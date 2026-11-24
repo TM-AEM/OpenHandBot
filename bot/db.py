@@ -1407,35 +1407,46 @@ class Database:
         *,
         size_bytes: int,
         staging_token: str | None = None,
+        now: str | None = None,
     ) -> bool:
-        """OHB2-LIFE-01/F2: انتقال **ذرّي مشروط** للعنصر `pending ⇒ stored` مع فحص الدفعة الأب.
+        """OHB2-LIFE-01/F2 + A4-F5: انتقال **ذرّي مشروط** للعنصر `pending ⇒ stored`.
 
         يمنع **الإحياء السباقي**: كتابة متأخّرة (بايتات اتنزّلت أثناء نافذة غير متزامنة
         بينما الكنس (LIFE-01) وسم الدفعة `expired` والعنصر `reaped`) ما تقدرش ترجّع العنصر
-        `stored` جوّه دفعة انتهت. الشرط **جوّه نفس الـ`UPDATE`** (تقييم ذرّي لحظة الكتابة،
-        على نفس اتصال القاعدة الوحيد، بلا قراءة-ثم-كتابة عبر `await`):
+        `stored` جوّه دفعة انتهت. الشروط **داخل نفس معاملة `BEGIN IMMEDIATE`**:
 
         - العنصر `status = 'pending'` (مش `stored`/`reaped`/أي حالة تانية).
         - الدفعة الأب موجودة (`EXISTS`).
         - الدفعة `status = 'pending'` (مش `expired`/`delivered`/`rejected`/`failed`/
           `intent_recorded`/`uncertain`/...).
+        - **A4-F5:** `now < T0 + 15د` (exact deadline = expired). الفحص مقصود أن يكون
+          مستقلًّا عن الكنس: دفعة لسه `pending` بعد المهلة لا تُقبل. `now` الصريح يُحترم؛
+          غيابه يعني الوقت الحقيقي UTC المقروء داخل المعاملة.
 
-        **ليه فحص حالة الدفعة (`status`) كافي وأدق من فحص المهلة (`t0`):** الكنس بيسجّل
-        الدفعة `expired` (DB-أولًا) **قبل** ما يوسم عناصرها `reaped`؛ فلو عنصر اتكنس،
-        دفعته أكيد مش `pending`. وسم `expired` بيمثّل القرار النهائي (مش مجرد فوات المهلة).
-        الفحصين (عنصر `pending` + دفعة `pending`) **ذاتيين** ⇒ سباق «الكنس وسمها expired
-        ثم الكتابة المتأخّرة» بيتحسم في SQL: إمّا الكتابة تلحق (الدفعة لسه `pending`)،
-        أو تُرفض (الدفعة بقت `expired`/العنصر `reaped`). **مفيش** حالة عنصر `stored` جوّه
-        دفعة **منتهية** (`expired`) — دي الحالة الممنوعة.
-
-        ترجّع True لو صف واحد اتحدّث، وFalse لو مفيش (عنصر غير مؤهّل/دفعة غير `pending`/
-        سباق) — والمستدعي **ما يعلنش نجاح** على False (fail closed). **ما بيلمسش `t0`**
-        (مفيش تمديد). معاملة واحدة (`BEGIN IMMEDIATE` + commit/rollback).
+        `now=None` يستخدم الوقت الحقيقي UTC **بعد** الحصول على قفل `BEGIN IMMEDIATE`
+        وقبل فحص المهلة/CAS، فلا يقدمه انتظار القفل. أي فشل في تحليل `now`/`t0` ⇒ False
+        (fail closed). **ما بيلمسش `t0`** (مفيش تمديد). ترجّع True فقط لو صف واحد اتحدّث.
         """
-        stamp = datetime.now(timezone.utc).isoformat()
         conn = self._conn
         conn.execute("BEGIN IMMEDIATE")
         try:
+            effective_now = (
+                now if now is not None else datetime.now(timezone.utc).isoformat()
+            )
+            row = conn.execute(
+                "SELECT i.status AS item_status, b.t0 AS batch_t0 "
+                "FROM attachment_items i JOIN attachment_batches b "
+                "ON b.batch_id = i.batch_id WHERE i.item_id=?",
+                (item_id,),
+            ).fetchone()
+            if row is None or row["item_status"] != ATTACHMENT_BATCH_PENDING:
+                conn.rollback()
+                return False
+            now_dt = _parse_iso(effective_now)
+            deadline = _attachment_batch_deadline(row["batch_t0"])
+            if deadline is None or now_dt is None or now_dt >= deadline:
+                conn.rollback()
+                return False
             cur = conn.execute(
                 "UPDATE attachment_items SET status=?, size_bytes=?, staging_token=?, "
                 "updated_at=? WHERE item_id=? AND status=? AND EXISTS ("
@@ -1445,7 +1456,7 @@ class Database:
                     ATTACHMENT_ITEM_STORED,
                     int(size_bytes),
                     staging_token,
-                    stamp,
+                    effective_now,
                     item_id,
                     ATTACHMENT_BATCH_PENDING,
                     ATTACHMENT_BATCH_PENDING,
@@ -2174,13 +2185,16 @@ class Database:
         (دليل بلا نتيجة). **مفيش ادّعاء exactly-once**: `update_id` مكرّر (نفس الدفعة أو
         دفعة جديدة) بيتسجّل بـ `duplicate_completed` (دليل دائم، بلا ازدواج).
 
-        **شرط مسبق:** المستدعي (A2) لسه متأكّد إن `batch` دفعة `pending` صالحة لنفس
-        المستخدم والمحادثة (وإلا مايناديش). الكتابة هنا **مش** بتعيد التحقّق من صلاحية
-        الدفعة (تجنّب قراءة-ثم-كتابة عبر `await`؛ العمليات تُسلسَل في العملية الواحدة).
+        **شرط مسبق:** المستدعي (A2) عمل التصنيف، لكن التصنيف **مش دليل** على أن الدفعة
+        ما زالت حيّة. داخل `BEGIN IMMEDIATE` نعيد قراءة الدفعة ونتحقّق من الملكية والمحادثة
+        والحالة و`now < T0 + 15د` (A4-F5). هذا يمنع إدخال عنصر في دفعة انتهت بين التصنيف
+        والقبول حتى لو الكنس لم يعمل بعد. `now` غير صالح أو `t0` غير صالح ⇒ رفض مغلق.
 
         بترجّع معرّف الدفعة الفعلي اللي العنصر اتسجّل فيه (للـ evidence)، أو **`None`**
         لما التحديث يكون **مكرّرًا** (`update_id` مسجّل قبل كده) ⇒ مفيش عنصر جديد
-        اتكتب (F-4). المستدعي **ما يصنعش** معرّف عنصر ولا يفترض قبولًا جديدًا.
+        اتكتب (F-4). المستدعي **ما يصنعش** معرّف عنصر ولا يفترض قبولًا جديدًا. عند خسارة
+        سباق المهلة/الحالة يرفع `AttachmentBatchStateChanged` (فالخدمة ترجع
+        `REJECTED_BATCH` بلا عنصر/بايتات).
         """
         conn = self._conn
         conn.execute("BEGIN IMMEDIATE")
@@ -2191,9 +2205,32 @@ class Database:
                 )
                 conn.commit()
                 return None
-            # OHB2-WP01 Stage 1: the batch may have been cancelled/expired/intent-recorded
-            # after classification. Re-check ownership + `pending` atomically in the
-            # INSERT itself; a lost race must not create an item in a non-pending batch.
+            # OHB2-WP01 Stage 1 + A4-F5: the batch may have been cancelled/expired/
+            # intent-recorded after classification. Re-check ownership, conversation,
+            # status, and the fixed deadline atomically before the INSERT.
+            row = conn.execute(
+                "SELECT * FROM attachment_batches WHERE batch_id=?", (batch.batch_id,)
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                raise AttachmentBatchStateChanged(
+                    "attachment batch is no longer pending"
+                )
+            current = self._row_to_attachment_batch(row)
+            now_dt = _parse_iso(now)
+            deadline = _attachment_batch_deadline(current.t0)
+            if (
+                current.telegram_id != int(batch.telegram_id)
+                or current.conversation_id != batch.conversation_id
+                or current.status != ATTACHMENT_BATCH_PENDING
+                or now_dt is None
+                or deadline is None
+                or now_dt >= deadline
+            ):
+                conn.rollback()
+                raise AttachmentBatchStateChanged(
+                    "attachment batch is expired or no longer pending"
+                )
             cur = conn.execute(
                 "INSERT INTO attachment_items"
                 "(item_id, batch_id, staging_token, display_name, size_bytes, status, "

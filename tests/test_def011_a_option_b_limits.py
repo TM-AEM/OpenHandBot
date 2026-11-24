@@ -315,7 +315,7 @@ def test_interrupted_partial_file_is_accounted_and_reclaimed(tmp_path):
     db_path = str(tmp_path / "state.sqlite3")
     db = Database(db_path)
     try:
-        store = StagingStore(db, db_path, max_total_bytes=100)
+        store = StagingStore(db, db_path, max_total_bytes=100, clock=lambda: T0_DT)
         add_batch(db)
         store.ensure_root()
 
@@ -327,7 +327,7 @@ def test_interrupted_partial_file_is_accounted_and_reclaimed(tmp_path):
         assert staging_total_bytes(store.root) == 60
 
         # إعادة بناء مخزن جديد: المحاسبة من الملفات الفعلية ⇒ المتبقّي 40.
-        fresh = StagingStore(db, db_path, max_total_bytes=100)
+        fresh = StagingStore(db, db_path, max_total_bytes=100, clock=lambda: T0_DT)
         ok = _store(db, fresh, "i2", b"y" * 40)
         assert ok.status is StageStatus.STORED
         assert staging_total_bytes(store.root) == 100

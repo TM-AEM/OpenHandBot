@@ -314,6 +314,20 @@ Delta vs the pre-fix snapshot: **+162 / −65 lines** (`/tmp/f01.diff`).
 > drain) remains **deferred**. The historical F-03 row is preserved unchanged above as a historical
 > record.
 
+> **⚠ LATER CORRECTION — 2026-11-24 (append-only; the earlier notice above and all historical rows are unchanged).**
+> The earlier `DEF-011-C` statement in the 2026-11-21 notice is **STALE** for the current tree. It
+> recorded C as `NOT IMPLEMENTED` at that time; that is no longer a current-state claim.
+>
+> **Verified current status (2026-11-24):** `DEF-011-C` is **IMPLEMENTED** as the local-only
+> acceptance copy. `bot/handlers.py::ATTACHMENT_ACCEPTED_TEXT` states that the file is stored locally
+> and is not uploaded to OpenHands, and `handle_attachment` selects that text only when
+> `result.outcome is AcceptOutcome.STORED`. `DEF-011-A` (quota reservation ledger) remains **NOT IMPLEMENTED**
+> and `DEF-011` remains **OPEN**; this correction does not close `DEF-011`,
+> change `OD-04`/`D-12`, or implement A.
+>
+> This is a new dated correction; the earlier notice and all historical rows above are preserved
+> unchanged as historical records.
+
 Unchanged blockers carried forward: DEF-006, DEF-013, NEW-DEF-03, NAV-01..06,
 WP-05, WP-06, WP-08 were **not** modified by this task.
 

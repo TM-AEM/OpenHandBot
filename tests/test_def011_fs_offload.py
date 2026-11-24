@@ -16,6 +16,7 @@
 
 import asyncio
 import threading
+from datetime import datetime, timezone
 
 import anyio
 import pytest
@@ -31,11 +32,13 @@ from bot.db import Database
 OWNER_ID = 111
 CID = "11111111222233334444555566667777"
 T0 = "2026-11-11T00:00:00+00:00"
+_TEST_NOW = datetime(2026, 11, 11, 0, 5, tzinfo=timezone.utc)
 
 
 def make_store(tmp_path, **kw):
     db_path = str(tmp_path / "state.sqlite3")
     db = Database(db_path)
+    kw.setdefault("clock", lambda: _TEST_NOW)
     return db, StagingStore(db, db_path, **kw)
 
 

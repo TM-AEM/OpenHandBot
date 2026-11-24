@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 CONFIG_SRC = (ROOT / "bot/config.py").read_text(encoding="utf-8")
 DB_SRC = (ROOT / "bot/db.py").read_text(encoding="utf-8")
+APP_SRC = (ROOT / "bot/app.py").read_text(encoding="utf-8")
 ENV_EXAMPLE = (ROOT / ".env.example").read_text(encoding="utf-8")
 README = (ROOT / "README.md").read_text(encoding="utf-8")
 RUNBOOK = (ROOT / "docs/OPERATIONS_RUNBOOK.md").read_text(encoding="utf-8")
@@ -139,6 +140,25 @@ def test_runbook_table_count_matches_schema():
     )
 
 
+def _runbook_poller_section() -> str:
+    """قسم الاستقبال في Runbook فقط، وليس أي ذكر آخر في الوثيقة."""
+    return _doc_section(RUNBOOK, "- **الاستقبال:**", "- **الحالة المستقرة:**")
+
+
+def test_runbook_poller_concurrency_matches_application():
+    """الـ Runbook لازم يوصف الـ Application التسلسلي الحالي، مش إعدادًا قديمًا."""
+    section = _runbook_poller_section()
+    assert ".concurrent_updates(False)" in APP_SRC, (
+        "bot/app.py لم يعد يستخدم concurrent_updates(False)"
+    )
+    assert "concurrent_updates(False)" in section, (
+        "Runbook لا يذكر concurrent_updates(False) في قسم الاستقبال"
+    )
+    assert "concurrent_updates(True)" not in section, (
+        "Runbook يذكر concurrent_updates(True) القديم في قسم الاستقبال"
+    )
+
+
 # ---------------------------------------------------------------------------
 # OHB2-WP07-DEF011-F03: عقيدة دورة حياة الوثائق (Document Supersession)
 #
@@ -200,6 +220,18 @@ def _correction_notice(text: str) -> str:
     """إشعار التصحيح من بداية العلامة لحد نهاية الاقتباس (سطر فاضي)."""
     start = text.index(CORRECTION_MARKER)
     # الإشعار كله اقتباس Markdown (كل سطر بيبدأ بـ `>`)، فبناخد لحد أول سطر مش اقتباس.
+    lines = text[start:].splitlines()
+    body = []
+    for line in lines:
+        if body and line.strip() and not line.lstrip().startswith(">"):
+            break
+        body.append(line)
+    return "\n".join(body)
+
+
+def _latest_correction_notice(text: str) -> str:
+    """آخر إشعار تصحيح مضاف — عشان التصحيحات اللاحقة تفضل قابلة للاختبار."""
+    start = text.rindex(CORRECTION_MARKER)
     lines = text[start:].splitlines()
     body = []
     for line in lines:
@@ -378,6 +410,18 @@ def test_t5_batch04_f01_report_correction_notice():
     assert "remains open" in lowered, "الإشعار لازم يصرّح إن DEF-011 لسه مفتوح"
     assert "not close" in lowered, "الإشعار لازم يوضّح إنه ما بيقفلش DEF-011"
 
+    # FOLLOW-01: التصحيح اللاحق لازم يوصف C الحالية، مش يكرر ادّعاء NOT IMPLEMENTED القديم.
+    latest = _latest_correction_notice(F01_REPORT)
+    assert "2026-11-24" in latest, "إشعار FOLLOW-01 لازم يحمل تاريخه"
+    assert _sub_defect_status(latest, "DEF-011-C") == "IMPLEMENTED", (
+        "إشعار FOLLOW-01 لازم يسجّل DEF-011-C كـ IMPLEMENTED"
+    )
+    assert _sub_defect_status(latest, "DEF-011-A") == "NOT IMPLEMENTED", (
+        "إشعار FOLLOW-01 لازم يبقي DEF-011-A NOT IMPLEMENTED"
+    )
+    assert "STORED" in latest and "ATTACHMENT_ACCEPTED_TEXT" in latest, (
+        "إشعار FOLLOW-01 لازم يربط C بالنص المحلي وشرط STORED"
+    )
 
 
 # --- T-6: تصحيح تقرير تنفيذ F-03 المتقادم ------------------------------------

@@ -11,6 +11,7 @@
 import asyncio
 import os
 import threading
+from datetime import datetime, timezone
 
 from bot.attachments import AttachmentReaper, OpportunisticSweeper
 from bot.db import ATTACHMENT_BATCH_DELIVERED, ATTACHMENT_ITEM_STORED, Database
@@ -19,6 +20,7 @@ OWNER_ID = 111
 CID = "11111111222233334444555566667777"
 T0 = "2026-11-11T00:00:00+00:00"
 NOW = "2026-11-19T00:00:00+00:00"
+_TEST_NOW = datetime(2026, 11, 11, 0, 5, tzinfo=timezone.utc)
 
 
 def make_reaper(tmp_path, *, items=1):
@@ -27,7 +29,7 @@ def make_reaper(tmp_path, *, items=1):
 
     db_path = str(tmp_path / "state.sqlite3")
     db = Database(db_path)
-    store = StagingStore(db, db_path)
+    store = StagingStore(db, db_path, clock=lambda: _TEST_NOW)
     db.create_attachment_batch("b1", OWNER_ID, CID, T0)
     store.ensure_root()
 

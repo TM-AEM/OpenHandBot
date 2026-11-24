@@ -68,7 +68,7 @@ class FakeClient:
 def make_env(tmp_path):
     db_path = str(tmp_path / "state.sqlite3")
     db = Database(db_path)
-    store = StagingStore(db, db_path)
+    store = StagingStore(db, db_path, clock=lambda: T0)
     client = FakeClient()
     service = AttachmentService(db, store, client, IdentityCache(client))
     return db, store, service, db_path
@@ -530,7 +530,7 @@ def test_case19_a3_f1_identity_evidence_survives_recovery(tmp_path):
 # ============================================================================
 def test_over_cap_write_leaves_no_partial_file(tmp_path):
     db, store, service, db_path = make_env(tmp_path)
-    store2 = StagingStore(db, db_path, max_bytes=4)
+    store2 = StagingStore(db, db_path, max_bytes=4, clock=lambda: T0)
     client = FakeClient()
     svc = AttachmentService(db, store2, client, IdentityCache(client))
     res = _run(accept(svc, chunks=(b"12345",)))

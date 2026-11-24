@@ -220,7 +220,7 @@ Phase 4 (External / Infrastructure / Product-Decision Gates)
 - **Addresses:** `DEF-019`
 - **Exact Target Files:** `.github/workflows/ci.yml` (verify execution — no code edits required unless Python 3.11/3.13 reveals warnings/failures)
 - **Root Cause:** Local audit container lacks Python >= 3.11 and `requirements-dev.txt` packages.
-- **Concrete Changes:** Run full `.github/workflows/ci.yml` (`python` job on 3.11 & 3.13 + `frontend` job on Node 22) via GitHub Actions or clean Termux/container venv:
+- **Concrete Changes:** Run full `.github/workflows/ci.yml` (`python` job on 3.11 & 3.13 + `frontend` job on Node 24) via GitHub Actions or clean Termux/container venv:
   - `python -m pytest -q`
   - `node --test tests/frontend/*.test.js`
   - `python -m pyflakes bot/ automation/ tools/ main.py tests/`
@@ -229,7 +229,7 @@ Phase 4 (External / Infrastructure / Product-Decision Gates)
 - **Dependencies:** Gates completion of `WP-01` .. `WP-08`.
 - **Risks:** `pip_audit` may flag newly disclosed upstream CVEs requiring dependency pin review (per `AGENTS.md` §4, only bump if proven necessary and re-verify).
 - **Required Tests:** Full repository suite.
-- **Acceptance Criteria:** Exit code `0` across all 5 commands on both Python 3.11 and 3.13 + Node 22.
+- **Acceptance Criteria:** Exit code `0` across all 5 commands on both Python 3.11 and 3.13 + Node 24.
 - **Independent Review Requirement:** Verification log inspection required.
 
 ---

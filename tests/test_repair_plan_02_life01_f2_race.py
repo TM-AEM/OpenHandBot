@@ -65,7 +65,7 @@ class FakeClient:
 def make_env(tmp_path):
     db_path = str(tmp_path / "state.sqlite3")
     db = Database(db_path)
-    store = StagingStore(db, db_path)
+    store = StagingStore(db, db_path, clock=lambda: T0)
     client = FakeClient()
     service = AttachmentService(db, store, client, IdentityCache(client))
     return db, store, service, db_path

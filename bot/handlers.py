@@ -1220,8 +1220,10 @@ async def _open_conversation_view(
     )
     if conv is None:
         # OHB2-SW-05: ناخد بالنا من نتيجة العرض؛ فشل عرض رسالة الرفض يتسجّل بدل ما يتخفي.
-        if not await _display_conversation_view(update, context, message, q=q):
+        displayed = await _display_conversation_view(update, context, message, q=q)
+        if not displayed:
             log.warning("تعذّر عرض رسالة رفض فتح الشات %s (فشل تسليم تيليجرام).", conversation_id)
+            mark_display_failed(update, context, "open_rejection_display_failed")
         # `/chat` فقط: الرفض النهائي (مش موجود/محذوف/غير مصرّح/4xx متوقّع) يمنع بقاء
         # مؤشر آخر شات إلى هدف غير صالح. فشل upstream العابر (5xx/429/مهلة) لا يمسح المرجع.
         terminal_rejection = status in (
@@ -1236,6 +1238,9 @@ async def _open_conversation_view(
         # قبل تسجيل أي نتيجة. رفض 4xx المتوقّع (401/403/404/410) يرجّع عادي.
         if status is FileStatus.UPSTREAM_ERROR and not _is_expected_upstream_rejection(auth_exc):
             await _raise_if_operational_api_failure(auth_exc)
+        # عرض الرفض هو المحتوى المطلوب؛ فشله عابر وغير مؤهّل، وما يمسحش التوجيه/النتيجة.
+        if not displayed:
+            return False
         if q is None and terminal_rejection:
             # F-01: clearing only the setting leaves the persistent `route` row alive;
             # the next text then goes to the unavailable conversation. Clear the
@@ -1257,10 +1262,14 @@ async def _open_conversation_view(
         user_text, reply = await client.get_last_exchange(conversation_id)
     except ApiError as exc:
         # نفس المسار المتسامح لرسالة الخطأ: مفيش توجيه جديد ولا انهيار في الـ callback.
-        if not await _display_conversation_view(update, context, error_text(exc), q=q):
+        displayed = await _display_conversation_view(update, context, error_text(exc), q=q)
+        if not displayed:
             log.warning("تعذّر عرض خطأ آخر تبادل للشات %s (فشل تسليم تيليجرام).", conversation_id)
+            mark_display_failed(update, context, "open_exchange_error_display_failed")
         # Operational upstream failures must propagate before any outcome is recorded.
         await _raise_if_operational_api_failure(exc)
+        if not displayed:
+            return False
         if q is None and _is_expected_upstream_rejection(exc):
             context.bot_data["db"].clear_awaiting_and_record_outcome(
                 update.effective_user.id,
@@ -1359,11 +1368,15 @@ async def copy_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
     if _conv is None:
         # OHB2-WP-03 (NEW-DEF-04): ردّ الفشل عبر `_safe_send_html` (مش send_message خام).
-        await _safe_send_html(context.bot, chat_id, message)
+        displayed = await _safe_send_html(context.bot, chat_id, message)
         # OHB2-SW-07: فشل upstream تشغيلي (5xx/429/بلا كود) ينتشر بعد الرسالة؛ رفض 4xx
         # المتوقّع + الرفض المشتقّ يرجّع عادي.
         if status is FileStatus.UPSTREAM_ERROR and not _is_expected_upstream_rejection(auth_exc):
             await _raise_if_operational_api_failure(auth_exc)
+        # عرض سبب الرفض هو المحتوى المطلوب؛ فشله عابر وغير مؤهّل للإقرار.
+        if not displayed:
+            mark_display_failed(update, context, "copy_reply_rejection_display_failed")
+            return
         # OHB2-STAGE2-HIGH-ACK-BLOCKING-FIX: رفض نهائي مؤكّد ⇒ نتيجة صريحة مؤهّلة للإقرار
         # (الفشل التشغيلي فوق بيرفع قبلها ⇒ مستحيل يتحوّل لتجاهل كاذب).
         mark_explicitly_ignored(update, context)
@@ -1373,12 +1386,17 @@ async def copy_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     except ApiError as exc:
         # فشل قراءة آخر تبادل: رسالة الخطأ المتنقّحة، ثم انتشار الفشل التشغيلي (SW-07).
         # الفشل التشغيلي **يرفع قبل** أي تسجيل ⇒ مايتحوّلش لتجاهل/نجاح كاذب.
-        await _safe_send_html(context.bot, chat_id, error_text(exc))
+        displayed = await _safe_send_html(context.bot, chat_id, error_text(exc))
         await _raise_if_operational_api_failure(exc)
+        if not displayed:
+            mark_display_failed(update, context, "copy_reply_error_display_failed")
+            return
         mark_explicitly_ignored(update, context)
         return
     if not reply:
-        await _safe_send_html(context.bot, chat_id, "لسه مفيش رد للشات ده.")
+        if not await _safe_send_html(context.bot, chat_id, "لسه مفيش رد للشات ده."):
+            mark_display_failed(update, context, "copy_reply_no_reply_display_failed")
+            return
         mark_explicitly_ignored(update, context)
         return
     try:
@@ -1407,11 +1425,14 @@ async def full_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
     if _conv is None:
         # OHB2-WP-03 (NEW-DEF-04): ردّ الفشل عبر `_safe_send_html` (مش send_message خام).
-        await _safe_send_html(context.bot, chat_id, message)
+        displayed = await _safe_send_html(context.bot, chat_id, message)
         # OHB2-SW-07: فشل upstream تشغيلي (5xx/429/بلا كود) ينتشر بعد الرسالة؛ رفض 4xx
         # المتوقّع + الرفض المشتقّ يرجّع عادي.
         if status is FileStatus.UPSTREAM_ERROR and not _is_expected_upstream_rejection(auth_exc):
             await _raise_if_operational_api_failure(auth_exc)
+        if not displayed:
+            mark_display_failed(update, context, "full_reply_rejection_display_failed")
+            return
         # OHB2-STAGE2-HIGH-ACK-BLOCKING-FIX: رفض نهائي مؤكّد ⇒ نتيجة صريحة مؤهّلة للإقرار
         # (الفشل التشغيلي فوق بيرفع قبلها ⇒ مستحيل يتحوّل لتجاهل كاذب).
         mark_explicitly_ignored(update, context)
@@ -1419,12 +1440,17 @@ async def full_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     try:
         _, reply = await _get_exchange(context, conversation_id)
     except ApiError as exc:
-        await _safe_send_html(context.bot, chat_id, error_text(exc))
+        displayed = await _safe_send_html(context.bot, chat_id, error_text(exc))
         await _raise_if_operational_api_failure(exc)
+        if not displayed:
+            mark_display_failed(update, context, "full_reply_error_display_failed")
+            return
         mark_explicitly_ignored(update, context)
         return
     if not reply:
-        await _safe_send_html(context.bot, chat_id, "لسه مفيش رد للشات ده.")
+        if not await _safe_send_html(context.bot, chat_id, "لسه مفيش رد للشات ده."):
+            mark_display_failed(update, context, "full_reply_no_reply_display_failed")
+            return
         mark_explicitly_ignored(update, context)
         return
     try:
@@ -1461,9 +1487,12 @@ async def send_reply_txt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.bot_data["client"], context, conversation_id
     )
     if _conv is None:
-        await _safe_send_html(context.bot, chat_id, message)
+        displayed = await _safe_send_html(context.bot, chat_id, message)
         if status is FileStatus.UPSTREAM_ERROR and not _is_expected_upstream_rejection(auth_exc):
             await _raise_if_operational_api_failure(auth_exc)
+        if not displayed:
+            mark_display_failed(update, context, "send_txt_rejection_display_failed")
+            return
         mark_explicitly_ignored(update, context)
         return
     try:
@@ -1471,12 +1500,17 @@ async def send_reply_txt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except ApiError as exc:
         # OHB2-WP-03 (DEF-004): فشل قراءة آخر تبادل تشغيلي (5xx/429/بلا كود) ⇒ ينتشر
         # (FAILED_TRANSIENT غير مؤهّل) بعد عرض الرسالة؛ رفض 4xx المتوقّع يرجّع عادي (تجاهل).
-        await _safe_send_html(context.bot, chat_id, error_text(exc))
+        displayed = await _safe_send_html(context.bot, chat_id, error_text(exc))
         await _raise_if_operational_api_failure(exc)
+        if not displayed:
+            mark_display_failed(update, context, "send_txt_error_display_failed")
+            return
         mark_explicitly_ignored(update, context)
         return
     if not reply:
-        await _safe_send_html(context.bot, chat_id, "لسه مفيش رد للشات ده.")
+        if not await _safe_send_html(context.bot, chat_id, "لسه مفيش رد للشات ده."):
+            mark_display_failed(update, context, "send_txt_no_reply_display_failed")
+            return
         mark_explicitly_ignored(update, context)
         return
     reply_to = getattr(q.message, "message_id", None)
@@ -2480,6 +2514,7 @@ def _attachment_service(context: ContextTypes.DEFAULT_TYPE):
             context.bot_data["config"].db_path,
             max_items_per_batch=MAX_ITEMS_PER_BATCH,
             max_total_bytes=MAX_STAGING_TOTAL_BYTES,
+            clock=lambda: datetime.now(timezone.utc),
         )
         context.bot_data["attachment_store"] = store
     return AttachmentService(db, store, context.bot_data["client"], _identity_cache(context))

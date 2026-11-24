@@ -14,7 +14,7 @@ import hashlib
 import os
 import re
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
@@ -95,8 +95,17 @@ def build(tmp_path, *, api=None, t0=None, telegram_id=OWNER, conversation_id=CID
     """
     db_path = str(tmp_path / "state.sqlite3")
     db = Database(db_path)
-    store = StagingStore(db, db_path, max_bytes=MAX_ATTACHMENT_BYTES)
     stamp = t0 or datetime.now(timezone.utc).isoformat()
+    # A deliberately expired t0 is for the web-layer expiry test; storage must
+    # still run live via an explicit clock so it can create the stored fixture.
+    if t0 is not None:
+        def store_clock():
+            return datetime.fromisoformat(stamp) + timedelta(minutes=1)
+    else:
+        store_clock = None
+    store = StagingStore(
+        db, db_path, max_bytes=MAX_ATTACHMENT_BYTES, clock=store_clock
+    )
     db.create_attachment_batch("b1", telegram_id, conversation_id, stamp)
     res = store.store(
         telegram_id=telegram_id,

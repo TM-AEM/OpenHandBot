@@ -84,6 +84,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
+from typing import Callable
 
 import anyio
 from anyio import to_thread
@@ -408,11 +409,11 @@ def batch_deadline(t0: str, *, ttl: timedelta = ATTACHMENT_BATCH_TTL) -> datetim
 
 
 def batch_is_expired(t0: str, now: datetime, *, ttl: timedelta = ATTACHMENT_BATCH_TTL) -> bool:
-    """هل فاتت مهلة الدفعة؟ `now > T0 + 15د` (fail closed عند `t0` غير صالح)."""
+    """هل فاتت مهلة الدفعة؟ `now >= T0 + 15د` (fail closed عند `t0` غير صالح)."""
     deadline = batch_deadline(t0, ttl=ttl)
     if deadline is None:
         return True
-    return _as_utc(now) > deadline
+    return _as_utc(now) >= deadline
 
 
 def normalize_declared_size(value) -> int | None:
@@ -507,13 +508,19 @@ class StagingStore:
         max_items_per_batch: int | None = None,
         max_total_bytes: int | None = None,
         max_bytes_per_batch: int | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         """`max_bytes` (سقف الملف) مفعّل دائمًا. باقي الحصص **معطّلة افتراضيًّا** (`None`)
         لحد موافقة المالك الصريحة (D-12 / Option A) — التفعيل بتمرير حدّ صريح من كود
         معتمَد، بلا أي مسار env/config ضمني.
+
+        `clock` هو مصدر الوقت لفحص مهلة الدفعة في prepare/finalize. غيابه لا يعطّل
+        الفحص: الافتراضي هو `datetime.now(timezone.utc)` عند كل استدعاء، لا قيمة مجمّدة
+        وقت البناء. الاختبارات تمرّر ساعة متحكَّم فيها؛ الإنتاج يمرّر نفس الساعة الحقيقية.
         """
         self._db = db
         self._root = staging_root_for(db_path)
+        self._clock = clock if clock is not None else (lambda: datetime.now(timezone.utc))
         self._max_bytes = int(max_bytes)
         self._max_items_per_batch = (
             None if max_items_per_batch is None else int(max_items_per_batch)
@@ -553,6 +560,10 @@ class StagingStore:
                 yield
         finally:
             self._sync_lock.release()
+
+    def _deadline_now(self) -> datetime:
+        """وقت فحص المهلة من الساعة المهيّأة — real UTC افتراضيًا، أو fake clock صريحًا."""
+        return _as_utc(self._clock())
 
     @property
     def max_bytes(self) -> int:
@@ -712,6 +723,8 @@ class StagingStore:
         # before item insertion or any byte write.
         if batch.status != ATTACHMENT_BATCH_PENDING:
             return StageResult(StageStatus.REJECTED_BATCH, item_id=item_id)
+        if batch_is_expired(batch.t0, self._deadline_now()):
+            return StageResult(StageStatus.REJECTED_BATCH, item_id=item_id)
 
         # (0b) الحجم المُعلَن (metadata) قبل أي استخدام للقرص.
         if declared_size is not None and int(declared_size) > self._max_bytes:
@@ -808,11 +821,15 @@ class StagingStore:
         #     مشروط** — العنصر `pending` **و** الدفعة الأب `pending`، كله في نفس الـ`UPDATE`
         #     (تقييم لحظة الكتابة) ⇒ كتابة متأخّرة على دفعة انتهت/عنصر اتكنس **ما تقدرش**
         #     ترجّعه `stored` (مفيش إحياء سباقي). الرفض = فشل مغلق.
+        #     A4-F5: نمرّر وقت finalize للقاعدة لتفحص المهلة داخل نفس معاملة CAS؛ لا يكفي
+        #     فحص `pending` لأن الكنس قد يتأخّر. الافتراضي real UTC عند كل استدعاء.
+        finalize_now = self._deadline_now()
         try:
             ok = self._db.try_mark_attachment_item_stored(
                 item_id,
                 size_bytes=written,
                 staging_token=token,
+                now=finalize_now.isoformat(),
             )
         except Exception as exc:  # noqa: BLE001 — فشل قاعدة ⇒ رفض مغلق
             _safe_unlink(path)

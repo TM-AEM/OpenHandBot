@@ -36,6 +36,7 @@ OWNER_ID = 111
 OWNER_UUID = "11111111-2222-3333-4444-555555555555"
 CID = "11111111222233334444555566667777"
 T0 = "2026-11-11T00:00:00+00:00"
+_TEST_NOW = datetime(2026, 11, 11, 0, 5, tzinfo=timezone.utc)
 
 
 class FakeClient:
@@ -55,6 +56,7 @@ class FakeClient:
 def make_store(tmp_path, **kw):
     db_path = str(tmp_path / "state.sqlite3")
     db = Database(db_path)
+    kw.setdefault("clock", lambda: _TEST_NOW)
     store = StagingStore(db, db_path, **kw)
     return db, store
 
@@ -392,7 +394,7 @@ def test_handler_quota_reply_on_full_batch(tmp_path, monkeypatch):
     harness = _harness(tmp_path, monkeypatch)
     db_path = harness.app.bot_data["config"].db_path
     harness.app.bot_data["attachment_store"] = StagingStore(
-        harness.db, db_path, max_items_per_batch=1
+        harness.db, db_path, max_items_per_batch=1, clock=lambda: _TEST_NOW
     )
     harness.db.set_awaiting(A2_OWNER, A2_CID, "route", title="A")
     harness.process(harness.document_update(9901))

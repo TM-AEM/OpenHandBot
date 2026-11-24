@@ -500,3 +500,241 @@ def test_delete_confirm_remote_failed_records_ambiguous(tmp_path, monkeypatch):
     assert db.update_outcome(9102) == uo.PARTIAL_OR_UNKNOWN
     assert db.is_update_acknowledgment_eligible(9102) is False
 
+
+
+# ============================================================================
+# 11) WP03-AUD-01/02: required display failure must not become ignored
+# ============================================================================
+class _FailingEditQ(CQ):
+    """كولباك fake بيفشل في تعديل الرسالة (فشل عرض تيليجرام مبرمَج)."""
+
+    async def edit_message_text(self, text, **kw):
+        raise TimedOut()
+
+
+_REPLY_HANDLERS = [
+    pytest.param(h.copy_reply, "copy:A", id="copy_reply"),
+    pytest.param(h.full_reply, "full:A", id="full_reply"),
+    pytest.param(h.send_reply_txt, "txt:A", id="send_reply_txt"),
+]
+
+
+def _run_reply_handler(handler, tmp_path, client, data, update_id, *, fail_display=False):
+    ctx = _ctx_with(tmp_path, client)
+    if fail_display:
+        ctx.bot = FailSendBot(fail_message=TimedOut())
+    update = _t55_cb_update(CQ(data))
+    update.update_id = update_id
+    asyncio.run(handler(update, ctx))
+    return ctx
+
+
+@pytest.mark.parametrize("handler, data", _REPLY_HANDLERS)
+def test_expected_rejection_display_success_keeps_ignored(handler, data, tmp_path):
+    ctx = _run_reply_handler(
+        handler, tmp_path, _AuthClient(open_error=ApiError("gone", 404)), data, 9200
+    )
+    db = ctx.bot_data["db"]
+    assert db.update_outcome(9200) == uo.EXPLICITLY_IGNORED
+    assert db.is_update_acknowledgment_eligible(9200) is True
+
+
+@pytest.mark.parametrize("handler, data", _REPLY_HANDLERS)
+def test_expected_rejection_display_failure_is_transient(handler, data, tmp_path):
+    ctx = _run_reply_handler(
+        handler,
+        tmp_path,
+        _AuthClient(open_error=ApiError("gone", 404)),
+        data,
+        9201,
+        fail_display=True,
+    )
+    db = ctx.bot_data["db"]
+    assert db.update_outcome(9201) == uo.FAILED_TRANSIENT
+    assert db.is_update_acknowledgment_eligible(9201) is False
+
+
+@pytest.mark.parametrize("handler, data", _REPLY_HANDLERS)
+def test_exchange_rejection_display_success_keeps_ignored(handler, data, tmp_path):
+    ctx = _run_reply_handler(
+        handler,
+        tmp_path,
+        ExchangeClient(CONV55, exchange_error=ApiError("gone", 404)),
+        data,
+        9202,
+    )
+    db = ctx.bot_data["db"]
+    assert db.update_outcome(9202) == uo.EXPLICITLY_IGNORED
+    assert db.is_update_acknowledgment_eligible(9202) is True
+
+
+@pytest.mark.parametrize("handler, data", _REPLY_HANDLERS)
+def test_exchange_rejection_display_failure_is_transient(handler, data, tmp_path):
+    ctx = _run_reply_handler(
+        handler,
+        tmp_path,
+        ExchangeClient(CONV55, exchange_error=ApiError("gone", 404)),
+        data,
+        9203,
+        fail_display=True,
+    )
+    db = ctx.bot_data["db"]
+    assert db.update_outcome(9203) == uo.FAILED_TRANSIENT
+    assert db.is_update_acknowledgment_eligible(9203) is False
+
+
+@pytest.mark.parametrize("handler, data", _REPLY_HANDLERS)
+def test_no_reply_display_success_keeps_ignored(handler, data, tmp_path):
+    ctx = _run_reply_handler(
+        handler, tmp_path, ExchangeClient(CONV55, reply=None), data, 9204
+    )
+    db = ctx.bot_data["db"]
+    assert db.update_outcome(9204) == uo.EXPLICITLY_IGNORED
+    assert db.is_update_acknowledgment_eligible(9204) is True
+
+
+@pytest.mark.parametrize("handler, data", _REPLY_HANDLERS)
+def test_no_reply_display_failure_is_transient(handler, data, tmp_path):
+    ctx = _run_reply_handler(
+        handler,
+        tmp_path,
+        ExchangeClient(CONV55, reply=None),
+        data,
+        9205,
+        fail_display=True,
+    )
+    db = ctx.bot_data["db"]
+    assert db.update_outcome(9205) == uo.FAILED_TRANSIENT
+    assert db.is_update_acknowledgment_eligible(9205) is False
+
+
+def _run_open_handler(tmp_path, client, q, update_id):
+    ctx = _ctx_with(tmp_path, client)
+    update = _t55_cb_update(q)
+    update.update_id = update_id
+    asyncio.run(h.open_conversation(update, ctx))
+    return ctx
+
+
+def test_open_rejection_display_success_keeps_ignored(tmp_path):
+    ctx = _run_open_handler(
+        tmp_path, _AuthClient(open_error=ApiError("gone", 404)), CQ("open:A"), 9210
+    )
+    db = ctx.bot_data["db"]
+    assert db.update_outcome(9210) == uo.EXPLICITLY_IGNORED
+    assert db.is_update_acknowledgment_eligible(9210) is True
+
+
+def test_open_rejection_display_failure_is_transient(tmp_path):
+    ctx = _run_open_handler(
+        tmp_path,
+        _AuthClient(open_error=ApiError("gone", 404)),
+        _FailingEditQ("open:A"),
+        9211,
+    )
+    db = ctx.bot_data["db"]
+    assert db.update_outcome(9211) == uo.FAILED_TRANSIENT
+    assert db.is_update_acknowledgment_eligible(9211) is False
+
+
+def test_open_exchange_error_display_success_keeps_ignored(tmp_path):
+    ctx = _run_open_handler(
+        tmp_path,
+        ExchangeClient(CONV55, exchange_error=ApiError("gone", 404)),
+        CQ("open:A"),
+        9212,
+    )
+    db = ctx.bot_data["db"]
+    assert db.update_outcome(9212) == uo.EXPLICITLY_IGNORED
+    assert db.is_update_acknowledgment_eligible(9212) is True
+
+
+def test_open_exchange_error_display_failure_is_transient(tmp_path):
+    ctx = _run_open_handler(
+        tmp_path,
+        ExchangeClient(CONV55, exchange_error=ApiError("gone", 404)),
+        _FailingEditQ("open:A"),
+        9213,
+    )
+    db = ctx.bot_data["db"]
+    assert db.update_outcome(9213) == uo.FAILED_TRANSIENT
+    assert db.is_update_acknowledgment_eligible(9213) is False
+
+
+def test_open_no_reply_display_success_keeps_ignored(tmp_path):
+    ctx = _run_open_handler(
+        tmp_path, ExchangeClient(CONV55, reply=None), CQ("open:A"), 9214
+    )
+    db = ctx.bot_data["db"]
+    assert db.update_outcome(9214) == uo.EXPLICITLY_IGNORED
+    assert db.is_update_acknowledgment_eligible(9214) is True
+    assert db.get_awaiting(1) == ("A", "route")
+
+
+def test_open_no_reply_display_failure_is_transient(tmp_path):
+    ctx = _run_open_handler(
+        tmp_path, ExchangeClient(CONV55, reply=None), _FailingEditQ("open:A"), 9215
+    )
+    db = ctx.bot_data["db"]
+    assert db.update_outcome(9215) == uo.FAILED_TRANSIENT
+    assert db.is_update_acknowledgment_eligible(9215) is False
+    assert db.get_awaiting(1) == (None, None)
+
+
+class _FailingMessage:
+    """رسالة fake بترفض الإرسال (فشل عرض مسار `/chat` بدون كولباك)."""
+
+    async def reply_text(self, text, **kw):
+        raise TimedOut()
+
+
+def _run_chat_command(tmp_path, client, update_id, *, fail_display=False):
+    ctx = _ctx_with(tmp_path, client)
+    ctx.bot_data["db"].set_last_accessed_conversation(OWNER_ID, "A")
+    update = make_update(OWNER_ID)
+    if fail_display:
+        update.message = _FailingMessage()
+    update.update_id = update_id
+    asyncio.run(h.chat(update, ctx))
+    return ctx
+
+
+def test_chat_rejection_display_success_keeps_ignored(tmp_path):
+    ctx = _run_chat_command(
+        tmp_path, _AuthClient(open_error=ApiError("gone", 404)), 9220
+    )
+    db = ctx.bot_data["db"]
+    assert db.update_outcome(9220) == uo.EXPLICITLY_IGNORED
+    assert db.is_update_acknowledgment_eligible(9220) is True
+
+
+def test_chat_rejection_display_failure_is_transient(tmp_path):
+    ctx = _run_chat_command(
+        tmp_path,
+        _AuthClient(open_error=ApiError("gone", 404)),
+        9221,
+        fail_display=True,
+    )
+    db = ctx.bot_data["db"]
+    assert db.update_outcome(9221) == uo.FAILED_TRANSIENT
+    assert db.is_update_acknowledgment_eligible(9221) is False
+
+
+def test_chat_no_reply_display_success_keeps_ignored(tmp_path):
+    ctx = _run_chat_command(
+        tmp_path, ExchangeClient(CONV55, reply=None), 9222
+    )
+    db = ctx.bot_data["db"]
+    assert db.update_outcome(9222) == uo.EXPLICITLY_IGNORED
+    assert db.is_update_acknowledgment_eligible(9222) is True
+    assert db.get_awaiting(OWNER_ID) == ("A", "route")
+
+
+def test_chat_no_reply_display_failure_is_transient(tmp_path):
+    ctx = _run_chat_command(
+        tmp_path, ExchangeClient(CONV55, reply=None), 9223, fail_display=True
+    )
+    db = ctx.bot_data["db"]
+    assert db.update_outcome(9223) == uo.FAILED_TRANSIENT
+    assert db.is_update_acknowledgment_eligible(9223) is False
+    assert db.get_awaiting(OWNER_ID) == (None, None)

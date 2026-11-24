@@ -4920,3 +4920,115 @@ final closure, or release approval.
 ## Safety
 - لا commit/push/PR/merge/deploy/Autopush في هذه المهمة.
 - لم يتم تعديل Notion.
+
+
+---
+
+# PROGRESS — OHB2-A4-F5-EXPIRATION-BOUNDARY-ATOMIC-ACCEPTANCE-AND-FINALIZATION (2026-11-23)
+
+## Status
+**`IMPLEMENTED_PENDING_INDEPENDENT_REVIEW`** — لم يتم إغلاق A4-F5 ولم يتم commit/push/PR/merge/deploy/Autopush.
+
+## Approved contract
+- Live: `now < T0 + 15m`.
+- Expired: `now >= T0 + 15m`؛ الحدّ بالظبط **منتهٍ**.
+- Mini App: **FROZEN** — لم يُعدّل أي مصدر/اختبار/أصل/إعداد/ملف واجهة.
+
+## Baseline
+- Branch `main`; HEAD `2d528633a86472a6a502d7dca5b69ae9f10359ab`;
+  tree `90b62951e53156ac55cffca2f471a0690f21b3d0`.
+- Working tree قبل التعديل: clean. لم توجد تغييرات سابقة متعارضة أو ملفات untracked
+  تخص المستخدم؛ تم الحفاظ على ignored state كما هو.
+- لا fetch/pull؛ الاعتماد على الحالة المحلية المتاحة فقط.
+
+## Implementation
+- `bot/attachments.py::batch_is_expired`: صار `now >= deadline` (كان `>`).
+- `bot/attachments.py::StagingStore`:
+  - `clock` اختياري لفحص المهلة في `_store_prepare` و`_store_finalize`؛
+    الإنتاج يمرّر `datetime.now(timezone.utc)` من `bot/handlers.py::_attachment_service`.
+  - `_store_prepare` يرفض `pending` منتهيًا قبل أي item/بايت.
+  - `_store_finalize` يمرّر وقت finalize إلى CAS القاعدة.
+- `bot/db.py::accept_attachment_item`: داخل `BEGIN IMMEDIATE` يعيد قراءة الدفعة ويتحقق
+  من owner/conversation/status و`now < deadline` قبل الـINSERT؛ خسارة السباق ترفع
+  `AttachmentBatchStateChanged` (الخدمة ترجع `REJECTED_BATCH` بلا عنصر/بايتات).
+- `bot/db.py::try_mark_attachment_item_stored`: أضيف `now` اختياري؛ عند تمريره يفحص
+  المهلة داخل نفس معاملة `BEGIN IMMEDIATE` قبل CAS `pending -> stored`، مستقلًّا عن
+  تشغيل الـreaper. `now=None` يبقي واجهة المسارات المباشرة القديمة.
+- فشل finalization يتبع السلوك القائم: `DB_FAILED`، حذف الملف المملوك فقط عبر
+  `_safe_unlink`، والعنصر يبقى `pending`/حالته القائمة؛ لا rollback للـfilesystem ولا
+  حذف واسع/تخميني.
+- لم تتغير أقفال `_accept_lock`/`_sync_lock`/F-02 worker-start gate.
+
+## Tests
+- New `tests/test_a4_f5_expiration_boundary.py` — 17 tests:
+  boundary/classification، atomic acceptance، stale classification، reaper/cancel/intent
+  races، slow prepare/finalize، duplicate، A2/A4 agreement، A3 exact intent.
+- Updated `tests/test_attachment_batch_lifecycle_a2.py::test_batch_is_expired_boundaries`
+  ليعتبر الحدّ منتهيًا.
+- Executed:
+  - New file: **17 passed**.
+  - Focused A2/A3/A4/F-02/storage suites: **613 passed**.
+  - Full Python: **3788 passed**, 0 failed, 74 warnings.
+  - Node: **280 passed**, 0 failed.
+  - `pyflakes`: 0.
+  - `bandit` High: 0 (Low 5 / Medium 19 / High 0).
+  - `pip-audit`: no known vulnerabilities.
+  - `compileall`: 0؛ `git diff --check`: 0.
+
+## Residual limitations
+- `StagingStore` المباشر بدون `clock` يحافظ على سلوك legacy (لا فحص مهلة)؛ المسار
+  الإنتاجي `_attachment_service` يمرّر clock. أي مستدعٍ مباشر جديد يجب أن يمرّر clock.
+- Mini App بقي على `now > deadline` حسب التجميد؛ لم يُحاول توحيده هنا.
+- لم تُجرَ مراجعة مستقلة؛ الحالة `IMPLEMENTED_PENDING_INDEPENDENT_REVIEW`.
+
+---
+
+# PROGRESS — OHB2-A4-F5-FINDING-1-FAIL-SAFE-UTC-DEFAULTS (2026-11-21)
+
+## Status
+**`IMPLEMENTED_PENDING_INDEPENDENT_REVIEW`** — لم يتم commit/push/PR/merge/deploy/Autopush.
+
+## Approved contract
+- Live iff `now < T0 + 15m`; expired iff `now >= T0 + 15m`; exact deadline expired.
+- `StagingStore` uses real UTC at invocation when no clock is supplied.
+- `try_mark_attachment_item_stored(now=None)` uses real UTC after `BEGIN IMMEDIATE`.
+- Explicit clock/`now` injection remains supported for deterministic tests.
+- Mini App product files remain FROZEN.
+
+## Baseline
+- Branch `main`; HEAD `2d528633a86472a6a502d7dca5b69ae9f10359ab`;
+  tree `90b62951e53156ac55cffca2f471a0690f21b3d0`; `main = origin/main`.
+- Pre-existing A4-F5 working-tree changes and the untracked A4-F5 test file were
+  preserved and extended; no reset/clean/force operation was used.
+
+## Implementation
+- `bot/attachments.py::StagingStore.__init__`: `clock=None` now installs
+  `lambda: datetime.now(timezone.utc)`; explicit clocks are preserved.
+- `StagingStore._deadline_now()` is always configured; prepare and finalize use it.
+- `bot/db.py::try_mark_attachment_item_stored`: when `now=None`, the real UTC
+  timestamp is read **after** `BEGIN IMMEDIATE` and before the deadline/CAS check;
+  explicit `now` remains deterministic. The atomic item/parent/status/deadline
+  predicates are unchanged.
+- Production `_attachment_service` still injects its explicit UTC clock.
+
+## Tests
+- New FINDING-1 regression coverage in
+  `tests/test_a4_f5_expiration_boundary.py` (7 added tests): invocation-time default,
+  explicit clock, direct default rejection/live acceptance, `now=None` rejection/live
+  acceptance, and explicit-now determinism.
+- Existing test helpers that intentionally use fixed historical `T0` now pass an
+  explicit deterministic clock. One Mini App **test fixture** was adapted to inject
+  a clock when it deliberately builds an expired web-layer fixture; no `bot/web/`
+  product file was changed.
+
+## Verification
+- A4-F5: **24 passed** (baseline 17 + 7).
+- Focused attachment/storage/F-02 suites: **620 passed** (baseline 613 + 7).
+- Full Python: **3795 passed, 0 failed, 74 warnings** (baseline 3788 + 7).
+- Node: **280 passed**.
+- `pyflakes`: 0; `bandit` High: 0; `pip-audit`: no known vulnerabilities.
+- `compileall`: 0; `git diff --check`: 0.
+
+## Residual limitations
+- Mini App `bot/web/services.py` still uses `now > deadline`; FROZEN and outside this task.
+- No independent review was performed in this session; later review required.
