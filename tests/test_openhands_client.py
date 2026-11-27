@@ -10,16 +10,6 @@ def make_client(handler):
     return OpenHandsClient("https://example.test", "key", transport=transport)
 
 
-class _RawStream(httpx.AsyncByteStream):
-    """تدفّق بايتات للاختبار — التنزيل المحدود بيقرا الخام (`aiter_raw`)."""
-
-    def __init__(self, data: bytes):
-        self._data = data
-
-    async def __aiter__(self):
-        yield self._data
-
-
 def test_search_conversations_sorts_desc_and_drops_nulls():
     def handler(request):
         assert request.url.path == "/api/v1/app-conversations/search"
@@ -204,17 +194,6 @@ def test_read_file_uses_file_path_param():
     client = make_client(handler)
     assert asyncio.run(client.read_file("c1", "main.py")) == "print('hi')\n"
     assert seen["file_path"] == "main.py"
-
-
-def test_export_conversation_returns_bytes():
-    def handler(request):
-        assert request.url.path == "/api/v1/app-conversations/c1/download"
-        return httpx.Response(200, stream=_RawStream(b"PK\x03\x04zip"))
-
-    import asyncio
-
-    client = make_client(handler)
-    assert asyncio.run(client.export_conversation("c1")) == b"PK\x03\x04zip"
 
 
 def test_search_repositories():

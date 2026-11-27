@@ -1,11 +1,10 @@
-/* OHB2-PHASE1B — اختبارات واجهة Mini App: نسخ الرد الكامل + تصدير الشات.
+/* OHB2-PHASE1B — اختبارات واجهة Mini App: نسخ الرد الكامل.
  *
- * `node --test tests/frontend/export_copy_ui.test.js`
+ * `node --test tests/frontend/copy_ui.test.js`
  * بتشغّل **نفس** app.js جوه بيئة DOM/شبكة مصغّرة (dom_stub.js)، وبتتحقّق من:
- * - ظهور زر النسخ وزر التصدير في تفاصيل الشات.
+ * - ظهور زر النسخ في تفاصيل الشات.
  * - النسخ بيجيب الرد **الكامل** من الـ endpoint المصادَق وبيبلّغ بالنتيجة.
  * - فشل جلب الرد الكامل ⇒ رسالة، مفيش نسخ كاذب.
- * - التصدير بينزّل ملف باسم آمن من الهيدر، وفشل التصدير ⇒ رسالة واضحة بلا تنزيل.
  */
 "use strict";
 
@@ -126,37 +125,6 @@ test("لو مفيش رد، زر النسخ معطّل", async () => {
   const { env } = await mkEnv({ id: "c1", title: "T", watched: false, last_reply: "" });
   const btn = findButton(env.doc.getElementById("view-detail"), "📋 نسخ الرد الكامل");
   assert.equal(btn.disabled, true, "مفيش رد ⇒ الزر معطّل");
-});
-
-test("زر تصدير الشات ظاهر وبينزّل ملف باسم آمن", async () => {
-  const { env } = await mkEnv({ id: "c1", title: "T", watched: false, last_reply: "x" });
-  env.fetch.route((c) => c.path === "/conversations/c1/export", () => ({
-    status: 200,
-    headers: { "content-disposition": 'attachment; filename="conversation-c1.zip"' },
-    blob: { size: 123 },
-  }));
-
-  const btn = findButton(env.doc.getElementById("view-detail"), "⬇️ تصدير الشات");
-  assert.ok(btn, "لازم يظهر زر التصدير");
-  btn.click();
-  await flush();
-
-  const call = env.fetch.last((c) => c.path === "/conversations/c1/export");
-  assert.ok(call, "لازم يبعت طلب التصدير");
-  assert.equal(call.method, "GET");
-  assert.match(env.doc.getElementById("toast").textContent, /تم تنزيل/);
-});
-
-test("فشل التصدير ⇒ رسالة عربي واضحة بلا تنزيل", async () => {
-  const { env } = await mkEnv({ id: "c1", title: "T", watched: false, last_reply: "x" });
-  env.fetch.route((c) => c.path === "/conversations/c1/export", () => ({
-    status: 413, data: { error: "too_large", message: "كبير" },
-  }));
-
-  findButton(env.doc.getElementById("view-detail"), "⬇️ تصدير الشات").click();
-  await flush();
-
-  assert.match(env.doc.getElementById("toast").textContent, /كبير/);
 });
 
 test("لو Clipboard API رفض وexecCommand نجح ⇒ نجاح حقيقي بالاحتياطي", async () => {

@@ -28,10 +28,6 @@ EXCHANGE_ACTION_LIMIT = 30
 MAX_FILE_RESPONSE_BYTES = 256 * 1024
 # حد صلب لجسم رد الأخطاء (تفاصيل `detail`) — منع تخزين جسم خطأ ضخم.
 MAX_ERROR_DETAIL_BYTES = 8 * 1024
-# OHB2-09-03: حد صلب لتنزيل تصدير الشات (zip أحداث+ميتا). التنزيل بيتحمّل في الذاكرة
-# قبل الإرسال على تيليجرام، فبنديه حد. الرد عادةً مضغوط أصلاً (zip)، فبنطلب `identity`
-# وبنقرا الخام عشان نمنع أي تضخيم من ضغط إضافي.
-MAX_EXPORT_BYTES = 16 * 1024 * 1024
 
 
 class OpenHandsClient:
@@ -288,51 +284,6 @@ class OpenHandsClient:
         """هوية المستخدم الحالي (`/users/me`) — بتُستخدم للتحقق من ملكية الشات."""
         data = await self._get("/users/me")
         return data if isinstance(data, dict) else {}
-
-    async def export_conversation(
-        self, conversation_id: str, max_bytes: int = MAX_EXPORT_BYTES
-    ) -> bytes:
-        """تصدير الشات كـ zip (events + meta)، مش ملفات الـ workspace.
-
-        OHB2-09-03: قراءة **محدودة** بنفس مسار الملفات الآمن — `Accept-Encoding: identity`
-        + قراءة خام (`aiter_raw`) على قطع مع حد تراكمي صلب. قبل كده كان `resp.content`
-        بيجمّع الجسم كله في الذاكرة بلا حد (ويفكّ ضغط تلقائي لو السيرفر ضغط).
-        """
-        if max_bytes < 0:
-            raise ValueError("max_bytes لازم يكون >= 0")
-        limit = int(max_bytes)
-        try:
-            async with self._client.stream(
-                "GET",
-                f"/app-conversations/{conversation_id}/download",
-                headers={"Accept-Encoding": "identity"},
-            ) as resp:
-                # OHB2-POST-PUB-01 (F03): نفس سياسة إعادة التوجيه الصارمة — 3xx مرفوضة
-                # صراحةً قبل أي قراءة، فمفيش متابعة ومفيش تفسير لجسم الـ redirect كتصدير.
-                if 300 <= resp.status_code < 400:
-                    raise ApiError(
-                        "رد إعادة توجيه غير متوقّع من OpenHands.", resp.status_code
-                    )
-                if resp.status_code >= 400:
-                    try:
-                        body = await self._read_capped_or_empty(resp, MAX_ERROR_DETAIL_BYTES)
-                    except (httpx.HTTPError, httpx.StreamError):
-                        body = b""
-                    raise ApiError(
-                        describe_status(resp.status_code, _detail_from_bytes(body)),
-                        resp.status_code,
-                    )
-                encoding = _content_encoding(resp)
-                if encoding is not None and encoding != "identity":
-                    raise ApiError(f"ترميز محتوى غير متوقّع من OpenHands ({encoding}).")
-                declared = _content_length(resp)
-                if declared is not None and declared > limit:
-                    raise ResponseTooLargeError(
-                        "ملف التصدير كبير أوي للتنزيل الآمن."
-                    )
-                return await self._read_capped(resp, limit)
-        except httpx.HTTPError as exc:
-            raise ApiError(f"تعذّر الاتصال بـ OpenHands ({type(exc).__name__}).") from exc
 
     async def send_message(self, conversation_id: str, text: str) -> None:
         body = {"role": "user", "content": [{"type": "text", "text": text}], "run": True}

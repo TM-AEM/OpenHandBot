@@ -81,7 +81,6 @@ Telegram WebView ──HTTPS──▶ ingress (TLS) ──HTTP──▶ الحا
 | `/api/v1/conversations/{id}/status` | GET | كوكي | لأ | حالة شات بس |
 | `/api/v1/conversations/{id}/cost` | GET | كوكي | لأ | تكلفة/استهلاك شات (من نفس نداء التفاصيل) |
 | `/api/v1/conversations/{id}/reply` | GET | كوكي | لأ | الرد الكامل للـ assistant (`reply` + `reply_truncated`) — مصدر زر «نسخ الرد الكامل» |
-| `/api/v1/conversations/{id}/export` | GET | كوكي | لأ | تنزيل تصدير الشات (zip، نفس صيغة البوت، حد صلب) |
 | `/api/v1/conversations/{id}/attachments` | GET | كوكي | لأ | قايمة **المرفقات المحلية المخزَّنة** القابلة للتنزيل (بيانات وصفية آمنة فقط: `item_id`، اسم منقّى، حجم، ثوانٍ متبقّية) — MT-2 |
 | `/api/v1/conversations/{id}/attachments/{item_id}/download` | GET | كوكي | لأ | تنزيل مرفق مصادَق من الـ staging المحلي (بثّ محدود غير حاجب) — MT-2 |
 | `/api/v1/conversations/{id}/files` | GET | كوكي | لأ | قايمة ملفات الشات (allowlist + تصريح) |
@@ -405,12 +404,12 @@ python -m pytest -q tests/test_miniapp_initdata.py tests/test_miniapp_api.py \
     tests/test_miniapp_features.py tests/test_miniapp_ratelimit.py \
     tests/test_miniapp_integration.py tests/test_miniapp_config.py \
     tests/test_miniapp_inbox.py tests/test_miniapp_session_persistence.py \
-    tests/test_miniapp_export_reply.py
+    tests/test_miniapp_full_reply.py
 ```
 
 اختبارات منطق الواجهة (دورة حياة معرّف العملية — idempotency، صندوق الإشعارات،
-تصدير الشات، ونسخ الرد الكامل): بتشتغل بـ Node المدمج على **نفس** الوحدات اللي
-الواجهة بتستعملها (`bot/web/static/ops.js`، `inbox.js`، `copy.js`، `export.js`):
+نسخ الرد الكامل): بتشتغل بـ Node المدمج على **نفس** الوحدات اللي
+الواجهة بتستعملها (`bot/web/static/ops.js`، `inbox.js`، `copy.js`):
 
 ```bash
 node --test tests/frontend/*.test.js
@@ -534,19 +533,8 @@ node --test tests/frontend/*.test.js
   `event_key` (حمولة داخلية)، وبيحمّل `delivery_status`/`delivery_attempts`/`delivered_at`
   و`archived`/`deletable`، وبيترقّم بترقيم محدود، والصفحة الفاضية بسبب تجاوز الحد بترجع للأولى.
 
-## 13ج. تصدير الشات + نسخ الرد الكامل (OHB2-PHASE1B)
+## 13ج. نسخ الرد الكامل (OHB2-PHASE1B)
 
-كان البوت فيه **تصدير الشات** و**نسخ الرد الكامل**، لكن الـ Mini App كان ناقصهم.
-اتضافوا بنفس منطق البوت (مفيش مسار إرسال/تصدير جديد، ومفيش تكرار منطق):
-
-- **تصدير الشات** (`GET /api/v1/conversations/{id}/export`): بينزّل zip بنفس صيغة البوت
-  (`OpenHandsClient.export_conversation`)، بنفس السقف الصلب `MAX_EXPORT_BYTES` ونفس
-  القراءة المحدودة (`_read_capped`، مفيش تجميع غير محدود في الذاكرة). الترتيب:
-  **تفويض ملكية الشات أولًا** (server-side من الجلسة، فشل مغلق) ⇒ فحص شاهد الحذف المحلي
-  (شات محذوف/مُعلَّم لا يُصدَّر ولا يُحيا) ⇒ تنزيل محدود. عدّى الحد ⇒ `413 too_large`،
-  فشل التنزيل ⇒ خطأ منظّم — **مفيش تصدير «ناجح» كاذب**. اسم الملف بيتولّد من معرّف
-  **صالح** ومنقّى لمحارف ASCII آمنة ⇒ مفيش CR/LF/اقتباس (مفيش response-header injection).
-  الواجهة بتعمل تنزيل مباشر (same-origin) وبتقرأ الاسم الآمن من `Content-Disposition`.
 - **نسخ الرد الكامل** (`GET /api/v1/conversations/{id}/reply`): بترجّع **النص الكامل**
   للـ assistant (`reply`) + علم `reply_truncated`. المعاينة في صفحة التفاصيل محدودة
   (4000 محرف) لكن النسخ بياخد النص الكامل من نفس `get_last_exchange` بتاع البوت (سقف
@@ -555,9 +543,9 @@ node --test tests/frontend/*.test.js
   فقيود Bot API ما بتسمحش بالكتابة المباشرة في الحافظة، لذلك زر البوت يحمل الاسم الصادق
   «📄 عرض للنسخ اليدوي» لعرض كتلة كود قابلة للنسخ يدويًا، مع إتاحة زر «📋 نسخ مباشر من التطبيق»
   عند تهيئة `MINI_APP_URL` وزر مستقل «ملف النص» لتنزيل `.txt`.
-- **منطق الواجهة المشترك**: `bot/web/static/copy.js` و`export.js` وحدات مستقلة عن الـ DOM،
-  بتُختبر بـ Node (`tests/frontend/copy.test.js`، `tests/frontend/export.test.js`) وبتُستخدم
-  من `app.js` مباشرة. التغطية الخلفية: `tests/test_miniapp_export_reply.py`.
+- **منطق الواجهة المشترك**: `bot/web/static/copy.js` وحدة مستقلة عن الـ DOM،
+  بتُختبر بـ Node (`tests/frontend/copy.test.js`) وبتُستخدم من `app.js` مباشرة.
+  التغطية الخلفية: `tests/test_miniapp_full_reply.py`.
 
 ## 13د. رؤية/إلغاء/تسوية طلبات الشات الجديد (OHB2-PHASE1D)
 
@@ -665,10 +653,6 @@ DOM ومُختبر بـ Node). الأزرار بتظهر **بس** حسب أعل�
 **الحدود الحالية (غير مُنفَّذة):** **تنزيل ملف منفرد (بايتات)** غير متاح (المعاينة عرض نصي
 محدود بس) — شوف القسم 13و للأسباب. مفيش بحث/فرز داخل المجلد.
 
-**الفرق عن التصدير:** المعاينة أعلاه لكل **ملف منفرد**؛ أما
-**`GET /api/v1/conversations/{id}/export`** فهو **تصدير الشات** كـ ZIP (`event_*.json` +
-`meta.json`) — ميزة منفصلة تمامًا (القسم 13ج)، مش عرض/تنزيل ملفات الـ workspace.
-
 ## 13و. تنزيل ملف مساحة عمل منفرد — OHB2-PLAN-13-WS-02 (BLOCKED_BY_PROVIDER_CAPABILITY)
 
 **الحالة: `BLOCKED_BY_PROVIDER_CAPABILITY`** (نفس التصنيف القائم `BLOCKED_BY_PROVIDER`، بس بصيغة الإغلاق الإداري الأدقّ) — **غير مُنفَّذ، عن قصد، ومفيش راوت مُختَرَع ولا بديل.** الإغلاق الإداري الكامل في `docs/reviews/OHB2-PLAN03-ADMINISTRATIVE-CLOSURE-REPORT.md`.
@@ -682,8 +666,6 @@ DOM ومُختبر بـ Node). الأزرار بتظهر **بس** حسب أعل�
     UTF-8 (`binary`/`not_utf8`). يعني ده **عرض نصي**، مش تنزيل بايتات.
   - `GET /api/v1/app-conversations/{id}/files` — **"List Conversation Files"**: `array of
     string` (مسارات نسبية).
-  - `GET /api/v1/app-conversations/{id}/download` — **"Export Conversation"**: تصدير
-    **trajectory** المحادثة كـ ZIP، **مش** ملف مساحة عمل منفرد.
   - **مفيش** أي راوت راجع `application/octet-stream`/`format: binary`، ومفيش `multipart`،
     ومفيش أي راوت "تنزيل ملف مساحة عمل" في Cloud V1 (فحص كامل للـ spec: `octet-stream=0`،
     `format: binary=0`، `multipart=0`، وكل ردود 2xx كلها `application/json`).
@@ -736,7 +718,6 @@ DOM ومُختبر بـ Node). الأزرار بتظهر **بس** حسب أعل�
 | 4 | اختيار المستودع | `IMPLEMENTED_AND_TESTED` | `GET /repositories` · `PATCH /conversations/{id}/repository` | `list_repositories` · `associate_repository` | — | تبويب «شات جديد» + تفاصيل | — | `_authorize_conversation` على PATCH | 404 متشاهد | `_require_repo` owner/repo | — | `test_miniapp_features`, `http_journeys`, `stale_guards.test.js` |
 | 5 | تصفّح الملفات (هرمي) | `IMPLEMENTED_AND_TESTED` | `GET /conversations/{id}/files` | `list_files` | `is_deleted` | قسم «ملفات الشات» (شجرة + فتات + لأعلى) | `features.files` (مفعّلة) | `_authorize_conversation` | 404 متشاهد | allowlist `is_safe_workspace_path` + شجرة محلية fail-closed | — | `test_miniapp_files`, `files_watch.test.js`, `files.test.js` |
 | 6 | معاينة الملف | `IMPLEMENTED_AND_TESTED` | `GET /conversations/{id}/file?path=` | `read_preview` | — | ضغط مسار الملف | `features.files` | `_authorize_conversation` | 404 متشاهد | allowlist + سقف قراءة | — | `test_miniapp_files`, `test_real_http_miniapp_download` |
-| 7 | تصدير الشات | `IMPLEMENTED_AND_TESTED` | `GET /conversations/{id}/export` | `export_conversation` | `is_deleted` | زر «تصدير الشات» | `features.export` | `_authorize_conversation` | 404 متشاهد | سقف `MAX_EXPORT_BYTES` | — | `test_miniapp_export_reply`, `test_real_http_miniapp_download`, `export.test.js` |
 | 8 | التكلفة/الاستهلاك | `IMPLEMENTED_AND_TESTED` | `GET /conversations/{id}/cost` | `get_cost` | — | قسم «التكلفة والاستهلاك» | `features.cost` | `_authorize_conversation` | 404 متشاهد | فشل القسم مايكسّر التفاصيل | — | `test_miniapp_cost`, `cost.test.js` |
 | 9 | المتابعات | `IMPLEMENTED_AND_TESTED` | `GET /watches` · `POST/DELETE /conversations/{id}/watch` | `list_watches`/`add_watch`/`remove_watch` | `add_watched`/`remove_watched`/`list_watched` | تبويب المتابعات | `features.is_hidden("followups")` (مفعّلة) | `_authorize_conversation` | استبعاد المتشاهد | — | — | `test_miniapp_features`, `inbox_watch.test.js` |
 | 10 | الإشعارات/الصندوق | `IMPLEMENTED_AND_TESTED` | `GET /notifications` · `POST …/read`,`/read-all`,`/archive`,`/unarchive` · `DELETE /notifications/{id}` | `list_inbox`/`mark_*`/`delete_inbox_item` | `list_inbox`/`count_inbox`/`mark_inbox_*` | تبويب الإشعارات | — | owner-scoped | استبعاد المتشاهد | `page∈[0,MAX_PAGE]` | eligibility CAS للحذف | `test_miniapp_inbox*`, `inbox*.test.js` |
@@ -767,7 +748,7 @@ DOM ومُختبر بـ Node). الأزرار بتظهر **بس** حسب أعل�
 | الفئة | الحالة | الدليل |
 | --- | --- | --- |
 | **تحقّق HTTP حقيقي** | ✔ مُتحقَّق | `tests/test_miniapp_*.py` (~370 اختبار عبر `TestClient`) + `tests/test_miniapp_http_journeys.py` (جديد: مصادقة/كوكي/أصل/برومت idempotent/PATCH مستودع/status) |
-| **تحقّق عبر سوكيت TCP حقيقي** | ✔ مُتحقَّق | `tests/test_real_http_miniapp_download.py` (معاينة/تصدير عبر خادم upstream على 127.0.0.1) |
+| **تحقّق عبر سوكيت TCP حقيقي** | ✔ مُتحقَّق | `tests/test_real_http_miniapp_download.py` (معاينة عبر خادم upstream على 127.0.0.1) |
 | **تحقّق بمتصفّح حقيقي** | ✖ **غير مُتحقَّق** | مفيش مشغّل متصفّح (Playwright/Selenium) في البيئة أو CI |
 | **تحقّق Node DOM-stub** | ✔ مُتحقَّق (بديل جزئي) | `tests/frontend/*.test.js` (250) — بيشغّل **نفس** `app.js` في DOM مصغّر |
 | **تحقّق Telegram WebView** | ✖ **غير مُتحقَّق** | يحتاج عميل تيليجرام حقيقي (خارج CI) |

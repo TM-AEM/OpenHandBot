@@ -343,7 +343,7 @@ function loadApp(opts) {
     Array,
     isFinite,
     encodeURIComponent,
-    // OHB2-PHASE1B: تنزيل الملف (Blob/objectURL) لمحاكاة زر التصدير.
+    // تنزيل الملف (Blob/objectURL) لمحاكاة تنزيل المرفقات.
     URL: {
       _urls: {},
       createObjectURL: function (blob) { const u = "blob:mock/" + (Object.keys(this._urls).length + 1); this._urls[u] = blob; return u; },
@@ -361,7 +361,7 @@ function loadApp(opts) {
 
   const root = path.resolve(__dirname, "../../bot/web/static");
   const ctx = vm.createContext(sandbox);
-  for (const file of ["jobs.js", "ops.js", "inbox.js", "files.js", "cost.js", "copy.js", "export.js", "attachments.js", "app.js"]) {
+  for (const file of ["jobs.js", "ops.js", "inbox.js", "files.js", "cost.js", "copy.js", "attachments.js", "app.js"]) {
     const code = fs.readFileSync(path.join(root, file), "utf8");
     vm.runInContext(code, ctx, { filename: file });
   }

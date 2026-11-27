@@ -1,7 +1,7 @@
 """TASK 04B-06: القرار 4 — الميزات المؤجّلة مخفية عن المستخدم، والبيانات الأساسية لسه موجودة.
 
 بنثبت إن:
-- الأزرار/القوايم مش بتعرض الملفات/التصدير/التكلفة/إدارة المتابعات.
+- الأزرار/القوايم مش بتعرض الملفات/التكلفة/إدارة المتابعات.
 - تسجيل الـ handlers بيرجّع نقاط الدخول دي بعيد (مفيش pattern مستني).
 - العمليات الأساسية (شاتاتي/شات جديد/رد/تحديث/حالة) لسه متاحة.
 - الكود والجداول مش متحذفين (الدوال والجداول لسه موجودين) — يعني إخفاء مش حذف.
@@ -41,9 +41,8 @@ def _make_config(tmp_path):
 
 
 def test_deferred_features_are_restored_by_default():
-    """OHB2-09-06/07: الميزات الأربع اتسترجعت (مفعّلة افتراضيًا)."""
+    """OHB2-09-06/07: الميزات المؤجّلة اتسترجعت (مفعّلة افتراضيًا)."""
     assert not features.is_hidden("files")
-    assert not features.is_hidden("export")
     assert not features.is_hidden("cost")
     assert not features.is_hidden("followups")
 
@@ -62,7 +61,7 @@ def test_deferred_callbacks_are_restored_in_user_facing_menus():
     menu = _callbacks(kb.main_menu())
     unwatched = _callbacks(kb.conversation_actions("c1", watched=False))
     watched = _callbacks(kb.conversation_actions("c1", watched=True))
-    for cb in ("watched:0", "files:c1:0", "cost:c1", "export:c1"):
+    for cb in ("watched:0", "files:c1:0", "cost:c1"):
         assert cb in (menu + unwatched), cb
     assert "watch:c1" in unwatched
     assert "unwatch:c1" in watched
@@ -72,7 +71,7 @@ def test_app_registers_deferred_handlers_when_restored(tmp_path):
     """OHB2-09-06: تسجيل الـ handlers المسترجَعة بيفرّج نقاط الدخول دي."""
     app = build_application(_make_config(tmp_path))
     pats = _patterns(app)
-    for prefix in (r"^files:", r"^file:", r"^cost:", r"^export:", r"^watch:", r"^unwatch:", r"^watched:"):
+    for prefix in (r"^files:", r"^file:", r"^cost:", r"^watch:", r"^unwatch:", r"^watched:"):
         assert prefix in pats, prefix
     # الأساسيات لسه متسجّلة.
     for prefix in (r"^list:", r"^open:", r"^reply:", r"^status:", r"^newchat$"):
@@ -84,17 +83,17 @@ def test_hide_switch_still_hides_when_enabled(monkeypatch, tmp_path):
     monkeypatch.setattr(features, "DEFERRED_FEATURES_HIDDEN", True)
     menu = _callbacks(kb.main_menu())
     convo = _callbacks(kb.conversation_actions("c1", watched=True))
-    for prefix in ("files:", "file:", "cost:", "export:", "watch:", "unwatch:", "watched:"):
+    for prefix in ("files:", "file:", "cost:", "watch:", "unwatch:", "watched:"):
         assert not any(cb.startswith(prefix) for cb in (menu + convo)), prefix
     app = build_application(_make_config(tmp_path))
     pats = _patterns(app)
-    for prefix in (r"^files:", r"^file:", r"^cost:", r"^export:", r"^watch:", r"^unwatch:", r"^watched:"):
+    for prefix in (r"^files:", r"^file:", r"^cost:", r"^watch:", r"^unwatch:", r"^watched:"):
         assert prefix not in pats, prefix
 
 
 def test_hiding_does_not_delete_implementations_or_schema():
     # الدوال لسه موجودة (إخفاء مش حذف).
-    for fn in ("show_cost", "export_conversation", "list_files", "show_file",
+    for fn in ("show_cost", "list_files", "show_file",
                "list_watches", "watch_conversation", "unwatch_conversation"):
         assert callable(getattr(h, fn))
     # جداول قاعدة البيانات لسه موجودة زي ما هي (نفس الـ schema).

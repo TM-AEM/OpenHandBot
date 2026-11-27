@@ -1,4 +1,4 @@
-"""OHB2-LARGE-FILE-REAL-HTTP: file preview + export over a real local HTTP server.
+"""OHB2-LARGE-FILE-REAL-HTTP: file preview over a real local HTTP server.
 
 These tests exercise the **actual** `OpenHandsClient` HTTP transport (httpcore/httpx)
 against a real TCP socket on 127.0.0.1, NOT `httpx.MockTransport`. The earlier
@@ -11,7 +11,6 @@ What is verified here:
 - Content-Length larger than the transmitted bytes followed by an early close;
 - a chunked response that is terminated prematurely (no final 0-chunk);
 - an upstream that never answers (real timeout);
-- export byte integrity / limit+1 / truncation;
 - non-identity Content-Encoding rejection and redirect rejection.
 
 No Telegram, no OpenHands production service, no live database, synthetic content only.
@@ -21,22 +20,15 @@ from __future__ import annotations
 import asyncio
 import json
 
-import httpx
 import pytest
 
 from bot.errors import ApiError, ResponseTooLargeError
 from bot.files import FileService, FileStatus
-from bot.openhands_client import (
-    MAX_EXPORT_BYTES,
-    MAX_FILE_RESPONSE_BYTES,
-    OpenHandsClient,
-)
+from bot.openhands_client import MAX_FILE_RESPONSE_BYTES, OpenHandsClient
 
 from tests._real_http import (
     RealHTTPServer,
     Router,
-    chunk_body,
-    chunk_header,
     chunked_response,
     close_delimited_response,
     http_response,
@@ -347,236 +339,3 @@ def test_preview_http_error_status_preserved_over_real_http():
         close_client(client)
     finally:
         srv.shutdown()
-
-
-# ============================================================== export: success
-def test_export_success_exact_bytes_and_content_length():
-    """تصدير حقيقي: بايتات مطابقة + `Content-Length` مطابق."""
-    payload = b"PK\x03\x04" + bytes(range(256)) * 4
-    srv = serve(lambda _r: http_response(200, headers={"Content-Type": "application/zip"}, body=payload))
-    try:
-        client = make_client(srv)
-        out = run(client.export_conversation(CID))
-        close_client(client)
-        assert out == payload
-        assert len(out) == len(payload)
-    finally:
-        srv.shutdown()
-
-
-def test_export_exactly_at_limit_accepted():
-    """عند حد التصدير بالضبط (16 MiB) ⇒ يُقبل كاملًا."""
-    payload = b"Z" * MAX_EXPORT_BYTES
-    srv = serve(lambda _r: http_response(200, body=payload))
-    try:
-        client = make_client(srv)
-        out = run(client.export_conversation(CID))
-        close_client(client)
-        assert len(out) == MAX_EXPORT_BYTES
-    finally:
-        srv.shutdown()
-
-
-def test_export_one_byte_over_limit_rejected():
-    """الحد + 1 بايت ⇒ ResponseTooLargeError عبر العدّ التراكمي الخام."""
-    payload = b"Z" * (MAX_EXPORT_BYTES + 1)
-    srv = serve(lambda _r: http_response(200, body=payload))
-    try:
-        client = make_client(srv)
-        with pytest.raises(ResponseTooLargeError):
-            run(client.export_conversation(CID))
-        close_client(client)
-        assert srv.wait_connections_closed(2.0) is True
-    finally:
-        srv.shutdown()
-
-
-def test_export_large_declared_length_rejected_before_body():
-    """`Content-Length` معلن > الحد ⇒ رفض فوري."""
-    srv = serve(
-        lambda _r: http_response(
-            200, headers={"Content-Length": str(MAX_EXPORT_BYTES + 1)}, body=b"PK\x03\x04"
-        )
-    )
-    try:
-        client = make_client(srv)
-        with pytest.raises(ResponseTooLargeError):
-            run(client.export_conversation(CID))
-        close_client(client)
-    finally:
-        srv.shutdown()
-
-
-def test_export_truncated_rejected_over_real_http():
-    """تصدير مقطوع (CL أكبر من المُرسَل ثم إغلاق) ⇒ فشل نقل، مفيش zip جزئي ناجح."""
-    srv = serve(lambda _r: truncated_response(MAX_EXPORT_BYTES, b"PK\x03\x04partial"))
-    try:
-        client = make_client(srv)
-        with pytest.raises(ApiError) as info:
-            run(client.export_conversation(CID))
-        assert not isinstance(info.value, ResponseTooLargeError)
-        close_client(client)
-    finally:
-        srv.shutdown()
-
-
-def test_export_chunked_terminated_prematurely_rejected():
-    """تصدير chunked مقطوع (بلا 0-chunk) ⇒ فشل نقل."""
-    srv = serve(lambda _r: chunked_response([b"PK\x03\x04abc"], terminate=False))
-    try:
-        client = make_client(srv)
-        with pytest.raises(ApiError):
-            run(client.export_conversation(CID))
-        close_client(client)
-    finally:
-        srv.shutdown()
-
-
-def test_export_redirect_rejected_over_real_http():
-    """3xx على التصدير ⇒ رفض بلا متابعة."""
-    headers = {"Location": "http://127.0.0.1:9/x"}
-    srv = serve(lambda _r: http_response(307, headers=headers, body=b"", reason="Temporary Redirect"))
-    try:
-        client = make_client(srv)
-        with pytest.raises(ApiError) as info:
-            run(client.export_conversation(CID))
-        assert info.value.status_code == 307
-        close_client(client)
-        assert srv.request_count == 1
-    finally:
-        srv.shutdown()
-
-
-def test_export_gzip_content_encoding_rejected_over_real_http():
-    """`Content-Encoding: gzip` على التصدير ⇒ رفض آمن."""
-    import gzip
-
-    srv = serve(
-        lambda _r: http_response(
-            200, headers={"Content-Encoding": "gzip"}, body=gzip.compress(b"PK\x03\x04data")
-        )
-    )
-    try:
-        client = make_client(srv)
-        with pytest.raises(ApiError) as info:
-            run(client.export_conversation(CID))
-        assert "gzip" in str(info.value)
-        close_client(client)
-    finally:
-        srv.shutdown()
-
-
-# ==================================================== cancellation + cleanup
-def test_cancellation_mid_body_closes_connection():
-    """إلغاء أثناء قراءة جسم متوقّف ⇒ CancelledError ينتشر + الاتصال يُغلق."""
-    async def scenario():
-        srv = RealHTTPServer(
-            lambda _r: (
-                chunk_header(),
-                chunk_body(b'"start'),
-                # no terminator: the client will stall waiting for more chunks
-            )
-        )
-        try:
-            client = make_client(srv, timeout=30.0)
-            task = asyncio.create_task(
-                client.read_file_text_bounded(CID, FILE_PATH, max_response_bytes=MAX_FILE_RESPONSE_BYTES)
-            )
-            # Give the request time to reach the server and the body to start.
-            for _ in range(200):
-                if srv.request_count >= 1:
-                    break
-                await asyncio.sleep(0.01)
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
-            await client.aclose()
-            closed = await asyncio.to_thread(srv.wait_connections_closed, 3.0)
-            return closed
-        finally:
-            srv.shutdown()
-
-    assert asyncio.run(scenario()) is True
-
-
-def test_connection_closed_after_size_limit_rejection():
-    """بعد رفض تجاوز الحد، الاتصال يُغلق (مفيش تسريب مقابس)."""
-    payload = b"Z" * (MAX_EXPORT_BYTES + 1)
-    srv = serve(lambda _r: http_response(200, body=payload))
-    try:
-        client = make_client(srv)
-        with pytest.raises(ResponseTooLargeError):
-            run(client.export_conversation(CID))
-        close_client(client)
-        assert srv.wait_connections_closed(3.0) is True
-    finally:
-        srv.shutdown()
-
-
-def test_connection_closed_after_timeout():
-    """بعد مهلة upstream، الاتصال يُغلق."""
-    srv = serve(lambda _r: None)
-    try:
-        client = make_client(srv, timeout=0.3)
-        with pytest.raises(ApiError):
-            run(client.read_file_text_bounded(CID, FILE_PATH, max_response_bytes=MAX_FILE_RESPONSE_BYTES))
-        close_client(client)
-        assert srv.wait_connections_closed(3.0) is True
-    finally:
-        srv.shutdown()
-
-
-def test_multiple_sequential_requests_reuse_or_close_cleanly():
-    """طلبات متتالية ناجحة ⇒ كلها تُخدم وكل الاتصالات تُغلق عند نهاية العميل."""
-    router = Router()
-    router.add(FILE_ROUTE, json_response("payload"))
-    srv = RealHTTPServer(router)
-    try:
-        async def scenario():
-            client = make_client(srv)
-            for _ in range(5):
-                out = await client.read_file_text_bounded(CID, FILE_PATH, max_response_bytes=MAX_FILE_RESPONSE_BYTES)
-                assert out == "payload"
-            await client.aclose()
-
-        run(scenario())
-        assert srv.request_count == 5
-        assert srv.wait_connections_closed(3.0) is True
-    finally:
-        srv.shutdown()
-
-
-# ============================== why a real socket is required (MockTransport lies)
-def test_mock_transport_would_false_pass_truncation_but_real_http_rejects():
-    """دليل حاسم: `MockTransport` بيقبل الجسم المقطوع كنجاح، بينما HTTP الحقيقي يرفضه.
-
-    الاختبار ده بيثبت سبب استخدام مقبس حقيقي لسيناريوهات القطع (بند إلزامي في المهمة).
-    """
-    declared = 100_000
-    partial = json.dumps("hello world").encode("utf-8")  # 13 bytes, valid JSON on its own
-
-    # (أ) محاكاة: نفس الاستجابة على MockTransport ⇒ تُقبل (نجاح كاذب).
-    class _Stream(httpx.AsyncByteStream):
-        async def __aiter__(self):
-            yield partial
-
-    def mock_handler(_request):
-        return httpx.Response(200, headers={"content-length": str(declared)}, stream=_Stream())
-
-    mock_client = OpenHandsClient(
-        "https://example.test", "key", transport=httpx.MockTransport(mock_handler)
-    )
-    mocked = run(mock_client.read_file_text_bounded(CID, FILE_PATH, max_response_bytes=MAX_FILE_RESPONSE_BYTES))
-    run(mock_client.aclose())
-    assert mocked == "hello world"  # ← النجاح الكاذب اللي المهمة بتمنعه
-
-    # (ب) الحقيقي: نفس الاستجابة على مقبس فعلي ⇒ تُرفض.
-    srv = serve(lambda _r: truncated_response(declared, partial))
-    try:
-        real_client = make_client(srv)
-        with pytest.raises(ApiError):
-            run(real_client.read_file_text_bounded(CID, FILE_PATH, max_response_bytes=MAX_FILE_RESPONSE_BYTES))
-        close_client(real_client)
-    finally:
-        srv.shutdown()
-

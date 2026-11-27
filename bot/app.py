@@ -157,7 +157,7 @@ def build_application(config: Config) -> Application:
     app.add_handler(CallbackQueryHandler(handlers.repos_page, pattern=r"^repos:"))
     app.add_handler(CallbackQueryHandler(handlers.repo_search_prompt, pattern=r"^reposearch$"))
     app.add_handler(CallbackQueryHandler(handlers.pick_repo, pattern=r"^pickrepo:"))
-    # القرار 4: الميزات المؤجّلة (الملفات/التصدير/التكلفة/إدارة المتابعات) مش بتتسجّل،
+    # القرار 4: الميزات المؤجّلة (الملفات/التكلفة/إدارة المتابعات) مش بتتسجّل،
     # فحتى أي callback قديم مستني مش هيوصل لأي handler (نقاط الدخول مخفية). الكود والبيانات
     # لسه موجودين (مش بنحذف حاجة) — بس مش معروضين للمستخدم.
     if not features.is_hidden("followups"):
@@ -166,8 +166,6 @@ def build_application(config: Config) -> Application:
         app.add_handler(CallbackQueryHandler(handlers.unwatch_conversation, pattern=r"^unwatch:"))
     if not features.is_hidden("cost"):
         app.add_handler(CallbackQueryHandler(handlers.show_cost, pattern=r"^cost:"))
-    if not features.is_hidden("export"):
-        app.add_handler(CallbackQueryHandler(handlers.export_conversation, pattern=r"^export:"))
     if not features.is_hidden("files"):
         # OHB2-BOT-FILE-BROWSER: المسار الجديد (شجرة + ترقيم + رموز قصيرة). الـ handlers
         # القديمة (`files:`/`file:`) باقية للرسائل القديمة فقط.

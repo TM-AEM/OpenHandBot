@@ -5,9 +5,9 @@ application and its real response construction), while the upstream OpenHands si
 real HTTP server on 127.0.0.1 — not `httpx.MockTransport`. Authentication stays fully
 isolated: `initData` is generated locally with the test bot token, no Telegram call.
 
-Verified here: successful preview/export byte integrity and headers; preview and export
-size boundaries (limit and limit+1); truncation and premature chunked termination never
-produce a successful complete download; non-identity encoding and redirects are rejected.
+Verified here: successful preview byte integrity and headers; preview size boundaries
+(limit and limit+1); truncation and premature chunked termination never produce a
+successful complete download; non-identity encoding and redirects are rejected.
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ import json
 from starlette.testclient import TestClient
 
 from bot.config import Config
-from bot.openhands_client import MAX_EXPORT_BYTES, MAX_FILE_RESPONSE_BYTES, OpenHandsClient
+from bot.openhands_client import MAX_FILE_RESPONSE_BYTES, OpenHandsClient
 from bot.web import build_web_app
 
 from tests._miniapp_helpers import BOT_TOKEN, make_init_data
@@ -213,151 +213,5 @@ def test_miniapp_preview_other_owner_is_403_no_read():
         resp = tc.get(f"/api/v1/conversations/{CID}/file", params={"path": FILE_PATH})
         assert resp.status_code == 403
         assert read_hits["n"] == 0
-    finally:
-        srv.shutdown()
-
-
-# =============================================================== export: routes
-def test_miniapp_export_success_headers_and_exact_bytes():
-    """مسار التصدير: بايتات مطابقة + `Content-Length` مطابق + اسم تنزيل آمن."""
-    payload = b"PK\x03\x04" + bytes(range(256)) * 8
-    router = auth_router()
-    router.add(f"/api/v1/app-conversations/{CID}/download", lambda _r: http_response(200, body=payload))
-    srv = RealHTTPServer(router)
-    try:
-        tc = build(srv)
-        login(tc)
-        resp = tc.get(f"/api/v1/conversations/{CID}/export")
-        assert resp.status_code == 200
-        assert resp.content == payload
-        assert resp.headers["content-type"] == "application/zip"
-        assert resp.headers["content-disposition"] == f'attachment; filename="conversation-{CID}.zip"'
-        assert int(resp.headers["content-length"]) == len(payload)
-        assert resp.headers["x-content-type-options"] == "nosniff"
-    finally:
-        srv.shutdown()
-
-
-def test_miniapp_export_one_byte_over_limit_is_413():
-    """الحد + 1 (16 MiB + 1) عبر المسار ⇒ 413 `too_large`، مفيش ملف."""
-    payload = b"Z" * (MAX_EXPORT_BYTES + 1)
-    router = auth_router()
-    router.add(f"/api/v1/app-conversations/{CID}/download", lambda _r: http_response(200, body=payload))
-    srv = RealHTTPServer(router)
-    try:
-        tc = build(srv)
-        login(tc)
-        resp = tc.get(f"/api/v1/conversations/{CID}/export")
-        assert resp.status_code == 413
-        assert resp.json()["error"] == "too_large"
-        assert "content-disposition" not in resp.headers
-    finally:
-        srv.shutdown()
-
-
-def test_miniapp_export_truncated_is_not_success():
-    """تصدير مقطوع ⇒ رد خطأ، مفيش `Content-Disposition` ولا بايتات جزئية ناجحة."""
-    router = auth_router()
-    router.add(
-        f"/api/v1/app-conversations/{CID}/download",
-        lambda _r: truncated_response(MAX_EXPORT_BYTES, b"PK\x03\x04partial"),
-    )
-    srv = RealHTTPServer(router)
-    try:
-        tc = build(srv)
-        login(tc)
-        resp = tc.get(f"/api/v1/conversations/{CID}/export")
-        assert resp.status_code >= 400
-        assert "content-disposition" not in resp.headers
-    finally:
-        srv.shutdown()
-
-
-def test_miniapp_export_chunked_truncated_is_not_success():
-    """chunked مقطوع ⇒ رد خطأ، مفيش تنزيل."""
-    router = auth_router()
-    router.add(
-        f"/api/v1/app-conversations/{CID}/download",
-        lambda _r: chunked_response([b"PK\x03\x04abc"], terminate=False),
-    )
-    srv = RealHTTPServer(router)
-    try:
-        tc = build(srv)
-        login(tc)
-        resp = tc.get(f"/api/v1/conversations/{CID}/export")
-        assert resp.status_code >= 400
-        assert "content-disposition" not in resp.headers
-    finally:
-        srv.shutdown()
-
-
-def test_miniapp_export_redirect_rejected():
-    """3xx على التصدير ⇒ رد خطأ، مفيش متابعة ولا تنزيل."""
-    router = auth_router()
-    router.add(
-        f"/api/v1/app-conversations/{CID}/download",
-        lambda _r: http_response(307, headers={"Location": "http://127.0.0.1:9/x"}, body=b""),
-    )
-    srv = RealHTTPServer(router)
-    try:
-        tc = build(srv)
-        login(tc)
-        resp = tc.get(f"/api/v1/conversations/{CID}/export")
-        assert resp.status_code >= 400
-        assert "content-disposition" not in resp.headers
-    finally:
-        srv.shutdown()
-
-
-def test_miniapp_export_gzip_rejected():
-    """`Content-Encoding: gzip` على التصدير ⇒ رد خطأ."""
-    import gzip
-
-    router = auth_router()
-    router.add(
-        f"/api/v1/app-conversations/{CID}/download",
-        lambda _r: http_response(200, headers={"Content-Encoding": "gzip"}, body=gzip.compress(b"PK\x03\x04x")),
-    )
-    srv = RealHTTPServer(router)
-    try:
-        tc = build(srv)
-        login(tc)
-        resp = tc.get(f"/api/v1/conversations/{CID}/export")
-        assert resp.status_code >= 400
-    finally:
-        srv.shutdown()
-
-
-def test_miniapp_export_requires_auth_before_upstream():
-    """بلا مصادقة ⇒ 401 وصفر نداءات upstream (الخادم الحقيقي ما اتلمسش)."""
-    router = auth_router()
-    router.add(f"/api/v1/app-conversations/{CID}/download", lambda _r: http_response(200, body=b"PK"))
-    srv = RealHTTPServer(router)
-    try:
-        tc = build(srv)
-        resp = tc.get(f"/api/v1/conversations/{CID}/export")
-        assert resp.status_code == 401
-        assert srv.request_count == 0
-    finally:
-        srv.shutdown()
-
-
-def test_miniapp_other_owner_export_forbidden_no_download():
-    """مالك مختلف ⇒ 403، وصفر نداء تنزيل."""
-    router = auth_router(conv_owner="someone-else")
-    hits = {"n": 0}
-
-    def download_responder(_r):
-        hits["n"] += 1
-        return http_response(200, body=b"PK\x03\x04zip")
-
-    router.add(f"/api/v1/app-conversations/{CID}/download", download_responder)
-    srv = RealHTTPServer(router)
-    try:
-        tc = build(srv)
-        login(tc)
-        resp = tc.get(f"/api/v1/conversations/{CID}/export")
-        assert resp.status_code == 403
-        assert hits["n"] == 0
     finally:
         srv.shutdown()

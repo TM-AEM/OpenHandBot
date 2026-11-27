@@ -96,15 +96,15 @@ def test_conversation_actions_has_new_buttons():
     for expected in ("reply:c1", "open:c1", "status:c1", "list:0"):
         assert expected in cbs
     assert "cancelroute" not in cbs
-    # OHB2-09-06: الملفات/التكلفة/التصدير اتسترجعت (ظاهرة افتراضيًا).
-    for restored in ("files:c1:0", "cost:c1", "export:c1"):
+    # OHB2-09-06: الملفات/التكلفة اتسترجعت (ظاهرة افتراضيًا).
+    for restored in ("files:c1:0", "cost:c1"):
         assert restored in cbs
 
 
 def test_conversation_actions_shows_deferred_when_unhidden(monkeypatch):
     monkeypatch.setattr(kb.features, "DEFERRED_FEATURES_HIDDEN", False)
     cbs = _callbacks(kb.conversation_actions("c1"))
-    for expected in ("files:c1:0", "cost:c1", "export:c1", "watch:c1"):
+    for expected in ("files:c1:0", "cost:c1", "watch:c1"):
         assert expected in cbs
 
 

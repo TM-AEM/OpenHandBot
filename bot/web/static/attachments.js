@@ -56,7 +56,7 @@
     return fallback || "حصل خطأ غير متوقع، جرّب تاني.";
   }
 
-  // اسم ملف آمن من هيدر Content-Disposition (نفس قواعد التصدير، بلا اعتماد على نص).
+  // اسم ملف آمن من هيدر Content-Disposition (نفس قواعد اسم الملف الآمن، بلا اعتماد على نص).
   function safeFilename(name) {
     if (typeof name !== "string") { return DEFAULT_NAME; }
     var trimmed = name.replace(/^.*[\\/]/, "").trim();

@@ -167,11 +167,10 @@ class DetailClient:
     # `/users/me` وبيضمن `created_by_user_id` مطابق (تقدر تتخطّى القيمة صراحةً في `conv`).
     OWNER_UUID = "owner-uuid-123"
 
-    def __init__(self, conv, files=None, content="", blob=b"zip"):
+    def __init__(self, conv, files=None, content=""):
         self._conv = conv
         self._files = files or []
         self._content = content
-        self._blob = blob
 
     async def get_conversations(self, ids):
         if not self._conv:
@@ -194,9 +193,6 @@ class DetailClient:
     async def read_file_text_bounded(self, conversation_id, file_path, max_response_bytes=None):
         # OHB2-09-06: مسار البوت بقى بيقرا محدود عبر FileService ⇒ الفيك لازم يدعم العقد ده.
         return self._content
-
-    async def export_conversation(self, conversation_id):
-        return self._blob
 
 
 class FakeBotWithDocs:
@@ -328,13 +324,6 @@ def test_show_file_sends_document(tmp_path):
     cache = FileCache(); gen = cache.put("c1", ["a/b/main.py"]); ctx.bot_data["file_cache"] = cache
     update = _cb_update(1, f"file:c1:{gen}:0")
     asyncio.run(h.show_file(update, ctx))
-    assert len(ctx.bot.documents) == 1
-
-
-def test_export_sends_zip(tmp_path):
-    ctx = _ctx_with(tmp_path, DetailClient({"id": "c1"}))
-    update = _cb_update(1, "export:c1")
-    asyncio.run(h.export_conversation(update, ctx))
     assert len(ctx.bot.documents) == 1
 
 
@@ -844,16 +833,17 @@ def test_open_no_reply_has_no_copy_button(tmp_path):
     assert "copy:A" not in _markup_callbacks(q.markups[-1])
 
 
-def test_open_with_reply_explains_manual_copy_and_links_mini_app(tmp_path):
+def test_open_with_reply_has_manual_copy_without_explanatory_text(tmp_path):
     ctx = make_context(1, tmp_path, client=ExchangeClient(CONV55, "ب", "رد مفيد"))
     ctx.bot_data["config"].mini_app_enabled = True
     ctx.bot_data["config"].mini_app_url = "https://app.example.com/mini"
     ctx.bot = RecBot()
     q = CQ("open:A")
     asyncio.run(h.open_conversation(_t55_cb_update(q), ctx))
-    assert "عرض للنسخ اليدوي" in q.edits[0]
-    assert "code block" in q.edits[0]
-    assert "Mini App" in q.edits[0]
+    assert "عرض للنسخ اليدوي" not in q.edits[0]
+    assert "code block" not in q.edits[0]
+    assert "Mini App" not in q.edits[0]
+    assert "copy:A" in _markup_callbacks(q.markups[-1])
     web_btns = [b for row in q.markups[-1].inline_keyboard for b in row if b.web_app is not None]
     assert len(web_btns) == 1
     assert web_btns[0].web_app["url"] == "https://app.example.com/mini"

@@ -1,3 +1,55 @@
+# PROGRESS — OHB2-REMOVE-EXPORT-BUTTON-AND-EXPLANATORY-TEXT (2026-11-27)
+
+## Goal
+Permanently remove the chat-export button/feature and the explanatory copy shown when a
+conversation has a reply, without changing any other bot or Mini App behavior.
+
+## Acceptance criteria
+1. No export button, `export:*` callback, handler, client method, Mini App route, frontend
+   module, or export-only test remains.
+2. Opening a conversation with a reply no longer appends the manual-copy/export explanatory
+   paragraph; the manual-copy, full-reply, `.txt`, and Mini App copy controls still work.
+3. Files, cost, followups, deletion, inbox, attachments, and pending-selection routing keep
+   their existing behavior.
+4. The removal is guarded by regression tests and current docs no longer advertise export.
+5. Focused, full Python, frontend, lint, security, and diff checks pass.
+
+## Baseline
+- Branch `main`; HEAD `12bd85291c02fcadb9203538f1b67fbd7498070a`; clean tree before this task.
+- Task 1 (`R-01`/`R-02`) was committed separately as `46622da` before this task's commit.
+
+## Changes
+- Bot: removed `EXPORT` keyboard constant/button, `export:` handler registration and
+  `export_conversation` handler; removed `OpenHandsClient.export_conversation` and
+  `MAX_EXPORT_BYTES`; removed the export feature flag.
+- Mini App: removed `/api/v1/conversations/{id}/export`, export service method and filename
+  helper, `EXPORT_CONTENT_TYPE`, the frontend export button/`export.js`, and its script tag.
+- Copy: removed the explanatory paragraph appended to `_open_conversation_view`; manual-copy
+  and `.txt`/Mini App controls are unchanged.
+- Tests: deleted export-only tests and pruned export cases from shared suites; added
+  `tests/test_export_removal.py`; renamed the remaining full-reply test to
+  `tests/test_miniapp_full_reply.py` and the copy UI test to `tests/frontend/copy_ui.test.js`.
+- Docs: README, `docs/API_NOTES.md`, and `docs/MINI_APP.md` no longer advertise export.
+
+## Verification
+- Focused Python suites: 581 passed.
+- Full Python: **4343 passed, 0 failed** (74 pre-existing warnings).
+- Node frontend: **272 pass / 0 fail** (8 export-only cases removed from the 280 baseline).
+- `pyflakes`: 0; Bandit High: 0; pip-audit: no known vulnerabilities; `git diff --check`: clean.
+- Residual `export`/`تصدير` grep in production/current docs: only JavaScript/Python module
+  `exports` and unrelated wording remain.
+
+## Not verified
+- Python 3.11/GitHub Actions CI was not run locally (local Python 3.13).
+- No live Telegram/OpenHands call.
+- Independent review not performed.
+
+## Status
+`DONE` — local verification green; no push/PR/deploy.
+
+---
+
+
 # PROGRESS — OHB2-REMOVE-CHAT-FORWARDING-R01-R02-REMEDIATION (2026-11-27)
 
 ## Goal

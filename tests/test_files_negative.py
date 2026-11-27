@@ -1,6 +1,6 @@
-"""TASK 04B-08: اختبارات المسارات السلبية لسلوك الملفات/التصدير (بدون حدّ حجم مصطنع).
+"""TASK 04B-08: اختبارات المسارات السلبية لسلوك الملفات (بدون حدّ حجم مصطنع).
 
-بنغطّي: قيم قايمة ملفات غريبة، فهارس ملفات غير صالحة، محتوى فاضي، فشل التصدير،
+بنغطّي: قيم قايمة ملفات غريبة، فهارس ملفات غير صالحة، محتوى فاضي،
 وقيم إرجاع غير متوقعة — مع رسائل خطأ آمنة من غير تسريب أسرار أو أجسام خام.
 """
 import asyncio
@@ -65,78 +65,14 @@ def test_read_file_malformed_returns_empty_string():
     assert asyncio.run(make_client(handler).read_file("c1", "main.py")) == ""
 
 
-def test_export_failure_raises_safe_error_no_body_leak():
-    def handler(request):
-        return httpx.Response(500, content=b"internal stack trace secret")
-
-    with pytest.raises(ApiError) as exc:
-        asyncio.run(make_client(handler).export_conversation("c1"))
-    assert exc.value.status_code == 500
-    assert "stack trace" not in str(exc.value)
-    assert "secret" not in str(exc.value)
-
-
-def test_export_under_limit_is_returned_intact():
-    # OHB2-09-03: التنزيل بقى محدود، لكن اللي داخل الحد بيتسلّم كامل (مفيش قص صامت).
-    big = b"PK\x03\x04" + b"x" * (2 * 1024 * 1024)
-
-    def handler(request):
-        return httpx.Response(200, stream=_RawStream(big))
-
-    assert asyncio.run(make_client(handler).export_conversation("c1")) == big
-
-
-def test_export_over_limit_raises_too_large():
-    from bot.errors import ResponseTooLargeError
-
-    def handler(request):
-        return httpx.Response(200, stream=_RawStream(b"y" * 4096))
-
-    with pytest.raises(ResponseTooLargeError):
-        asyncio.run(make_client(handler).export_conversation("c1", max_bytes=1024))
-
-
-def test_export_rejects_unexpected_content_encoding():
-    def handler(request):
-        return httpx.Response(
-            200, headers={"content-encoding": "gzip"}, stream=_RawStream(b"x")
-        )
-
-    with pytest.raises(ApiError) as exc:
-        asyncio.run(make_client(handler).export_conversation("c1"))
-    assert "gzip" in str(exc.value)
-
-
-def test_export_declared_length_over_limit_rejected_before_read():
-    def handler(request):
-        return httpx.Response(
-            200, headers={"content-length": str(10 * 1024 * 1024)}, stream=_RawStream(b"tiny")
-        )
-
-    from bot.errors import ResponseTooLargeError
-
-    with pytest.raises(ResponseTooLargeError):
-        asyncio.run(make_client(handler).export_conversation("c1", max_bytes=1024))
-
-
-def test_export_negative_limit_rejected():
-    with pytest.raises(ValueError):
-        asyncio.run(
-            make_client(lambda r: httpx.Response(200, stream=_RawStream(b"x"))).export_conversation(
-                "c1", max_bytes=-1
-            )
-        )
-
-
 # ----------------------------------------------------------------- handler layer
 
 
 class FailingFileClient(DetailClient):
-    def __init__(self, conv, files_error=None, read_error=None, export_error=None):
+    def __init__(self, conv, files_error=None, read_error=None):
         super().__init__(conv)
         self._files_error = files_error
         self._read_error = read_error
-        self._export_error = export_error
 
     async def list_files(self, conversation_id, path=""):
         if self._files_error:
@@ -147,11 +83,6 @@ class FailingFileClient(DetailClient):
         if self._read_error:
             raise self._read_error
         return await super().read_file(conversation_id, file_path)
-
-    async def export_conversation(self, conversation_id):
-        if self._export_error:
-            raise self._export_error
-        return await super().export_conversation(conversation_id)
 
 
 def test_list_files_empty_shows_message(tmp_path):
@@ -205,31 +136,10 @@ def test_show_file_api_error_is_safe(tmp_path):
     assert update.callback_query.edits  # رسالة خطأ ظهرت
 
 
-def test_export_api_error_is_safe_no_document(tmp_path):
-    client = FailingFileClient({"id": "c1"}, export_error=ApiError("خدمة مش متاحة", 503))
-    ctx = _ctx_with(tmp_path, client)
-    update = _cb_update(1, "export:c1")
-    asyncio.run(h.export_conversation(update, ctx))
-    assert ctx.bot.documents == []
-    assert update.callback_query.edits
-
-
-def test_export_too_large_is_safe_no_document(tmp_path):
-    # OHB2-09-03: تصدير عدّى الحد ⇒ مفيش مستند، ورسالة آمنة (مفيش تفاصيل خام).
-    from bot.errors import ResponseTooLargeError
-
-    client = FailingFileClient({"id": "c1"}, export_error=ResponseTooLargeError())
-    ctx = _ctx_with(tmp_path, client)
-    update = _cb_update(1, "export:c1")
-    asyncio.run(h.export_conversation(update, ctx))
-    assert ctx.bot.documents == []
-    assert update.callback_query.edits
-
-
 def test_read_file_text_bounded_rejects_unexpected_content_encoding():
     """M8 (BATCH-C): مسار القراءة المحدودة للملفات (read_file_text_bounded) لازم يرفض
     content-encoding غير `identity` (السيرفر تجاهل طلبنا) بأمان بدل ما يفكّ ضغط على مسار
-    غير محدود. قبل كده كان الاختبار ده على مسار التصدير بس، مش مسار الملفات الأساسي."""
+    غير محدود."""
     def handler(request):
         return httpx.Response(
             200, headers={"content-encoding": "gzip"}, stream=_RawStream(b'"x"')

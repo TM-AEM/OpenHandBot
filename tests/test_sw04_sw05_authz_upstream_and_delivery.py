@@ -180,7 +180,6 @@ _CALLERS = [
     ("watch", h.watch_conversation, "watch:A"),
     ("delete_prompt", h.delete_conversation_prompt, "delete:A"),
     ("delete_confirm", h.delete_conversation_confirm, "deleteok:A"),
-    ("export", h.export_conversation, "export:A"),
     ("reply_prompt", h.reply_prompt, "reply:A"),
 ]
 
@@ -219,22 +218,6 @@ def test_identity_upstream_does_not_permit_reply_prompt(tmp_path):
     ctx.bot = RecBot()
     asyncio.run(h.reply_prompt(_t55_cb_update(CQ("reply:A")), ctx))
     assert ctx.bot_data["db"].get_awaiting(1) == (None, None)
-
-
-def test_identity_upstream_does_not_permit_export_download(tmp_path):
-    """فشل upstream ⇒ مفيش مستند تصدير ومفيش نداء تنزيل."""
-    calls = {"export": 0}
-
-    class ExportGuardClient(IdentityUpstreamClient):
-        async def export_conversation(self, cid):
-            calls["export"] += 1
-            return (b"zip", "x.zip")
-
-    ctx = make_context(1, tmp_path, client=ExportGuardClient(CONV55))
-    ctx.bot = RecBot()
-    asyncio.run(h.export_conversation(_t55_cb_update(CQ("export:A")), ctx))
-    assert calls["export"] == 0
-    assert ctx.bot.documents == []
 
 
 def test_list_files_identity_upstream_not_shown_as_unauthorized(tmp_path):

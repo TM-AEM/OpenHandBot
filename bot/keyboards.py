@@ -36,7 +36,6 @@ MORE = "المزيد"
 STATUS = "الحالة"
 FILES = "الملفات"
 COST = "التكلفة"
-EXPORT = "تصدير"
 WATCHES = "متابعاتي"
 DELETE = "🗑 حذف الشات"
 DELETE_CONFIRM = "🗑 أكّد الحذف"
@@ -131,7 +130,7 @@ def conversation_actions(
     mini_app_url: str = "",
     files_cb: str | None = None,
 ) -> InlineKeyboardMarkup:
-    # الميزات المؤجّلة (القرار 4): الملفات/التكلفة/التصدير مخفية، وزر المتابعة اليدوية
+    # الميزات المؤجّلة (القرار 4): الملفات/التكلفة مخفية، وزر المتابعة اليدوية
     # (تابع/إلغاء المتابعة) مخفي مع «متابعاتي». الأزرار الأساسية (رد/تحديث/رجوع) تفضل ظاهرة.
     toggle = (
         _btn("إلغاء المتابعة", callback_data=f"unwatch:{conversation_id}")
@@ -167,11 +166,7 @@ def conversation_actions(
         rows.append([_btn(STATUS, callback_data=f"status:{conversation_id}"), *extra])
     else:
         rows.append([_btn(STATUS, callback_data=f"status:{conversation_id}")])
-    if not features.is_hidden("export") and not features.is_hidden("followups"):
-        rows.append([_btn(EXPORT, callback_data=f"export:{conversation_id}"), toggle])
-    elif not features.is_hidden("export"):
-        rows.append([_btn(EXPORT, callback_data=f"export:{conversation_id}")])
-    elif not features.is_hidden("followups"):
+    if not features.is_hidden("followups"):
         rows.append([toggle])
     rows.append([_btn(BACK, callback_data="list:0")])
     # OHB2-C7: زر حذف الشات (محلي فقط) — منفصل في صف لوحده عشان مايتضغطش بالغلط،

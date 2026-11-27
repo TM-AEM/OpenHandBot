@@ -39,7 +39,7 @@ DOWNLOAD_CONTENT_TYPE = "application/octet-stream"
 # امتداد بديل لو اسم العرض مفيهوش امتداد صالح.
 DEFAULT_DOWNLOAD_NAME = "attachment"
 
-# محارف ASCII آمنة لاسم ملف هيدر `Content-Disposition` (نفس مجموعة التصدير):
+# محارف ASCII آمنة لاسم ملف هيدر `Content-Disposition` (نفس مجموعة اسم الملف الآمن):
 # بنمنع CR/LF/اقتباس/محارف تحكّم ⇒ مفيش response-header injection.
 _HEADER_SAFE_NAME = frozenset(
     ch for ch in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."

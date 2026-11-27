@@ -16,7 +16,7 @@ import math
 import time
 from datetime import datetime, timezone
 
-from ..errors import ApiError, ResponseTooLargeError
+from ..errors import ApiError
 from ..messages import get_status, pr_url, state_label, task_state, task_state_label, truncate
 from ..openhands_client import collect_conversations
 from .. import features
@@ -344,27 +344,6 @@ def _cost_dto(conv: dict) -> dict:
         "completion_tokens": _as_int(usage.get("completion_tokens")),
         "total_tokens": _as_int(usage.get("total_tokens")),
     }
-
-
-# OHB2-PHASE1B: تصدير الشات من الـ Mini App بنفس صيغة البوت (zip من OpenHands) ونفس
-# الحدود. اسم الملف بيتولّد من معرّف **متفوَّض عليه** (بعد التحقق)، وبيتنقّى لمجموعة
-# محارف آمنة عشان مايتحوّلش لقناة حقن في الهيدر (CR/LF) أو مسار.
-EXPORT_CONTENT_TYPE = "application/zip"
-_EXPORT_NAME_SAFE = frozenset(
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
-)
-
-
-def export_filename(conversation_id: str) -> str:
-    """اسم ملف تنزيل آمن (`conversation-<id>.zip`).
-
-    المعرّف لازم يكون **صالح** (حروف/أرقام/`-`/`_` بطول محدود) — نتأكد تاني هنا
-    (دفاع بعمق) وبعدين ننقّي أي محرف تاني. النتيجة قاصر على محارف آمنة ⇒ مفيش CR/LF
-    ولا اقتباس ولا مسار، فمفيش response-header injection ولا اجتياز مسار.
-    """
-    cid = conversation_id if is_valid_conversation_id(conversation_id) else ""
-    safe = "".join(ch for ch in cid if ch in _EXPORT_NAME_SAFE)
-    return f"conversation-{safe}.zip" if safe else "conversation.zip"
 
 
 class MiniAppService:
@@ -721,43 +700,6 @@ class MiniAppService:
         text, cut = truncate(reply, MAX_FULL_REPLY_CHARS)
         return {"conversation_id": cid, "reply": text, "reply_truncated": cut}
 
-    async def export_conversation(self, conversation_id: str):
-        """OHB2-PHASE1B: تصدير الشات (zip) للمستخدم المصرّح له — نفس صيغة البوت.
-
-        بترجّع `(data, filename)` أو بترمي `CodedApiError` منظّم. الترتيب المهم:
-
-        1. **التفويض قبل أي تنزيل** (ملكية الشات من `/users/me` + `created_by_user_id`،
-           فشل مغلق) — مفيش ثقة في أي هوية من العميل، والمستخدم جاي من الجلسة.
-        2. **فحص شاهد الحذف المحلي** بعد التفويض وقبل التنزيل: شات محذوف/مُعلَّم لا
-           يُصدَّر ولا يُحيا من بيانات محلية قديمة (نفس حماية الحذف البعيد).
-        3. تنزيل **محدود** بنفس `OpenHandsClient.export_conversation` (سقف صلب
-           `MAX_EXPORT_BYTES` عبر `_read_capped`، ومفيش تجميع غير محدود).
-        4. فشل التنزيل/عدّى الحد ⇒ خطأ منظّم، **مفيش** تصدير «ناجح» كاذب.
-        """
-        cid = _require_id(conversation_id)
-        client = self._require_client()
-        await self._authorize_conversation(cid)
-        # شاهد الحذف المحلي (لو فيه قاعدة مربوطة): شات محذوف/مُعلَّم لا يُصدَّر ولا يُحيا
-        # من بيانات محلية قديمة. من غير قاعدة (وضع مستقل) مفيش شواهد محلية نحترمها —
-        # نفس سلوك `_watched_ids`. أي فشل قراءة ⇒ فشل مغلق (مفيش تصدير).
-        if self._db is not None:
-            try:
-                if self._db.is_deleted(cid):
-                    # نفس رسالة «مش موجود» عشان ما نسيبش استنتاج وجود شات متحذف.
-                    raise CodedApiError("not_found", "الشات مش موجود.", 404)
-            except CodedApiError:
-                raise
-            except Exception:  # noqa: BLE001 — قاعدة غير متاحة ⇒ فشل مغلق
-                log.warning("تعذّر قراءة شاهد الحذف؛ بنرفض التصدير (فشل مغلق).")
-                raise ApiError("قاعدة البيانات مش متاحة دلوقتي.", 503)
-        try:
-            data = await client.export_conversation(cid)
-        except ResponseTooLargeError:
-            raise CodedApiError(
-                "too_large", "التصدير كبير أوي للتنزيل الآمن. جرّب شات أصغر.", 413
-            )
-        return data, export_filename(cid)
-
     async def download_attachment(
         self, conversation_id: str, item_id: str, telegram_id: int
     ) -> AttachmentDownload:
@@ -1010,7 +952,7 @@ class MiniAppService:
 
         التحقق من الملكية/المسار/الـ allowlist كله جوّه `FileService` — الـ route
         ما بيكرّرش أي منطق تفويض. بنمرّر كاش الهوية بتاع الخدمة عشان كل العمليات
-        (تفاصيل/تكلفة/ملفات/تصدير) تشارك نداء `/users/me` واحد.
+        (تفاصيل/تكلفة/ملفات) تشارك نداء `/users/me` واحد.
         """
         client = self._require_client()
         if self._identity is None:
@@ -1383,7 +1325,7 @@ class MiniAppService:
         `unwatch_conversation` (اللي مابيفحصش الملكية برضه). الحماية المطلوبة موجودة:
         جلسة المالك + origin/CSRF (state_changing) + معرّف صالح، والإزالة محصورة في
         قايمة المالك. عشان كده unwatch **مستثنى** من فحص الملكية عن قصد، بعكس المسارات
-        اللي بترجّع بيانات (تفاصيل/حالة/تكلفة/ملفات/تصدير/متابعة-إضافة).
+        اللي بترجّع بيانات (تفاصيل/حالة/تكلفة/ملفات/متابعة-إضافة).
         """
         cid = _require_id(conversation_id)
         if features.is_hidden("followups"):

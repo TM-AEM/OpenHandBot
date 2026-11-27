@@ -146,8 +146,6 @@
   if (!COST) { throw new Error("RecovoCost مش محمّل (cost.js)"); }
   var COPY = window.RecovoCopy;
   if (!COPY) { throw new Error("RecovoCopy مش محمّل (copy.js)"); }
-  var EXPORT = window.RecovoExport;
-  if (!EXPORT) { throw new Error("RecovoExport مش محمّل (export.js)"); }
   // OHB2-MT-2: منطق تنزيل المرفقات المحلية — مشترك ومُختبر في attachments.js.
   var ATTACH = window.RecovoAttachments;
   if (!ATTACH) { throw new Error("RecovoAttachments مش محمّل (attachments.js)"); }
@@ -1028,41 +1026,6 @@
           trackOperation(opBox, "prompt", ref, id, null, resend, promptOps);
         });
       });
-
-      // OHB2-PHASE1B: زر تصدير الشات (zip) — تنزيل مباشر عبر رابط مصادَق. بنقرأ اسم
-      // الملف الآمن من هيدر `Content-Disposition`، ولو فشل الطلب بنعرض رسالة واضحة
-      // (مفيش تنزيل وهمي). التنزيل بيحصل على مسار المصادقة/الكوكي نفسه (same-origin).
-      var exportBtn = el("button", "btn ghost small", "⬇️ تصدير الشات");
-      exportBtn.addEventListener("click", function () {
-        if (exportBtn.disabled) { return; }
-        exportBtn.disabled = true;
-        var url = API + "/conversations/" + encodeURIComponent(id) + "/export";
-        fetch(url, { method: "GET", credentials: "same-origin", cache: "no-store" })
-          .then(function (res) {
-            if (!res.ok) {
-              return res.json().catch(function () { return {}; }).then(function (data) {
-                exportBtn.disabled = false;
-                var code = data && data.error;
-                toast(EXPORT.errorLabel(code, friendlyMessage(res.status, data)));
-              });
-            }
-            var name = EXPORT.filenameFromDisposition(res.headers.get("content-disposition"));
-            return res.blob().then(function (blob) {
-              var objUrl = URL.createObjectURL(blob);
-              var a = el("a", "link", "");
-              a.href = objUrl;
-              a.download = name;
-              document.body.appendChild(a);
-              a.click();
-              if (a.remove) { a.remove(); }
-              setTimeout(function () { URL.revokeObjectURL(objUrl); }, 0);
-              exportBtn.disabled = false;
-              toast("تم تنزيل التصدير ✅");
-            });
-          })
-          .catch(function () { exportBtn.disabled = false; toast("مش قادر أوصل للسيرفر."); });
-      });
-      box.appendChild(exportBtn);
 
       var watchBtn = el("button", "btn ghost small", d.watched ? "إلغاء المتابعة" : "متابعة");
       watchBtn.addEventListener("click", function () {

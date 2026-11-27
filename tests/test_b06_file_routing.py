@@ -1,7 +1,7 @@
 """OHB2-09-06 (B-06-04): مسار ملفات/تفاصيل البوت لازم يعدّي من `FileService`.
 
 المشكلة اللي بنغطّيها: معالجات البوت (`list_files`/`show_file`/`show_status`/`show_cost`/
-`watch_conversation`/`open_conversation`/`copy_reply`/`full_reply`/`export_conversation`)
+`watch_conversation`/`open_conversation`/`copy_reply`/`full_reply`)
 كانت بتستخدم عميل خام (`client.list_files`/`client.read_file` غير المحدود) وتفويض مكرّر.
 الاختبارات دي بتثبت إن المسار بقى يعدّي من **نفس** عقد `FileService`:
 
@@ -225,7 +225,7 @@ async def _dispatch(data, ctx):
         await h.list_files(_cb_update(1, data), ctx)
 
 
-# ---------------------------------------------------------------- open/copy/full/export
+# ---------------------------------------------------------------- open/copy/full
 def test_open_other_owner_denied_no_exchange(tmp_path):
     client = FileFlowClient(conv_owner="someone-else")
     ctx = _ctx_with(tmp_path, client)
@@ -249,15 +249,6 @@ def test_full_other_owner_denied(tmp_path):
     update = _cb_update(1, "full:c1")
     asyncio.run(h.full_reply(update, ctx))
     assert any("مش مسموح" in m for m in ctx.bot.sent)
-
-
-def test_export_other_owner_denied_no_download(tmp_path):
-    client = FileFlowClient(conv_owner="someone-else")
-    ctx = _ctx_with(tmp_path, client)
-    update = _cb_update(1, "export:c1")
-    asyncio.run(h.export_conversation(update, ctx))
-    assert ctx.bot.documents == []
-    assert "مش مسموح" in update.callback_query.edits[-1]
 
 
 # ---------------------------------------------------------------- invalid id

@@ -96,26 +96,6 @@ MUTATIONS: list[dict] = [
                    "tests/test_messages.py::test_format_cost_no_currency_and_rejects_non_finite"],
     },
     {
-        "id": "M6",
-        "target": "Remove export authorization",
-        "file": "bot/handlers.py",
-        "old": (
-            "    conv, message = await _authorized_conversation(client, context, conversation_id)\n"
-            "    if conv is None:\n"
-            '        log.info("export: رفض تفويض الشات (ref=%s)", conversation_id)\n'
-            "        await _safe_edit(q, message)\n"
-            "        return"
-        ),
-        "new": (
-            "    conv, message = await _authorized_conversation(client, context, conversation_id)\n"
-            "    # M6 mutation: export authorization bypassed"
-        ),
-        "detect": ["pytest",
-                   "tests/test_a2_export_auth.py::test_export_other_owner_cannot_export",
-                   "tests/test_a2_export_auth.py::test_export_null_owner_cannot_export",
-                   "tests/test_a2_export_auth.py::test_export_authorization_precedes_download"],
-    },
-    {
         "id": "M7-A",
         "target": "Remove only the sequence guard",
         "file": "bot/web/static/app.js",

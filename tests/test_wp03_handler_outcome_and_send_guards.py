@@ -26,7 +26,7 @@ from telegram.error import BadRequest, TimedOut
 import bot.handlers as h
 from bot import deletion
 from bot import update_outcomes as uo
-from bot.errors import ApiError, OperationalApiFailure, ResponseTooLargeError
+from bot.errors import ApiError, OperationalApiFailure
 from bot.sender import TextDocumentTooLargeError
 
 from tests.test_handlers import (
@@ -65,20 +65,6 @@ class _AuthClient:
 
     async def get_current_user(self):
         return {"id": self.OWNER_UUID}
-
-
-class _ExportClient(ExchangeClient):
-    """عميل يدعم التصدير + فشل تسليم مبرمَج."""
-
-    def __init__(self, conv=CONV55, *, export_error=None, blob=b"zip", exchange_error=None):
-        super().__init__(conv, exchange_error=exchange_error)
-        self._export_error = export_error
-        self._blob = blob
-
-    async def export_conversation(self, cid):
-        if self._export_error is not None:
-            raise self._export_error
-        return self._blob
 
 
 class FailSendBot(FakeBotWithDocs):
@@ -181,52 +167,6 @@ def test_display_site_expected_rejection_is_ignored(name, handler, data, code, t
     )
     assert raised is None, f"{name}"
     assert ctx.bot_data["db"].update_outcome(8101) == uo.EXPLICITLY_IGNORED, f"{name}"
-
-
-# ============================================================================
-# 3) `export_conversation` — فشل التفويض/التصدير/التسليم
-# ============================================================================
-def test_export_auth_operational_failure_is_transient(tmp_path):
-    _update, ctx, raised = _run_cb(
-        h.export_conversation, tmp_path, _AuthClient(open_error=ApiError("down", 503)),
-        "export:A", 8200,
-    )
-    assert raised is None
-    assert ctx.bot_data["db"].update_outcome(8200) == uo.FAILED_TRANSIENT
-
-
-def test_export_auth_expected_rejection_is_ignored(tmp_path):
-    _update, ctx, _r = _run_cb(
-        h.export_conversation, tmp_path, _AuthClient(open_error=ApiError("gone", 404)),
-        "export:A", 8201,
-    )
-    assert ctx.bot_data["db"].update_outcome(8201) == uo.EXPLICITLY_IGNORED
-
-
-def test_export_operational_api_failure_is_transient_not_ambiguous(tmp_path):
-    _update, ctx, _r = _run_cb(
-        h.export_conversation, tmp_path, _ExportClient(export_error=ApiError("down", 503)),
-        "export:A", 8202,
-    )
-    # كان `mark_ambiguous_external`؛ أدق دلوقتي: فشل تشغيلي ⇒ failed_transient.
-    assert ctx.bot_data["db"].update_outcome(8202) == uo.FAILED_TRANSIENT
-
-
-def test_export_expected_api_rejection_is_ignored(tmp_path):
-    _update, ctx, _r = _run_cb(
-        h.export_conversation, tmp_path, _ExportClient(export_error=ApiError("gone", 404)),
-        "export:A", 8203,
-    )
-    assert ctx.bot_data["db"].update_outcome(8203) == uo.EXPLICITLY_IGNORED
-
-
-def test_export_document_delivery_failure_is_transient(tmp_path):
-    bot = FailSendBot(fail_document=TimedOut())
-    _update, ctx, _r = _run_cb(
-        h.export_conversation, tmp_path, _ExportClient(), "export:A", 8204, bot=bot
-    )
-    assert ctx.bot_data["db"].update_outcome(8204) == uo.FAILED_TRANSIENT
-    assert ctx.bot_data["db"].is_update_acknowledgment_eligible(8204) is False
 
 
 # ============================================================================
@@ -464,21 +404,6 @@ def test_send_reply_txt_oversized_records_permanent(tmp_path, monkeypatch):
     db = ctx.bot_data["db"]
     assert db.update_outcome(9100) == uo.FAILED_PERMANENT
     assert db.is_update_acknowledgment_eligible(9100) is False
-
-
-def test_export_response_too_large_records_ignored(tmp_path):
-    """`ResponseTooLargeError` (رفض 4xx متوقّع) ⇒ `explicitly_ignored` مؤهّل (مش غموض).
-
-    التصدير المحدود اللي عدّى السقف رفض نهائي معروف ⇒ مفيش إعادة محاولة، والتحديث مؤهّل
-    للإقرار. الاختبار يثبّت إن المسار بيسجّل نتيجة **صريحة** (مش `None` ومش `partial_or_unknown`).
-    """
-    _update, ctx, _raised = _run_cb(
-        h.export_conversation, tmp_path,
-        _ExportClient(export_error=ResponseTooLargeError()), "export:A", 9101,
-    )
-    db = ctx.bot_data["db"]
-    assert db.update_outcome(9101) == uo.EXPLICITLY_IGNORED
-    assert db.is_update_acknowledgment_eligible(9101) is True
 
 
 def test_delete_confirm_remote_failed_records_ambiguous(tmp_path, monkeypatch):

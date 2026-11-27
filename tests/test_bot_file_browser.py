@@ -77,11 +77,6 @@ class FakeClient:
         self.calls.append(("read_file_text_bounded", conversation_id, file_path))
         return self.content_map.get(file_path, self.content)
 
-    async def export_conversation(self, conversation_id):
-        self.calls.append(("export_conversation", conversation_id))
-        return b"PK\x03\x04zip"
-
-
 def _ctx(tmp_path, client):
     ctx = SimpleNamespace()
     ctx.bot_data = {
@@ -473,15 +468,6 @@ def test_unicode_and_space_paths(tmp_path):
         asyncio.run(h.browse_dir(u, ctx))
         assert "📁" in u.callback_query.edits[-1]
         assert f"fbf:{nav}:{index}:0" in _callbacks(u.callback_query.edits_markup[-1])
-
-
-def test_conversation_zip_export_still_works(tmp_path):
-    client = FakeClient([])
-    ctx = _ctx(tmp_path, client)
-    u = _cb("export:c1")
-    asyncio.run(h.export_conversation(u, ctx))
-    assert len(ctx.bot.documents) == 1
-    assert ctx.bot.documents[0].filename.endswith(".zip")
 
 
 def test_legacy_show_file_binary_message(tmp_path):

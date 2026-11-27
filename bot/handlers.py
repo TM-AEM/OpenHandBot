@@ -47,7 +47,7 @@ from .review.report import (
     ReviewCallbackError,
     parse_review_callback,
 )
-from .errors import ApiError, OperationalApiFailure, ResponseTooLargeError, error_text
+from .errors import ApiError, OperationalApiFailure, error_text
 from .file_cache import FileCache
 from .openhands_client import collect_conversations
 from .files import (
@@ -339,7 +339,7 @@ async def _authorized_conversation(
     القديم)، ولسه **مفيش أي جلب بيانات محمية** غير الميتاداتا المتفوَّض عليها.
 
     F-1: بنمرّر قاعدة بيانات البوت (`bot_data["db"]`) عشان فرض شاهد الحذف يحصل **قبل**
-    أي نداء بعيد — أي مسار بيمرّ من هنا (فتح/حالة/تكلفة/رد/تصدير/ملفات/متابعة/حذف)
+    أي نداء بعيد — أي مسار بيمرّ من هنا (فتح/حالة/تكلفة/رد/ملفات/متابعة/حذف)
     يرفض الشات المتشاهد برسالة «مش موجود» من غير أي كشف. `allow_deleted=True` استثناء
     مقصود لعمليتي watch/حذف بس (زي طبقة الـ Mini App).
     """
@@ -1293,12 +1293,6 @@ async def _open_conversation_view(
     db = context.bot_data["db"]
     watched = db.is_watched(conversation_id)
     text, reply_cut = format_conversation_view(conv, user_text, reply)
-    if reply is not None:
-        text += (
-            "\n\n📋 زر «عرض للنسخ اليدوي» بيبعتلك الرد جوه code block عشان تنسخه يدويًا "
-            "(بوتات تيليجرام ما بتكتبش في الحافظة تلقائيًا) — أو انسخ بضغطة من الـ Mini App "
-            "أو نزّله كـ «ملف النص» (.txt)."
-        )
     markup = kb.conversation_actions(
         conversation_id,
         watched,
@@ -1935,61 +1929,6 @@ async def show_cost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     mark_explicitly_ignored(update, context)
 
 
-async def export_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    q = update.callback_query
-    await _safe_answer(q)
-    if not _allowed(update, context.bot_data["config"]):
-        # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
-        _authorization_ignored(update, context)
-        return
-    conversation_id = q.data.split(":", 1)[1]
-    client = context.bot_data["client"]
-    # OHB2-09-A2-01: تفويض على مستوى الشات **قبل أي تنزيل** — نفس عقد FileService
-    # (المعرّف + هوية المالك من /users/me + `created_by_user_id`، وفشل مغلق). بنستخدم
-    # نفس خدمة الملفات المشتركة عشان مايبقاش فيه نسخة تانية من منطق التفويض.
-    # OHB2-WP-03 (DEF-004): المسار المفصّل عشان الفشل التشغيلي (5xx/429/بلا كود) ينتشر
-    # بدل ما يبلعه التجاهل.
-    conv, status, message, auth_exc = await _authorized_conversation_status(
-        client, context, conversation_id
-    )
-    if conv is None:
-        log.info("export: رفض تفويض الشات (ref=%s)", conversation_id)
-        await _safe_edit(q, message)
-        if status is FileStatus.UPSTREAM_ERROR and not _is_expected_upstream_rejection(auth_exc):
-            mark_operational_failure(update, context, "export_upstream_failure")
-            return
-        mark_explicitly_ignored(update, context)
-        return
-    try:
-        data = await client.export_conversation(conversation_id)
-    except ResponseTooLargeError:
-        # OHB2-09-06: التصدير محدود؛ عدّى الحد ⇒ رسالة صريحة (مش خطأ عام)، مفيش مستند.
-        await _safe_edit(q, "التصدير كبير أوي للتنزيل الآمن. جرّب شات أصغر.")
-        mark_explicitly_ignored(update, context)
-        return
-    except ApiError as exc:
-        # OHB2-WP-03 (DEF-004): فشل التصدير التشغيلي (5xx/429/بلا كود) ⇒ `failed_transient`
-        # غير مؤهّل (كان `partial_or_unknown`؛ أدق دلوقتي)، والرفض 4xx المتوقّع ⇒ تجاهل صريح.
-        await _safe_edit(q, error_text(exc))
-        if outbox.is_permanent(exc):
-            mark_explicitly_ignored(update, context)
-        else:
-            mark_operational_failure(update, context, "export_upstream_failure")
-        return
-    buffer = io.BytesIO(data)
-    try:
-        await context.bot.send_document(
-            chat_id=q.message.chat_id,
-            document=InputFile(buffer, filename=f"conversation-{conversation_id[:8]}.zip"),
-        )
-    except (TelegramError, asyncio.TimeoutError) as exc:
-        # OHB2-WP-03 (DEF-004/NEW-DEF-04): فشل تسليم المستند ⇒ failed_transient (مش نجاح).
-        log.warning("تعذّر إرسال ملف التصدير (%s)", type(exc).__name__)
-        mark_display_failed(update, context, "export_display_failed")
-        return
-    mark_explicitly_ignored(update, context)
-
-
 async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await _safe_answer(q)
@@ -2446,7 +2385,7 @@ async def reply_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     conversation_id = q.data.split(":", 1)[1]
     db = context.bot_data["db"]
     # OHB2-09-A2-02/B2-06-04: تفويض ملكية الشات **قبل** أي توجيه لبرومت — نفس عقد
-    # باقي مسارات الشات (ملفات/حالة/تفاصيل/تصدير). كده مايتفتحش توجيه برومت لشات
+    # باقي مسارات الشات (ملفات/حالة/تفاصيل). كده مايتفتحش توجيه برومت لشات
     # مش مملوك (فشل مغلق عند غياب/عدم تطابق المالك).
     conv, status, message, auth_exc = await _authorized_conversation_status(
         context.bot_data["client"], context, conversation_id

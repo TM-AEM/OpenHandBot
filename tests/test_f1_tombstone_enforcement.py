@@ -1,6 +1,6 @@
 """F-1 regression: فرض شاهد الحذف (tombstone) على **كل** مسارات الوصول للشات.
 
-العيب F-1 (من التدقيق الشامل): القوائم والتصدير كانوا بيحترموا `is_deleted`، لكن
+العيب F-1 (من التدقيق الشامل): القوائم ومسارات القراءة القديمة كانوا بيحترموا `is_deleted`، لكن
 مسارات القراءة/التفاعل التانية (`detail`/`status`/`cost`/`reply`/`files`/`file` في
 الـ Mini App، و`open_conversation` وغيره في البوت) كانوا بيوصلوا لبيانات OpenHands
 رغم وجود شاهد حذف محلي. الاختبارات دي بتثبت الفرض الموحّد:
@@ -48,7 +48,6 @@ ORIGIN = "https://app.test"
 SECRET_TITLE = "TOP_SECRET_TITLE"
 SECRET_REPLY = "TOP_SECRET_REPLY"
 SECRET_FILE = "TOP_SECRET_FILE"
-SECRET_ZIP = b"PK\x03\x04TOP_SECRET_ZIP"
 SAFE_BOT_MESSAGE = "الشات مش موجود."
 SAFE_BOT_FILE_MESSAGE = "الشات أو الملف مش موجود."
 
@@ -73,7 +72,6 @@ class MockAPI:
         self.events_calls = 0
         self.files_calls = 0
         self.file_calls = 0
-        self.export_calls = 0
         self.delete_calls = 0
 
     @property
@@ -84,7 +82,6 @@ class MockAPI:
             + self.events_calls
             + self.files_calls
             + self.file_calls
-            + self.export_calls
         )
 
     def handler(self, request: httpx.Request) -> httpx.Response:
@@ -130,9 +127,6 @@ class MockAPI:
         if path.endswith("/file"):
             self.file_calls += 1
             return httpx.Response(200, stream=_Body(json.dumps(SECRET_FILE).encode()))
-        if path.endswith("/download"):
-            self.export_calls += 1
-            return httpx.Response(200, stream=_Body(SECRET_ZIP))
         if method == "DELETE" and "/app-conversations/" in path:
             self.delete_calls += 1
             return httpx.Response(200, json={"success": True})
@@ -173,7 +167,6 @@ READ_ROUTES = [
     ("reply", lambda cid: f"/api/v1/conversations/{cid}/reply", {}),
     ("files", lambda cid: f"/api/v1/conversations/{cid}/files", {}),
     ("file", lambda cid: f"/api/v1/conversations/{cid}/file", {"path": "a/b/main.py"}),
-    ("export", lambda cid: f"/api/v1/conversations/{cid}/export", {}),
 ]
 ROUTE_IDS = [r[0] for r in READ_ROUTES]
 
@@ -280,18 +273,6 @@ def test_miniapp_tombstone_check_fails_closed_on_db_error(tmp_path, monkeypatch)
     assert api.protected_calls == 0
 
 
-def test_miniapp_export_remains_protected(tmp_path):
-    """التصدير لسه محمي (سلوك قائم ما اترجعش للخلف)."""
-    api = MockAPI()
-    db = Database(str(tmp_path / "export.sqlite3"))
-    db.delete_conversation(CID, outbox.now_iso(), remote_confirmed=True)
-    tc = make_client(api, db=db)
-    login(tc)
-    r = tc.get(f"/api/v1/conversations/{CID}/export")
-    assert r.status_code == 404 and r.json()["error"] == "not_found"
-    assert api.export_calls == 0
-
-
 # ---------------------------------------- Mini App: lifecycle ops still allowed
 def test_miniapp_watch_on_tombstoned_reengages(tmp_path):
     """زر «متابعة» (إعادة تفاعل صريح) لسه شغّال على شات متشاهد ويشيل الشاهد."""
@@ -353,10 +334,6 @@ class CountingClient:
         self.calls.append(("read_file_text_bounded", cid, p))
         return SECRET_FILE
 
-    async def export_conversation(self, cid):
-        self.calls.append(("export_conversation", cid))
-        return SECRET_ZIP
-
     async def send_message(self, cid, text):
         self.calls.append(("send_message", cid, text))
 
@@ -377,14 +354,13 @@ BOT_READ_HANDLERS = [
     ("reply", "reply:c1", "edit", SAFE_BOT_MESSAGE),
     ("copy", "copy:c1", "sent", SAFE_BOT_MESSAGE),
     ("full", "full:c1", "sent", SAFE_BOT_MESSAGE),
-    ("export", "export:c1", "edit", SAFE_BOT_MESSAGE),
     ("files", "files:c1:0:0", "edit", SAFE_BOT_FILE_MESSAGE),
     ("file", "file:c1:0:0", "edit", SAFE_BOT_FILE_MESSAGE),
 ]
 BOT_HANDLER_IDS = [x[0] for x in BOT_READ_HANDLERS]
 
-# المعالجات اللي بترد بمستند عند النجاح (تصدير/معاينة ملف): تحقّق النجاح بوجود مستند.
-BOT_DOC_HANDLERS = {"export", "file"}
+# المعالجات اللي بترد بمستند عند النجاح (معاينة ملف): تحقّق النجاح بوجود مستند.
+BOT_DOC_HANDLERS = {"file"}
 
 _HANDLER_FUNCS = {
     "open": h.open_conversation,
@@ -393,7 +369,6 @@ _HANDLER_FUNCS = {
     "reply": h.reply_prompt,
     "copy": h.copy_reply,
     "full": h.full_reply,
-    "export": h.export_conversation,
     "files": h.list_files,
     "file": h.show_file,
 }
@@ -404,7 +379,7 @@ def _bot_outputs(update, where: str, ctx) -> list[str]:
         return list(update.callback_query.edits)
     if where == "sent":
         return list(ctx.bot.sent)
-    # 'doc': مستندات مُرسَلة (تصدير/معاينة ملف) — بنرجّع عددها كنص للتحقّق من وجود رد.
+    # 'doc': مستندات مُرسَلة (معاينة ملف) — بنرجّع عددها كنص للتحقّق من وجود رد.
     return [f"doc:{len(ctx.bot.documents)}"] if ctx.bot.documents else []
 
 

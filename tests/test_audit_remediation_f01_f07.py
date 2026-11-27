@@ -3,7 +3,7 @@
 كل قسم بيغطّي finding واحد على الكود الحقيقي (بدون mocks غير ضرورية):
 - F01: القراءة المحدودة المتدفّقة لجسم طلب الـ Mini App.
 - F02: الإكمال المحلي القابل للتعافي (إشعار/متابعة) بعد نجاح العملية الخارجية.
-- F03: رفض إعادة التوجيه 3xx في مسارات التنزيل/التصدير المتدفّقة.
+- F03: رفض إعادة التوجيه 3xx في مسارات تنزيل الملفات المتدفّقة.
 - F05: رفض قيم الإعداد المنطقية غير الصالحة.
 - F06: تكامل SQLite عند الإقلاع + جاهزية صادقة.
 - F07: تحديد IP العميل بأمان خلف البروكسيات.
@@ -394,24 +394,6 @@ def test_f03_read_file_rejects_redirects(code):
         asyncio.run(client.read_file_text_bounded("c1", "f.txt"))
     assert ei.value.status_code == code
     assert seen["n"] == 1  # مفيش متابعة
-
-
-@pytest.mark.parametrize("code", [301, 302, 307, 308])
-def test_f03_export_rejects_redirects(code):
-    seen = {"n": 0}
-
-    def handler(request):
-        seen["n"] += 1
-        return httpx.Response(
-            code, headers={"location": "https://evil.test/x"},
-            stream=_ChunkedStream([b"x"]),
-        )
-
-    client = _client(handler)
-    with pytest.raises(ApiError) as ei:
-        asyncio.run(client.export_conversation("c1"))
-    assert ei.value.status_code == code
-    assert seen["n"] == 1
 
 
 def test_f03_redirect_body_not_returned_as_content():

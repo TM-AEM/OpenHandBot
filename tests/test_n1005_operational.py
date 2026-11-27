@@ -290,7 +290,6 @@ def test_exchange_and_file_bounds_are_finite():
     assert file_cache.MAX_TOTAL_CHARS > 0
     assert EXCHANGE_CACHE_MAX > 0
     assert openhands_client.MAX_FILE_RESPONSE_BYTES > 0
-    assert openhands_client.MAX_EXPORT_BYTES > 0
     limiter = SlidingWindowLimiter([Limit(max_events=2, window_seconds=60)], max_keys=3)
     for i in range(50):
         limiter.allow(f"key-{i}", now=float(i))
