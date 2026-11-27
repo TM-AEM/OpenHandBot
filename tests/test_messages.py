@@ -198,10 +198,7 @@ from bot.messages import (  # noqa: E402
     truncate,
 )
 
-FOOTER = (
-    "\n\n✉️ رسايلك الجاية هتتبعت للشات ده لحد ما تفتح/تختار شات تاني. "
-    "للإلغاء: زر إلغاء التوجيه أو /cancel."
-)
+FOOTER = ""  # إرشاد التوجيه اتشال من رسالة فتح الشات.
 
 
 def test_truncate_short_unchanged():

@@ -318,7 +318,7 @@ def test_t2_handler_rejected_batch_does_not_report_success(
 ):
     ctx = make_context(OWNER, tmp_path)
     db = ctx.bot_data["db"]
-    db.set_awaiting(OWNER, CID, "route", "chat")
+    db.set_last_accessed_conversation(OWNER, CID)
     update = make_update(OWNER, text="")
     update.update_id = 901
     update.message.document = SimpleNamespace(

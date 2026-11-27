@@ -680,17 +680,6 @@ def test_command_database_failure_has_no_success_reply(tmp_path, monkeypatch):
     db.close()
 
 
-def test_cancel_route_still_does_not_cancel_batch(tmp_path):
-    db = _db(tmp_path)
-    _batch(db)
-    ctx = _ctx(tmp_path, db)
-    update = make_update(OWNER, "/cancel")
-    update.update_id = 8209
-    asyncio.run(h.cancel_route(update, ctx))
-    assert db.get_attachment_batch("b1").status == ATTACHMENT_BATCH_PENDING
-    db.close()
-
-
 def test_cancelled_routing_is_non_blocking_for_text(tmp_path):
     db = _db(tmp_path)
     _batch(db, status=ATTACHMENT_BATCH_CANCELLED)

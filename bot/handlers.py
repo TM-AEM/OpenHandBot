@@ -944,7 +944,6 @@ HELP_TEXT = (
     "/app — فتح التطبيق المصغّر (Mini App)\n"
     "/help — هذه المساعدة\n"
     "/notifications — ضبط الإشعارات الاستباقية\n"
-    "/cancel — إلغاء التوجيه الحالي\n"
     "/attachments — حالة دفعات المرفقات\n"
     "/attachments_clear — إخلاء دفعة expired/rejected صراحةً\n"
     "/attachments_cancel — إلغاء دفعة pending واحدة (يتطلب confirm)\n"
@@ -973,8 +972,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         update.effective_user.id, _update_id(update), outbox.now_iso(),
         update_outcomes.EXPLICITLY_IGNORED,
     )
-    # /start إعادة ضبط عامة: يلغي إيقاف /cancel ويترك آخر شات محفوظًا للتوجيه الافتراضي.
-    context.bot_data["db"].resume_routing(update.effective_user.id)
+    # /start إعادة ضبط عامة: يمسح الحالة المؤقتة ويترك آخر شات محفوظًا.
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1219,7 +1217,7 @@ async def _open_conversation_view(
     *,
     q=None,
 ) -> bool:
-    """يفتح شات موجود بنفس مسار العرض/التوجيه، للكولباك أو للأمر."""
+    """يفتح شات موجود بنفس مسار العرض/الاختيار، للكولباك أو للأمر."""
     client = context.bot_data["client"]
     # OHB2-09-06: تفويض ملكية الشات أولًا (نفس عقد FileService)، بعدين نجيب آخر تبادل طازة.
     # (فتح الشات بيقرا طازة دايماً — مش من كاش copy/full.)
@@ -1246,11 +1244,11 @@ async def _open_conversation_view(
         # قبل تسجيل أي نتيجة. رفض 4xx المتوقّع (401/403/404/410) يرجّع عادي.
         if status is FileStatus.UPSTREAM_ERROR and not _is_expected_upstream_rejection(auth_exc):
             await _raise_if_operational_api_failure(auth_exc)
-        # عرض الرفض هو المحتوى المطلوب؛ فشله عابر وغير مؤهّل، وما يمسحش التوجيه/النتيجة.
+        # عرض الرفض هو المحتوى المطلوب؛ فشله عابر وغير مؤهّل، وما يمسحش الاختيار/النتيجة.
         if not displayed:
             return False
         if q is None and terminal_rejection:
-            # F-01: clearing only the setting leaves the persistent `route` row alive;
+            # F-01: clearing only the setting leaves a stale awaiting row alive;
             # the next text then goes to the unavailable conversation. Clear the
             # matching routing state and record the outcome in one transaction.
             context.bot_data["db"].clear_awaiting_and_record_outcome(
@@ -1269,7 +1267,7 @@ async def _open_conversation_view(
     try:
         user_text, reply = await client.get_last_exchange(conversation_id)
     except ApiError as exc:
-        # نفس المسار المتسامح لرسالة الخطأ: مفيش توجيه جديد ولا انهيار في الـ callback.
+        # نفس المسار المتسامح لرسالة الخطأ: مفيش اختيار جديد ولا انهيار في الـ callback.
         displayed = await _display_conversation_view(update, context, error_text(exc), q=q)
         if not displayed:
             log.warning("تعذّر عرض خطأ آخر تبادل للشات %s (فشل تسليم تيليجرام).", conversation_id)
@@ -1300,7 +1298,6 @@ async def _open_conversation_view(
             "(بوتات تيليجرام ما بتكتبش في الحافظة تلقائيًا) — أو انسخ بضغطة من الـ Mini App "
             "أو نزّله كـ «ملف النص» (.txt)."
         )
-    text += "\n\n✉️ رسايلك الجاية هتتبعت للشات ده لحد ما تفتح/تختار شات تاني. للإلغاء: زر إلغاء التوجيه أو /cancel."
     markup = kb.conversation_actions(
         conversation_id,
         watched,
@@ -1309,19 +1306,15 @@ async def _open_conversation_view(
         mini_app_url=_mini_app_url(context),
         files_cb=_files_open_cb(context, conversation_id),
     )
-    # بعد فتح الشات، رسايلك الجاية بتتوجّه له لحد ما تفتح/تختار شات تاني (مع زر إلغاء).
-    # بنفعّل التوجيه بس بعد ما العرض يظهر فعلاً، عشان فشل العرض ما يسبش توجيه مفعّل من غير
-    # ما تشوف الشات (وما نلمسش أي توجيه قائم لو الفتح فشل).
-    # OHB2-WP-07 (NEW-DEF-03 / NAV-06): تفعيل التوجيه ونتيجة التحديث الدائمة في
-    # **معاملة واحدة** — قبل كده كانوا `set_awaiting` (commit) ثم `mark_explicitly_ignored`
-    # (commit تاني)، فعطل بينهم كان يفعّل توجيه **بلا** سجل دائم لسببها.
+    # نحفظ آخر شات مفتوح/مختار بعد ما العرض يظهر فعلاً، عشان فشل العرض ما يغيّرش الهدف.
+    # لا نُنشئ حالة `route` (توجيه تلقائي خاص بالشات) بعد إزالة هذه الميزة؛ نمسح أي
+    # حالة انتظار مؤقتة ونحفظ `last_accessed` والنتيجة في معاملة واحدة.
     if await _display_conversation_view(
         update, context, text, q=q, reply_markup=markup
     ):
         db.set_awaiting_and_record_outcome(
-            update.effective_user.id, conversation_id, "route",
+            update.effective_user.id, None, None,
             _update_id(update), outbox.now_iso(), update_outcomes.EXPLICITLY_IGNORED,
-            title=conv.get("title") or "",
             last_accessed_conversation_id=conversation_id,
         )
         return True
@@ -2790,7 +2783,7 @@ async def handle_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     المدخل غير موثوق بالكامل. التسلسل (fail-closed):
     - التفويض (`_guard`) ⇒ مستخدم مالك في محادثة خاصة.
-    - محادثة صريحة مفتوحة (`route`) ⇒ بدونها نرفض (مفيش توجيه = مفيش محادثة مختارة،
+    - محادثة مفتوحة/مختارة آخر مرة ⇒ بدونها نرفض (مفيش اختيار = مفيش محادثة مختارة،
       ومفيش إنشاء شات جديد كبديل — البند 6 في R4).
     - تفويض ملكية المحادثة + شاهد الحذف (fail closed) **قبل** أي قبول دائم.
     - الرد **بعد** كتابة النية الدائمة (row-first) ⇒ فشل الرد = فشل مُسجّل (مش نجاح كاذب).
@@ -2815,9 +2808,9 @@ async def handle_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     db = context.bot_data["db"]
     update_id = _update_id(update)
 
-    # محادثة صريحة مفتوحة: مفيش توجيه ⇒ مفيش محادثة مختارة ⇒ رفض (مفيش fallback).
-    conversation_id, kind, _title, _at = db.awaiting_state(telegram_id)
-    if kind != "route" or not conversation_id:
+    # محادثة مفتوحة/مختارة آخر مرة: مفيش اختيار ⇒ رفض (مفيش fallback).
+    conversation_id = db.get_last_accessed_conversation(telegram_id)
+    if not conversation_id:
         try:
             await message.reply_text(
                 "افتح شات الأول (من القائمة) وابعت الملف جواه، عشان نعرف نبعته فين."
@@ -2995,7 +2988,7 @@ async def _handle_accompanying_text(
       العادي (فشل مغلق) — حتى لو لمحادثة أخرى (D-32). الرفض نهائي مؤهّل للإقرار.
     - **دفعة حيّة واحدة بالضبط** ⇒ نصّ **مؤهّل** (D-28) ⇒ نيّة متينة (`intent_recorded` + النصّ +
       دليل الهوية + `durable_intent_recorded`) ذرّيًّا؛ نصّ **غير مؤهّل** ⇒ `rejected_ineligible`.
-    - **أكثر من دفعة حيّة**، أو **دفعة حيّة لمحادثة أخرى**، أو **لا route**، أو **route لمحادثة
+    - **أكثر من دفعة حيّة**، أو **دفعة حيّة لمحادثة أخرى**، أو **لا اختيار**، أو **اختيار لمحادثة
       مختلفة**، أو **شاهد حذف** ⇒ **غموض ⇒ فشل مغلق**: `rejected_ineligible` (نهائي) + ردّ
       توضيحي. **مفيش** ربط بأحدث دفعة، **مفيش** استبدال محادثة، **مفيش** تحويل لبرومت عادي.
     - **دفعة `pending` منتهية** (بلا حيّة) ⇒ `rejected_ineligible` (لا إحياء/لا تحويل تلقائي).
@@ -3004,7 +2997,7 @@ async def _handle_accompanying_text(
       `rejected_ineligible` (لا سقوط لمسار البرومت/`_send_prompt`/`outbox`، ولا تحويل/إحياء
       تلقائي). غياب دليل الهوية **ليس** دليلًا على رسالة جديدة.
 
-    **محلي فقط:** لا نداء بعيد، ولا صفّ `outbox`، ولا إرسال. «إعادة التحقّق» (D-26) = هوية route
+    **محلي فقط:** لا نداء بعيد، ولا صفّ `outbox`، ولا إرسال. «إعادة التحقّق» (D-26) = هوية الاختيار
     + ملكية تيليجرام (المستخدم نفسه مالك الحالة والدفعة) + الربط بالضبط + صلاحية الدفعة + شاهد
     الحذف — كلها محليًّا.
     """
@@ -3029,7 +3022,7 @@ async def _handle_accompanying_text(
 
     if state is AttachmentRoutingState.NONE:
         # `NONE` مُتحقَّق فقط: لا دفعة ذات صلة بالمالك ⇒ البرومت العادي كما هو (A0/A2)،
-        # رَهينةً بفحوص route/الملكية/المحادثة المستقلة في `handle_text` بعده.
+        # رَهينةً بفحوص الاختيار/الملكية/المحادثة المستقلة في `handle_text` بعده.
         return False
 
     if state in (
@@ -3072,15 +3065,11 @@ async def _handle_accompanying_text(
 
     # state is AttachmentRoutingState.LIVE — دفعة حيّة واحدة بالضبط.
     batch = routing.live_batches[0]
-    route_cid, route_kind, _route_title, _route_at = db.awaiting_state(telegram_id)
-    if (
-        route_kind != "route"
-        or not route_cid
-        or route_cid != batch.conversation_id
-    ):
-        # لا route، أو route لمحادثة مختلفة عن دفعة النصّ ⇒ لا ربط/لا استبدال (فشل مغلق).
+    selected_cid = db.get_last_accessed_conversation(telegram_id)
+    if not selected_cid or selected_cid != batch.conversation_id:
+        # لا هدف، أو هدف مختلف عن دفعة النصّ ⇒ لا ربط/لا استبدال (فشل مغلق).
         await _reject_accompanying_text(
-            update, context, ATTACHMENT_TEXT_AMBIGUOUS_TEXT, reason="route_mismatch"
+            update, context, ATTACHMENT_TEXT_AMBIGUOUS_TEXT, reason="selection_mismatch"
         )
         return True
 
@@ -3174,14 +3163,10 @@ async def _reject_accompanying_text(
 async def _reply_no_routing_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """يرفض نصًّا عاديًّا بدون هدف مختار — بلا إنشاء شات أو اختيار شات آخر."""
     mark_explicitly_ignored(update, context)
-    if context.bot_data["db"].is_routing_paused(update.effective_user.id):
-        text = "التوجيه متوقف. افتح شات أو استخدم /chat الأول، وبعدها ابعت رسالتك."
-    else:
-        text = (
-            "مفيش شات محدد. افتح شات من القائمة أو استخدم /start أو /chat الأول، "
-            "وبعدها ابعت رسالتك."
-        )
-    await update.message.reply_text(text)
+    await update.message.reply_text(
+        "مفيش شات محدد. افتح شات من القائمة أو استخدم /start أو /chat الأول، "
+        "وبعدها ابعت رسالتك."
+    )
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3189,7 +3174,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     db = context.bot_data["db"]
     telegram_id = update.effective_user.id
-    # OHB2-P0-A3/D-29: فرع النصّ المصاحب **قبل** أي مسار برومت عادي (وقبل فحص انتهاء route)
+    # OHB2-P0-A3/D-29: فرع النصّ المصاحب **قبل** أي مسار برومت عادي (وقبل فحص انتهاء الحالة)
     # عشان نصّ قد يخصّ دفعة معلّقة ما يتسرّبش لمسار البرومت/الـ outbox. الفحص **محلي فقط**
     # (بلا نداء بعيد)؛ وبيرجّع True لو تعامل مع التحديث (نيّة متينة أو رفض نهائي).
     if await _handle_accompanying_text(update, context):
@@ -3198,7 +3183,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # reposearch) بتتستهلك **ذرّيًا مع كتابة السجل الدائم** جوه
     # add_or_group_outbox/add_creation_job (أو consume_one_shot_awaiting لبحث المستودعات)
     # ⇒ مفيش نافذة بين استهلاك الحالة وكتابة العمل يضيع فيها البرومت لو العملية ماتت.
-    # `route` مستمر (مش لمرة واحدة) وما بينتهيش بالمهلة؛ بنحدّث طابعه هنا للتوافق.
+    # الحالات لمرة واحدة (reply/newchat/reposearch) هي الوحيدة الباقية بعد إزالة route.
     pending, kind, title, awaiting_at = db.awaiting_state(telegram_id)
     last_target = db.get_last_accessed_conversation(telegram_id)
     # الحالات لمرة واحدة (newchat/reposearch) لسه ليها مهلة. `reply` استثناء: لو انتهت
@@ -3220,13 +3205,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if kind == "reply" and pending and db.awaiting_is_expired(awaiting_at):
         # اختيار محادثة سابقة انتهت مهلته، لكن آخر شات مختار محفوظ ⇒ نكمل عليه بدل
         # إجبار المستخدم على /start أو إعادة الفتح.
-        if db.is_routing_paused(telegram_id):
-            db.clear_awaiting_and_record_outcome(
-                telegram_id, _update_id(update), outbox.now_iso(),
-                update_outcomes.EXPLICITLY_IGNORED,
-            )
-            await _reply_no_routing_target(update, context)
-        elif last_target:
+        if last_target:
             await _send_prompt(
                 update, context, last_target, update.message.text,
                 consume_awaiting=(telegram_id, "reply"),
@@ -3239,31 +3218,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 update_outcomes.EXPLICITLY_IGNORED,
             )
             await update.message.reply_text(
-                "انتهت مهلة التوجيه. افتح الشات تاني وابعت برومتك."
+                "انتهت مهلة اختيار الشات. افتح الشات تاني وابعت برومتك."
             )
         return
-    if kind == "route":
-        # route مستمر: لا ينتهي بالمهلة. آخر شات مفتوح/مختار محفوظ هو المرجع، ولو مش
-        # موجود (صفوف قديمة) نستخدم target الـ route نفسه. /cancel يوقف التوجيه صراحةً.
-        if db.is_routing_paused(telegram_id):
-            await _reply_no_routing_target(update, context)
-            return
-        target = last_target or pending
-        if not target:
-            await _reply_no_routing_target(update, context)
-            return
-        if target != pending:
-            # مزامنة صف الـ route مع المرجع المحفوظ (لو الاتنين اختلفوا لأي سبب قديم).
-            db.set_awaiting(telegram_id, target, "route")
-        elif update.message.text.strip():
-            # الحفاظ على تحديث طابع النشاط للتوافق/التشخيص؛ لا يؤثر على الصلاحية.
-            db.renew_awaiting(telegram_id)
-        await _send_prompt(
-            update, context, target, update.message.text,
-            title if target == pending else None,
-            routing_target_required=True,
-        )
-    elif kind == "reply" and pending:
+    if kind == "reply" and pending:
         await _send_prompt(
             update, context, pending, update.message.text,
             consume_awaiting=(telegram_id, "reply"),
@@ -3295,7 +3253,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             uid = _update_id(update)
             if uid is not None and db.update_outcome(uid) is None:
                 mark_explicitly_ignored(update, context)
-    elif last_target and not db.is_routing_paused(telegram_id):
+    elif last_target:
         # الافتراضي الدائم: أي نص عادي بعد اختيار شات يروح لآخر شات مفتوح/مختار.
         await _send_prompt(
             update, context, last_target, update.message.text,
@@ -3333,8 +3291,9 @@ async def attachments_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def attachments_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/attachments_clear <batch_id> confirm — clearance صريح لدفعة واحدة.
 
-    OHB2-WP01/OD-01 Option C: لا يمسح terminal block تلقائيًا، ولا يمسّ `/cancel`.
-    فقط `expired`/`rejected` بعد فحص ملكية/حالة دائم. النجاح لا يُعلن قبل commit.
+    OHB2-WP01/OD-01 Option C: لا يمسح terminal block تلقائيًا، ولا يمسّ أي حالة
+    توجيه/اختيار. فقط `expired`/`rejected` بعد فحص ملكية/حالة دائم. النجاح لا يُعلن قبل
+    commit.
     """
     if not await _guard(update, context):
         return
@@ -3379,7 +3338,7 @@ async def attachments_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def attachments_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/attachments_cancel <batch_id> confirm — إلغاء دفعة `pending` واحدة.
 
-    OHB2-WP01 Stage 1: لا يمسح route، ولا يحذف/ينقل أي ملف أو صف أو دليل هوية.
+    OHB2-WP01 Stage 1: لا يمسح اختيار آخر شات، ولا يحذف/ينقل أي ملف أو صف أو دليل هوية.
     النجاح لا يُعلن قبل commit؛ الأخطاء تُرفع بلا ردّ نجاح.
     """
     if not await _guard(update, context):
@@ -3420,36 +3379,6 @@ async def attachments_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(messages.get(result, "تعذّر إلغاء الدفعة."))
     if result in ("not_found", "not_eligible"):
         mark_explicitly_ignored(update, context)
-
-
-async def cancel_route(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/cancel: يلغي أي توجيه أو انتظار معلّق."""
-    if not await _guard(update, context):
-        return
-    # OHB2-WP-07 (NEW-DEF-03): مسح حالة الانتظار + نتيجة `durable_completed` ذرّيًّا
-    # (معاملة واحدة) — بدل commitين منفصلين، فما يحصلش حالة ممسوحة بلا نتيجة لو حصل عطل.
-    context.bot_data["db"].clear_awaiting_and_record_outcome(
-        update.effective_user.id, _update_id(update), outbox.now_iso(),
-        update_outcomes.DURABLE_COMPLETED,
-        pause_routing=True,
-    )
-    await update.message.reply_text("اتلغى التوجيه. ابعت /start للقائمة.")
-
-
-async def cancel_route_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    q = update.callback_query
-    await _safe_answer(q)
-    if not _allowed(update, context.bot_data["config"]):
-        # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
-        _authorization_ignored(update, context)
-        return
-    # OHB2-WP-07 (NEW-DEF-03): نفس الذرّية في مسار الزر — مسح الحالة + النتيجة معًا.
-    context.bot_data["db"].clear_awaiting_and_record_outcome(
-        update.effective_user.id, _update_id(update), outbox.now_iso(),
-        update_outcomes.DURABLE_COMPLETED,
-        pause_routing=True,
-    )
-    await _safe_edit(q, "اتلغى التوجيه ✅", reply_markup=kb.main_menu(_mini_app_url(context)))
 
 
 async def _send_prompt(
@@ -3526,11 +3455,7 @@ async def _send_prompt(
         routing_changed = False
         if routing_target_required:
             last = db.get_last_accessed_conversation(update.effective_user.id)
-            route_target, route_kind = db.get_awaiting(update.effective_user.id)
-            routing_changed = (
-                (last is not None and last != conversation_id)
-                or (last is None and route_kind == "route" and route_target != conversation_id)
-            )
+            routing_changed = last is not None and last != conversation_id
         uid = _update_id(update)
         if uid is not None and db.update_outcome(uid) is None:
             mark_explicitly_ignored(update, context)

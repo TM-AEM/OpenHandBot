@@ -692,7 +692,7 @@ def _harness(tmp_path, monkeypatch, **kw) -> Harness:
 
 def test_handler_document_accepted_records_durable_intent(tmp_path, monkeypatch):
     harness = _harness(tmp_path, monkeypatch)
-    harness.db.set_awaiting(OWNER_ID, CID, "route", title="A")
+    harness.db.set_last_accessed_conversation(OWNER_ID, CID)
     harness.process(harness.document_update(900))
     assert harness.replies == [h_mod.ATTACHMENT_ACCEPTED_TEXT]
     batch = harness.db.get_attachment_batch(
@@ -703,9 +703,9 @@ def test_handler_document_accepted_records_durable_intent(tmp_path, monkeypatch)
     assert harness.db.is_update_acknowledgment_eligible(900) is True
 
 
-def test_handler_document_without_route_rejected(tmp_path, monkeypatch):
+def test_handler_document_without_selection_rejected(tmp_path, monkeypatch):
     harness = _harness(tmp_path, monkeypatch)
-    # مفيش توجيه ⇒ مفيش محادثة مختارة ⇒ رفض، ومفيش دفعة، ومفيش تنزيل.
+    # مفيش اختيار ⇒ مفيش محادثة مختارة ⇒ رفض، ومفيش دفعة، ومفيش تنزيل.
     harness.process(harness.document_update(901))
     assert harness.replies and harness.replies[0] != h_mod.ATTACHMENT_ACCEPTED_TEXT
     assert harness.db._conn.execute("SELECT COUNT(*) c FROM attachment_batches").fetchone()["c"] == 0
@@ -715,7 +715,7 @@ def test_handler_document_without_route_rejected(tmp_path, monkeypatch):
 
 def test_handler_non_owner_document_ignored(tmp_path, monkeypatch):
     harness = _harness(tmp_path, monkeypatch)
-    harness.db.set_awaiting(OWNER_ID, CID, "route", title="A")
+    harness.db.set_last_accessed_conversation(OWNER_ID, CID)
     harness.process(harness.document_update(902, uid=999))
     assert harness.replies == []
     assert harness.db._conn.execute("SELECT COUNT(*) c FROM attachment_batches").fetchone()["c"] == 0
@@ -723,7 +723,7 @@ def test_handler_non_owner_document_ignored(tmp_path, monkeypatch):
 
 def test_handler_duplicate_document_single_batch(tmp_path, monkeypatch):
     harness = _harness(tmp_path, monkeypatch)
-    harness.db.set_awaiting(OWNER_ID, CID, "route", title="A")
+    harness.db.set_last_accessed_conversation(OWNER_ID, CID)
     harness.process(harness.document_update(903))
     harness.process(harness.document_update(903))  # نفس التحديث (إعادة تسليم)
     assert harness.db._conn.execute("SELECT COUNT(*) c FROM attachment_batches").fetchone()["c"] == 1
@@ -737,7 +737,7 @@ def test_handler_duplicate_race_replies_duplicate_without_new_item(tmp_path, mon
     #   - تردّ بنص «متسجل قبل كده» (مش ادّعاء قبول جديد، ومش خطأ كاذب)،
     #   - تسيب النتيجة الدائمة `duplicate_completed` (ما تتكتبش فوقها durable_completed).
     harness = _harness(tmp_path, monkeypatch)
-    harness.db.set_awaiting(OWNER_ID, CID, "route", title="A")
+    harness.db.set_last_accessed_conversation(OWNER_ID, CID)
     first = harness.document_update(914)
     harness.process_attachment_direct(first)
     batch_id = harness.db._conn.execute("SELECT batch_id FROM attachment_batches").fetchone()["batch_id"]
@@ -756,7 +756,7 @@ def test_handler_duplicate_race_replies_duplicate_without_new_item(tmp_path, mon
 
 def test_handler_rejected_type_is_ignored(tmp_path, monkeypatch):
     harness = _harness(tmp_path, monkeypatch)
-    harness.db.set_awaiting(OWNER_ID, CID, "route", title="A")
+    harness.db.set_last_accessed_conversation(OWNER_ID, CID)
     harness.process(harness.document_update(904, name="evil.exe"))
     assert harness.replies == [h_mod.ATTACHMENT_UNSUPPORTED_TYPE_TEXT]
     assert harness.db._conn.execute("SELECT COUNT(*) c FROM attachment_batches").fetchone()["c"] == 0
@@ -765,7 +765,7 @@ def test_handler_rejected_type_is_ignored(tmp_path, monkeypatch):
 
 def test_handler_photo_still_uses_legacy_rejection(tmp_path, monkeypatch):
     harness = _harness(tmp_path, monkeypatch)
-    harness.db.set_awaiting(OWNER_ID, CID, "route", title="A")
+    harness.db.set_last_accessed_conversation(OWNER_ID, CID)
     harness.process(harness.photo_update(905))
     assert harness.replies == [h_mod.UNSUPPORTED_ATTACHMENT_DOCUMENT_ENABLED_TEXT]
     assert harness.db._conn.execute("SELECT COUNT(*) c FROM attachment_batches").fetchone()["c"] == 0
@@ -773,7 +773,7 @@ def test_handler_photo_still_uses_legacy_rejection(tmp_path, monkeypatch):
 
 def test_handler_reply_failure_is_recorded(tmp_path, monkeypatch):
     harness = _harness(tmp_path, monkeypatch)
-    harness.db.set_awaiting(OWNER_ID, CID, "route", title="A")
+    harness.db.set_last_accessed_conversation(OWNER_ID, CID)
 
     async def _boom(self, chat_id=None, text=None, **kw):
         raise RuntimeError("telegram down")
@@ -788,7 +788,7 @@ def test_handler_reply_failure_is_recorded(tmp_path, monkeypatch):
 def test_handler_stored_item_is_not_dispatched(tmp_path, monkeypatch):
     # A2 ما بترسلش أي حاجة (مفيش صندوق/إنشاء) — التسليم مرحلة A3/B.
     harness = _harness(tmp_path, monkeypatch)
-    harness.db.set_awaiting(OWNER_ID, CID, "route", title="A")
+    harness.db.set_last_accessed_conversation(OWNER_ID, CID)
     harness.process(harness.document_update(907))
     assert harness.db.count_outbox() == 0
     assert harness.db.list_open_creation_jobs() == []
@@ -797,7 +797,7 @@ def test_handler_stored_item_is_not_dispatched(tmp_path, monkeypatch):
 def test_handler_streamed_oversize_replies_too_large(tmp_path, monkeypatch):
     # البايتات الفعلية أكبر من سقف A1 (3 MiB) ⇒ رد «كبير أوي»، والعنصر يفضل pending.
     harness = _harness(tmp_path, monkeypatch, file_bytes=b"x" * (3 * 1024 * 1024 + 1))
-    harness.db.set_awaiting(OWNER_ID, CID, "route", title="A")
+    harness.db.set_last_accessed_conversation(OWNER_ID, CID)
     harness.process(harness.document_update(908))
     assert harness.replies == [h_mod.ATTACHMENT_TOO_LARGE_TEXT]
     batch_id = harness.db._conn.execute("SELECT batch_id FROM attachment_batches").fetchone()["batch_id"]
@@ -808,7 +808,7 @@ def test_handler_streamed_oversize_replies_too_large(tmp_path, monkeypatch):
 
 def test_handler_second_document_appends_same_batch(tmp_path, monkeypatch):
     harness = _harness(tmp_path, monkeypatch)
-    harness.db.set_awaiting(OWNER_ID, CID, "route", title="A")
+    harness.db.set_last_accessed_conversation(OWNER_ID, CID)
     harness.process(harness.document_update(909))
     harness.process(harness.document_update(910))
     assert harness.db._conn.execute("SELECT COUNT(*) c FROM attachment_batches").fetchone()["c"] == 1

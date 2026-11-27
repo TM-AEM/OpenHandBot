@@ -71,7 +71,7 @@ def test_message_immediately_after_open_routes_to_opened_conversation(tmp_path):
     items = _pending(ctx)
     assert len(items) == 1
     assert items[0].conversation_id == "A"
-    assert update.message.replies == ["وصل ✅ ← «شات» — تم حفظ طلبك، ولسه هيتبعت."]
+    assert update.message.replies == ["وصل ✅ — تم حفظ طلبك، ولسه هيتبعت."]
 
 
 def test_message_after_more_than_ten_minutes_routes_without_start(tmp_path):
@@ -393,7 +393,8 @@ def test_persisted_target_is_authoritative_over_stale_route(tmp_path):
     _send(ctx, "يجب أن يذهب إلى B")
 
     assert [i.conversation_id for i in _pending(ctx)] == ["B"]
-    assert db.get_awaiting(OWNER) == ("B", "route")
+    # Legacy route rows are inert; ordinary text follows last_accessed only.
+    assert db.get_awaiting(OWNER) == ("A", "route")
 
 
 def test_commands_remain_registered_as_commands(tmp_path):
@@ -435,20 +436,14 @@ def test_chat_opens_last_accessed_without_prompt_or_creation(tmp_path):
     assert update.message.replies
 
 
-def test_cancel_pauses_default_routing_until_chat_reopens(tmp_path):
+def test_legacy_route_without_last_target_does_not_route(tmp_path):
     ctx = make_context(OWNER, tmp_path)
-    _open(ctx, "A")
-    asyncio.run(h.cancel_route(make_update(OWNER, "/cancel"), ctx))
-    paused = _send(ctx, "بعد الإلغاء")
+    db = ctx.bot_data["db"]
+    db.set_awaiting(OWNER, "A", "route", title="A")
+    update = _send(ctx, "لا يجب أن يذهب إلى route قديم")
 
     assert _pending(ctx) == []
-    assert "التوجيه متوقف" in paused.message.replies[0]
-    assert ctx.bot_data["db"].get_last_accessed_conversation(OWNER) == "A"
-
-    asyncio.run(h.chat(make_update(OWNER, "/chat"), ctx))
-    _send(ctx, "بعد إعادة الفتح")
-
-    assert [i.conversation_id for i in _pending(ctx)] == ["A"]
+    assert "مفيش شات محدد" in update.message.replies[0]
 
 
 def test_start_is_not_required_after_inactivity(tmp_path):

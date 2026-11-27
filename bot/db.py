@@ -4369,11 +4369,10 @@ class Database:
         reason: str | None = None,
         clear_last_accessed_conversation_id: str | None = None,
         clear_awaiting_conversation_id: str | None = None,
-        pause_routing: bool = False,
     ) -> bool:
         """OHB2-WP-07 (DEF-013/NEW-DEF-03): يمسح حالة انتظار **ويسجّل نتيجة التحديث ذرّيًّا**.
 
-        مسارات الرد/التوجيه (`/cancel`، التنقّل، انتهاء مهلة الحالة) كانت بتعمل
+        مسارات الرد/التنقّل/انتهاء مهلة الحالة كانت بتعمل
         `clear_awaiting` (commit مستقل) **قبل** تسجيل النتيجة (`mark_durable_completed`/
         `mark_explicitly_ignored`) — commit تانٍ. عطل بين الكتابتين كان يسيب حالة ممسوحة
         **بلا** نتيجة مسجّلة ⇒ إعادة التسليم تقع في الفرع العام (تلميح `/start`) بدل السلوك
@@ -4399,8 +4398,6 @@ class Database:
                 row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
                 if row is not None and row["value"] == clear_last_accessed_conversation_id:
                     self._delete_setting_nocommit(key)
-            if pause_routing:
-                self._set_setting_nocommit(self._routing_paused_key(telegram_id), "1")
             if update_id is not None:
                 self.mark_update_outcome(update_id, now, outcome, reason=reason, commit=False)
             conn.commit()
@@ -4415,7 +4412,7 @@ class Database:
         `last_accessed` و`awaiting` ممكن يكونوا اتغيّروا لمستخدم/وجهة أحدث قبل ما نوصل
         هنا. الفحص والمسح الاتنين جوه `BEGIN IMMEDIATE` واحدة: إما الحالتين المتطابقتين
         يتمسحوا مع بعض، أو يتراجعوا مع بعض عند أي فشل. الحالة الأحدث لا تُمسح، والحالات
-        غير المرتبطة (repository selection، pending outbox، pause flag) لا تُلمس.
+        غير المرتبطة (repository selection، pending outbox) لا تُلمس.
         """
         conn = self._conn
         conn.execute("BEGIN IMMEDIATE")
@@ -4467,8 +4464,6 @@ class Database:
                 self._set_setting_nocommit(
                     self._last_accessed_key(telegram_id), last_accessed_conversation_id
                 )
-                # فتح/اختيار شات صريح يلغي أي إيقاف سابق من /cancel.
-                self._delete_setting_nocommit(self._routing_paused_key(telegram_id))
             if update_id is not None:
                 self.mark_update_outcome(update_id, now, outcome, reason=reason, commit=False)
             conn.commit()
@@ -4911,9 +4906,8 @@ class Database:
         NEW-02 safety: كل جزء له `telegram_message_id` فريد، والتكرار لا يضيف نصًا أو
         معرّفًا ثانيًا. تنظيف السجل يظل مقيّدًا بـ IDs الخاصة به فقط.
 
-        NEW-01: عند `expected_routing`، فحص الإيقاف داخل نفس معاملة القبول. `/cancel`
-        بيثبّت الإيقاف ويمسح الانتظار في معاملة واحدة؛ أي برومت بدأ قبل الإلغاء لكنه وصل
-        للقبول بعده لازم يُرفض (0) بلا صف outbox، وأي قبول سبق الإلغاء يظل قائمًا.
+        عند `expected_routing`، نتحقق داخل معاملة القبول أن آخر شات محفوظ ما زال هو
+        الهدف المتوقّع؛ تغيير الاختيار أثناء التحضير يرفض الطلب (0) بلا صف outbox.
         """
         effective_window = window if window is not None else GROUP_WINDOW
         conn = self._conn
@@ -4952,33 +4946,8 @@ class Database:
                     "SELECT value FROM settings WHERE key=?",
                     (self._last_accessed_key(routing_tg),),
                 ).fetchone()
-                route = conn.execute(
-                    "SELECT awaiting_conversation_id, awaiting_kind FROM user_state "
-                    "WHERE telegram_id=?",
-                    (routing_tg,),
-                ).fetchone()
-                route_target = (
-                    route["awaiting_conversation_id"]
-                    if route is not None and route["awaiting_kind"] == "route"
-                    else None
-                )
                 last_target = last["value"] if last is not None else None
-                # NEW-01: `/cancel` commits the pause and clears awaiting atomically.
-                # The target read above may predate that commit; reject at the actual
-                # acceptance boundary if cancellation is already durable.
-                paused = conn.execute(
-                    "SELECT value FROM settings WHERE key=?",
-                    (self._routing_paused_key(routing_tg),),
-                ).fetchone()
-                if paused is not None and paused["value"] == "1":
-                    conn.rollback()
-                    return 0
-                matches = (
-                    last_target == expected_target
-                    if last_target is not None
-                    else route_target == expected_target
-                )
-                if not matches:
+                if last_target != expected_target:
                     conn.rollback()
                     return 0
             if self.is_deleted(conversation_id):
@@ -6412,18 +6381,11 @@ class Database:
     ACK_BOUNDARY_KEY = "acknowledgment_boundary"
     # آخر شات فتحه/اختاره المالك فعلًا. المفتاح لكل telegram_id عشان العزل.
     LAST_ACCESSED_CONVERSATION_KEY_PREFIX = "last_accessed_conversation:"
-    # إيقاف صريح للتوجيه الافتراضي عبر /cancel أو زر الإلغاء. منفصل عن آخر شات محفوظ
-    # عشان `/chat` يفضل قادرًا على إعادة فتحه لاحقًا.
-    ROUTING_PAUSED_KEY_PREFIX = "routing_paused:"
     _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 
     @classmethod
     def _last_accessed_key(cls, telegram_id: int) -> str:
         return f"{cls.LAST_ACCESSED_CONVERSATION_KEY_PREFIX}{int(telegram_id)}"
-
-    @classmethod
-    def _routing_paused_key(cls, telegram_id: int) -> str:
-        return f"{cls.ROUTING_PAUSED_KEY_PREFIX}{int(telegram_id)}"
 
     def get_setting(self, key: str, default: str | None = None) -> str | None:
         row = self._conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
@@ -6455,17 +6417,6 @@ class Database:
         self._conn.execute(
             "DELETE FROM settings WHERE key=?", (self._last_accessed_key(telegram_id),)
         )
-        self._conn.commit()
-
-    def is_routing_paused(self, telegram_id: int) -> bool:
-        return self.get_setting(self._routing_paused_key(telegram_id)) == "1"
-
-    def pause_routing(self, telegram_id: int) -> None:
-        """إيقاف التوجيه الافتراضي صراحةً مع الإبقاء على آخر شات محفوظ لـ /chat."""
-        self.set_setting(self._routing_paused_key(telegram_id), "1")
-
-    def resume_routing(self, telegram_id: int) -> None:
-        self._delete_setting_nocommit(self._routing_paused_key(telegram_id))
         self._conn.commit()
 
     def get_notifications_enabled(self) -> bool:

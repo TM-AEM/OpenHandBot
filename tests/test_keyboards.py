@@ -92,9 +92,10 @@ def test_conversations_menu_second_page_has_previous():
 
 def test_conversation_actions_has_new_buttons():
     cbs = _callbacks(kb.conversation_actions("c1"))
-    # الأساسيات (رد/تحديث/حالة/رجوع/إلغاء التوجيه) بتفضل ظاهرة.
-    for expected in ("reply:c1", "open:c1", "status:c1", "list:0", "cancelroute"):
+    # الأساسيات (رد/تحديث/حالة/رجوع) بتفضل ظاهرة؛ إلغاء التوجيه اتشال.
+    for expected in ("reply:c1", "open:c1", "status:c1", "list:0"):
         assert expected in cbs
+    assert "cancelroute" not in cbs
     # OHB2-09-06: الملفات/التكلفة/التصدير اتسترجعت (ظاهرة افتراضيًا).
     for restored in ("files:c1:0", "cost:c1", "export:c1"):
         assert restored in cbs

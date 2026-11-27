@@ -107,42 +107,6 @@ def test_explicit_clearance_succeeds_for_expired_and_rejected(tmp_path, status):
     db.close()
 
 
-def test_cancel_alone_does_not_clear_terminal_block(tmp_path):
-    db = _db(tmp_path)
-    batch_id = _batch(db, "b1", ATTACHMENT_BATCH_EXPIRED)
-    ctx = make_context(OWNER, tmp_path)
-    ctx.bot_data["db"] = db
-    update = make_update(OWNER, "/cancel")
-    update.update_id = 7001
-
-    asyncio.run(h.cancel_route(update, ctx))
-
-    assert db.is_attachment_terminal_cleared(OWNER, batch_id) is False
-    assert _classify(db).state is AttachmentRoutingState.TERMINAL_UNPROVEN
-    assert db.get_attachment_batch(batch_id).status == ATTACHMENT_BATCH_EXPIRED
-    db.close()
-
-
-def test_cancel_does_not_delete_active_batch_data(tmp_path):
-    db = _db(tmp_path)
-    batch_id = _batch(db, "b1", ATTACHMENT_BATCH_PENDING, t0=_live_t0())
-    db.add_attachment_item("i1", batch_id, staging_token="tok", display_name="a.txt",
-                           size_bytes=1, status="stored", now=_iso(_now()))
-    ctx = make_context(OWNER, tmp_path)
-    ctx.bot_data["db"] = db
-    update = make_update(OWNER, "/cancel")
-    update.update_id = 7004
-
-    asyncio.run(h.cancel_route(update, ctx))
-
-    assert db.get_attachment_batch(batch_id).status == ATTACHMENT_BATCH_PENDING
-    assert db.get_attachment_item("i1").status == "stored"
-    assert db.count_attachment_batches() == 1
-    assert db.count_attachment_items() == 1
-    assert db.is_attachment_terminal_cleared(OWNER, batch_id) is False
-    db.close()
-
-
 @pytest.mark.parametrize("status", [ATTACHMENT_BATCH_DELIVERED, ATTACHMENT_BATCH_FAILED])
 def test_clearance_rejected_for_delivered_and_failed(tmp_path, status):
     db = _db(tmp_path)

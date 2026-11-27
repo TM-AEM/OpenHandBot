@@ -1,9 +1,9 @@
 """OHB2-WP07-F1 — اختبارات انحدار على **فشل إشعار تيليجرام بعد الالتزام المحلي**.
 
-السياق (F-1، قرار المالك: الخيار C): المسارات الستة
-(`cancel_route`، `cancel_route_button`، `reply_prompt`، `repo_search_prompt`، `pick_repo`،
-`new_chat_no_repo`) بتلتزم بحالة SQLite المحلية **مع** نتيجة `durable_completed` في معاملة
-واحدة (WP-07)، **وبعدين** تبعت رسالة/تعدّل رسالة تيليجرام. لو الإرسال فشل، الالتزام المحلي
+السياق (F-1، قرار المالك: الخيار C): مسارات الاختيار/التوجيه الباقية
+(`reply_prompt`، `repo_search_prompt`، `pick_repo`، `new_chat_no_repo`) بتلتزم بحالة SQLite
+المحلية **مع** نتيجة `durable_completed` في معاملة واحدة (WP-07)، **وبعدين** تبعت
+رسالة/تعدّل رسالة تيليجرام. لو الإرسال فشل، الالتزام المحلي
 والنتيجة **يفضلوا كما هما** (مفيش تراجع/تخفيض/حذف)، والتحديث يفضل **مؤهّلًا للإقرار**
 (الديدَب في `processed_updates`)، **و** يتحفظ دليل فشل منفصل في `update_failures` عبر مسار
 معالج أخطاء PTB الموجود (`handle_processing_error` ⇒ `record_update_failure`).
@@ -25,12 +25,10 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 
-import pytest
 from telegram import CallbackQuery, Chat, Message, MessageEntity, Update, User
 from telegram.error import BadRequest, TimedOut
 
 import bot.app as app_mod
-import bot.handlers as h
 from bot import outbox
 from bot import update_outcomes as uo
 from bot.db import Database
@@ -137,30 +135,6 @@ def _assert_f1_preserved(db: Database, update_id: int, *, failure: str) -> None:
 # ============================================================================
 # 1) لكل مسار: فشل الإشعار بعد الالتزام ⇒ durable_completed + مؤهّل + دليل فشل منفصل
 # ============================================================================
-def test_cancel_route_notification_failure_preserves_commit(tmp_path, monkeypatch):
-    app = _build_app(tmp_path, monkeypatch, send_exc=TimedOut())
-    db = app.bot_data["db"]
-    db.set_awaiting(OWNER_ID, "conv-A", "route", title="t")
-
-    _drive(app, _command_update(app, 9001, "/cancel"))
-
-    assert db.get_awaiting(OWNER_ID) == (None, None)  # الحالة اتمسحت واتثبتت
-    _assert_f1_preserved(db, 9001, failure=uo.FAILED_TRANSIENT)
-    db.close()
-
-
-def test_cancel_route_button_notification_failure_preserves_commit(tmp_path, monkeypatch):
-    app = _build_app(tmp_path, monkeypatch, edit_exc=TimedOut())
-    db = app.bot_data["db"]
-    db.set_awaiting(OWNER_ID, "conv-A", "route", title="t")
-
-    _drive(app, _cb_update(app, 9002, "cancelroute"))
-
-    assert db.get_awaiting(OWNER_ID) == (None, None)
-    _assert_f1_preserved(db, 9002, failure=uo.FAILED_TRANSIENT)
-    db.close()
-
-
 def test_reply_prompt_notification_failure_preserves_commit(tmp_path, monkeypatch):
     client = FakeOpenHands({CID_A: _conv(CID_A)})
     app = _build_app(tmp_path, monkeypatch, client=client, edit_exc=TimedOut())
@@ -211,11 +185,11 @@ def test_new_chat_no_repo_notification_failure_preserves_commit(tmp_path, monkey
 # 2) رفض تيليجرام صريح (BadRequest) ⇒ فشل دائم مسجّل، والالتزام المحلي محفوظ
 # ============================================================================
 def test_notification_permanent_rejection_preserves_commit(tmp_path, monkeypatch):
-    app = _build_app(tmp_path, monkeypatch, send_exc=BadRequest("chat not found"))
+    app = _build_app(tmp_path, monkeypatch, edit_exc=BadRequest("chat not found"))
     db = app.bot_data["db"]
-    db.set_awaiting(OWNER_ID, "conv-A", "route", title="t")
+    app.bot_data["repo_nav"] = {OWNER_ID: {"gen": 0, "names": ["owner/repo"]}}
 
-    _drive(app, _command_update(app, 9007, "/cancel"))
+    _drive(app, _cb_update(app, 9007, "pickrepo:0:0"))
 
     _assert_f1_preserved(db, 9007, failure=uo.FAILED_PERMANENT)
     db.close()
@@ -227,9 +201,9 @@ def test_notification_permanent_rejection_preserves_commit(tmp_path, monkeypatch
 def test_successful_notification_no_failure_record(tmp_path, monkeypatch):
     app = _build_app(tmp_path, monkeypatch)  # بلا استثناءات
     db = app.bot_data["db"]
-    db.set_awaiting(OWNER_ID, "conv-A", "route", title="t")
+    app.bot_data["repo_nav"] = {OWNER_ID: {"gen": 0, "names": ["owner/repo"]}}
 
-    _drive(app, _command_update(app, 9008, "/cancel"))
+    _drive(app, _cb_update(app, 9008, "pickrepo:0:0"))
 
     assert db.update_outcome(9008) == uo.DURABLE_COMPLETED
     assert db.is_update_acknowledgment_eligible(9008) is True
@@ -266,7 +240,7 @@ def test_duplicate_delivery_does_not_repeat_local_transition(tmp_path, monkeypat
 def test_failure_recording_error_does_not_downgrade_commit(tmp_path, monkeypatch):
     app = _build_app(tmp_path, monkeypatch, edit_exc=TimedOut())
     db = app.bot_data["db"]
-    db.set_awaiting(OWNER_ID, "conv-A", "route", title="t")
+    app.bot_data["repo_nav"] = {OWNER_ID: {"gen": 0, "names": ["owner/repo"]}}
 
     real = db.mark_update_outcome
 
@@ -278,7 +252,7 @@ def test_failure_recording_error_does_not_downgrade_commit(tmp_path, monkeypatch
 
     monkeypatch.setattr(db, "mark_update_outcome", _boom)
 
-    _drive(app, _cb_update(app, 9010, "cancelroute"))
+    _drive(app, _cb_update(app, 9010, "pickrepo:0:0"))
 
     # النتيجة الملتزمة محفوظة (اتكتبت قبل الإشعار)، ومعالج الأخطاء فشل بأمان (مفيش تخفيض).
     assert db.update_outcome(9010) == uo.DURABLE_COMPLETED
@@ -291,10 +265,10 @@ def test_failure_recording_error_does_not_downgrade_commit(tmp_path, monkeypatch
 # 6) استمرارية الدليل بعد إعادة فتح القاعدة (restart)
 # ============================================================================
 def test_failure_evidence_survives_reopen(tmp_path, monkeypatch):
-    app = _build_app(tmp_path, monkeypatch, send_exc=TimedOut())
+    app = _build_app(tmp_path, monkeypatch, edit_exc=TimedOut())
     db = app.bot_data["db"]
-    db.set_awaiting(OWNER_ID, "conv-A", "route", title="t")
-    _drive(app, _command_update(app, 9011, "/cancel"))
+    app.bot_data["repo_nav"] = {OWNER_ID: {"gen": 0, "names": ["owner/repo"]}}
+    _drive(app, _cb_update(app, 9011, "pickrepo:0:0"))
     db_path = db.path if hasattr(db, "path") else str(tmp_path / "t.sqlite3")
     db.close()
 
@@ -306,48 +280,7 @@ def test_failure_evidence_survives_reopen(tmp_path, monkeypatch):
 
 
 # ============================================================================
-# 7) انتشار الإلغاء (CancelledError) بلا كتم، والالتزام المحلي محفوظ
-# ============================================================================
-def test_cancellation_propagates_and_commit_preserved(tmp_path, monkeypatch):
-    """`CancelledError` مش `Exception` ⇒ `_safe_edit` ما بتلتقطهوش ⇒ ينتشر.
-
-    الالتزام المحلي (حالة + نتيجة) حصل **قبل** الإرسال ⇒ محفوظ رغم الانتشار.
-    """
-    from types import SimpleNamespace
-
-    db = Database(str(tmp_path / "cancel.sqlite3"))
-    db.set_awaiting(OWNER_ID, "conv-A", "route", title="t")
-
-    class _Q:
-        data = "cancelroute"
-
-        async def answer(self):
-            pass
-
-        async def edit_message_text(self, *a, **k):
-            raise asyncio.CancelledError()
-
-    ctx = SimpleNamespace(
-        bot_data={"db": db, "config": SimpleNamespace(is_allowed=lambda _u: True)},
-    )
-    update = SimpleNamespace(
-        update_id=9012,
-        effective_user=SimpleNamespace(id=OWNER_ID),
-        effective_chat=SimpleNamespace(id=CHAT_ID, type="private"),
-        callback_query=_Q(),
-    )
-
-    with pytest.raises(asyncio.CancelledError):
-        asyncio.run(h.cancel_route_button(update, ctx))
-
-    assert db.update_outcome(9012) == uo.DURABLE_COMPLETED
-    assert db.is_update_acknowledgment_eligible(9012) is True
-    assert db.get_awaiting(OWNER_ID) == (None, None)
-    db.close()
-
-
-# ============================================================================
-# 8) تفاعل الدفعة: أول تحديث فاشل الإشعار لكنه مؤهّل ⇒ الحدّ يتقدّم (مفيش حجب)
+# 7) تفاعل الدفعة: أول تحديث فاشل الإشعار لكنه مؤهّل ⇒ الحدّ يتقدّم (مفيش حجب)
 # ============================================================================
 def test_acknowledgment_boundary_advances_after_notification_failure(tmp_path, monkeypatch):
     """الفشل المنفصل **ما يحجبش** حدّ الإقرار (النتيجة المؤهّلة هي الحاكمة)."""

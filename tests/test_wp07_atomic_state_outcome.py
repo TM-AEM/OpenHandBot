@@ -130,46 +130,7 @@ def test_expired_branch_is_atomic_on_outcome_failure(tmp_path, monkeypatch):
 
 
 # ============================================================================
-# 3) `/cancel` (رسالة + زر) (NEW-DEF-03)
-# ============================================================================
-def test_cancel_route_message_records_durable_completed(tmp_path):
-    ctx = make_context(OWNER_ID, tmp_path)
-    db = ctx.bot_data["db"]
-    db.set_awaiting(OWNER_ID, "conv-A", "route", title="t")
-    update = make_update(OWNER_ID, "/cancel")
-    update.update_id = 5201
-
-    asyncio.run(h.cancel_route(update, ctx))
-
-    assert db.get_awaiting(OWNER_ID) == (None, None)
-    assert db.update_outcome(5201) == uo.DURABLE_COMPLETED
-    assert "اتلغى" in update.message.replies[0]
-
-
-def test_cancel_route_is_atomic_on_outcome_failure(tmp_path, monkeypatch):
-    """الحاسم: فشل تسجيل النتيجة في `/cancel` **مايسيبش** الحالة ممسوحة.
-
-    على الكود القديم (مسح بـcommit مستقل) كانت الحالة هتفضل ممسوحة ⇒ الاختبار يفشل.
-    """
-    ctx = make_context(OWNER_ID, tmp_path)
-    db = ctx.bot_data["db"]
-    db.set_awaiting(OWNER_ID, "conv-A", "route", title="t")
-    update = make_update(OWNER_ID, "/cancel")
-    update.update_id = 5202
-
-    def _boom(*_a, **_k):
-        raise RuntimeError("db down")
-
-    monkeypatch.setattr(db, "mark_update_outcome", _boom)
-    with pytest.raises(RuntimeError):
-        asyncio.run(h.cancel_route(update, ctx))
-
-    assert db.get_awaiting(OWNER_ID) == ("conv-A", "route")
-    assert db.update_outcome(5202) is None
-
-
-# ============================================================================
-# 4) ضبط التوجيه + النتيجة ذرّيًّا (NEW-DEF-03): reply_prompt / pick_repo / ...
+# 3) ضبط التوجيه + النتيجة ذرّيًّا (NEW-DEF-03): reply_prompt / pick_repo / ...
 # ============================================================================
 def test_set_helper_rolls_back_state_when_outcome_write_fails(tmp_path, monkeypatch):
     """الحاسم: فشل كتابة النتيجة **مايخلّيش** حالة التوجيه مضبوطة (الاتنين يتراجعوا)."""

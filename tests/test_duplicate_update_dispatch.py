@@ -180,7 +180,7 @@ def _harness(tmp_path, monkeypatch, client=None) -> Harness:
 # ------------------------------------------------------------------ السيناريو 1
 def test_one_prompt_existing_repo_conversation_exactly_one_send_zero_creation(tmp_path, monkeypatch):
     h = _harness(tmp_path, monkeypatch, FakeOpenHands({CID_A: _conv(CID_A, "owner/repo")}))
-    h.db.set_awaiting(OWNER_ID, CID_A, "route", title="A")
+    h.db.set_last_accessed_conversation(OWNER_ID, CID_A)
 
     h.process(h.text_update(1001, "برومت للمستودع"))
     h.deliver_pending()
@@ -193,7 +193,7 @@ def test_one_prompt_existing_repo_conversation_exactly_one_send_zero_creation(tm
 # ------------------------------------------------------------------ السيناريو 2
 def test_duplicate_delivery_of_same_update_produces_no_extra_operation(tmp_path, monkeypatch):
     h = _harness(tmp_path, monkeypatch, FakeOpenHands({CID_A: _conv(CID_A, "owner/repo")}))
-    h.db.set_awaiting(OWNER_ID, CID_A, "route", title="A")
+    h.db.set_last_accessed_conversation(OWNER_ID, CID_A)
 
     update = h.text_update(1002, "برومت")
     h.process(update)
@@ -214,7 +214,7 @@ def test_concurrent_processing_of_same_update_no_duplicate(tmp_path, monkeypatch
     فالمعالج بيتنفّذ مرتين في نفس اللحظة. الحاجز الذرّي (INSERT OR IGNORE) بيخلّي واحد يفوز.
     """
     h = _harness(tmp_path, monkeypatch, FakeOpenHands({CID_A: _conv(CID_A, "owner/repo")}))
-    h.db.set_awaiting(OWNER_ID, CID_A, "route", title="A")
+    h.db.set_last_accessed_conversation(OWNER_ID, CID_A)
     update = h.text_update(1003, "برومت متزامن")
 
     async def go():
@@ -236,7 +236,7 @@ def test_exact_reported_symptom_one_update_cannot_send_and_create(tmp_path, monk
     (إرسال + إنشاء). بالحاجز: قرار معالجة واحد بس (إرسال لـ A) وصفر إنشاء.
     """
     h = _harness(tmp_path, monkeypatch, FakeOpenHands({CID_A: _conv(CID_A, "owner/repo")}))
-    h.db.set_awaiting(OWNER_ID, CID_A, "route", title="A")
+    h.db.set_last_accessed_conversation(OWNER_ID, CID_A)
     update = h.text_update(1004, "برومت")
 
     h.process(update)  # المرة الأولى: توجيه route ⇒ إرسال للشات الموجود
@@ -253,11 +253,11 @@ def test_exact_reported_symptom_one_update_cannot_send_and_create(tmp_path, monk
 # ------------------------------------------------------------------ السيناريو 4
 def test_two_legitimate_consecutive_messages_both_processed(tmp_path, monkeypatch):
     h = _harness(tmp_path, monkeypatch, FakeOpenHands({CID_A: _conv(CID_A, "owner/repo")}))
-    h.db.set_awaiting(OWNER_ID, CID_A, "route", title="A")
+    h.db.set_last_accessed_conversation(OWNER_ID, CID_A)
 
     h.process(h.text_update(2001, "أول"))
     h.deliver_pending()
-    h.db.set_awaiting(OWNER_ID, CID_A, "route", title="A")  # المستخدم لسه موجّه للشات
+    h.db.set_last_accessed_conversation(OWNER_ID, CID_A)  # المستخدم لسه موجّه للشات
     h.process(h.text_update(2002, "تاني"))
     h.deliver_pending()
 
@@ -316,7 +316,7 @@ def test_existing_conversation_repository_and_sandbox_preserved(tmp_path, monkey
         tmp_path, monkeypatch,
         FakeOpenHands({CID_A: _conv(CID_A, "owner/repo", sandbox="PAUSED", sandbox_id="sb-repo-9")}),
     )
-    h.db.set_awaiting(OWNER_ID, CID_A, "route", title="A")
+    h.db.set_last_accessed_conversation(OWNER_ID, CID_A)
 
     h.process(h.text_update(5001, "برومت"))
     h.deliver_pending()
@@ -331,7 +331,7 @@ def test_existing_conversation_repository_and_sandbox_preserved(tmp_path, monkey
 def test_process_restart_and_update_replay_no_duplicate(tmp_path, monkeypatch):
     """إعادة تشغيل: نفس قاعدة البيانات، نفس التحديث بيتسلّم تاني ⇒ مايتعالجش مرتين."""
     h = _harness(tmp_path, monkeypatch, FakeOpenHands({CID_A: _conv(CID_A, "owner/repo")}))
-    h.db.set_awaiting(OWNER_ID, CID_A, "route", title="A")
+    h.db.set_last_accessed_conversation(OWNER_ID, CID_A)
     h.process(h.text_update(6001, "برومت قبل الريستارت"))
     h.deliver_pending()
 
@@ -353,7 +353,7 @@ def test_process_restart_and_update_replay_no_duplicate(tmp_path, monkeypatch):
 # ------------------------------------------------------------------ السيناريو 9
 def test_outbox_recovery_no_duplicate_conversation_creation(tmp_path, monkeypatch):
     h = _harness(tmp_path, monkeypatch, FakeOpenHands({CID_A: _conv(CID_A, "owner/repo")}))
-    h.db.set_awaiting(OWNER_ID, CID_A, "route", title="A")
+    h.db.set_last_accessed_conversation(OWNER_ID, CID_A)
     h.process(h.text_update(7001, "برومت"))
     h.deliver_pending()
 
@@ -377,7 +377,7 @@ def test_failed_or_ambiguous_response_no_unsafe_fallback_creation(tmp_path, monk
 
     client.send_message = boom  # نتيجة غامضة (شبكة)
     h = _harness(tmp_path, monkeypatch, client)
-    h.db.set_awaiting(OWNER_ID, CID_A, "route", title="A")
+    h.db.set_last_accessed_conversation(OWNER_ID, CID_A)
 
     h.process(h.text_update(8001, "برومت غامض"))
     h.deliver_pending()
@@ -391,17 +391,17 @@ def test_failed_or_ambiguous_response_no_unsafe_fallback_creation(tmp_path, monk
 def test_multiple_handlers_cannot_consume_same_update(tmp_path, monkeypatch):
     """التحديث الواحد بيتنفّذ فيه handler واحد بس لكل مجموعة، والحاجز في group=-1 يمنع الباقي."""
     h = _harness(tmp_path, monkeypatch, FakeOpenHands({CID_A: _conv(CID_A, "owner/repo")}))
-    h.db.set_awaiting(OWNER_ID, CID_A, "route", title="A")
+    h.db.set_last_accessed_conversation(OWNER_ID, CID_A)
     h.process(h.text_update(9001, "برومت"))
     # الحاجز سجّل التحديث، والحالة اتستهلكت مرة واحدة (مفيش تنفيذ تاني).
-    assert h.db.get_awaiting(OWNER_ID) == (CID_A, "route")  # route بتتجدد (مش تتلغى)
+    assert h.db.get_last_accessed_conversation(OWNER_ID) == CID_A
     assert h.db.count_outbox() == 1
 
 
 # ------------------------------------------------------------------ السيناريو 12
 def test_user_authorization_and_ownership_enforced(tmp_path, monkeypatch):
     h = _harness(tmp_path, monkeypatch, FakeOpenHands({CID_A: _conv(CID_A, "owner/repo")}))
-    h.db.set_awaiting(OWNER_ID, CID_A, "route", title="A")
+    h.db.set_last_accessed_conversation(OWNER_ID, CID_A)
 
     # مستخدم غير مسموح: مفيش أي عملية (إرسال/إنشاء) ومفيش تسجيل صندوق.
     chat = Chat(id=CHAT_ID, type="private")
@@ -524,7 +524,7 @@ def test_guard_is_read_only_marker_written_with_durable_record(tmp_path, monkeyp
     ⇒ إعادة التسليم بتنفّذ (مفيش فقد). التسجيل بيحصل مع الكتابة الدائمة نفسها.
     """
     h = _harness(tmp_path, monkeypatch, FakeOpenHands({CID_A: _conv(CID_A, "owner/repo")}))
-    h.db.set_awaiting(OWNER_ID, CID_A, "route", title="A")
+    h.db.set_last_accessed_conversation(OWNER_ID, CID_A)
     update = h.text_update(9501, "برومت")
 
     # الحاجز لوحده (نفس التحديث، قاعدة حقيقية) — بيكمّل من غير ما يسجّل.
@@ -548,7 +548,7 @@ def test_guard_db_error_fails_closed_stops_handlers_and_logs(tmp_path, monkeypat
     import logging as _logging
 
     h = _harness(tmp_path, monkeypatch, FakeOpenHands({CID_A: _conv(CID_A, "owner/repo")}))
-    h.db.set_awaiting(OWNER_ID, CID_A, "route", title="A")
+    h.db.set_last_accessed_conversation(OWNER_ID, CID_A)
 
     def boom(_update_id):
         raise sqlite3.OperationalError("database is locked")
@@ -609,7 +609,7 @@ def test_crash_between_guard_and_durable_write_does_not_lose_prompt(tmp_path, mo
     الحاجز فحص قراءة، فالتحديث مش مسجّل ⇒ إعادة التسليم بتكتب السجل الدائم وتنفّذ (مفيش فقد).
     """
     h = _harness(tmp_path, monkeypatch, FakeOpenHands({CID_A: _conv(CID_A, "owner/repo")}))
-    h.db.set_awaiting(OWNER_ID, CID_A, "route", title="A")
+    h.db.set_last_accessed_conversation(OWNER_ID, CID_A)
     update = h.text_update(9901, "برومت قبل العطل")
 
     calls = {"n": 0}
@@ -646,7 +646,7 @@ def test_transient_db_failure_recovers_and_processes_once(tmp_path, monkeypatch)
     الفشل العابر بيتغطّى بمحاولات قصيرة، والتنفيذ بيكمّل عادي (سجل دائم واحد، مفيش فقد).
     """
     h = _harness(tmp_path, monkeypatch, FakeOpenHands({CID_A: _conv(CID_A, "owner/repo")}))
-    h.db.set_awaiting(OWNER_ID, CID_A, "route", title="A")
+    h.db.set_last_accessed_conversation(OWNER_ID, CID_A)
     update = h.text_update(4001, "برومت")
 
     calls = {"n": 0}
@@ -679,7 +679,7 @@ def test_persistent_transient_failure_remains_fail_closed(tmp_path, monkeypatch,
     import logging as _logging
 
     h = _harness(tmp_path, monkeypatch, FakeOpenHands({CID_A: _conv(CID_A, "owner/repo")}))
-    h.db.set_awaiting(OWNER_ID, CID_A, "route", title="A")
+    h.db.set_last_accessed_conversation(OWNER_ID, CID_A)
     update = h.text_update(4101, "برومت")
 
     calls = {"n": 0}
@@ -709,7 +709,7 @@ def test_permanent_db_failure_not_retried_fails_closed(tmp_path, monkeypatch, ca
     import logging as _logging
 
     h = _harness(tmp_path, monkeypatch, FakeOpenHands({CID_A: _conv(CID_A, "owner/repo")}))
-    h.db.set_awaiting(OWNER_ID, CID_A, "route", title="A")
+    h.db.set_last_accessed_conversation(OWNER_ID, CID_A)
     update = h.text_update(4201, "برومت")
 
     calls = {"n": 0}
@@ -768,7 +768,7 @@ def test_transient_classifier_matches_busy_locked_by_code():
 def test_transient_retry_preserves_dedup_no_double_processing(tmp_path, monkeypatch):
     """بعد نجاح إعادة المحاولة، إعادة تسليم **نفس** التحديث تفضل مرفوضة (مفيش ازدواج)."""
     h = _harness(tmp_path, monkeypatch, FakeOpenHands({CID_A: _conv(CID_A, "owner/repo")}))
-    h.db.set_awaiting(OWNER_ID, CID_A, "route", title="A")
+    h.db.set_last_accessed_conversation(OWNER_ID, CID_A)
     update = h.text_update(4301, "برومت")
 
     calls = {"n": 0}
@@ -804,7 +804,7 @@ def test_transient_retry_does_not_lose_unrelated_updates(tmp_path, monkeypatch):
     )
     # حالة الانتظار صف واحد لكل مستخدم، فبنضبط الوجهة قبل معالجة كل تحديث على حدة
     # (وجهتان مختلفتان ⇒ سجلان، مفيش دمج).
-    h.db.set_awaiting(OWNER_ID, CID_A, "route", title="A")
+    h.db.set_last_accessed_conversation(OWNER_ID, CID_A)
     bad = h.text_update(4401, "أول")
 
     calls = {"n": 0}
@@ -821,7 +821,7 @@ def test_transient_retry_does_not_lose_unrelated_updates(tmp_path, monkeypatch):
     monkeypatch.setattr(h_mod, "_DEDUPE_RETRY_DELAYS", (0.0, 0.0, 0.0))
 
     h.process(bad)   # عابر ⇒ يتعافى
-    h.db.set_awaiting(OWNER_ID, CID_B, "route", title="B")
+    h.db.set_last_accessed_conversation(OWNER_ID, CID_B)
     good = h.text_update(4402, "تاني")
     h.process(good)  # سليم ⇒ يعالج
 

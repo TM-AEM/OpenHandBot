@@ -97,7 +97,7 @@ class _A3:
         return batch_id
 
     def route(self, cid: str = CID_A, kind: str = "route") -> None:
-        self.db.set_awaiting(OWNER_ID, cid, kind, title="A")
+        self.db.set_last_accessed_conversation(OWNER_ID, cid)
 
     def tombstone(self, cid: str = CID_A) -> None:
         self.db._conn.execute(
@@ -513,4 +513,5 @@ def test_attachment_window_is_independent_from_routing_ttl(tmp_path, monkeypatch
     a.mkbatch(t0=_live_t0(), batch_id="b1")
     a.process(U_A3 + 80, "نصّ")
     # حالة route (10د) ما اتغيّرتش بواسطة A3 (مفيش استهلاك/مسح).
-    assert a.db.get_awaiting(OWNER_ID) == (CID_A, "route")
+    assert a.db.get_awaiting(OWNER_ID) == (None, None)
+    assert a.db.get_last_accessed_conversation(OWNER_ID) == CID_A

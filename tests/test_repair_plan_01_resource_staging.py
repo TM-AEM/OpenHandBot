@@ -396,7 +396,7 @@ def test_handler_quota_reply_on_full_batch(tmp_path, monkeypatch):
     harness.app.bot_data["attachment_store"] = StagingStore(
         harness.db, db_path, max_items_per_batch=1, clock=lambda: _TEST_NOW
     )
-    harness.db.set_awaiting(A2_OWNER, A2_CID, "route", title="A")
+    harness.db.set_last_accessed_conversation(A2_OWNER, A2_CID)
     harness.process(harness.document_update(9901))
     harness.process(harness.document_update(9902))
     assert harness.replies[0] == handlers.ATTACHMENT_ACCEPTED_TEXT

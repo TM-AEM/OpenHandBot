@@ -440,7 +440,7 @@ def test_durable_intent_recorded_is_not_external_success(tmp_path):
 
 def test_duplicate_update_after_durable_intent_creates_no_second_record(tmp_path, monkeypatch):
     hh = _harness(tmp_path, monkeypatch, FakeOpenHands({CID_A: _conv(CID_A, "owner/repo")}))
-    hh.db.set_awaiting(OWNER_ID, CID_A, "route", title="A")
+    hh.db.set_last_accessed_conversation(OWNER_ID, CID_A)
     update = hh.text_update(7100, "برومت")
     hh.process(update)
     assert hh.db.count_outbox() == 1

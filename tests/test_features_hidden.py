@@ -3,7 +3,7 @@
 بنثبت إن:
 - الأزرار/القوايم مش بتعرض الملفات/التصدير/التكلفة/إدارة المتابعات.
 - تسجيل الـ handlers بيرجّع نقاط الدخول دي بعيد (مفيش pattern مستني).
-- العمليات الأساسية (شاتاتي/شات جديد/رد/تحديث/حالة/إلغاء التوجيه) لسه متاحة.
+- العمليات الأساسية (شاتاتي/شات جديد/رد/تحديث/حالة) لسه متاحة.
 - الكود والجداول مش متحذفين (الدوال والجداول لسه موجودين) — يعني إخفاء مش حذف.
 """
 import inspect
@@ -52,8 +52,9 @@ def test_core_actions_remain_available_in_menu_and_conversation():
     menu = _callbacks(kb.main_menu())
     assert "list:0" in menu and "newchat" in menu  # العمليات الأساسية ظاهرة
     convo = _callbacks(kb.conversation_actions("c1"))
-    for cb in ("reply:c1", "open:c1", "status:c1", "list:0", "cancelroute"):
+    for cb in ("reply:c1", "open:c1", "status:c1", "list:0"):
         assert cb in convo
+    assert "cancelroute" not in convo
 
 
 def test_deferred_callbacks_are_restored_in_user_facing_menus():

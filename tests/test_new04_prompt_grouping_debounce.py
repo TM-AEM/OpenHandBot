@@ -176,26 +176,25 @@ def test_chat_and_destination_isolation(tmp_path):
         db.close()
 
 
-def test_cancel_during_pending_batch_preserves_accepted_part_and_rejects_later(tmp_path):
+def test_selection_change_during_pending_batch_does_not_regroup_across_targets(tmp_path):
     ctx = make_context(1, tmp_path)
     db = ctx.bot_data["db"]
-    db.set_awaiting(1, "A", "route")
+    db.set_last_accessed_conversation(1, "A")
     first = make_update(1, "الجزء الأول")
     first.update_id = 8101
     first.message.message_id = 61
     asyncio.run(h.handle_text(first, ctx))
     assert db.count_outbox(OUTBOX_PENDING) == 1
 
-    asyncio.run(h.cancel_route(make_update(1, "/cancel"), ctx))
+    db.set_last_accessed_conversation(1, "B")
     second = make_update(1, "الجزء الثاني")
     second.update_id = 8102
     second.message.message_id = 62
     asyncio.run(h.handle_text(second, ctx))
 
-    assert db.count_outbox(OUTBOX_PENDING) == 1
-    item = db.list_outbox_by_status(OUTBOX_PENDING)[0]
-    assert item.text == "الجزء الأول"
-    assert item.telegram_message_ids == (61,)
+    items = db.list_outbox_by_status(OUTBOX_PENDING)
+    assert len(items) == 2
+    assert {item.conversation_id for item in items} == {"A", "B"}
 
 
 def test_refreshed_batch_is_not_claimed_until_new_deadline(tmp_path):

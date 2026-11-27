@@ -668,7 +668,8 @@ def test_open_no_reply_display_success_keeps_ignored(tmp_path):
     db = ctx.bot_data["db"]
     assert db.update_outcome(9214) == uo.EXPLICITLY_IGNORED
     assert db.is_update_acknowledgment_eligible(9214) is True
-    assert db.get_awaiting(1) == ("A", "route")
+    assert db.get_awaiting(1) == (None, None)
+    assert db.get_last_accessed_conversation(1) == "A"
 
 
 def test_open_no_reply_display_failure_is_transient(tmp_path):
@@ -727,7 +728,8 @@ def test_chat_no_reply_display_success_keeps_ignored(tmp_path):
     db = ctx.bot_data["db"]
     assert db.update_outcome(9222) == uo.EXPLICITLY_IGNORED
     assert db.is_update_acknowledgment_eligible(9222) is True
-    assert db.get_awaiting(OWNER_ID) == ("A", "route")
+    assert db.get_awaiting(OWNER_ID) == (None, None)
+    assert db.get_last_accessed_conversation(OWNER_ID) == "A"
 
 
 def test_chat_no_reply_display_failure_is_transient(tmp_path):

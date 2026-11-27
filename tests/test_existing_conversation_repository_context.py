@@ -244,7 +244,8 @@ def test_prompt_to_repo_linked_conversation_reuses_existing_conversation(tmp_pat
     ctx = _ctx(tmp_path, api)
 
     asyncio.run(h.open_conversation(_callback_update(OWNER_ID, f"open:{CID}"), ctx))
-    assert ctx.bot_data["db"].get_awaiting(OWNER_ID) == (CID, "route")
+    assert ctx.bot_data["db"].get_awaiting(OWNER_ID) == (None, None)
+    assert ctx.bot_data["db"].get_last_accessed_conversation(OWNER_ID) == CID
 
     _send_and_deliver(ctx, "برومت للمستودع")
 

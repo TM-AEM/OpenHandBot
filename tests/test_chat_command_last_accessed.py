@@ -34,7 +34,7 @@ def test_chat_opens_last_accessed_conversation(tmp_path):
 
     update = _chat(ctx)
 
-    assert ctx.bot_data["db"].get_awaiting(OWNER) == ("B", "route")
+    assert ctx.bot_data["db"].get_awaiting(OWNER) == (None, None)
     assert ctx.bot_data["db"].get_last_accessed_conversation(OWNER) == "B"
     assert update.message.replies
     assert "B" not in update.message.replies[0]  # لا نعرض IDs داخلية
@@ -56,7 +56,7 @@ def test_chat_does_not_create_conversation_or_send_prompt(tmp_path):
     _chat(ctx)
 
     assert ctx.bot_data["db"].count_outbox() == 0
-    assert ctx.bot_data["db"].get_awaiting(OWNER) == ("A", "route")
+    assert ctx.bot_data["db"].get_awaiting(OWNER) == (None, None)
 
 
 def test_chat_without_history_points_to_start(tmp_path):
@@ -112,7 +112,7 @@ def test_last_accessed_survives_database_reopen(tmp_path):
         reopened.close()
 
 
-def test_start_clears_route_but_chat_restores_last_accessed(tmp_path):
+def test_start_clears_transient_state_but_chat_restores_last_accessed(tmp_path):
     ctx = make_context(OWNER, tmp_path)
     _open(ctx, "A")
 
@@ -120,7 +120,8 @@ def test_start_clears_route_but_chat_restores_last_accessed(tmp_path):
     assert ctx.bot_data["db"].get_awaiting(OWNER) == (None, None)
 
     _chat(ctx)
-    assert ctx.bot_data["db"].get_awaiting(OWNER) == ("A", "route")
+    assert ctx.bot_data["db"].get_awaiting(OWNER) == (None, None)
+    assert ctx.bot_data["db"].get_last_accessed_conversation(OWNER) == "A"
 
 
 def test_reply_selection_updates_last_accessed(tmp_path):
@@ -179,7 +180,6 @@ def test_chat_help_text_and_existing_commands_intact():
         "/app",
         "/help",
         "/notifications",
-        "/cancel",
         "/attachments",
         "/attachments_clear",
         "/attachments_cancel",

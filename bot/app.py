@@ -61,7 +61,6 @@ BOT_COMMANDS: tuple[tuple[str, str], ...] = (
     ("app", "فتح التطبيق المصغّر"),
     ("help", "المساعدة والأوامر"),
     ("notifications", "ضبط الإشعارات الاستباقية"),
-    ("cancel", "إلغاء التوجيه الحالي"),
     ("attachments", "حالة دفعات المرفقات"),
     ("attachments_clear", "إخلاء دفعة نهائية صراحةً"),
     ("attachments_cancel", "إلغاء دفعة pending واحدة"),
@@ -126,7 +125,6 @@ def build_application(config: Config) -> Application:
     app.add_handler(TypeHandler(Update, handlers.dedupe_update), group=-1)
     app.add_handler(CommandHandler("chat", handlers.chat))
     app.add_handler(CommandHandler("start", handlers.start))
-    app.add_handler(CommandHandler("cancel", handlers.cancel_route))
     app.add_handler(CommandHandler("attachments", handlers.attachments_list))
     app.add_handler(CommandHandler("attachments_clear", handlers.attachments_clear))
     app.add_handler(CommandHandler("attachments_cancel", handlers.attachments_cancel))
@@ -141,7 +139,6 @@ def build_application(config: Config) -> Application:
     app.add_handler(CallbackQueryHandler(handlers.app_open, pattern=r"^app:open$"))
     app.add_handler(CallbackQueryHandler(handlers.notifications_menu, pattern=r"^notif:menu$"))
     app.add_handler(CallbackQueryHandler(handlers.notifications_toggle, pattern=r"^notif:toggle$"))
-    app.add_handler(CallbackQueryHandler(handlers.cancel_route_button, pattern=r"^cancelroute$"))
     app.add_handler(CallbackQueryHandler(handlers.list_conversations, pattern=r"^list:"))
     app.add_handler(CallbackQueryHandler(handlers.open_conversation, pattern=r"^open:"))
     app.add_handler(CallbackQueryHandler(handlers.copy_reply, pattern=r"^copy:"))

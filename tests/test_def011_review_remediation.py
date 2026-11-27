@@ -7,7 +7,6 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta, timezone
 
-import pytest
 from types import SimpleNamespace
 
 import bot.handlers as h
@@ -24,34 +23,10 @@ def _aged(minutes: int) -> datetime:
     return datetime.now(timezone.utc) - timedelta(minutes=minutes)
 
 
-def test_cancel_pause_failure_rolls_back_route_and_awaiting(tmp_path, monkeypatch):
-    ctx = make_context(OWNER, tmp_path)
-    db = ctx.bot_data["db"]
-    db.set_last_accessed_conversation(OWNER, "A")
-    db.set_awaiting(OWNER, "A", "route", title="A")
-    original = db._set_setting_nocommit
-
-    def fail_pause(key, value):
-        if key.startswith(db.ROUTING_PAUSED_KEY_PREFIX):
-            raise RuntimeError("pause write failed")
-        return original(key, value)
-
-    monkeypatch.setattr(db, "_set_setting_nocommit", fail_pause)
-
-    with pytest.raises(RuntimeError):
-        asyncio.run(h.cancel_route(make_update(OWNER, "/cancel"), ctx))
-
-    assert db.get_last_accessed_conversation(OWNER) == "A"
-    assert db.get_awaiting(OWNER) == ("A", "route")
-    assert db.is_routing_paused(OWNER) is False
-
-
 def test_routing_target_cas_rejects_prompt_after_selection_changes(tmp_path):
     db = Database(str(tmp_path / "cas.sqlite3"))
     db.set_last_accessed_conversation(OWNER, "A")
-    db.set_awaiting(OWNER, "A", "route", title="A")
     db.set_last_accessed_conversation(OWNER, "B")
-    db.set_awaiting(OWNER, "B", "route", title="B")
 
     out_id = db.add_or_group_outbox(
         "A", OWNER, "برومت", outbox.now_iso(),
@@ -65,7 +40,6 @@ def test_routing_target_cas_rejects_prompt_after_selection_changes(tmp_path):
 def test_routing_target_cas_allows_unchanged_target(tmp_path):
     db = Database(str(tmp_path / "cas-ok.sqlite3"))
     db.set_last_accessed_conversation(OWNER, "A")
-    db.set_awaiting(OWNER, "A", "route", title="A")
 
     out_id = db.add_or_group_outbox(
         "A", OWNER, "برومت", outbox.now_iso(),
@@ -83,7 +57,6 @@ def test_handler_rejects_prompt_when_selection_changes_during_preparation(
         ctx = make_context(OWNER, tmp_path)
         db = ctx.bot_data["db"]
         db.set_last_accessed_conversation(OWNER, "A")
-        db.set_awaiting(OWNER, "A", "route", title="A")
         started = asyncio.Event()
         release = asyncio.Event()
 
@@ -98,7 +71,6 @@ def test_handler_rejects_prompt_when_selection_changes_during_preparation(
         task = asyncio.create_task(h.handle_text(update, ctx))
         await started.wait()
         db.set_last_accessed_conversation(OWNER, "B")
-        db.set_awaiting(OWNER, "B", "route", title="B")
         release.set()
         await task
 
@@ -106,21 +78,6 @@ def test_handler_rejects_prompt_when_selection_changes_during_preparation(
         assert any("تغيّر الشات المختار" in text for text in update.message.replies)
 
     asyncio.run(_run())
-
-
-def test_paused_expired_reply_does_not_route_and_clears_stale_reply(tmp_path):
-    ctx = make_context(OWNER, tmp_path)
-    db = ctx.bot_data["db"]
-    db.set_last_accessed_conversation(OWNER, "A")
-    db.set_awaiting(OWNER, "A", "reply", now=_aged(30))
-    db.pause_routing(OWNER)
-    update = make_update(OWNER, "رد متأخر")
-
-    asyncio.run(h.handle_text(update, ctx))
-
-    assert db.count_outbox() == 0
-    assert db.get_awaiting(OWNER) == (None, None)
-    assert "التوجيه متوقف" in update.message.replies[-1]
 
 
 def test_expired_reply_consumes_stale_state_when_routing_allowed(tmp_path):

@@ -127,20 +127,6 @@ def test_pick_repo_records_durable_completed(tmp_path):
     assert ctx.bot_data["db"].update_outcome(9204) == uo.DURABLE_COMPLETED
 
 
-def test_cancel_route_button_records_durable_completed(tmp_path):
-    update, ctx = _cb(tmp_path, DetailClient(None), "cancelroute", 9205)
-    asyncio.run(h.cancel_route_button(update, ctx))
-    assert ctx.bot_data["db"].update_outcome(9205) == uo.DURABLE_COMPLETED
-
-
-def test_cancel_route_message_records_durable_completed(tmp_path):
-    ctx = _ctx_with(tmp_path, DetailClient(None))
-    update = make_update(OWNER_ID, "/cancel")
-    update.update_id = 9206
-    asyncio.run(h.cancel_route(update, ctx))
-    assert ctx.bot_data["db"].update_outcome(9206) == uo.DURABLE_COMPLETED
-
-
 # ============================================================================
 # 2) قراءة/رفض مقصود ⇒ explicitly_ignored
 # ============================================================================

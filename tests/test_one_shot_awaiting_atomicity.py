@@ -174,7 +174,7 @@ def test_reposearch_crash_before_consume_keeps_state_and_redelivery_resends(tmp_
 
 def test_route_crash_before_durable_write_renewed_and_redelivery_sends(tmp_path, monkeypatch):
     h = _harness(tmp_path, monkeypatch, FakeOpenHands({CID_A: _conv(CID_A, "owner/repo")}))
-    h.db.set_awaiting(OWNER_ID, CID_A, "route", title="A")
+    h.db.set_last_accessed_conversation(OWNER_ID, CID_A)
     update = h.text_update(U_ROUTE, "برومت route")
 
     calls = {"n": 0}
@@ -189,11 +189,13 @@ def test_route_crash_before_durable_write_renewed_and_redelivery_sends(tmp_path,
     monkeypatch.setattr(h.db, "add_or_group_outbox", flaky)
 
     h.process(update)
-    assert h.db.get_awaiting(OWNER_ID) == (CID_A, "route")  # route مستمر: لسه قائم
+    assert h.db.get_last_accessed_conversation(OWNER_ID) == CID_A
+    assert h.db.get_awaiting(OWNER_ID) == (None, None)
     h.process(update)
     h.deliver_pending()
     assert h.client.sends == [(CID_A, "برومت route")]
-    assert h.db.get_awaiting(OWNER_ID) == (CID_A, "route")  # لسه قائم (route مايتستهلكش)
+    assert h.db.get_last_accessed_conversation(OWNER_ID) == CID_A
+    assert h.db.get_awaiting(OWNER_ID) == (None, None)
 
 
 # ============================================================================
@@ -287,16 +289,16 @@ def test_restart_recovery_preserves_pending_work(tmp_path, monkeypatch):
 # 6) حالة غير متوقّعة/متغيّرة ما تتستهلكش
 # ============================================================================
 def test_changed_awaiting_kind_not_consumed(tmp_path, monkeypatch):
-    """الحالة بقت `route` (اتغيّرت) لكن الطلب بيستهلك `reply` ⇒ مفيش استهلاك ولا كتابة."""
+    """الحالة بقت `newchat` (اتغيّرت) لكن الطلب بيستهلك `reply` ⇒ مفيش استهلاك ولا كتابة."""
     h = _harness(tmp_path, monkeypatch, FakeOpenHands({CID_A: _conv(CID_A, "owner/repo")}))
-    h.db.set_awaiting(OWNER_ID, CID_A, "route", title="A")
+    h.db.set_awaiting(OWNER_ID, CID_A, "newchat")
     out_id = h.db.add_or_group_outbox(
         CID_A, CHAT_ID, "برومت", outbox.now_iso(), reengage=True,
         update_id=U_ROUTE + 10, consume_awaiting=(OWNER_ID, "reply"),
     )
     assert out_id == 0  # مرفوض: النوع مش متوقّع
     assert h.db.count_outbox() == 0
-    assert h.db.get_awaiting(OWNER_ID) == (CID_A, "route")  # الحالة اتسابت زي ما هي
+    assert h.db.get_awaiting(OWNER_ID) == (CID_A, "newchat")  # الحالة اتسابت زي ما هي
     assert h.db.update_is_processed(U_ROUTE + 10) is False
 
 

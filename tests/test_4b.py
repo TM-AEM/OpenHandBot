@@ -396,10 +396,10 @@ def test_ttl_is_ten_minutes():
     assert AWAITING_TTL == timedelta(minutes=10)
 
 
-def test_route_is_sticky_refreshes_and_shows_chat_name(tmp_path):
+def test_selected_target_refreshes_without_route_state(tmp_path):
     ctx = make_context(1, tmp_path)
     db = ctx.bot_data["db"]
-    db.set_awaiting(1, "conv-A", "route", title="مشروع الموقع", now=aged(8))
+    db.set_last_accessed_conversation(1, "conv-A")
 
     u1 = make_update(1, "أول")
     asyncio.run(h.handle_text(u1, ctx))
@@ -411,8 +411,7 @@ def test_route_is_sticky_refreshes_and_shows_chat_name(tmp_path):
     assert len(items) == 1
     assert items[0].conversation_id == "conv-A"
     assert items[0].text == "أول\nتاني"
-    assert "مشروع الموقع" in u1.message.replies[0]  # اسم الشات المستهدف ظاهر
-    assert db.get_awaiting(1) == ("conv-A", "route")  # لسه شغال (اتجدّد وقته)
+    assert db.get_awaiting(1) == (None, None)
 
 
 def test_route_survives_ten_minutes_of_inactivity(tmp_path):
@@ -438,30 +437,16 @@ def test_route_with_activity_does_not_expire_while_in_use(tmp_path):
     assert db.take_awaiting(1, now=t0 + timedelta(minutes=40))[1] == "route"
 
 
-def test_cancel_command_and_button_clear_route(tmp_path):
-    ctx = make_context(1, tmp_path)
-    db = ctx.bot_data["db"]
-    db.set_awaiting(1, "conv-A", "route", title="t")
-    update = make_update(1, "/cancel")
-    asyncio.run(h.cancel_route(update, ctx))
-    assert db.get_awaiting(1) == (None, None)
-    assert "اتلغى" in update.message.replies[0]
-
-    db.set_awaiting(1, "conv-A", "route", title="t")
-    asyncio.run(h.cancel_route_button(cb_update(Q("cancelroute")), ctx))
-    assert db.get_awaiting(1) == (None, None)
-    follow = make_update(1, "بعد الإلغاء")
-    asyncio.run(h.handle_text(follow, ctx))
-    assert db.count_outbox() == 0
-
-
-def test_cancel_ignored_for_non_private_or_unauthorized(tmp_path):
-    ctx = make_context(1, tmp_path)
-    db = ctx.bot_data["db"]
-    db.set_awaiting(1, "conv-A", "route", title="t")
-    update = make_update(999, "/cancel")
-    asyncio.run(h.cancel_route(update, ctx))
-    assert db.get_awaiting(1) == ("conv-A", "route")
+def test_cancel_forwarding_controls_are_removed(tmp_path):
+    assert not hasattr(h, "cancel_route")
+    assert not hasattr(h, "cancel_route_button")
+    callbacks = [
+        button.callback_data
+        for row in kb.conversation_actions("c1").inline_keyboard
+        for button in row
+    ]
+    assert "cancelroute" not in callbacks
+    assert "cancel" not in [name for name, _ in __import__("bot.app", fromlist=["BOT_COMMANDS"]).BOT_COMMANDS]
 
 
 def test_navigation_clears_pending_state(tmp_path):
@@ -509,8 +494,9 @@ def test_opening_a_chat_routes_following_messages_to_it_and_replaces_previous(tm
 
     q = Q("open:A")
     asyncio.run(h.open_conversation(cb_update(q), ctx))
-    assert db.get_awaiting(1) == ("A", "route")
-    assert "لحد ما تفتح/تختار شات تاني" in "".join(q.edits)
+    assert db.get_awaiting(1) == (None, None)
+    assert db.get_last_accessed_conversation(1) == "A"
+    assert "لحد ما تفتح/تختار شات تاني" not in "".join(q.edits)
 
     ctx.bot_data["client"] = OpenClient({"id": "B", "title": "شات B", "execution_status": "finished"})
     asyncio.run(h.open_conversation(cb_update(Q("open:B")), ctx))
@@ -519,10 +505,10 @@ def test_opening_a_chat_routes_following_messages_to_it_and_replaces_previous(tm
     assert [i.conversation_id for i in db.list_outbox_by_status("pending")] == ["B"]
 
 
-def test_concurrent_messages_on_route_all_reach_the_same_chat(tmp_path):
+def test_concurrent_messages_on_selected_target_all_reach_the_same_chat(tmp_path):
     ctx = make_context(1, tmp_path)
     db = ctx.bot_data["db"]
-    db.set_awaiting(1, "A", "route", title="t")
+    db.set_last_accessed_conversation(1, "A")
     updates = []
     for i in range(10):
         update = make_update(1, f"m{i}")
@@ -630,7 +616,8 @@ def test_open_success_renders_view_and_activates_route(tmp_path):
     q = Q("open:A")
     asyncio.run(h.open_conversation(cb_update(q), ctx))
     assert q.edits and "شات A" in q.edits[0] and "آخر رد" in q.edits[0]
-    assert ctx.bot_data["db"].get_awaiting(1) == ("A", "route")
+    assert ctx.bot_data["db"].get_awaiting(1) == (None, None)
+    assert ctx.bot_data["db"].get_last_accessed_conversation(1) == "A"
 
 
 # 2) شات مش موجود: رسالة متوقعة + الحفاظ على التوجيه القائم -------------------
@@ -764,7 +751,8 @@ def test_open_edit_failure_is_handled_without_crash(tmp_path):
     ctx.bot = RecordingBot()
     q = FailQuery("open:A", BadRequest("Message is not modified"))
     asyncio.run(h.open_conversation(_open_update(q), ctx))  # مايرميش
-    assert ctx.bot_data["db"].get_awaiting(1) == ("A", "route")  # العرض موجود => التوجيه اتفعّل
+    assert ctx.bot_data["db"].get_awaiting(1) == (None, None)
+    assert ctx.bot_data["db"].get_last_accessed_conversation(1) == "A"  # العرض موجود => الهدف اتحفظ
 
 
 def test_open_edit_expired_message_is_handled_without_crash(tmp_path):
@@ -881,8 +869,8 @@ def test_open_api_error_edit_failure_preserves_all_state(tmp_path):
     assert db.get_creation_job(job).status == "pending"
 
 
-def test_conversation_actions_has_cancel_route_button():
-    assert "cancelroute" in callbacks(kb.conversation_actions("c1"))
+def test_conversation_actions_has_no_cancel_route_button():
+    assert "cancelroute" not in callbacks(kb.conversation_actions("c1"))
 
 
 def test_main_logging_setup_redacts_and_silences_url_loggers():

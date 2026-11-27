@@ -224,7 +224,7 @@ def _harness(tmp_path, monkeypatch) -> Harness:
 def test_attachment_type_rejected_once_with_no_side_effects(tmp_path, monkeypatch, name, builder):
     harness = _harness(tmp_path, monkeypatch)
     # حالة توجيه معلّقة: لو المرفق وصل لمسار البرومت كان هيرسل/ينشئ — نتأكد إن ده ماحصلش.
-    harness.db.set_awaiting(OWNER_ID, "11111111222233334444555566667777", "route", title="A")
+    harness.db.set_last_accessed_conversation(OWNER_ID, "11111111222233334444555566667777")
 
     harness.process(harness.message_update(2000, **builder()))
 
@@ -235,9 +235,8 @@ def test_attachment_type_rejected_once_with_no_side_effects(tmp_path, monkeypatc
     # 3) مفيش صندوق ولا طلب إنشاء ولا شات جديد.
     assert harness.db.count_outbox() == 0
     assert harness.db.list_open_creation_jobs() == []
-    # 4) حالة التوجيه ما اتغيّرتش (مفيش استهلاك/إرسال).
-    pending, kind, title, _ = harness.db.awaiting_state(OWNER_ID)
-    assert (pending, kind, title) == ("11111111222233334444555566667777", "route", "A")
+    # 4) الهدف المحفوظ ما اتغيّرش (مفيش استهلاك/إرسال).
+    assert harness.db.get_last_accessed_conversation(OWNER_ID) == "11111111222233334444555566667777"
 
 
 def test_attachment_rejection_does_not_create_local_files(tmp_path, monkeypatch):
@@ -262,7 +261,7 @@ def test_attachment_rejection_records_explicitly_ignored_outcome(tmp_path, monke
 def test_plain_text_still_uses_text_path(tmp_path, monkeypatch):
     """النص العادي بيفضل على مساره: بيتبعت للصندوق كبرومت (مش رد الرفض)."""
     harness = _harness(tmp_path, monkeypatch)
-    harness.db.set_awaiting(OWNER_ID, "11111111222233334444555566667777", "route", title="A")
+    harness.db.set_last_accessed_conversation(OWNER_ID, "11111111222233334444555566667777")
 
     harness.process(harness.message_update(2300, text="برومت نصي"))
 

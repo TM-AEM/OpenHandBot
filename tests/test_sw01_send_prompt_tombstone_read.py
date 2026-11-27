@@ -300,7 +300,7 @@ def test_confirmation_failure_after_commit_keeps_prompt_durable(tmp_path, monkey
     client = CountingClient()
     ctx = _ctx_with(tmp_path, client)
     db = ctx.bot_data["db"]
-    db.set_awaiting(1, CID, "route", title="A")
+    db.set_last_accessed_conversation(1, CID)
 
     update = _text_update(1, "برومت", update_id=7777)
     real_reply = update.message.reply_text
@@ -316,7 +316,8 @@ def test_confirmation_failure_after_commit_keeps_prompt_durable(tmp_path, monkey
     with pytest.raises(RuntimeError):
         asyncio.run(h.handle_text(update, ctx))
     assert db.count_outbox() == 1  # البرومت اتحفظ بثبات رغم فشل التأكيد
-    assert db.get_awaiting(1) == (CID, "route")  # route مستمر (بيتجدد، مش بيتستهلك)
+    assert db.get_awaiting(1) == (None, None)
+    assert db.get_last_accessed_conversation(1) == CID
 
     # إعادة تسليم **نفس** التحديث: علامة «معالَج» بتمنع برومت تاني (idempotency).
     update2 = _text_update(1, "برومت", update_id=7777)
@@ -330,7 +331,7 @@ def test_duplicate_update_creates_single_prompt(tmp_path):
     client = CountingClient()
     ctx = _ctx_with(tmp_path, client)
     db = ctx.bot_data["db"]
-    db.set_awaiting(1, CID, "route", title="A")
+    db.set_last_accessed_conversation(1, CID)
 
     asyncio.run(h.handle_text(_text_update(1, "برومت", update_id=8888), ctx))
     asyncio.run(h.handle_text(_text_update(1, "برومت", update_id=8888), ctx))

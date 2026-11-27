@@ -116,13 +116,13 @@ def test_cleanup_preserves_newer_last_accessed_but_clears_old_awaiting(tmp_path)
     try:
         db.set_last_accessed_conversation(OWNER, OTHER)
         db.set_awaiting(OWNER, CID, "route", title=CID)
-        db.pause_routing(OWNER)
+        db.set_setting(f"routing_paused:{OWNER}", "1")
 
         db.clear_unavailable_selection(OWNER, CID)
 
         assert db.get_last_accessed_conversation(OWNER) == OTHER
         assert db.get_awaiting(OWNER) == (None, None)
-        assert db.is_routing_paused(OWNER) is True
+        assert db.get_setting(f"routing_paused:{OWNER}") == "1"
     finally:
         db.close()
 
@@ -238,7 +238,7 @@ def test_successful_atomic_cleanup_still_emits_existing_notice(tmp_path):
         db.close()
 
 
-def test_concurrent_cancel_and_cleanup_serialize(tmp_path):
+def test_concurrent_state_clear_and_cleanup_serialize(tmp_path):
     path = str(tmp_path / "cancel-race.sqlite3")
     db_cleanup = Database(path)
     db_cancel = Database(path)
@@ -265,7 +265,6 @@ def test_concurrent_cancel_and_cleanup_serialize(tmp_path):
                     None,
                     outbox.now_iso(),
                     "cancelled",
-                    pause_routing=True,
                 )
             except BaseException as exc:  # pragma: no cover - surfaced below
                 errors.append(exc)
@@ -278,7 +277,6 @@ def test_concurrent_cancel_and_cleanup_serialize(tmp_path):
 
         assert not errors
         assert results["cleanup"] is True
-        assert db_cleanup.is_routing_paused(OWNER) is True
         assert db_cleanup.get_last_accessed_conversation(OWNER) is None
         assert db_cleanup.get_awaiting(OWNER) == (None, None)
     finally:

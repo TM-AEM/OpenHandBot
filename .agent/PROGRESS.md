@@ -6366,3 +6366,55 @@ worker/Canary; SCHEMA approval, AUTH, LIFECYCLE/TTL, and INTEGRATION remain pend
 - No GitHub/OpenHands/Telegram/provider call; no worker/Canary.
 - No commit, push, PR, merge, deploy, fetch, pull.
 - Autopush disabled/inactive.
+
+## OHB2-REMOVE-CHAT-FORWARDING-AND-CANCEL (2026-11-27)
+
+- **Goal:** remove chat-forwarding UX, forwarding-specific automatic route state,
+  `/cancel`, the `إلغاء التوجيه` button, callbacks, and obsolete pause state.
+- **Preserve:** manual copy (`عرض للنسخ اليدوي`), ordinary prompt submission, explicit
+  reply/newchat/reposearch, persistent last-accessed `/chat` behavior, Mini App,
+  deletion/archive/inbox/status, F-01 cleanup, F-02 queued-ack wording, F-07 CAS.
+- **Acceptance criteria:**
+  1. Opening a conversation emits no forwarding instruction and creates no `route`
+     forwarding state; `last_accessed` remains the ordinary selection.
+  2. `/cancel`, `cancelroute`, and `إلغاء التوجيه` are absent from commands,
+     callbacks, keyboards, and help; legacy route/pause rows cannot redirect or block
+     ordinary text.
+  3. Manual-copy and ordinary prompt submission/selection still work; unavailable
+     targets produce an explicit error with no fallback/creation.
+  4. F-01/F-02/F-06/F-07 behavior is verified in the resulting code; no new
+     architecture/schema/worker is introduced.
+  5. Focused, full Python, frontend, static, doc-parity, security, and diff checks pass
+     or any failure is reported honestly.
+- **Baseline:** branch `main`, HEAD `9a34a3a0006b1367f0ff089a083f1eaf1b1251c0`,
+  tree `0409516d81ec5d360b8c3d19c80730b1f78865f2`, clean tree; focused baseline 335
+  passed; previous identical-tree full suite 4413 passed.
+- **Implementation:**
+  - Removed `/cancel` from `BOT_COMMANDS`, help text, and `build_application`; removed
+    `cancel_route`/`cancel_route_button`, the `cancelroute` callback/pattern, and the
+    `إلغاء التوجيه` keyboard button.
+  - Opening a conversation now clears transient awaiting state and persists only
+    `last_accessed_conversation_id` atomically with the update outcome; no `route` row,
+    title, or forwarding instruction is created.
+  - Ordinary text uses only `last_accessed`; legacy `route` rows and `routing_paused:*`
+    settings are inert (no redirect, no blocking, no automatic renewal).
+  - Removed `pause_routing`/`resume_routing`/`is_routing_paused` and the pause flag from
+    atomic state helpers; document upload and accompanying attachment text use the
+    persisted last-accessed target instead of `route`.
+  - Updated affected regression tests and added
+    `tests/test_remove_chat_forwarding_and_cancel.py` for removal boundaries.
+- **Verification (final):**
+  - Focused forwarding/attachment/handler suite: 279 passed; document/attachment suite:
+    146 passed.
+  - Full Python: **4407 passed, 0 failed** (74 pre-existing warnings; 327.06s).
+  - Node frontend: **280 pass / 0 fail**.
+  - `pyflakes`: 0; Bandit High: 0 (7 Low/22 Medium); pip-audit: no known vulnerabilities;
+    `git diff --check`: clean.
+  - Residual symbol grep: no `/cancel`, `cancelroute`, `cancel_route`,
+    `cancel_route_button`, `إلغاء التوجيه`, `routing_paused`, `pause_routing`,
+    `resume_routing`, or `is_routing_paused` in production/docs; only generic
+    `cancelled` status strings remain.
+- **Not verified:** Python 3.11/GitHub Actions CI was not run locally (local Python
+  3.13.15); no live Telegram/OpenHands call. No commit/push/PR/deploy performed.
+- **Status:** `OHB2_REMOVE_CHAT_FORWARDING_AND_CANCEL_COMPLETE` — local verification
+  green; independent review not performed.

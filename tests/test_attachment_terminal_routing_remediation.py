@@ -93,7 +93,7 @@ class _R:
         return batch_id
 
     def route(self, cid: str = CID_A, kind: str = "route") -> None:
-        self.db.set_awaiting(OWNER_ID, cid, kind, title="A")
+        self.db.set_last_accessed_conversation(OWNER_ID, cid)
 
     def process(self, update_id: int, text: str) -> None:
         self.h.process(self.h.text_update(update_id, text))

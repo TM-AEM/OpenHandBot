@@ -92,7 +92,7 @@ def _count(harness: Harness, table: str) -> int:
 # ============================================================================
 def test_e2e_intake_then_expiry_sweep_via_tick(tmp_path, monkeypatch):
     harness = _harness(tmp_path, monkeypatch)
-    harness.db.set_awaiting(OWNER_ID, CID, "route", title="A")
+    harness.db.set_last_accessed_conversation(OWNER_ID, CID)
     harness.process(harness.document_update(U + 1))
 
     # (أ) القبول: نيّة متينة + رد صادق + مؤهّل للإقرار.
@@ -120,7 +120,7 @@ def test_e2e_intake_then_expiry_sweep_via_tick(tmp_path, monkeypatch):
 
 def test_e2e_two_documents_same_batch_then_sweep_both(tmp_path, monkeypatch):
     harness = _harness(tmp_path, monkeypatch)
-    harness.db.set_awaiting(OWNER_ID, CID, "route", title="A")
+    harness.db.set_last_accessed_conversation(OWNER_ID, CID)
     harness.process(harness.document_update(U + 2, name="a.txt"))
     harness.process(harness.document_update(U + 3, name="b.txt"))
     assert _count(harness, "attachment_batches") == 1  # نفس الدفعة (بلا تمديد)
@@ -142,7 +142,7 @@ def test_e2e_two_documents_same_batch_then_sweep_both(tmp_path, monkeypatch):
 
 def test_e2e_repeated_sweeps_are_idempotent(tmp_path, monkeypatch):
     harness = _harness(tmp_path, monkeypatch)
-    harness.db.set_awaiting(OWNER_ID, CID, "route", title="A")
+    harness.db.set_last_accessed_conversation(OWNER_ID, CID)
     harness.process(harness.document_update(U + 4))
     batch_id = _batch_id(harness)
     item = _item(harness, batch_id)
@@ -157,7 +157,7 @@ def test_e2e_repeated_sweeps_are_idempotent(tmp_path, monkeypatch):
 # ============================================================================
 def test_e2e_recovers_stale_partial_after_interruption(tmp_path, monkeypatch):
     harness = _harness(tmp_path, monkeypatch)
-    harness.db.set_awaiting(OWNER_ID, CID, "route", title="A")
+    harness.db.set_last_accessed_conversation(OWNER_ID, CID)
     harness.process(harness.document_update(U + 5))
     batch_id = _batch_id(harness)
     item = _item(harness, batch_id)
@@ -176,7 +176,7 @@ def test_e2e_kill_switch_no_side_effects_then_clean_sweep(tmp_path, monkeypatch)
     harness.app.bot_data["config"] = dataclasses.replace(
         cfg, attachment_document_intake_enabled=False
     )
-    harness.db.set_awaiting(OWNER_ID, CID, "route", title="A")
+    harness.db.set_last_accessed_conversation(OWNER_ID, CID)
     harness.process(harness.document_update(U + 6))
     assert harness.replies == [h_mod.ATTACHMENT_INTAKE_DISABLED_TEXT]
     assert _count(harness, "attachment_batches") == 0
@@ -191,7 +191,7 @@ def test_e2e_kill_switch_no_side_effects_then_clean_sweep(tmp_path, monkeypatch)
 # ============================================================================
 def test_e2e_tick_creates_no_asyncio_task(tmp_path, monkeypatch):
     harness = _harness(tmp_path, monkeypatch)
-    harness.db.set_awaiting(OWNER_ID, CID, "route", title="A")
+    harness.db.set_last_accessed_conversation(OWNER_ID, CID)
     harness.process(harness.document_update(U + 7))
     created = []
     real_create = asyncio.create_task
@@ -216,7 +216,7 @@ def test_e2e_attachments_module_has_no_asyncio_or_worker_class():
 
 def test_e2e_watcher_owns_no_extra_connection(tmp_path, monkeypatch):
     harness = _harness(tmp_path, monkeypatch)
-    harness.db.set_awaiting(OWNER_ID, CID, "route", title="A")
+    harness.db.set_last_accessed_conversation(OWNER_ID, CID)
     harness.process(harness.document_update(U + 8))
     conn_before = harness.db._conn
     _tick(harness, now=_after_ttl(harness))

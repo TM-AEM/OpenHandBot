@@ -810,8 +810,10 @@ def test_open_shows_last_prompt_and_agent_reply(tmp_path):
     asyncio.run(h.open_conversation(_t55_cb_update(q), ctx))
     assert q.edits and "آخر برومت منك:" in q.edits[0] and "برومتي" in q.edits[0]
     assert "رد الـ agent:" in q.edits[0] and "ردي" in q.edits[0]
-    assert "لحد ما تفتح/تختار شات تاني" in q.edits[0]
-    assert ctx.bot_data["db"].get_awaiting(1) == ("A", "route")
+    assert "لحد ما تفتح/تختار شات تاني" not in q.edits[0]
+    assert "إلغاء التوجيه" not in q.edits[0]
+    assert ctx.bot_data["db"].get_awaiting(1) == (None, None)
+    assert ctx.bot_data["db"].get_last_accessed_conversation(1) == "A"
 
 
 def test_open_long_reply_offers_full_button(tmp_path):

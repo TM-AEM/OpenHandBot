@@ -52,7 +52,7 @@ def _batch_rows(db: Database) -> int:
 def test_disabled_intake_rejects_with_truthful_message(tmp_path, monkeypatch):
     harness = _harness(tmp_path, monkeypatch)
     _disable_intake(harness)
-    harness.db.set_awaiting(OWNER_ID, CID, "route", title="A")
+    harness.db.set_last_accessed_conversation(OWNER_ID, CID)
     harness.process(harness.document_update(U + 1))
     assert harness.replies == [h_mod.ATTACHMENT_INTAKE_DISABLED_TEXT]
 
@@ -60,7 +60,7 @@ def test_disabled_intake_rejects_with_truthful_message(tmp_path, monkeypatch):
 def test_disabled_intake_does_not_call_get_file(tmp_path, monkeypatch):
     harness = _harness(tmp_path, monkeypatch)
     _disable_intake(harness)
-    harness.db.set_awaiting(OWNER_ID, CID, "route", title="A")
+    harness.db.set_last_accessed_conversation(OWNER_ID, CID)
     harness.process(harness.document_update(U + 2))
     assert harness.get_file_calls == []  # مفيش get_file خالص
 
@@ -68,7 +68,7 @@ def test_disabled_intake_does_not_call_get_file(tmp_path, monkeypatch):
 def test_disabled_intake_creates_no_rows_or_files(tmp_path, monkeypatch):
     harness = _harness(tmp_path, monkeypatch)
     _disable_intake(harness)
-    harness.db.set_awaiting(OWNER_ID, CID, "route", title="A")
+    harness.db.set_last_accessed_conversation(OWNER_ID, CID)
     harness.process(harness.document_update(U + 3))
     assert _batch_rows(harness.db) == 0            # مفيش دفعة
     assert _count(harness.db, "attachment_items") == 0
@@ -83,7 +83,7 @@ def test_disabled_intake_creates_no_rows_or_files(tmp_path, monkeypatch):
 def test_disabled_intake_makes_no_openhands_call(tmp_path, monkeypatch):
     harness = _harness(tmp_path, monkeypatch)
     _disable_intake(harness)
-    harness.db.set_awaiting(OWNER_ID, CID, "route", title="A")
+    harness.db.set_last_accessed_conversation(OWNER_ID, CID)
     harness.app.bot_data["client"].calls.clear()
     harness.process(harness.document_update(U + 4))
     assert harness.app.bot_data["client"].calls == []  # مفيش نداء OpenHands
@@ -92,7 +92,7 @@ def test_disabled_intake_makes_no_openhands_call(tmp_path, monkeypatch):
 def test_disabled_intake_writes_no_outbox_row(tmp_path, monkeypatch):
     harness = _harness(tmp_path, monkeypatch)
     _disable_intake(harness)
-    harness.db.set_awaiting(OWNER_ID, CID, "route", title="A")
+    harness.db.set_last_accessed_conversation(OWNER_ID, CID)
     harness.process(harness.document_update(U + 5))
     assert _count(harness.db, "outbox") == 0
 
@@ -100,7 +100,7 @@ def test_disabled_intake_writes_no_outbox_row(tmp_path, monkeypatch):
 def test_disabled_intake_records_explicitly_ignored(tmp_path, monkeypatch):
     harness = _harness(tmp_path, monkeypatch)
     _disable_intake(harness)
-    harness.db.set_awaiting(OWNER_ID, CID, "route", title="A")
+    harness.db.set_last_accessed_conversation(OWNER_ID, CID)
     harness.process(harness.document_update(U + 6))
     assert harness.db.update_outcome(U + 6) == "explicitly_ignored"
     assert harness.db.is_update_acknowledgment_eligible(U + 6) is True
@@ -110,7 +110,7 @@ def test_disabled_intake_no_download_helper_invoked(tmp_path, monkeypatch):
     """لا نداء لمسار التنزيل المقيّد (`_download_attachment_chunks`) ولا `get_file`."""
     harness = _harness(tmp_path, monkeypatch)
     _disable_intake(harness)
-    harness.db.set_awaiting(OWNER_ID, CID, "route", title="A")
+    harness.db.set_last_accessed_conversation(OWNER_ID, CID)
     called = []
     real = h_mod._download_attachment_chunks
 
@@ -129,7 +129,7 @@ def test_disabled_intake_no_download_helper_invoked(tmp_path, monkeypatch):
 def test_explicit_enable_stores_document(tmp_path, monkeypatch):
     harness = _harness(tmp_path, monkeypatch)
     assert harness.app.bot_data["config"].attachment_document_intake_enabled is True
-    harness.db.set_awaiting(OWNER_ID, CID, "route", title="A")
+    harness.db.set_last_accessed_conversation(OWNER_ID, CID)
     harness.process(harness.document_update(U + 8))
     assert harness.replies == [h_mod.ATTACHMENT_ACCEPTED_TEXT]
     assert _batch_rows(harness.db) == 1
@@ -138,7 +138,7 @@ def test_explicit_enable_stores_document(tmp_path, monkeypatch):
 def test_re_enabling_restores_behavior(tmp_path, monkeypatch):
     """عكوس بلا فقدان: تعطيل ثم تفعيل ⇒ نفس السلوك الأصلي."""
     harness = _harness(tmp_path, monkeypatch)
-    harness.db.set_awaiting(OWNER_ID, CID, "route", title="A")
+    harness.db.set_last_accessed_conversation(OWNER_ID, CID)
     _disable_intake(harness)
     harness.process(harness.document_update(U + 9))
     assert harness.replies == [h_mod.ATTACHMENT_INTAKE_DISABLED_TEXT]

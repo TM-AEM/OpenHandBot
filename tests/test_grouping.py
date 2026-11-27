@@ -162,7 +162,7 @@ def test_only_pending_rows_are_grouped_not_sent():
 def test_handler_groups_rapid_messages_into_one_row(tmp_path):
     ctx = make_context(1, tmp_path)
     db = ctx.bot_data["db"]
-    db.set_awaiting(1, "A", "route")
+    db.set_last_accessed_conversation(1, "A")
     for i, text in enumerate(("سطر1", "سطر2", "سطر3"), start=1):
         update = make_update(1, text)
         update.update_id = 100 + i
@@ -177,7 +177,7 @@ def test_handler_groups_rapid_messages_into_one_row(tmp_path):
 def test_handler_new_row_after_window(tmp_path, monkeypatch):
     ctx = make_context(1, tmp_path)
     db = ctx.bot_data["db"]
-    db.set_awaiting(1, "A", "route")
+    db.set_last_accessed_conversation(1, "A")
     clock = ["2026-01-01T00:00:00+00:00"]
     monkeypatch.setattr("bot.outbox.now_iso", lambda: clock[0])
     for i, (when, text) in enumerate(
@@ -202,7 +202,7 @@ def test_handler_new_row_after_window(tmp_path, monkeypatch):
 def test_handler_groups_explicit_reply_parts(tmp_path):
     ctx = make_context(1, tmp_path)
     db = ctx.bot_data["db"]
-    db.set_awaiting(1, "A", "route")
+    db.set_last_accessed_conversation(1, "A")
     first = make_update(1, "سطر1")
     first.update_id = 301
     first.message.message_id = 11
@@ -233,7 +233,7 @@ def test_handler_isolates_two_conversations(tmp_path):
 def test_concurrent_handler_messages_group_without_loss(tmp_path):
     ctx = make_context(1, tmp_path)
     db = ctx.bot_data["db"]
-    db.set_awaiting(1, "A", "route")
+    db.set_last_accessed_conversation(1, "A")
     updates = []
     for i in range(12):
         update = make_update(1, f"m{i}")

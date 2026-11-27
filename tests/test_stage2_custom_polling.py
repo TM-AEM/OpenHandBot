@@ -427,7 +427,7 @@ def test_crash_before_outcome_recording_redelivery_reprocesses(tmp_path, monkeyp
 
 def test_crash_after_outcome_before_boundary_redelivery_is_duplicate(tmp_path, monkeypatch):
     hh = _harness(tmp_path, monkeypatch, FakeOpenHands({CID_A: _conv(CID_A, "owner/repo")}))
-    hh.db.set_awaiting(OWNER_ID, CID_A, "route", title="A")
+    hh.db.set_last_accessed_conversation(OWNER_ID, CID_A)
     update = hh.text_update(600, "برومت")
     hh.process(update)
     assert hh.db.count_outbox() == 1
