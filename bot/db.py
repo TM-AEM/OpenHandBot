@@ -1,8 +1,11 @@
 """قاعدة بيانات SQLite لحفظ الشاتات المتابَعة وحالة الحوار وصندوق الصادر."""
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import re
+import secrets
 import sqlite3
 import time
 import uuid
@@ -118,6 +121,244 @@ CREATION_DISCARDED = "discarded"
 CREATION_NOTIFY_NONE = ""
 CREATION_NOTIFY_PENDING = "pending"
 CREATION_NOTIFY_SENT = "sent"
+
+# OHB2-AUTO-REVIEW-R2: حجز دورة مراجعة. الـscope صريح من المستدعي (مش اختيار صامت):
+# - conversation: دورة نشطة واحدة لكل محادثة.
+# - per_pr: دورة نشطة واحدة لكل (محادثة، repository_id، pr_number).
+# الـreservation_key هو مفتاح الحدث الدقيق (idempotency)، والـpartial unique indexes
+# بتفرض سياسة الـscope المختارة. لا يوجد worker/lease هنا (R5 لاحقًا).
+AUTO_REVIEW_SCOPE_CONVERSATION = "conversation"
+AUTO_REVIEW_SCOPE_PER_PR = "per_pr"
+AUTO_REVIEW_SCOPE_POLICY_CONVERSATION_WIDE = "conversation-wide"
+AUTO_REVIEW_STATUS_RESERVED = "reserved"
+AUTO_REVIEW_STATUS_TERMINAL = "terminal"
+AUTO_REVIEW_STAGE_RESERVED = "reserved"
+AUTO_REVIEW_STAGE_QUEUED = "queued"
+AUTO_REVIEW_STAGE_EVIDENCE = "evidence"
+AUTO_REVIEW_STAGE_BLIND = "blind"
+AUTO_REVIEW_STAGE_BLIND_VALIDATED = "blind_validated"
+AUTO_REVIEW_STAGE_ADVERSARIAL = "adversarial"
+AUTO_REVIEW_STAGE_ADVERSARIAL_VALIDATED = "adversarial_validated"
+AUTO_REVIEW_STAGE_VERDICT = "verdict"
+AUTO_REVIEW_STAGE_DELIVERY = "delivery"
+AUTO_REVIEW_STAGE_DONE = "done"
+AUTO_REVIEW_STAGES = (
+    AUTO_REVIEW_STAGE_RESERVED,
+    AUTO_REVIEW_STAGE_QUEUED,
+    AUTO_REVIEW_STAGE_EVIDENCE,
+    AUTO_REVIEW_STAGE_BLIND,
+    AUTO_REVIEW_STAGE_BLIND_VALIDATED,
+    AUTO_REVIEW_STAGE_ADVERSARIAL,
+    AUTO_REVIEW_STAGE_ADVERSARIAL_VALIDATED,
+    AUTO_REVIEW_STAGE_VERDICT,
+    AUTO_REVIEW_STAGE_DELIVERY,
+    AUTO_REVIEW_STAGE_DONE,
+)
+AUTO_REVIEW_LIFECYCLE_QUEUED = "queued"
+AUTO_REVIEW_LIFECYCLE_ACTIVE = "active"
+AUTO_REVIEW_LIFECYCLE_RETRY_WAIT = "retry_wait"
+AUTO_REVIEW_LIFECYCLE_DELIVERY_PENDING = "delivery_pending"
+AUTO_REVIEW_LIFECYCLE_TERMINAL = "terminal"
+AUTO_REVIEW_LIFECYCLES = (
+    AUTO_REVIEW_LIFECYCLE_QUEUED,
+    AUTO_REVIEW_LIFECYCLE_ACTIVE,
+    AUTO_REVIEW_LIFECYCLE_RETRY_WAIT,
+    AUTO_REVIEW_LIFECYCLE_DELIVERY_PENDING,
+    AUTO_REVIEW_LIFECYCLE_TERMINAL,
+)
+AUTO_REVIEW_WORKER_IDLE = "idle"
+AUTO_REVIEW_WORKER_CLAIMED = "claimed"
+AUTO_REVIEW_WORKER_RUNNING = "running"
+AUTO_REVIEW_WORKER_RELEASED = "released"
+AUTO_REVIEW_WORKER_EXHAUSTED = "exhausted"
+AUTO_REVIEW_WORKER_STATES = (
+    AUTO_REVIEW_WORKER_IDLE,
+    AUTO_REVIEW_WORKER_CLAIMED,
+    AUTO_REVIEW_WORKER_RUNNING,
+    AUTO_REVIEW_WORKER_RELEASED,
+    AUTO_REVIEW_WORKER_EXHAUSTED,
+)
+AUTO_REVIEW_DELIVERY_NONE = "none"
+AUTO_REVIEW_DELIVERY_PENDING = "pending"
+AUTO_REVIEW_DELIVERY_CLAIMED = "claimed"
+AUTO_REVIEW_DELIVERY_SENDING = "sending"
+AUTO_REVIEW_DELIVERY_SENT = "sent"
+AUTO_REVIEW_DELIVERY_UNKNOWN = "unknown"
+AUTO_REVIEW_DELIVERY_FAILED = "failed"
+AUTO_REVIEW_DELIVERY_STATES = (
+    AUTO_REVIEW_DELIVERY_NONE,
+    AUTO_REVIEW_DELIVERY_PENDING,
+    AUTO_REVIEW_DELIVERY_CLAIMED,
+    AUTO_REVIEW_DELIVERY_SENDING,
+    AUTO_REVIEW_DELIVERY_SENT,
+    AUTO_REVIEW_DELIVERY_UNKNOWN,
+    AUTO_REVIEW_DELIVERY_FAILED,
+)
+# OHB2-AUTO-REVIEW-R6: report versions and owner decisions are separate from the
+# technical verdict. A report version is immutable once persisted.
+AUTO_REVIEW_REPORT_VERSION = 1
+AUTO_REVIEW_OWNER_ACCEPTANCE_EVENT = "OWNER_ACCEPTANCE"
+OWNER_ACTION_ACCEPT = "ACCEPT"
+OWNER_ACTION_REJECT = "REJECT"
+OWNER_ACTIONS = (OWNER_ACTION_ACCEPT, OWNER_ACTION_REJECT)
+OWNER_DECISION_RECORDED = "recorded"
+OWNER_DECISION_DUPLICATE = "duplicate"
+OWNER_DECISION_CONFLICT = "conflict"
+OUTBOX_REVIEW_KIND_SUMMARY_DOCUMENT = "summary_document"
+AUTO_REVIEW_STAGE_STATUS_RUNNING = "running"
+AUTO_REVIEW_STAGE_STATUS_VALIDATED = "validated"
+AUTO_REVIEW_STAGE_STATUS_INVALID = "invalid"
+AUTO_REVIEW_STAGE_STATUS_FAILED = "failed"
+AUTO_REVIEW_STAGE_STATUSES = (
+    AUTO_REVIEW_STAGE_STATUS_RUNNING,
+    AUTO_REVIEW_STAGE_STATUS_VALIDATED,
+    AUTO_REVIEW_STAGE_STATUS_INVALID,
+    AUTO_REVIEW_STAGE_STATUS_FAILED,
+)
+AUTO_REVIEW_OBSERVATION_PENDING = "observed_pending"
+AUTO_REVIEW_OBSERVATION_ALREADY = "already_member"
+AUTO_REVIEW_OBSERVATION_DEFERRED = "deferred_active_cycle"
+AUTO_REVIEW_OBSERVATION_CONFLICT = "conflicting_membership"
+AUTO_REVIEW_OBSERVATION_INVALID = "invalid_input"
+AUTO_REVIEW_RESERVATION_NEW = "newly_reserved"
+AUTO_REVIEW_RESERVATION_ALREADY = "already_reserved"
+AUTO_REVIEW_RESERVATION_CONFLICT = "conflicting_identity"
+AUTO_REVIEW_RESERVATION_INVALID = "invalid_input"
+
+
+def build_auto_review_reservation_key(
+    *,
+    scope: str,
+    conversation_id: str,
+    repository_id: int,
+    head_sha: str,
+    pr_number: int | None = None,
+) -> str:
+    """يبني مفتاح حجز حدثي صريح. اختيار الـscope مسؤولية المستدعي/المالك."""
+    if scope == AUTO_REVIEW_SCOPE_CONVERSATION:
+        return f"v1:conversation:{conversation_id}:{head_sha}"
+    if scope == AUTO_REVIEW_SCOPE_PER_PR:
+        if pr_number is None:
+            raise ValueError("pr_number مطلوب مع scope=per_pr")
+        return f"v1:per_pr:{conversation_id}:{repository_id}:{pr_number}:{head_sha}"
+    raise ValueError("scope غير معروف")
+
+
+def build_conversation_review_key(
+    conversation_id: str, memberships: tuple[AutoReviewMembership, ...]
+) -> str:
+    """Deterministic idempotency key for one conversation-wide PR snapshot."""
+    if not isinstance(conversation_id, str) or not _AUTO_REVIEW_ID_RE.match(conversation_id):
+        raise ValueError("conversation_id غير صالح")
+    ordered = sorted(memberships, key=lambda item: (item.repository_id, item.pr_number))
+    if not ordered:
+        raise ValueError("memberships مطلوبة")
+    payload = [
+        [
+            item.repository_id,
+            item.pr_number,
+            item.branch,
+            item.base_sha,
+            item.head_sha,
+        ]
+        for item in ordered
+    ]
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return f"v1:conversation-wide:{conversation_id}:{digest}"
+
+
+_AUTO_REVIEW_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_AUTO_REVIEW_REPORT_FILENAME_RE = re.compile(r"^review-[0-9a-f]{7}\.md$")
+_AUTO_REVIEW_KEY_RE = re.compile(r"^[A-Za-z0-9._:-]{1,256}$")
+_AUTO_REVIEW_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+_AUTO_REVIEW_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_SECRETISH_CONFIG_KEYS = ("key", "token", "secret", "password", "credential", "authorization", "auth")
+
+
+def _valid_sha40(value: str | None) -> bool:
+    return isinstance(value, str) and bool(_AUTO_REVIEW_SHA_RE.match(value))
+
+
+def _valid_text(value: str, max_len: int, *, allow_empty: bool = False) -> bool:
+    if not isinstance(value, str):
+        return False
+    if not value and not allow_empty:
+        return False
+    if len(value) > max_len:
+        return False
+    return not any(ch.isspace() or ord(ch) < 32 for ch in value)
+
+
+def _valid_repo_full_name(value: str) -> bool:
+    if not isinstance(value, str) or not _AUTO_REVIEW_REPO_RE.match(value):
+        return False
+    owner, repo = value.split("/", 1)
+    return owner not in {".", ".."} and repo not in {".", ".."}
+
+
+def _contains_secretish_key(value) -> bool:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            lowered = str(key).lower()
+            if any(part in lowered for part in _SECRETISH_CONFIG_KEYS):
+                return True
+            if _contains_secretish_key(item):
+                return True
+    elif isinstance(value, (list, tuple)):
+        return any(_contains_secretish_key(item) for item in value)
+    return False
+
+
+def _canonical_review_config(payload: dict) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _valid_review_membership(item: AutoReviewMembership) -> bool:
+    return (
+        isinstance(item, AutoReviewMembership)
+        and isinstance(item.repository_id, int)
+        and not isinstance(item.repository_id, bool)
+        and item.repository_id > 0
+        and _valid_repo_full_name(item.repository_full_name)
+        and isinstance(item.pr_number, int)
+        and not isinstance(item.pr_number, bool)
+        and item.pr_number > 0
+        and isinstance(item.branch, str)
+        and _valid_text(item.branch, 256)
+        and _valid_sha40(item.base_sha)
+        and _valid_sha40(item.head_sha)
+    )
+
+
+def _membership_identity(item: AutoReviewMembership) -> tuple:
+    # repository_full_name is a display snapshot; repository_id is the stable identity.
+    return (
+        item.repository_id,
+        item.pr_number,
+        item.branch,
+        item.base_sha,
+        item.head_sha,
+    )
+
+
+def _ordered_memberships(
+    memberships: tuple[AutoReviewMembership, ...] | list[AutoReviewMembership],
+) -> tuple[AutoReviewMembership, ...] | None:
+    if not isinstance(memberships, (tuple, list)) or not memberships:
+        return None
+    ordered = tuple(sorted(memberships, key=lambda item: (item.repository_id, item.pr_number)))
+    if any(not _valid_review_membership(item) for item in ordered):
+        return None
+    seen: set[tuple[int, int]] = set()
+    for item in ordered:
+        key = (item.repository_id, item.pr_number)
+        if key in seen:
+            return None
+        seen.add(key)
+    return ordered
+
 
 # OHB2-P0-A0: حالات الدفعة/العنصر المحلية للمرفقات (نموذج بيانات A0 — المخطّط فقط).
 #   pending          : اتسجّل بثبات (صف موجود) ولسه مافيش محاولة رفع.
@@ -236,6 +477,18 @@ INBOX_KIND_TIMEOUT = "timeout"         # انتهت مهلة متابعة (24 س
 INBOX_KIND_MISSING = "missing"         # شات متابَع اختفى من OpenHands
 INBOX_KIND_STALE_REPORT = "stale_report"  # مفيش تقرير جديد بعد البرومبت
 INBOX_KIND_PROACTIVE = "proactive"     # إشعار استباقي عام (المُبلّغ)
+# OHB2-OPENHANDS-WAIT-UNTIL-TERMINAL-STATUS: حالة جلب التقرير، منفصلة عن حالة المزود.
+REPORT_STATE_NOT_REQUESTED = "not_requested"
+REPORT_STATE_PENDING = "pending"
+# التقرير متاح وبدأت محاولة تسليمه. الحالة الدائمة تُكتب قبل الإرسال عشان
+# إعادة التشغيل لا تعيد إرسالًا أعمى.
+REPORT_STATE_SENDING = "sending"
+# قد يكون تيليجرام قبل الرسالة لكن تعذّر تثبيت التسليم محليًا. لا يُعاد الإرسال
+# تلقائيًا؛ تُستخدم هوية حدث الصندوق/الانتقال للتسوية أو يبقى واضحًا كغير مؤكد.
+REPORT_STATE_UNCERTAIN = "uncertain"
+REPORT_STATE_DELIVERED = "delivered"
+REPORT_STATE_NOT_REQUIRED = "not_required"
+REPORT_STATE_TIMED_OUT = "timed_out"
 
 # OHB2-PHASE1C: مجموعة الحذف النهائي **الآمنة** (allowlist صريحة). دول بس أنواع **تقارير
 # حالة/نتيجة** مش مرتبطة بعملية قابلة للتنفيذ: مفيش outbox/creation job مرتبط بيهم،
@@ -452,6 +705,16 @@ class Watched:
     # التلميحات in-memory (`_marker_pending`) بتتبط بيه، فمتابعة جديدة بمعرّف جديد ما تتأثّرش
     # بتلميح قديم. مش مشتقّ من hash() ولا من الوقت.
     watch_seq: str = ""
+    # آخر وقت نجح فيه استطلاع OpenHands لهذه المتابعة (UTC ISO). NULL = لم ينجح
+    # استطلاع بعد، أو بدأت دورة متابعة/برومبت جديدة. يُستخدم للتشخيص واستعادة
+    # السياق بعد restart، ولا يعني أن المهمة انتهت.
+    last_verified_at: str | None = None
+    # حالة جلب التقرير النهائي. مستقلة عن حالة المزود: pending يعني أن المزود أكّد
+    # terminal لكن التقرير لم يظهر بعد، ولا يعني النجاح أو الفشل.
+    report_state: str | None = None
+    # عدد محاولات الاستطلاع الفاشلة المتتالية وموعد المحاولة القادمة (UTC ISO).
+    poll_failures: int = 0
+    next_check_at: str | None = None
 
 
 @dataclass
@@ -506,6 +769,11 @@ class OutboxItem:
     cleanup_next_at: str | None = None
     cleanup_attempts: int = 0
     cleanup_last_error: str | None = None
+    review_id: int | None = None
+    review_delivery_key: str | None = None
+    review_kind: str | None = None
+    review_version: int | None = None
+    review_report_id: int | None = None
 
 
 @dataclass
@@ -526,6 +794,188 @@ class CreationJob:
     # OHB2-POST-PUB-01/F02: حالة إكمال الأثر المحلي لطلب الشات الجديد (إشعار الرابط +
     # تسجيل المتابعة). نفس عقد الـ outbox.
     notify_state: str = CREATION_NOTIFY_NONE
+
+
+@dataclass(frozen=True)
+class AutoReviewProviderSnapshot:
+    """لقطة غير سرية لإعداد مزوّد المراجعة. لا تحتوي API key/token إطلاقًا."""
+
+    id: int
+    provider: str
+    api_base: str
+    model: str
+    config_json: str
+    config_fingerprint: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class AutoReview:
+    id: int
+    reservation_key: str
+    conversation_id: str
+    repository_id: int
+    repository_full_name: str
+    pr_number: int | None
+    branch: str
+    base_sha: str | None
+    head_sha: str
+    scope: str
+    status: str
+    stage: str
+    terminal_reason: str | None
+    ci_run_id: str | None
+    ci_conclusion: str | None
+    verdict: str | None
+    report_ref: str | None
+    provider_snapshot_id: int
+    rounds: int
+    reserved_by: str
+    reserved_at: str
+    created_at: str
+    updated_at: str
+    error_class: str | None
+    error_detail: str | None
+    chat_id: int = 0
+    scope_policy: str | None = None
+    lifecycle_state: str = AUTO_REVIEW_LIFECYCLE_QUEUED
+    worker_state: str = AUTO_REVIEW_WORKER_IDLE
+    delivery_state: str = AUTO_REVIEW_DELIVERY_NONE
+    attempts: int = 0
+    max_attempts: int = 5
+    next_attempt_at: str | None = None
+    delivery_outbox_id: int | None = None
+    membership_count: int = 0
+    implementation_report: str = ""
+    delivery_text: str = ""
+
+    @property
+    def conversation_wide(self) -> bool:
+        return (
+            self.scope == AUTO_REVIEW_SCOPE_CONVERSATION
+            and self.scope_policy == AUTO_REVIEW_SCOPE_POLICY_CONVERSATION_WIDE
+        )
+
+
+@dataclass(frozen=True)
+class AutoReviewReport:
+    """Immutable generated report bound to one review cycle and version."""
+
+    id: int
+    review_id: int
+    version: int
+    filename: str
+    content: str
+    summary: str
+    report_sha256: str
+    verdict: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class AutoReviewEvidence:
+    review_id: int
+    repository_id: int
+    pr_number: int
+    head_sha: str
+    base_sha: str
+    evidence_sha256: str
+    diff_sha256: str
+    coverage_complete: bool
+    ci_state: str
+    evidence_json: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class AutoReviewOwnerDecision:
+    id: int
+    review_id: int
+    report_version: int
+    owner_user_id: int
+    action: str
+    event_type: str
+    idempotency_key: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class OwnerDecisionResult:
+    outcome: str
+    acceptance_id: int | None
+    action: str | None = None
+
+
+@dataclass(frozen=True)
+class AutoReviewReservation:
+    """نتيجة حجز ذرّية. `outcome` واحد من AUTO_REVIEW_RESERVATION_*."""
+
+    outcome: str
+    review_id: int | None = None
+    existing_id: int | None = None
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class AutoReviewMembership:
+    """PR membership snapshot for one conversation-wide review cycle."""
+
+    repository_id: int
+    repository_full_name: str
+    pr_number: int
+    branch: str
+    base_sha: str
+    head_sha: str
+
+
+@dataclass(frozen=True)
+class AutoReviewObservation:
+    outcome: str
+    review_id: int | None = None
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class AutoReviewClaim:
+    review_id: int
+    conversation_id: str
+    chat_id: int
+    scope: str
+    scope_policy: str
+    lifecycle_state: str
+    stage: str
+    worker_state: str
+    lease_token: str
+    lease_epoch: int
+    lease_expires_at: str
+    attempts: int
+    max_attempts: int
+    provider_snapshot_id: int
+
+
+@dataclass(frozen=True)
+class AutoReviewStage:
+    review_id: int
+    repository_id: int
+    pr_number: int
+    stage: str
+    status: str
+    attempt: int
+    evidence_sha256: str | None
+    output_json: str | None
+    output_sha256: str | None
+    validation_json: str | None
+    error_class: str | None
+    created_at: str
+    updated_at: str
+
+
+class AutoReviewLeaseLost(RuntimeError):
+    """Raised when a worker no longer owns the cycle lease/epoch."""
+
+
+class AutoReviewConflict(ValueError):
+    """Raised for an illegal or conflicting durable review transition."""
 
 
 @dataclass
@@ -733,7 +1183,11 @@ class Database:
                 added_at        TEXT,
                 retry_count     INTEGER NOT NULL DEFAULT 0,
                 pending_delivery_state TEXT,
-                watch_seq       TEXT
+                watch_seq       TEXT,
+                last_verified_at TEXT,
+                report_state    TEXT,
+                poll_failures   INTEGER NOT NULL DEFAULT 0,
+                next_check_at   TEXT
             );
             CREATE TABLE IF NOT EXISTS user_state (
                 telegram_id INTEGER PRIMARY KEY,
@@ -761,7 +1215,12 @@ class Database:
                 cleanup_confirmation_message_id INTEGER,
                 cleanup_next_at TEXT,
                 cleanup_attempts INTEGER NOT NULL DEFAULT 0,
-                cleanup_last_error TEXT
+                cleanup_last_error TEXT,
+                review_id INTEGER,
+                review_delivery_key TEXT,
+                review_kind TEXT,
+                review_version INTEGER,
+                review_report_id INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox(status);
             CREATE TABLE IF NOT EXISTS creation_jobs (
@@ -959,6 +1418,273 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_attachment_message_identity_batch
                 ON attachment_message_identity(batch_id);
+
+            -- OHB2-AUTO-REVIEW-R2: لقطة إعداد المزوّد غير سرية وثابتة. ممنوع UPDATE/DELETE
+            -- (trigger تحت) عشان الدورة الحالية ما تتغيّرش بعد إنشائها. لا تُخزَّن أي مفاتيح.
+            CREATE TABLE IF NOT EXISTS auto_review_provider_snapshots (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider            TEXT NOT NULL,
+                api_base            TEXT NOT NULL,
+                model               TEXT NOT NULL,
+                config_json         TEXT NOT NULL,
+                config_fingerprint  TEXT NOT NULL UNIQUE,
+                created_at          TEXT NOT NULL,
+                CHECK (length(provider) BETWEEN 1 AND 64),
+                CHECK (length(api_base) BETWEEN 1 AND 2048),
+                CHECK (length(model) BETWEEN 1 AND 256),
+                CHECK (length(config_fingerprint) = 64)
+            );
+            CREATE TRIGGER IF NOT EXISTS trg_auto_review_provider_snapshot_no_update
+            BEFORE UPDATE ON auto_review_provider_snapshots
+            BEGIN
+                SELECT RAISE(ABORT, 'auto review provider snapshots are immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_auto_review_provider_snapshot_no_delete
+            BEFORE DELETE ON auto_review_provider_snapshots
+            BEGIN
+                SELECT RAISE(ABORT, 'auto review provider snapshots are immutable');
+            END;
+
+            -- OHB2-AUTO-REVIEW-R2: سجل حجز دورة المراجعة. `reservation_key` هو مفتاح
+            -- الحدث الدقيق (idempotency). الـscope صريح، والـpartial unique indexes
+            -- بتفرض سياسة واحدة نشطة إما لكل محادثة أو لكل PR — من غير اختيار صامت.
+            -- لا lease/worker fencing هنا (R5).
+            CREATE TABLE IF NOT EXISTS auto_reviews (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                reservation_key      TEXT NOT NULL UNIQUE,
+                conversation_id      TEXT NOT NULL,
+                repository_id        INTEGER NOT NULL,
+                repository_full_name TEXT NOT NULL,
+                pr_number            INTEGER,
+                branch               TEXT NOT NULL DEFAULT '',
+                base_sha             TEXT,
+                head_sha             TEXT NOT NULL,
+                scope                TEXT NOT NULL CHECK (scope IN ('conversation', 'per_pr')),
+                status               TEXT NOT NULL DEFAULT 'reserved'
+                                     CHECK (status IN ('reserved', 'terminal')),
+                stage                TEXT NOT NULL DEFAULT 'reserved',
+                terminal_reason      TEXT,
+                ci_run_id            TEXT,
+                ci_conclusion        TEXT,
+                verdict              TEXT,
+                report_ref           TEXT,
+                provider_snapshot_id INTEGER NOT NULL
+                                     REFERENCES auto_review_provider_snapshots(id)
+                                     ON DELETE RESTRICT,
+                rounds               INTEGER NOT NULL DEFAULT 0,
+                reserved_by          TEXT NOT NULL,
+                reserved_at          TEXT NOT NULL,
+                created_at           TEXT NOT NULL,
+                updated_at           TEXT NOT NULL,
+                error_class          TEXT,
+                error_detail         TEXT,
+                chat_id              INTEGER NOT NULL DEFAULT 0,
+                scope_policy         TEXT NOT NULL DEFAULT 'conversation-wide',
+                lifecycle_state      TEXT NOT NULL DEFAULT 'queued',
+                worker_state         TEXT NOT NULL DEFAULT 'idle',
+                delivery_state       TEXT NOT NULL DEFAULT 'none',
+                attempts             INTEGER NOT NULL DEFAULT 0,
+                max_attempts         INTEGER NOT NULL DEFAULT 5,
+                next_attempt_at      TEXT,
+                delivery_outbox_id   INTEGER,
+                membership_count     INTEGER NOT NULL DEFAULT 0,
+                implementation_report TEXT NOT NULL DEFAULT '',
+                delivery_text        TEXT NOT NULL DEFAULT '',
+                CHECK (chat_id >= 0),
+                CHECK (scope_policy = 'conversation-wide'),
+                CHECK (lifecycle_state IN ('queued','active','retry_wait','delivery_pending','terminal')),
+                CHECK (worker_state IN ('idle','claimed','running','released','exhausted')),
+                CHECK (delivery_state IN ('none','pending','claimed','sending','sent','unknown','failed')),
+                CHECK (attempts >= 0),
+                CHECK (max_attempts BETWEEN 1 AND 20),
+                CHECK (membership_count >= 0),
+                CHECK (length(implementation_report) <= 100000),
+                CHECK (length(delivery_text) <= 10000),
+                CHECK (length(reservation_key) BETWEEN 1 AND 256),
+                CHECK (length(conversation_id) BETWEEN 1 AND 128),
+                CHECK (repository_id > 0),
+                CHECK (length(repository_full_name) BETWEEN 1 AND 255),
+                CHECK (pr_number IS NULL OR pr_number > 0),
+                CHECK (length(head_sha) = 40 AND head_sha NOT GLOB '*[^0-9a-f]*'),
+                CHECK (base_sha IS NULL OR (length(base_sha) = 40 AND base_sha NOT GLOB '*[^0-9a-f]*')),
+                CHECK (scope <> 'per_pr' OR pr_number IS NOT NULL),
+                CHECK (status = 'reserved' OR terminal_reason IS NOT NULL),
+                CHECK (length(stage) BETWEEN 1 AND 32),
+                CHECK (rounds >= 0),
+                CHECK (length(reserved_by) BETWEEN 1 AND 64),
+                CHECK (ci_run_id IS NULL OR length(ci_run_id) <= 128),
+                CHECK (ci_conclusion IS NULL OR length(ci_conclusion) <= 64),
+                CHECK (verdict IS NULL OR length(verdict) <= 64),
+                CHECK (report_ref IS NULL OR length(report_ref) <= 512),
+                CHECK (terminal_reason IS NULL OR length(terminal_reason) <= 256),
+                CHECK (error_class IS NULL OR length(error_class) <= 128),
+                CHECK (error_detail IS NULL OR length(error_detail) <= 2048)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_auto_reviews_active_conversation
+                ON auto_reviews(conversation_id)
+                WHERE status = 'reserved' AND scope = 'conversation';
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_auto_reviews_active_per_pr
+                ON auto_reviews(conversation_id, repository_id, pr_number)
+                WHERE status = 'reserved' AND scope = 'per_pr';
+            CREATE INDEX IF NOT EXISTS idx_auto_reviews_conversation
+                ON auto_reviews(conversation_id);
+            CREATE INDEX IF NOT EXISTS idx_auto_reviews_head_sha
+                ON auto_reviews(head_sha);
+
+            -- OHB2-AUTO-REVIEW-R5: immutable PR membership snapshot. A cycle is
+            -- conversation-wide; every included PR has its own exact SHA evidence.
+            CREATE TABLE IF NOT EXISTS auto_review_memberships (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                review_id            INTEGER NOT NULL
+                                     REFERENCES auto_reviews(id) ON DELETE CASCADE,
+                repository_id        INTEGER NOT NULL,
+                repository_full_name TEXT NOT NULL,
+                pr_number            INTEGER NOT NULL,
+                branch               TEXT NOT NULL DEFAULT '',
+                base_sha             TEXT NOT NULL,
+                head_sha             TEXT NOT NULL,
+                created_at           TEXT NOT NULL,
+                CHECK (repository_id > 0),
+                CHECK (pr_number > 0),
+                CHECK (length(repository_full_name) BETWEEN 1 AND 255),
+                CHECK (length(head_sha) = 40 AND head_sha NOT GLOB '*[^0-9a-f]*'),
+                CHECK (length(base_sha) = 40 AND base_sha NOT GLOB '*[^0-9a-f]*'),
+                UNIQUE (review_id, repository_id, pr_number)
+            );
+            CREATE INDEX IF NOT EXISTS idx_auto_review_memberships_review
+                ON auto_review_memberships(review_id);
+
+            -- New PR observations while an active cycle exists. They never mutate
+            -- that cycle's snapshot; the next cycle consumes them atomically.
+            CREATE TABLE IF NOT EXISTS auto_review_pending_memberships (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id      TEXT NOT NULL,
+                repository_id        INTEGER NOT NULL,
+                repository_full_name TEXT NOT NULL,
+                pr_number            INTEGER NOT NULL,
+                branch               TEXT NOT NULL DEFAULT '',
+                base_sha             TEXT NOT NULL,
+                head_sha             TEXT NOT NULL,
+                observed_at          TEXT NOT NULL,
+                CHECK (repository_id > 0),
+                CHECK (pr_number > 0),
+                CHECK (length(head_sha) = 40 AND head_sha NOT GLOB '*[^0-9a-f]*'),
+                CHECK (length(base_sha) = 40 AND base_sha NOT GLOB '*[^0-9a-f]*'),
+                UNIQUE (conversation_id, repository_id, pr_number)
+            );
+
+            -- Per-PR, per-stage durable R4 results. Output is validated JSON and is
+            -- never trusted without re-validation against current pinned evidence.
+            CREATE TABLE IF NOT EXISTS auto_review_stages (
+                review_id            INTEGER NOT NULL
+                                     REFERENCES auto_reviews(id) ON DELETE CASCADE,
+                repository_id        INTEGER NOT NULL,
+                pr_number            INTEGER NOT NULL,
+                stage                TEXT NOT NULL CHECK (stage IN ('blind','adversarial')),
+                status               TEXT NOT NULL CHECK (status IN ('running','validated','invalid','failed')),
+                attempt              INTEGER NOT NULL DEFAULT 0,
+                evidence_sha256      TEXT,
+                output_json          TEXT,
+                output_sha256        TEXT,
+                validation_json      TEXT,
+                error_class          TEXT,
+                created_at           TEXT NOT NULL,
+                updated_at           TEXT NOT NULL,
+                PRIMARY KEY (review_id, repository_id, pr_number, stage),
+                CHECK (attempt >= 0),
+                CHECK (evidence_sha256 IS NULL OR length(evidence_sha256) = 64),
+                CHECK (output_json IS NULL OR length(output_json) <= 400000),
+                CHECK (output_sha256 IS NULL OR length(output_sha256) = 64),
+                CHECK (validation_json IS NULL OR length(validation_json) <= 20000),
+                CHECK (error_class IS NULL OR length(error_class) <= 128)
+            );
+
+            -- Immutable per-PR evidence attestation. Raw diffs are not stored here;
+            -- the SHA/coverage/CI metadata binds the exact evidence used.
+            CREATE TABLE IF NOT EXISTS auto_review_evidence (
+                review_id            INTEGER NOT NULL
+                                     REFERENCES auto_reviews(id) ON DELETE CASCADE,
+                repository_id        INTEGER NOT NULL,
+                pr_number            INTEGER NOT NULL,
+                head_sha             TEXT NOT NULL,
+                base_sha             TEXT NOT NULL,
+                evidence_sha256      TEXT NOT NULL,
+                diff_sha256          TEXT NOT NULL,
+                coverage_complete    INTEGER NOT NULL,
+                ci_state             TEXT NOT NULL,
+                evidence_json        TEXT NOT NULL,
+                created_at           TEXT NOT NULL,
+                PRIMARY KEY (review_id, repository_id, pr_number),
+                CHECK (length(head_sha) = 40 AND head_sha NOT GLOB '*[^0-9a-f]*'),
+                CHECK (length(base_sha) = 40 AND base_sha NOT GLOB '*[^0-9a-f]*'),
+                CHECK (length(evidence_sha256) = 64),
+                CHECK (length(diff_sha256) = 64),
+                CHECK (coverage_complete IN (0,1)),
+                CHECK (length(evidence_json) <= 100000)
+            );
+
+            -- One durable lease per cycle. Token + monotonically increasing epoch
+            -- fence stale workers out after takeover.
+            CREATE TABLE IF NOT EXISTS auto_review_leases (
+                review_id            INTEGER PRIMARY KEY
+                                     REFERENCES auto_reviews(id) ON DELETE CASCADE,
+                owner                TEXT NOT NULL,
+                lease_token          TEXT NOT NULL UNIQUE,
+                lease_epoch          INTEGER NOT NULL,
+                acquired_at          TEXT NOT NULL,
+                renewed_at           TEXT,
+                expires_at           TEXT NOT NULL,
+                CHECK (length(owner) BETWEEN 1 AND 128),
+                CHECK (length(lease_token) BETWEEN 1 AND 128),
+                CHECK (lease_epoch > 0)
+            );
+            CREATE INDEX IF NOT EXISTS idx_auto_review_leases_expiry
+                ON auto_review_leases(expires_at);
+
+            -- R6: immutable generated report bound to a review cycle/version. The
+            -- report is generated only from persisted R5 data and is never rewritten.
+            CREATE TABLE IF NOT EXISTS auto_review_reports (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                review_id            INTEGER NOT NULL
+                                     REFERENCES auto_reviews(id) ON DELETE CASCADE,
+                version              INTEGER NOT NULL,
+                filename             TEXT NOT NULL,
+                content              TEXT NOT NULL,
+                summary              TEXT NOT NULL,
+                report_sha256        TEXT NOT NULL,
+                verdict              TEXT NOT NULL,
+                created_at           TEXT NOT NULL,
+                UNIQUE (review_id, version),
+                UNIQUE (review_id, report_sha256),
+                CHECK (version > 0),
+                CHECK (length(filename) BETWEEN 12 AND 64),
+                CHECK (length(content) BETWEEN 1 AND 300000),
+                CHECK (length(summary) BETWEEN 1 AND 1024),
+                CHECK (length(report_sha256) = 64),
+                CHECK (verdict IN ('PASS','PASS_WITH_NOTES','FAIL','BLOCKED'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_auto_review_reports_review
+                ON auto_review_reports(review_id, version);
+
+            -- R6: owner decision is an audit event, not the technical verdict. The
+            -- unique constraint makes the first decision immutable and idempotent.
+            CREATE TABLE IF NOT EXISTS auto_review_owner_acceptance (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                review_id            INTEGER NOT NULL,
+                report_version       INTEGER NOT NULL,
+                owner_user_id        INTEGER NOT NULL,
+                action               TEXT NOT NULL CHECK (action IN ('ACCEPT','REJECT')),
+                event_type           TEXT NOT NULL DEFAULT 'OWNER_ACCEPTANCE'
+                                     CHECK (event_type = 'OWNER_ACCEPTANCE'),
+                idempotency_key      TEXT NOT NULL UNIQUE,
+                created_at           TEXT NOT NULL,
+                FOREIGN KEY (review_id, report_version)
+                    REFERENCES auto_review_reports(review_id, version),
+                UNIQUE (review_id, report_version, owner_user_id),
+                CHECK (owner_user_id > 0)
+            );
+            CREATE INDEX IF NOT EXISTS idx_auto_review_owner_acceptance_review
+                ON auto_review_owner_acceptance(review_id, report_version);
             """
         )
         self._migrate()
@@ -994,6 +1720,21 @@ class Database:
         # تتعبّى فورًا بمعرّف ثابت مولّد من SQLite (تحت)، فكل قراءة ترجّع نفس المعرّف.
         if "watch_seq" not in columns:
             self._conn.execute("ALTER TABLE watched ADD COLUMN watch_seq TEXT")
+        # OHB2-OPENHANDS-WAIT-UNTIL-TERMINAL-STATUS: آخر استطلاع ناجح. عمود إضافي
+        # nullable ⇒ الصفوف القديمة تفضل صالحة؛ لا يُستخدم كدليل انتهاء.
+        if "last_verified_at" not in columns:
+            self._conn.execute("ALTER TABLE watched ADD COLUMN last_verified_at TEXT")
+        # OHB2-OPENHANDS-WAIT-UNTIL-TERMINAL-STATUS: حالة جلب التقرير، وعدد محاولات
+        # الاستطلاع الفاشلة، وموعد المحاولة القادمة. كلها nullable/افتراضية ⇒ ترقية
+        # غير مدمّرة لقواعد موجودة.
+        if "report_state" not in columns:
+            self._conn.execute("ALTER TABLE watched ADD COLUMN report_state TEXT")
+        if "poll_failures" not in columns:
+            self._conn.execute(
+                "ALTER TABLE watched ADD COLUMN poll_failures INTEGER NOT NULL DEFAULT 0"
+            )
+        if "next_check_at" not in columns:
+            self._conn.execute("ALTER TABLE watched ADD COLUMN next_check_at TEXT")
         # NTF-19: نعبّي المعرّف للصفوف القديمة بمعرّف ثابت **مولّد من SQLite** (randomblob)
         # عشان القراءات المتكرّرة ترجّع نفس المعرّف (مايتولّدش عشوائيًا في كل قراءة).
         self._conn.execute(
@@ -1263,6 +2004,168 @@ class Database:
             self._conn.execute(
                 "ALTER TABLE attachment_batches ADD COLUMN intent_text TEXT"
             )
+
+        # OHB2-AUTO-REVIEW-R5: additive lifecycle/lease/delivery columns and indexes.
+        # Existing R2 rows keep their data; defaults preserve the legacy reservation.
+        review_cols = {
+            r["name"] for r in self._conn.execute("PRAGMA table_info(auto_reviews)")
+        }
+        if review_cols:
+            additions = (
+                ("chat_id", "INTEGER NOT NULL DEFAULT 0"),
+                ("scope_policy", "TEXT NOT NULL DEFAULT 'conversation-wide'"),
+                ("lifecycle_state", "TEXT NOT NULL DEFAULT 'queued'"),
+                ("worker_state", "TEXT NOT NULL DEFAULT 'idle'"),
+                ("delivery_state", "TEXT NOT NULL DEFAULT 'none'"),
+                ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+                ("max_attempts", "INTEGER NOT NULL DEFAULT 5"),
+                ("next_attempt_at", "TEXT"),
+                ("delivery_outbox_id", "INTEGER"),
+                ("membership_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("implementation_report", "TEXT NOT NULL DEFAULT ''"),
+                ("delivery_text", "TEXT NOT NULL DEFAULT ''"),
+            )
+            for name, definition in additions:
+                if name not in review_cols:
+                    self._conn.execute(
+                        f"ALTER TABLE auto_reviews ADD COLUMN {name} {definition}"
+                    )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_auto_reviews_claimable "
+                "ON auto_reviews(status, lifecycle_state, next_attempt_at)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_auto_reviews_delivery_pending "
+                "ON auto_reviews(lifecycle_state, delivery_state)"
+            )
+
+        outbox_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(outbox)")}
+        if outbox_cols:
+            if "review_id" not in outbox_cols:
+                self._conn.execute("ALTER TABLE outbox ADD COLUMN review_id INTEGER")
+            if "review_delivery_key" not in outbox_cols:
+                self._conn.execute("ALTER TABLE outbox ADD COLUMN review_delivery_key TEXT")
+            if "review_kind" not in outbox_cols:
+                self._conn.execute("ALTER TABLE outbox ADD COLUMN review_kind TEXT")
+            if "review_version" not in outbox_cols:
+                self._conn.execute("ALTER TABLE outbox ADD COLUMN review_version INTEGER")
+            if "review_report_id" not in outbox_cols:
+                self._conn.execute("ALTER TABLE outbox ADD COLUMN review_report_id INTEGER")
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_outbox_review_delivery_key "
+                "ON outbox(review_delivery_key) WHERE review_delivery_key IS NOT NULL"
+            )
+
+        # Membership/evidence snapshots are immutable once written. The cycle
+        # snapshot must not be silently rewritten after execution starts.
+        self._conn.executescript(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_auto_review_membership_no_update
+            BEFORE UPDATE ON auto_review_memberships
+            BEGIN
+                SELECT RAISE(ABORT, 'auto review memberships are immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_auto_review_membership_no_delete
+            BEFORE DELETE ON auto_review_memberships
+            BEGIN
+                SELECT RAISE(ABORT, 'auto review memberships are immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_auto_review_evidence_no_update
+            BEFORE UPDATE ON auto_review_evidence
+            BEGIN
+                SELECT RAISE(ABORT, 'auto review evidence is immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_auto_review_evidence_no_delete
+            BEFORE DELETE ON auto_review_evidence
+            BEGIN
+                SELECT RAISE(ABORT, 'auto review evidence is immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_auto_review_report_no_update
+            BEFORE UPDATE ON auto_review_reports
+            BEGIN
+                SELECT RAISE(ABORT, 'auto review reports are immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_auto_review_report_no_delete
+            BEFORE DELETE ON auto_review_reports
+            BEGIN
+                SELECT RAISE(ABORT, 'auto review reports are immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_auto_review_owner_acceptance_no_update
+            BEFORE UPDATE ON auto_review_owner_acceptance
+            BEGIN
+                SELECT RAISE(ABORT, 'owner acceptance records are immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_auto_review_owner_acceptance_no_delete
+            BEFORE DELETE ON auto_review_owner_acceptance
+            BEGIN
+                SELECT RAISE(ABORT, 'owner acceptance records are immutable');
+            END;
+
+            -- Outbox is the single delivery mechanism. This trigger mirrors its
+            -- authoritative status into the review cycle without sending anything.
+            CREATE TRIGGER IF NOT EXISTS trg_outbox_review_insert
+            AFTER INSERT ON outbox
+            WHEN NEW.review_id IS NOT NULL
+            BEGIN
+                UPDATE auto_reviews
+                   SET delivery_state = CASE NEW.status
+                           WHEN 'sent' THEN 'sent'
+                           WHEN 'unknown' THEN 'unknown'
+                           WHEN 'failed' THEN 'failed'
+                           WHEN 'discarded' THEN 'failed'
+                           WHEN 'claimed' THEN 'claimed'
+                           WHEN 'sending' THEN 'sending'
+                           ELSE 'pending' END,
+                       lifecycle_state = CASE
+                           WHEN NEW.status IN ('sent','unknown','failed','discarded')
+                           THEN 'terminal' ELSE 'delivery_pending' END,
+                       status = CASE
+                           WHEN NEW.status IN ('sent','unknown','failed','discarded')
+                           THEN 'terminal' ELSE status END,
+                       stage = CASE
+                           WHEN NEW.status IN ('sent','unknown','failed','discarded')
+                           THEN 'done' ELSE 'delivery' END,
+                       terminal_reason = CASE
+                           WHEN NEW.status = 'sent' THEN 'delivered'
+                           WHEN NEW.status = 'unknown' THEN 'delivery_unknown'
+                           WHEN NEW.status IN ('failed','discarded') THEN 'delivery_failed'
+                           ELSE terminal_reason END,
+                       updated_at = NEW.updated_at
+                 WHERE id = NEW.review_id;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_outbox_review_update
+            AFTER UPDATE OF status ON outbox
+            WHEN NEW.review_id IS NOT NULL
+            BEGIN
+                UPDATE auto_reviews
+                   SET delivery_state = CASE NEW.status
+                           WHEN 'sent' THEN 'sent'
+                           WHEN 'unknown' THEN 'unknown'
+                           WHEN 'failed' THEN 'failed'
+                           WHEN 'discarded' THEN 'failed'
+                           WHEN 'claimed' THEN 'claimed'
+                           WHEN 'sending' THEN 'sending'
+                           ELSE 'pending' END,
+                       lifecycle_state = CASE
+                           WHEN NEW.status IN ('sent','unknown','failed','discarded')
+                           THEN 'terminal' ELSE 'delivery_pending' END,
+                       status = CASE
+                           WHEN NEW.status IN ('sent','unknown','failed','discarded')
+                           THEN 'terminal' ELSE status END,
+                       stage = CASE
+                           WHEN NEW.status IN ('sent','unknown','failed','discarded')
+                           THEN 'done' ELSE 'delivery' END,
+                       terminal_reason = CASE
+                           WHEN NEW.status = 'sent' THEN 'delivered'
+                           WHEN NEW.status = 'unknown' THEN 'delivery_unknown'
+                           WHEN NEW.status IN ('failed','discarded') THEN 'delivery_failed'
+                           ELSE terminal_reason END,
+                       updated_at = NEW.updated_at
+                 WHERE id = NEW.review_id;
+            END;
+            """
+        )
 
     # ------------------------------------------------- attachment batches (OHB2-P0-A0)
     def create_attachment_batch(
@@ -2425,6 +3328,7 @@ class Database:
                 "chat_id=COALESCE(excluded.chat_id, watched.chat_id), "
                 "added_at=COALESCE(watched.added_at, excluded.added_at), "
                 "retry_count=0, pending_delivery_state=NULL, "
+                "last_verified_at=NULL, report_state=NULL, poll_failures=0, next_check_at=NULL, "
                 "watch_seq=lower(hex(randomblob(16)))",
                 (conversation_id, title, chat_id, now),
             )
@@ -2544,9 +3448,14 @@ class Database:
         self._conn.commit()
 
     def mark_submitted(self, conversation_id: str, submitted_at: str) -> None:
-        """يسجّل وقت إرسال آخر برومبت للشات (بيتحدّث مع كل برومبت جديد)."""
+        """يسجّل وقت إرسال آخر برومبت للشات (بيتحدّث مع كل برومبت جديد).
+
+        `last_verified_at` و`report_state` و`poll_failures` و`next_check_at` تُصفَّر لأن
+        نجاح استطلاع/تقرير الدورة السابقة لا يثبت شيئًا عن الدورة الجديدة.
+        """
         self._conn.execute(
-            "UPDATE watched SET submitted_at=? WHERE conversation_id=?",
+            "UPDATE watched SET submitted_at=?, last_verified_at=NULL, report_state=NULL, "
+            "poll_failures=0, next_check_at=NULL WHERE conversation_id=?",
             (submitted_at, conversation_id),
         )
         self._conn.commit()
@@ -3196,7 +4105,8 @@ class Database:
         """
         rows = self._conn.execute(
             "SELECT conversation_id, title, last_state, chat_id, submitted_at, added_at, "
-            "retry_count, pending_delivery_state, watch_seq FROM watched "
+            "retry_count, pending_delivery_state, watch_seq, last_verified_at, report_state, "
+            "poll_failures, next_check_at FROM watched "
             "WHERE NOT EXISTS (SELECT 1 FROM deleted_conversations d "
             "WHERE d.conversation_id = watched.conversation_id)"
         ).fetchall()
@@ -3204,7 +4114,8 @@ class Database:
             Watched(
                 r["conversation_id"], r["title"], r["last_state"], r["chat_id"],
                 r["submitted_at"], r["added_at"], r["retry_count"],
-                r["pending_delivery_state"], r["watch_seq"],
+                r["pending_delivery_state"], r["watch_seq"], r["last_verified_at"],
+                r["report_state"], r["poll_failures"], r["next_check_at"],
             )
             for r in rows
         ]
@@ -3213,7 +4124,8 @@ class Database:
         """يجيب صف متابعة واحد (بالحقول الطازجة، خاصة pending_delivery_state) أو None."""
         r = self._conn.execute(
             "SELECT conversation_id, title, last_state, chat_id, submitted_at, added_at, "
-            "retry_count, pending_delivery_state, watch_seq FROM watched WHERE conversation_id=?",
+            "retry_count, pending_delivery_state, watch_seq, last_verified_at, report_state, "
+            "poll_failures, next_check_at FROM watched WHERE conversation_id=?",
             (conversation_id,),
         ).fetchone()
         if r is None:
@@ -3221,7 +4133,8 @@ class Database:
         return Watched(
             r["conversation_id"], r["title"], r["last_state"], r["chat_id"],
             r["submitted_at"], r["added_at"], r["retry_count"], r["pending_delivery_state"],
-            r["watch_seq"],
+            r["watch_seq"], r["last_verified_at"], r["report_state"], r["poll_failures"],
+            r["next_check_at"],
         )
 
     def increment_watched_retry(self, conversation_id: str) -> int:
@@ -3256,12 +4169,61 @@ class Database:
     def advance_watched_state(self, conversation_id: str, state: str) -> None:
         """يسجّل الحالة المسجَّلة ويصفّر عدّاد المحاولات (TASK 54).
 
-        الحالة اللي بتوصل هنا دايمًا مش منتهية (المسار المنتهي بيخرج قبلها)، فتسجيلها
-        معناه إن إشعار الانتهاء القديم مات أو ما اتولدش ⇒ بداية دورة إشعار جديدة بميزانية
-        كاملة. التصفير والكتابة في جملة واحدة (ذرّية) عشان مفيش حالة وسطية.
+        الحالة اللي بتوصل هنا غالبًا مش منتهية، لكن بعد تأكيد `finished` بدون تقرير
+        بنسجّلها نهائية مؤقتًا مع استمرار المتابعة؛ التصفير والكتابة في جملة واحدة
+        (ذرّية) عشان مفيش حالة وسطية.
         """
         self._conn.execute(
             "UPDATE watched SET last_state=?, retry_count=0 WHERE conversation_id=?",
+            (state, conversation_id),
+        )
+        self._conn.commit()
+
+    def mark_watched_verified(
+        self, conversation_id: str, verified_at: str, next_check_at: str | None = None
+    ) -> None:
+        """يسجّل آخر استطلاع ناجح وموعد المحاولة القادمة (تشخيص/استعادة فقط)."""
+        self._conn.execute(
+            "UPDATE watched SET last_verified_at=?, poll_failures=0, next_check_at=? "
+            "WHERE conversation_id=?",
+            (verified_at, next_check_at, conversation_id),
+        )
+        self._conn.commit()
+
+    def mark_poll_failure(
+        self, conversation_ids: list[str], next_check_at: str
+    ) -> int:
+        """يزيد عدّاد فشل الاستطلاع ويحفظ موعد المحاولة القادمة.
+
+        يرجّع أعلى عدّاد بعد التحديث (0 لو لا يوجد صف). لا يغيّر `last_state` ولا
+        `report_state`، فلا يتحول فشل الشبكة إلى اكتمال أو فشل مزود.
+        """
+        if not conversation_ids:
+            return 0
+        placeholders = ",".join("?" for _ in conversation_ids)
+        rows = self._conn.execute(
+            "UPDATE watched SET poll_failures=poll_failures+1, next_check_at=? "
+            f"WHERE conversation_id IN ({placeholders}) RETURNING poll_failures",
+            (next_check_at, *conversation_ids),
+        ).fetchall()
+        self._conn.commit()
+        return max((int(r["poll_failures"]) for r in rows), default=0)
+
+    def set_poll_next_check(self, conversation_ids: list[str], next_check_at: str) -> None:
+        """يحدّث موعد المحاولة القادمة بعد حساب backoff بناءً على عدّاد الفشل."""
+        if not conversation_ids:
+            return
+        placeholders = ",".join("?" for _ in conversation_ids)
+        self._conn.execute(
+            f"UPDATE watched SET next_check_at=? WHERE conversation_id IN ({placeholders})",
+            (next_check_at, *conversation_ids),
+        )
+        self._conn.commit()
+
+    def set_report_state(self, conversation_id: str, state: str) -> None:
+        """يحفظ حالة جلب التقرير (مستقلة عن حالة المزود)."""
+        self._conn.execute(
+            "UPDATE watched SET report_state=? WHERE conversation_id=?",
             (state, conversation_id),
         )
         self._conn.commit()
@@ -4632,6 +5594,31 @@ class Database:
             cleanup_last_error=(
                 row["cleanup_last_error"] if "cleanup_last_error" in row.keys() else None
             ),
+            review_id=(
+                int(row["review_id"])
+                if "review_id" in row.keys() and row["review_id"] is not None
+                else None
+            ),
+            review_delivery_key=(
+                row["review_delivery_key"]
+                if "review_delivery_key" in row.keys()
+                else None
+            ),
+            review_kind=(
+                row["review_kind"]
+                if "review_kind" in row.keys() and row["review_kind"] is not None
+                else None
+            ),
+            review_version=(
+                int(row["review_version"])
+                if "review_version" in row.keys() and row["review_version"] is not None
+                else None
+            ),
+            review_report_id=(
+                int(row["review_report_id"])
+                if "review_report_id" in row.keys() and row["review_report_id"] is not None
+                else None
+            ),
         )
 
     # ----------------------------------------------------------- creation jobs
@@ -4744,6 +5731,22 @@ class Database:
                 "SELECT * FROM creation_jobs WHERE id=? AND chat_id=?", (job_id, int(chat_id))
             ).fetchone()
         return self._row_to_creation(row) if row else None
+
+    def list_done_creation_jobs_for_conversation(
+        self, conversation_id: str
+    ) -> tuple[CreationJob, ...]:
+        """Return durable ``done`` creation jobs bound to one exact conversation id.
+
+        The canary linkage source requires exactly one row; this query is read-only
+        and intentionally does not fall back to repository or OpenHands metadata.
+        """
+        if not isinstance(conversation_id, str) or not conversation_id:
+            return ()
+        rows = self._conn.execute(
+            "SELECT * FROM creation_jobs WHERE conversation_id=? AND status=? ORDER BY id",
+            (conversation_id, CREATION_DONE),
+        ).fetchall()
+        return tuple(self._row_to_creation(row) for row in rows)
 
     def list_creation_jobs_for_owner(
         self, chat_id: int, page: int = 0, page_size: int = 10
@@ -6470,6 +7473,2046 @@ class Database:
             (int(item_id), token),
         )
         self._conn.commit()
+
+    # ---------------------------------------------------- auto review (R2)
+    @staticmethod
+    def _row_to_auto_review_provider_snapshot(
+        row: sqlite3.Row,
+    ) -> AutoReviewProviderSnapshot:
+        return AutoReviewProviderSnapshot(
+            id=int(row["id"]),
+            provider=row["provider"],
+            api_base=row["api_base"],
+            model=row["model"],
+            config_json=row["config_json"],
+            config_fingerprint=row["config_fingerprint"],
+            created_at=row["created_at"],
+        )
+
+    @staticmethod
+    def _row_to_auto_review(row: sqlite3.Row) -> AutoReview:
+        return AutoReview(
+            id=int(row["id"]),
+            reservation_key=row["reservation_key"],
+            conversation_id=row["conversation_id"],
+            repository_id=int(row["repository_id"]),
+            repository_full_name=row["repository_full_name"],
+            pr_number=row["pr_number"],
+            branch=row["branch"],
+            base_sha=row["base_sha"],
+            head_sha=row["head_sha"],
+            scope=row["scope"],
+            status=row["status"],
+            stage=row["stage"],
+            terminal_reason=row["terminal_reason"],
+            ci_run_id=row["ci_run_id"],
+            ci_conclusion=row["ci_conclusion"],
+            verdict=row["verdict"],
+            report_ref=row["report_ref"],
+            provider_snapshot_id=int(row["provider_snapshot_id"]),
+            rounds=int(row["rounds"]),
+            reserved_by=row["reserved_by"],
+            reserved_at=row["reserved_at"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            error_class=row["error_class"],
+            error_detail=row["error_detail"],
+            chat_id=int(row["chat_id"]) if row["chat_id"] is not None else 0,
+            scope_policy=row["scope_policy"],
+            lifecycle_state=row["lifecycle_state"],
+            worker_state=row["worker_state"],
+            delivery_state=row["delivery_state"],
+            attempts=int(row["attempts"]),
+            max_attempts=int(row["max_attempts"]),
+            next_attempt_at=row["next_attempt_at"],
+            delivery_outbox_id=(
+                int(row["delivery_outbox_id"])
+                if row["delivery_outbox_id"] is not None
+                else None
+            ),
+            membership_count=int(row["membership_count"]),
+            implementation_report=row["implementation_report"] or "",
+            delivery_text=row["delivery_text"] or "",
+        )
+
+    def get_auto_review_provider_snapshot(
+        self, snapshot_id: int
+    ) -> AutoReviewProviderSnapshot | None:
+        row = self._conn.execute(
+            "SELECT * FROM auto_review_provider_snapshots WHERE id=?", (int(snapshot_id),)
+        ).fetchone()
+        return self._row_to_auto_review_provider_snapshot(row) if row else None
+
+    def get_or_create_auto_review_provider_snapshot(
+        self,
+        *,
+        provider: str,
+        api_base: str,
+        model: str,
+        config: dict | None = None,
+        now: str | None = None,
+    ) -> AutoReviewProviderSnapshot:
+        """لقطة إعداد غير سرية. ترفض أي config فيه مفتاح/توكن/سر.
+
+        الـfingerprint = SHA-256 لـ JSON قانوني (provider, api_base, model, settings).
+        نفس الإعداد ⇒ نفس اللقطة (idempotent)؛ تغيير الموديل/المزوّد ⇒ لقطة جديدة.
+        """
+        if isinstance(provider, str):
+            provider = provider.strip().lower()
+        if isinstance(api_base, str):
+            api_base = api_base.strip().rstrip("/")
+        if isinstance(model, str):
+            model = model.strip()
+        if not _valid_text(provider, 64):
+            raise ValueError("provider غير صالح")
+        if not _valid_text(api_base, 2048) or not api_base.startswith(("http://", "https://")):
+            raise ValueError("api_base غير صالح")
+        if not _valid_text(model, 256):
+            raise ValueError("model غير صالح")
+        settings = dict(config or {})
+        if _contains_secretish_key(settings):
+            raise ValueError("config snapshot يحتوي على مفتاح/سر — ممنوع")
+        payload = {
+            "provider": provider,
+            "api_base": api_base,
+            "model": model,
+            "settings": settings,
+        }
+        canonical = _canonical_review_config(payload)
+        fingerprint = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        stamp = now or datetime.now(timezone.utc).isoformat()
+        conn = self._conn
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM auto_review_provider_snapshots WHERE config_fingerprint=?",
+                (fingerprint,),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO auto_review_provider_snapshots"
+                    "(provider, api_base, model, config_json, config_fingerprint, created_at) "
+                    "VALUES(?, ?, ?, ?, ?, ?)",
+                    (provider, api_base, model, canonical, fingerprint, stamp),
+                )
+                row = conn.execute(
+                    "SELECT * FROM auto_review_provider_snapshots WHERE config_fingerprint=?",
+                    (fingerprint,),
+                ).fetchone()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        if row is None:
+            raise RuntimeError("auto review provider snapshot could not be read")
+        return self._row_to_auto_review_provider_snapshot(row)
+
+    def get_auto_review(self, review_id: int) -> AutoReview | None:
+        row = self._conn.execute(
+            "SELECT * FROM auto_reviews WHERE id=?", (int(review_id),)
+        ).fetchone()
+        return self._row_to_auto_review(row) if row else None
+
+    def get_auto_review_by_key(self, reservation_key: str) -> AutoReview | None:
+        row = self._conn.execute(
+            "SELECT * FROM auto_reviews WHERE reservation_key=?", (reservation_key,)
+        ).fetchone()
+        return self._row_to_auto_review(row) if row else None
+
+    @staticmethod
+    def _auto_review_identity_matches(
+        row: sqlite3.Row,
+        *,
+        conversation_id: str,
+        repository_id: int,
+        pr_number: int | None,
+        branch: str,
+        base_sha: str | None,
+        head_sha: str,
+        scope: str,
+        provider_snapshot_id: int,
+        rounds: int,
+    ) -> bool:
+        # repository_full_name is a mutable snapshot, not identity; repository_id is stable.
+        return (
+            row["conversation_id"] == conversation_id
+            and int(row["repository_id"]) == int(repository_id)
+            and row["pr_number"] == pr_number
+            and row["branch"] == branch
+            and row["base_sha"] == base_sha
+            and row["head_sha"] == head_sha
+            and row["scope"] == scope
+            and int(row["provider_snapshot_id"]) == int(provider_snapshot_id)
+            and int(row["rounds"]) == int(rounds)
+        )
+
+    def reserve_auto_review(
+        self,
+        *,
+        reservation_key: str,
+        conversation_id: str,
+        repository_id: int,
+        repository_full_name: str,
+        head_sha: str,
+        scope: str,
+        provider_snapshot_id: int,
+        reserved_by: str,
+        branch: str = "",
+        base_sha: str | None = None,
+        pr_number: int | None = None,
+        rounds: int = 0,
+        now: str | None = None,
+    ) -> AutoReviewReservation:
+        """حجز ذرّي لدورة مراجعة (BEGIN IMMEDIATE).
+
+        - نفس المفتاح ونفس الهوية ⇒ already_reserved (idempotent).
+        - نفس المفتاح بهوية مختلفة ⇒ conflicting_identity.
+        - دورة نشطة بنفس الـscope (محادثة أو PR) ⇒ conflicting_identity.
+        - إدخال غير صالح ⇒ invalid_input (بدون كتابة).
+        """
+        if not isinstance(reservation_key, str) or not _AUTO_REVIEW_KEY_RE.match(
+            reservation_key
+        ):
+            return AutoReviewReservation(AUTO_REVIEW_RESERVATION_INVALID, detail="reservation_key")
+        if not isinstance(conversation_id, str) or not _AUTO_REVIEW_ID_RE.match(
+            conversation_id
+        ):
+            return AutoReviewReservation(AUTO_REVIEW_RESERVATION_INVALID, detail="conversation_id")
+        if (
+            not isinstance(repository_id, int)
+            or isinstance(repository_id, bool)
+            or repository_id <= 0
+        ):
+            return AutoReviewReservation(AUTO_REVIEW_RESERVATION_INVALID, detail="repository_id")
+        if not _valid_repo_full_name(repository_full_name):
+            return AutoReviewReservation(
+                AUTO_REVIEW_RESERVATION_INVALID, detail="repository_full_name"
+            )
+        if not _valid_sha40(head_sha):
+            return AutoReviewReservation(AUTO_REVIEW_RESERVATION_INVALID, detail="head_sha")
+        if scope not in (AUTO_REVIEW_SCOPE_CONVERSATION, AUTO_REVIEW_SCOPE_PER_PR):
+            return AutoReviewReservation(AUTO_REVIEW_RESERVATION_INVALID, detail="scope")
+        if scope == AUTO_REVIEW_SCOPE_PER_PR and (
+            not isinstance(pr_number, int)
+            or isinstance(pr_number, bool)
+            or pr_number <= 0
+        ):
+            return AutoReviewReservation(AUTO_REVIEW_RESERVATION_INVALID, detail="pr_number")
+        if pr_number is not None and (
+            not isinstance(pr_number, int)
+            or isinstance(pr_number, bool)
+            or pr_number <= 0
+        ):
+            return AutoReviewReservation(AUTO_REVIEW_RESERVATION_INVALID, detail="pr_number")
+        if base_sha is not None and not _valid_sha40(base_sha):
+            return AutoReviewReservation(AUTO_REVIEW_RESERVATION_INVALID, detail="base_sha")
+        if not isinstance(branch, str) or not _valid_text(branch, 256, allow_empty=True):
+            return AutoReviewReservation(AUTO_REVIEW_RESERVATION_INVALID, detail="branch")
+        if (
+            not isinstance(provider_snapshot_id, int)
+            or isinstance(provider_snapshot_id, bool)
+            or provider_snapshot_id <= 0
+        ):
+            return AutoReviewReservation(
+                AUTO_REVIEW_RESERVATION_INVALID, detail="provider_snapshot_id"
+            )
+        if not isinstance(reserved_by, str) or not _AUTO_REVIEW_ID_RE.match(reserved_by):
+            return AutoReviewReservation(AUTO_REVIEW_RESERVATION_INVALID, detail="reserved_by")
+        if not isinstance(rounds, int) or isinstance(rounds, bool) or not 0 <= rounds <= 100:
+            return AutoReviewReservation(AUTO_REVIEW_RESERVATION_INVALID, detail="rounds")
+        if now is not None and not _valid_text(now, 64):
+            return AutoReviewReservation(AUTO_REVIEW_RESERVATION_INVALID, detail="now")
+        stamp = now or datetime.now(timezone.utc).isoformat()
+        conn = self._conn
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            snapshot = conn.execute(
+                "SELECT id FROM auto_review_provider_snapshots WHERE id=?",
+                (provider_snapshot_id,),
+            ).fetchone()
+            if snapshot is None:
+                conn.rollback()
+                return AutoReviewReservation(
+                    AUTO_REVIEW_RESERVATION_INVALID, detail="provider_snapshot_id"
+                )
+            existing = conn.execute(
+                "SELECT * FROM auto_reviews WHERE reservation_key=?",
+                (reservation_key,),
+            ).fetchone()
+            if existing is not None:
+                conn.rollback()
+                if self._auto_review_identity_matches(
+                    existing,
+                    conversation_id=conversation_id,
+                    repository_id=repository_id,
+                    pr_number=pr_number,
+                    branch=branch,
+                    base_sha=base_sha,
+                    head_sha=head_sha,
+                    scope=scope,
+                    provider_snapshot_id=provider_snapshot_id,
+                    rounds=rounds,
+                ):
+                    return AutoReviewReservation(
+                        AUTO_REVIEW_RESERVATION_ALREADY,
+                        existing_id=int(existing["id"]),
+                    )
+                return AutoReviewReservation(
+                    AUTO_REVIEW_RESERVATION_CONFLICT,
+                    existing_id=int(existing["id"]),
+                    detail="reservation_key",
+                )
+            mixed_scope = conn.execute(
+                "SELECT id FROM auto_reviews WHERE status=? AND conversation_id=? "
+                "AND scope<>?",
+                (AUTO_REVIEW_STATUS_RESERVED, conversation_id, scope),
+            ).fetchone()
+            if mixed_scope is not None:
+                conn.rollback()
+                return AutoReviewReservation(
+                    AUTO_REVIEW_RESERVATION_CONFLICT,
+                    existing_id=int(mixed_scope["id"]),
+                    detail="active_scope_mismatch",
+                )
+            if scope == AUTO_REVIEW_SCOPE_CONVERSATION:
+                conflict = conn.execute(
+                    "SELECT id FROM auto_reviews WHERE status=? AND scope=? "
+                    "AND conversation_id=?",
+                    (AUTO_REVIEW_STATUS_RESERVED, scope, conversation_id),
+                ).fetchone()
+            else:
+                conflict = conn.execute(
+                    "SELECT id FROM auto_reviews WHERE status=? AND scope=? "
+                    "AND conversation_id=? AND repository_id=? AND pr_number=?",
+                    (
+                        AUTO_REVIEW_STATUS_RESERVED,
+                        scope,
+                        conversation_id,
+                        repository_id,
+                        pr_number,
+                    ),
+                ).fetchone()
+            if conflict is not None:
+                conn.rollback()
+                return AutoReviewReservation(
+                    AUTO_REVIEW_RESERVATION_CONFLICT,
+                    existing_id=int(conflict["id"]),
+                    detail="active_scope",
+                )
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO auto_reviews"
+                "(reservation_key, conversation_id, repository_id, repository_full_name, "
+                " pr_number, branch, base_sha, head_sha, scope, status, stage, "
+                " provider_snapshot_id, rounds, reserved_by, reserved_at, created_at, updated_at) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    reservation_key,
+                    conversation_id,
+                    repository_id,
+                    repository_full_name,
+                    pr_number,
+                    branch,
+                    base_sha,
+                    head_sha,
+                    scope,
+                    AUTO_REVIEW_STATUS_RESERVED,
+                    AUTO_REVIEW_STAGE_RESERVED,
+                    provider_snapshot_id,
+                    rounds,
+                    reserved_by,
+                    stamp,
+                    stamp,
+                    stamp,
+                ),
+            )
+            if cur.rowcount == 1:
+                review_id = int(cur.lastrowid)
+                conn.commit()
+                return AutoReviewReservation(
+                    AUTO_REVIEW_RESERVATION_NEW, review_id=review_id
+                )
+            # سباق نادر: الـunique constraint منع الإدخال بعد فحص الـscope. نقرأ الفائز.
+            existing = conn.execute(
+                "SELECT * FROM auto_reviews WHERE reservation_key=?",
+                (reservation_key,),
+            ).fetchone()
+            if existing is not None:
+                conn.rollback()
+                if self._auto_review_identity_matches(
+                    existing,
+                    conversation_id=conversation_id,
+                    repository_id=repository_id,
+                    pr_number=pr_number,
+                    branch=branch,
+                    base_sha=base_sha,
+                    head_sha=head_sha,
+                    scope=scope,
+                    provider_snapshot_id=provider_snapshot_id,
+                    rounds=rounds,
+                ):
+                    return AutoReviewReservation(
+                        AUTO_REVIEW_RESERVATION_ALREADY,
+                        existing_id=int(existing["id"]),
+                    )
+                return AutoReviewReservation(
+                    AUTO_REVIEW_RESERVATION_CONFLICT,
+                    existing_id=int(existing["id"]),
+                    detail="reservation_key",
+                )
+            mixed_scope = conn.execute(
+                "SELECT id FROM auto_reviews WHERE status=? AND conversation_id=? "
+                "AND scope<>?",
+                (AUTO_REVIEW_STATUS_RESERVED, conversation_id, scope),
+            ).fetchone()
+            if mixed_scope is not None:
+                conn.rollback()
+                return AutoReviewReservation(
+                    AUTO_REVIEW_RESERVATION_CONFLICT,
+                    existing_id=int(mixed_scope["id"]),
+                    detail="active_scope_mismatch",
+                )
+            if scope == AUTO_REVIEW_SCOPE_CONVERSATION:
+                conflict = conn.execute(
+                    "SELECT id FROM auto_reviews WHERE status=? AND scope=? "
+                    "AND conversation_id=?",
+                    (AUTO_REVIEW_STATUS_RESERVED, scope, conversation_id),
+                ).fetchone()
+            else:
+                conflict = conn.execute(
+                    "SELECT id FROM auto_reviews WHERE status=? AND scope=? "
+                    "AND conversation_id=? AND repository_id=? AND pr_number=?",
+                    (
+                        AUTO_REVIEW_STATUS_RESERVED,
+                        scope,
+                        conversation_id,
+                        repository_id,
+                        pr_number,
+                    ),
+                ).fetchone()
+            conn.rollback()
+            if conflict is not None:
+                return AutoReviewReservation(
+                    AUTO_REVIEW_RESERVATION_CONFLICT,
+                    existing_id=int(conflict["id"]),
+                    detail="active_scope",
+                )
+            return AutoReviewReservation(
+                AUTO_REVIEW_RESERVATION_CONFLICT, detail="insert_ignored"
+            )
+        except Exception:
+            conn.rollback()
+            raise
+
+    # ------------------------------------------------ auto review R5 lifecycle
+    @staticmethod
+    def _row_to_auto_review_membership(row: sqlite3.Row) -> AutoReviewMembership:
+        return AutoReviewMembership(
+            repository_id=int(row["repository_id"]),
+            repository_full_name=row["repository_full_name"],
+            pr_number=int(row["pr_number"]),
+            branch=row["branch"],
+            base_sha=row["base_sha"],
+            head_sha=row["head_sha"],
+        )
+
+    @staticmethod
+    def _row_to_auto_review_stage(row: sqlite3.Row) -> AutoReviewStage:
+        return AutoReviewStage(
+            review_id=int(row["review_id"]),
+            repository_id=int(row["repository_id"]),
+            pr_number=int(row["pr_number"]),
+            stage=row["stage"],
+            status=row["status"],
+            attempt=int(row["attempt"]),
+            evidence_sha256=row["evidence_sha256"],
+            output_json=row["output_json"],
+            output_sha256=row["output_sha256"],
+            validation_json=row["validation_json"],
+            error_class=row["error_class"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    @staticmethod
+    def _row_to_auto_review_evidence(row: sqlite3.Row) -> AutoReviewEvidence:
+        return AutoReviewEvidence(
+            review_id=int(row["review_id"]),
+            repository_id=int(row["repository_id"]),
+            pr_number=int(row["pr_number"]),
+            head_sha=row["head_sha"],
+            base_sha=row["base_sha"],
+            evidence_sha256=row["evidence_sha256"],
+            diff_sha256=row["diff_sha256"],
+            coverage_complete=bool(row["coverage_complete"]),
+            ci_state=row["ci_state"],
+            evidence_json=row["evidence_json"],
+            created_at=row["created_at"],
+        )
+
+    @staticmethod
+    def _row_to_auto_review_report(row: sqlite3.Row) -> AutoReviewReport:
+        return AutoReviewReport(
+            id=int(row["id"]),
+            review_id=int(row["review_id"]),
+            version=int(row["version"]),
+            filename=row["filename"],
+            content=row["content"],
+            summary=row["summary"],
+            report_sha256=row["report_sha256"],
+            verdict=row["verdict"],
+            created_at=row["created_at"],
+        )
+
+    @staticmethod
+    def _row_to_auto_review_owner_decision(row: sqlite3.Row) -> AutoReviewOwnerDecision:
+        return AutoReviewOwnerDecision(
+            id=int(row["id"]),
+            review_id=int(row["review_id"]),
+            report_version=int(row["report_version"]),
+            owner_user_id=int(row["owner_user_id"]),
+            action=row["action"],
+            event_type=row["event_type"],
+            idempotency_key=row["idempotency_key"],
+            created_at=row["created_at"],
+        )
+
+    def get_auto_review_evidence(
+        self, review_id: int, repository_id: int, pr_number: int
+    ) -> AutoReviewEvidence | None:
+        row = self._conn.execute(
+            "SELECT * FROM auto_review_evidence WHERE review_id=? AND repository_id=? "
+            "AND pr_number=?",
+            (int(review_id), int(repository_id), int(pr_number)),
+        ).fetchone()
+        return self._row_to_auto_review_evidence(row) if row else None
+
+    def list_auto_reviews_by_lifecycle(self, lifecycle_state: str) -> tuple[AutoReview, ...]:
+        if lifecycle_state not in AUTO_REVIEW_LIFECYCLES:
+            raise AutoReviewConflict("invalid lifecycle state")
+        rows = self._conn.execute(
+            "SELECT * FROM auto_reviews WHERE lifecycle_state=? ORDER BY id",
+            (lifecycle_state,),
+        ).fetchall()
+        return tuple(self._row_to_auto_review(row) for row in rows)
+
+    def get_auto_review_memberships(self, review_id: int) -> tuple[AutoReviewMembership, ...]:
+        rows = self._conn.execute(
+            "SELECT * FROM auto_review_memberships WHERE review_id=? "
+            "ORDER BY repository_id, pr_number",
+            (int(review_id),),
+        ).fetchall()
+        return tuple(self._row_to_auto_review_membership(row) for row in rows)
+
+    def list_pending_auto_review_memberships(
+        self, conversation_id: str
+    ) -> tuple[AutoReviewMembership, ...]:
+        if not isinstance(conversation_id, str) or not _AUTO_REVIEW_ID_RE.match(
+            conversation_id
+        ):
+            return ()
+        rows = self._conn.execute(
+            "SELECT * FROM auto_review_pending_memberships WHERE conversation_id=? "
+            "ORDER BY repository_id, pr_number",
+            (conversation_id,),
+        ).fetchall()
+        return tuple(self._row_to_auto_review_membership(row) for row in rows)
+
+    def get_auto_review_stage(
+        self, review_id: int, repository_id: int, pr_number: int, stage: str
+    ) -> AutoReviewStage | None:
+        if stage not in ("blind", "adversarial"):
+            raise AutoReviewConflict("unsupported stage")
+        row = self._conn.execute(
+            "SELECT * FROM auto_review_stages WHERE review_id=? AND repository_id=? "
+            "AND pr_number=? AND stage=?",
+            (int(review_id), int(repository_id), int(pr_number), stage),
+        ).fetchone()
+        return self._row_to_auto_review_stage(row) if row else None
+
+    def get_auto_review_report(
+        self, review_id: int, version: int | None = None
+    ) -> AutoReviewReport | None:
+        if version is None:
+            row = self._conn.execute(
+                "SELECT * FROM auto_review_reports WHERE review_id=? "
+                "ORDER BY version DESC LIMIT 1",
+                (int(review_id),),
+            ).fetchone()
+        else:
+            if isinstance(version, bool) or not isinstance(version, int) or version <= 0:
+                raise AutoReviewConflict("invalid report version")
+            row = self._conn.execute(
+                "SELECT * FROM auto_review_reports WHERE review_id=? AND version=?",
+                (int(review_id), int(version)),
+            ).fetchone()
+        return self._row_to_auto_review_report(row) if row else None
+
+    def save_auto_review_report(
+        self,
+        review_id: int,
+        *,
+        version: int,
+        filename: str,
+        content: str,
+        summary: str,
+        report_sha256: str,
+        verdict: str,
+        now: str | None = None,
+    ) -> AutoReviewReport:
+        if isinstance(review_id, bool) or not isinstance(review_id, int) or review_id <= 0:
+            raise AutoReviewConflict("invalid review_id")
+        if isinstance(version, bool) or not isinstance(version, int) or not 1 <= version <= 9999:
+            raise AutoReviewConflict("invalid report version")
+        if not isinstance(filename, str) or not _AUTO_REVIEW_REPORT_FILENAME_RE.match(filename):
+            raise AutoReviewConflict("invalid report filename")
+        if not isinstance(content, str) or not 1 <= len(content) <= 300000:
+            raise AutoReviewConflict("invalid report content")
+        if not isinstance(summary, str) or not 1 <= len(summary) <= 1024:
+            raise AutoReviewConflict("invalid report summary")
+        if not isinstance(report_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", report_sha256):
+            raise AutoReviewConflict("invalid report hash")
+        if verdict not in ("PASS", "PASS_WITH_NOTES", "FAIL", "BLOCKED"):
+            raise AutoReviewConflict("invalid report verdict")
+        if hashlib.sha256(content.encode("utf-8")).hexdigest() != report_sha256:
+            raise AutoReviewConflict("report hash mismatch")
+        from .review.redact import redact_text
+
+        for value in (content, summary):
+            scan = redact_text(value, max_input_chars=300000)
+            if scan.status != "ok" or scan.redactions:
+                raise AutoReviewConflict("secret_in_report")
+        stamp = now or datetime.now(timezone.utc).isoformat()
+        conn = self._conn
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cycle = conn.execute(
+                "SELECT id FROM auto_reviews WHERE id=?", (int(review_id),)
+            ).fetchone()
+            if cycle is None:
+                conn.rollback()
+                raise AutoReviewConflict("review cycle not found")
+            existing = conn.execute(
+                "SELECT * FROM auto_review_reports WHERE review_id=? AND version=?",
+                (int(review_id), int(version)),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["filename"] == filename
+                    and existing["content"] == content
+                    and existing["summary"] == summary
+                    and existing["report_sha256"] == report_sha256
+                    and existing["verdict"] == verdict
+                ):
+                    conn.commit()
+                    return self._row_to_auto_review_report(existing)
+                conn.rollback()
+                raise AutoReviewConflict("report version conflict")
+            cur = conn.execute(
+                "INSERT INTO auto_review_reports"
+                "(review_id, version, filename, content, summary, report_sha256, verdict, "
+                " created_at) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    int(review_id),
+                    int(version),
+                    filename,
+                    content,
+                    summary,
+                    report_sha256,
+                    verdict,
+                    stamp,
+                ),
+            )
+            report_id = int(cur.lastrowid)
+            row = conn.execute(
+                "SELECT * FROM auto_review_reports WHERE id=?", (report_id,)
+            ).fetchone()
+            conn.commit()
+            return self._row_to_auto_review_report(row)
+        except Exception:
+            conn.rollback()
+            raise
+
+    def _auto_review_active_id(
+        self, conn: sqlite3.Connection, conversation_id: str
+    ) -> sqlite3.Row | None:
+        return conn.execute(
+            "SELECT * FROM auto_reviews WHERE status=? AND scope=? AND conversation_id=? "
+            "AND scope_policy=? ORDER BY id DESC LIMIT 1",
+            (
+                AUTO_REVIEW_STATUS_RESERVED,
+                AUTO_REVIEW_SCOPE_CONVERSATION,
+                conversation_id,
+                AUTO_REVIEW_SCOPE_POLICY_CONVERSATION_WIDE,
+            ),
+        ).fetchone()
+
+    def _auto_review_membership_rows_match(
+        self,
+        conn: sqlite3.Connection,
+        review_id: int,
+        memberships: tuple[AutoReviewMembership, ...],
+    ) -> bool:
+        rows = conn.execute(
+            "SELECT * FROM auto_review_memberships WHERE review_id=? "
+            "ORDER BY repository_id, pr_number",
+            (int(review_id),),
+        ).fetchall()
+        actual = tuple(self._row_to_auto_review_membership(row) for row in rows)
+        return tuple(_membership_identity(item) for item in actual) == tuple(
+            _membership_identity(item) for item in memberships
+        )
+
+    def _auto_review_pending_identity(
+        self, row: sqlite3.Row
+    ) -> tuple:
+        return (
+            int(row["repository_id"]),
+            int(row["pr_number"]),
+            row["branch"],
+            row["base_sha"],
+            row["head_sha"],
+        )
+
+    def _record_pending_membership(
+        self, conn: sqlite3.Connection, conversation_id: str, item: AutoReviewMembership, now: str
+    ) -> bool:
+        row = conn.execute(
+            "SELECT * FROM auto_review_pending_memberships "
+            "WHERE conversation_id=? AND repository_id=? AND pr_number=?",
+            (conversation_id, item.repository_id, item.pr_number),
+        ).fetchone()
+        if row is not None:
+            return self._auto_review_pending_identity(row) == _membership_identity(item)
+        conn.execute(
+            "INSERT INTO auto_review_pending_memberships"
+            "(conversation_id, repository_id, repository_full_name, pr_number, branch, "
+            " base_sha, head_sha, observed_at) VALUES(?,?,?,?,?,?,?,?)",
+            (
+                conversation_id,
+                item.repository_id,
+                item.repository_full_name,
+                item.pr_number,
+                item.branch,
+                item.base_sha,
+                item.head_sha,
+                now,
+            ),
+        )
+        return True
+
+    def _auto_review_row_matches_conversation(
+        self,
+        row: sqlite3.Row,
+        memberships: tuple[AutoReviewMembership, ...],
+        *,
+        chat_id: int,
+        provider_snapshot_id: int,
+        rounds: int,
+        implementation_report: str,
+    ) -> bool:
+        return (
+            row["scope"] == AUTO_REVIEW_SCOPE_CONVERSATION
+            and row["scope_policy"] == AUTO_REVIEW_SCOPE_POLICY_CONVERSATION_WIDE
+            and int(row["chat_id"]) == int(chat_id)
+            and int(row["provider_snapshot_id"]) == int(provider_snapshot_id)
+            and int(row["rounds"]) == int(rounds)
+            and (row["implementation_report"] or "") == implementation_report
+            and int(row["membership_count"]) == len(memberships)
+            and self._auto_review_membership_rows_match(
+                self._conn, int(row["id"]), memberships
+            )
+        )
+
+    def reserve_conversation_review(
+        self,
+        *,
+        conversation_id: str,
+        chat_id: int,
+        memberships: tuple[AutoReviewMembership, ...],
+        provider_snapshot_id: int,
+        reserved_by: str,
+        implementation_report: str = "",
+        rounds: int = 0,
+        max_attempts: int = 5,
+        reservation_key: str | None = None,
+        now: str | None = None,
+    ) -> AutoReviewReservation:
+        """Reserve one conversation-wide cycle and snapshot all PR membership atomically."""
+        ordered = _ordered_memberships(memberships)
+        if ordered is None:
+            return AutoReviewReservation(AUTO_REVIEW_RESERVATION_INVALID, detail="memberships")
+        if not isinstance(conversation_id, str) or not _AUTO_REVIEW_ID_RE.match(
+            conversation_id
+        ):
+            return AutoReviewReservation(AUTO_REVIEW_RESERVATION_INVALID, detail="conversation_id")
+        if not isinstance(chat_id, int) or isinstance(chat_id, bool) or chat_id <= 0:
+            return AutoReviewReservation(AUTO_REVIEW_RESERVATION_INVALID, detail="chat_id")
+        if (
+            not isinstance(provider_snapshot_id, int)
+            or isinstance(provider_snapshot_id, bool)
+            or provider_snapshot_id <= 0
+        ):
+            return AutoReviewReservation(
+                AUTO_REVIEW_RESERVATION_INVALID, detail="provider_snapshot_id"
+            )
+        if not isinstance(reserved_by, str) or not _AUTO_REVIEW_ID_RE.match(reserved_by):
+            return AutoReviewReservation(AUTO_REVIEW_RESERVATION_INVALID, detail="reserved_by")
+        if not isinstance(rounds, int) or isinstance(rounds, bool) or not 0 <= rounds <= 100:
+            return AutoReviewReservation(AUTO_REVIEW_RESERVATION_INVALID, detail="rounds")
+        if (
+            not isinstance(max_attempts, int)
+            or isinstance(max_attempts, bool)
+            or not 1 <= max_attempts <= 20
+        ):
+            return AutoReviewReservation(AUTO_REVIEW_RESERVATION_INVALID, detail="max_attempts")
+        if not isinstance(implementation_report, str) or len(implementation_report) > 100000:
+            return AutoReviewReservation(
+                AUTO_REVIEW_RESERVATION_INVALID, detail="implementation_report"
+            )
+        from .review.redact import redact_text
+
+        report_scan = redact_text(
+            implementation_report, max_input_chars=100000, max_output_chars=100000
+        )
+        if report_scan.status != "ok":
+            return AutoReviewReservation(
+                AUTO_REVIEW_RESERVATION_INVALID, detail="implementation_report"
+            )
+        implementation_report = report_scan.text
+        if now is not None and not _valid_text(now, 64):
+            return AutoReviewReservation(AUTO_REVIEW_RESERVATION_INVALID, detail="now")
+        expected_key = build_conversation_review_key(conversation_id, ordered)
+        if reservation_key is not None and reservation_key != expected_key:
+            return AutoReviewReservation(AUTO_REVIEW_RESERVATION_INVALID, detail="reservation_key")
+        key = expected_key
+        stamp = now or datetime.now(timezone.utc).isoformat()
+        conn = self._conn
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if conn.execute(
+                "SELECT id FROM auto_review_provider_snapshots WHERE id=?",
+                (provider_snapshot_id,),
+            ).fetchone() is None:
+                conn.rollback()
+                return AutoReviewReservation(
+                    AUTO_REVIEW_RESERVATION_INVALID, detail="provider_snapshot_id"
+                )
+            existing = conn.execute(
+                "SELECT * FROM auto_reviews WHERE reservation_key=?", (key,)
+            ).fetchone()
+            if existing is not None:
+                conn.rollback()
+                if self._auto_review_row_matches_conversation(
+                    existing,
+                    ordered,
+                    chat_id=chat_id,
+                    provider_snapshot_id=provider_snapshot_id,
+                    rounds=rounds,
+                    implementation_report=implementation_report,
+                ):
+                    return AutoReviewReservation(
+                        AUTO_REVIEW_RESERVATION_ALREADY, existing_id=int(existing["id"])
+                    )
+                return AutoReviewReservation(
+                    AUTO_REVIEW_RESERVATION_CONFLICT,
+                    existing_id=int(existing["id"]),
+                    detail="reservation_key",
+                )
+            mixed_scope = conn.execute(
+                "SELECT id FROM auto_reviews WHERE status=? AND conversation_id=? "
+                "AND scope<>?",
+                (AUTO_REVIEW_STATUS_RESERVED, conversation_id, AUTO_REVIEW_SCOPE_CONVERSATION),
+            ).fetchone()
+            if mixed_scope is not None:
+                conn.rollback()
+                return AutoReviewReservation(
+                    AUTO_REVIEW_RESERVATION_CONFLICT,
+                    existing_id=int(mixed_scope["id"]),
+                    detail="active_scope_mismatch",
+                )
+            active = self._auto_review_active_id(conn, conversation_id)
+            if active is not None:
+                for item in ordered:
+                    member = conn.execute(
+                        "SELECT * FROM auto_review_memberships WHERE review_id=? "
+                        "AND repository_id=? AND pr_number=?",
+                        (int(active["id"]), item.repository_id, item.pr_number),
+                    ).fetchone()
+                    if member is not None:
+                        if _membership_identity(
+                            self._row_to_auto_review_membership(member)
+                        ) != _membership_identity(item):
+                            conn.rollback()
+                            return AutoReviewReservation(
+                                AUTO_REVIEW_RESERVATION_CONFLICT,
+                                existing_id=int(active["id"]),
+                                detail="conflicting_membership",
+                            )
+                        continue
+                    if not self._record_pending_membership(
+                        conn, conversation_id, item, stamp
+                    ):
+                        conn.rollback()
+                        return AutoReviewReservation(
+                            AUTO_REVIEW_RESERVATION_CONFLICT,
+                            existing_id=int(active["id"]),
+                            detail="conflicting_pending_membership",
+                        )
+                conn.commit()
+                return AutoReviewReservation(
+                    AUTO_REVIEW_RESERVATION_CONFLICT,
+                    existing_id=int(active["id"]),
+                    detail="active_cycle",
+                )
+            pending_rows = conn.execute(
+                "SELECT * FROM auto_review_pending_memberships WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchall()
+            combined: dict[tuple[int, int], AutoReviewMembership] = {
+                (item.repository_id, item.pr_number): item for item in ordered
+            }
+            for row in pending_rows:
+                item = self._row_to_auto_review_membership(row)
+                existing_item = combined.get((item.repository_id, item.pr_number))
+                if existing_item is not None and _membership_identity(existing_item) != _membership_identity(item):
+                    conn.rollback()
+                    return AutoReviewReservation(
+                        AUTO_REVIEW_RESERVATION_CONFLICT, detail="pending_membership"
+                    )
+                combined.setdefault((item.repository_id, item.pr_number), item)
+            final_memberships = tuple(
+                sorted(combined.values(), key=lambda item: (item.repository_id, item.pr_number))
+            )
+            anchor = final_memberships[0]
+            cur = conn.execute(
+                "INSERT INTO auto_reviews"
+                "(reservation_key, conversation_id, repository_id, repository_full_name, "
+                " pr_number, branch, base_sha, head_sha, scope, scope_policy, status, stage, "
+                " provider_snapshot_id, rounds, reserved_by, reserved_at, created_at, updated_at, "
+                " chat_id, lifecycle_state, worker_state, delivery_state, attempts, max_attempts, "
+                " membership_count, implementation_report) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    key,
+                    conversation_id,
+                    anchor.repository_id,
+                    anchor.repository_full_name,
+                    anchor.pr_number,
+                    anchor.branch,
+                    anchor.base_sha,
+                    anchor.head_sha,
+                    AUTO_REVIEW_SCOPE_CONVERSATION,
+                    AUTO_REVIEW_SCOPE_POLICY_CONVERSATION_WIDE,
+                    AUTO_REVIEW_STATUS_RESERVED,
+                    AUTO_REVIEW_STAGE_QUEUED,
+                    provider_snapshot_id,
+                    rounds,
+                    reserved_by,
+                    stamp,
+                    stamp,
+                    stamp,
+                    chat_id,
+                    AUTO_REVIEW_LIFECYCLE_QUEUED,
+                    AUTO_REVIEW_WORKER_IDLE,
+                    AUTO_REVIEW_DELIVERY_NONE,
+                    0,
+                    max_attempts,
+                    len(final_memberships),
+                    implementation_report,
+                ),
+            )
+            review_id = int(cur.lastrowid)
+            for item in final_memberships:
+                conn.execute(
+                    "INSERT INTO auto_review_memberships"
+                    "(review_id, repository_id, repository_full_name, pr_number, branch, "
+                    " base_sha, head_sha, created_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        review_id,
+                        item.repository_id,
+                        item.repository_full_name,
+                        item.pr_number,
+                        item.branch,
+                        item.base_sha,
+                        item.head_sha,
+                        stamp,
+                    ),
+                )
+            conn.execute(
+                "DELETE FROM auto_review_pending_memberships WHERE conversation_id=?",
+                (conversation_id,),
+            )
+            conn.commit()
+            return AutoReviewReservation(AUTO_REVIEW_RESERVATION_NEW, review_id=review_id)
+        except Exception:
+            conn.rollback()
+            raise
+
+    def observe_auto_review_membership(
+        self,
+        *,
+        conversation_id: str,
+        membership: AutoReviewMembership,
+        now: str | None = None,
+    ) -> AutoReviewObservation:
+        """Record a newly observed PR without mutating an active snapshot."""
+        if not _valid_review_membership(membership):
+            return AutoReviewObservation(AUTO_REVIEW_OBSERVATION_INVALID, detail="membership")
+        if not isinstance(conversation_id, str) or not _AUTO_REVIEW_ID_RE.match(
+            conversation_id
+        ):
+            return AutoReviewObservation(
+                AUTO_REVIEW_OBSERVATION_INVALID, detail="conversation_id"
+            )
+        if now is not None and not _valid_text(now, 64):
+            return AutoReviewObservation(AUTO_REVIEW_OBSERVATION_INVALID, detail="now")
+        stamp = now or datetime.now(timezone.utc).isoformat()
+        conn = self._conn
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            active = self._auto_review_active_id(conn, conversation_id)
+            if active is not None:
+                member = conn.execute(
+                    "SELECT * FROM auto_review_memberships WHERE review_id=? "
+                    "AND repository_id=? AND pr_number=?",
+                    (int(active["id"]), membership.repository_id, membership.pr_number),
+                ).fetchone()
+                if member is not None:
+                    conn.rollback()
+                    if _membership_identity(
+                        self._row_to_auto_review_membership(member)
+                    ) == _membership_identity(membership):
+                        return AutoReviewObservation(
+                            AUTO_REVIEW_OBSERVATION_ALREADY, review_id=int(active["id"])
+                        )
+                    return AutoReviewObservation(
+                        AUTO_REVIEW_OBSERVATION_CONFLICT, review_id=int(active["id"])
+                    )
+                if not self._record_pending_membership(
+                    conn, conversation_id, membership, stamp
+                ):
+                    conn.rollback()
+                    return AutoReviewObservation(
+                        AUTO_REVIEW_OBSERVATION_CONFLICT, review_id=int(active["id"])
+                    )
+                conn.commit()
+                return AutoReviewObservation(
+                    AUTO_REVIEW_OBSERVATION_DEFERRED, review_id=int(active["id"])
+                )
+            if not self._record_pending_membership(conn, conversation_id, membership, stamp):
+                conn.rollback()
+                return AutoReviewObservation(AUTO_REVIEW_OBSERVATION_CONFLICT)
+            conn.commit()
+            return AutoReviewObservation(AUTO_REVIEW_OBSERVATION_PENDING)
+        except Exception:
+            conn.rollback()
+            raise
+
+    def claim_auto_review(
+        self,
+        *,
+        owner: str,
+        now: str | None = None,
+        lease_seconds: int = 300,
+    ) -> AutoReviewClaim | None:
+        """Atomically claim one eligible cycle; expired leases are takeover-able."""
+        if not isinstance(owner, str) or not _AUTO_REVIEW_ID_RE.match(owner):
+            raise AutoReviewConflict("invalid owner")
+        if (
+            not isinstance(lease_seconds, int)
+            or isinstance(lease_seconds, bool)
+            or not 1 <= lease_seconds <= 3600
+        ):
+            raise AutoReviewConflict("invalid lease_seconds")
+        if now is not None and not _valid_text(now, 64):
+            raise AutoReviewConflict("invalid now")
+        stamp = now or datetime.now(timezone.utc).isoformat()
+        current = _parse_iso(stamp)
+        if current is None:
+            raise AutoReviewConflict("invalid now")
+        expires = (current + timedelta(seconds=lease_seconds)).isoformat()
+        token = secrets.token_hex(16)
+        conn = self._conn
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            exhausted = conn.execute(
+                "SELECT ar.id FROM auto_reviews ar "
+                "LEFT JOIN auto_review_leases l ON l.review_id=ar.id "
+                "WHERE ar.status=? AND ar.lifecycle_state IN (?, ?, ?) "
+                "AND ar.attempts>=ar.max_attempts AND ar.stage NOT IN (?, ?) "
+                "AND (l.review_id IS NULL OR l.expires_at<=?)",
+                (
+                    AUTO_REVIEW_STATUS_RESERVED,
+                    AUTO_REVIEW_LIFECYCLE_QUEUED,
+                    AUTO_REVIEW_LIFECYCLE_ACTIVE,
+                    AUTO_REVIEW_LIFECYCLE_RETRY_WAIT,
+                    AUTO_REVIEW_STAGE_DELIVERY,
+                    AUTO_REVIEW_STAGE_DONE,
+                    stamp,
+                ),
+            ).fetchall()
+            for item in exhausted:
+                conn.execute(
+                    "UPDATE auto_reviews SET lifecycle_state=?, worker_state=?, stage=?, "
+                    "verdict=COALESCE(verdict, 'BLOCKED'), terminal_reason=?, "
+                    "delivery_text=CASE WHEN delivery_text='' THEN ? ELSE delivery_text END, "
+                    "updated_at=? WHERE id=? AND status=?",
+                    (
+                        AUTO_REVIEW_LIFECYCLE_DELIVERY_PENDING,
+                        AUTO_REVIEW_WORKER_EXHAUSTED,
+                        AUTO_REVIEW_STAGE_DELIVERY,
+                        "retry_exhausted",
+                        "تعذّر إكمال دورة المراجعة بعد استنفاد المحاولات.",
+                        stamp,
+                        int(item["id"]),
+                        AUTO_REVIEW_STATUS_RESERVED,
+                    ),
+                )
+                conn.execute(
+                    "DELETE FROM auto_review_leases WHERE review_id=? AND expires_at<=?",
+                    (int(item["id"]), stamp),
+                )
+            row = conn.execute(
+                "SELECT ar.*, l.lease_epoch AS current_epoch FROM auto_reviews ar "
+                "LEFT JOIN auto_review_leases l ON l.review_id=ar.id "
+                "WHERE ar.status=? AND ar.scope=? AND ar.scope_policy=? "
+                "AND ar.lifecycle_state IN (?, ?, ?) "
+                "AND ar.stage NOT IN (?, ?) "
+                "AND (ar.next_attempt_at IS NULL OR ar.next_attempt_at<=?) "
+                "AND (l.review_id IS NULL OR l.expires_at<=?) "
+                "AND ar.attempts < ar.max_attempts "
+                "ORDER BY ar.id LIMIT 1",
+                (
+                    AUTO_REVIEW_STATUS_RESERVED,
+                    AUTO_REVIEW_SCOPE_CONVERSATION,
+                    AUTO_REVIEW_SCOPE_POLICY_CONVERSATION_WIDE,
+                    AUTO_REVIEW_LIFECYCLE_QUEUED,
+                    AUTO_REVIEW_LIFECYCLE_ACTIVE,
+                    AUTO_REVIEW_LIFECYCLE_RETRY_WAIT,
+                    AUTO_REVIEW_STAGE_DELIVERY,
+                    AUTO_REVIEW_STAGE_DONE,
+                    stamp,
+                    stamp,
+                ),
+            ).fetchone()
+            if row is None:
+                conn.commit()
+                return None
+            epoch = int(row["current_epoch"] or 0) + 1
+            conn.execute(
+                "INSERT INTO auto_review_leases"
+                "(review_id, owner, lease_token, lease_epoch, acquired_at, renewed_at, expires_at) "
+                "VALUES(?,?,?,?,?,NULL,?) "
+                "ON CONFLICT(review_id) DO UPDATE SET owner=excluded.owner, "
+                "lease_token=excluded.lease_token, lease_epoch=excluded.lease_epoch, "
+                "acquired_at=excluded.acquired_at, renewed_at=NULL, expires_at=excluded.expires_at",
+                (int(row["id"]), owner, token, epoch, stamp, expires),
+            )
+            changed = conn.execute(
+                "UPDATE auto_reviews SET lifecycle_state=?, worker_state=?, attempts=attempts+1, "
+                "next_attempt_at=NULL, error_class=NULL, error_detail=NULL, updated_at=? "
+                "WHERE id=? AND status=?",
+                (
+                    AUTO_REVIEW_LIFECYCLE_ACTIVE,
+                    AUTO_REVIEW_WORKER_CLAIMED,
+                    stamp,
+                    int(row["id"]),
+                    AUTO_REVIEW_STATUS_RESERVED,
+                ),
+            ).rowcount
+            if changed != 1:
+                conn.rollback()
+                return None
+            conn.commit()
+            return AutoReviewClaim(
+                review_id=int(row["id"]),
+                conversation_id=row["conversation_id"],
+                chat_id=int(row["chat_id"]),
+                scope=row["scope"],
+                scope_policy=row["scope_policy"],
+                lifecycle_state=AUTO_REVIEW_LIFECYCLE_ACTIVE,
+                stage=row["stage"],
+                worker_state=AUTO_REVIEW_WORKER_CLAIMED,
+                lease_token=token,
+                lease_epoch=epoch,
+                lease_expires_at=expires,
+                attempts=int(row["attempts"]) + 1,
+                max_attempts=int(row["max_attempts"]),
+                provider_snapshot_id=int(row["provider_snapshot_id"]),
+            )
+        except Exception:
+            conn.rollback()
+            raise
+
+    def _auto_review_lease_owned(
+        self,
+        conn: sqlite3.Connection,
+        review_id: int,
+        lease_token: str,
+        lease_epoch: int,
+        now: str,
+    ) -> bool:
+        if (
+            not isinstance(lease_token, str)
+            or not lease_token
+            or not isinstance(lease_epoch, int)
+            or isinstance(lease_epoch, bool)
+            or lease_epoch <= 0
+        ):
+            return False
+        row = conn.execute(
+            "SELECT 1 FROM auto_review_leases WHERE review_id=? AND lease_token=? "
+            "AND lease_epoch=? AND expires_at>?",
+            (int(review_id), lease_token, int(lease_epoch), now),
+        ).fetchone()
+        return row is not None
+
+    def renew_auto_review_lease(
+        self,
+        review_id: int,
+        lease_token: str,
+        *,
+        now: str | None = None,
+        lease_seconds: int = 300,
+    ) -> bool:
+        if not _valid_text(lease_token, 128):
+            return False
+        if (
+            not isinstance(lease_seconds, int)
+            or isinstance(lease_seconds, bool)
+            or not 1 <= lease_seconds <= 3600
+        ):
+            return False
+        stamp = now or datetime.now(timezone.utc).isoformat()
+        current = _parse_iso(stamp)
+        if current is None:
+            return False
+        expires = (current + timedelta(seconds=lease_seconds)).isoformat()
+        conn = self._conn
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            changed = conn.execute(
+                "UPDATE auto_review_leases SET expires_at=?, renewed_at=? "
+                "WHERE review_id=? AND lease_token=? AND expires_at>?",
+                (expires, stamp, int(review_id), lease_token, stamp),
+            ).rowcount
+            if changed == 1:
+                conn.execute(
+                    "UPDATE auto_reviews SET worker_state=?, updated_at=? "
+                    "WHERE id=? AND status=? AND worker_state IN (?, ?)",
+                    (
+                        AUTO_REVIEW_WORKER_RUNNING,
+                        stamp,
+                        int(review_id),
+                        AUTO_REVIEW_STATUS_RESERVED,
+                        AUTO_REVIEW_WORKER_CLAIMED,
+                        AUTO_REVIEW_WORKER_RUNNING,
+                    ),
+                )
+            conn.commit()
+            return changed == 1
+        except Exception:
+            conn.rollback()
+            raise
+
+    def release_auto_review_lease(
+        self, review_id: int, lease_token: str, *, now: str | None = None
+    ) -> bool:
+        stamp = now or datetime.now(timezone.utc).isoformat()
+        conn = self._conn
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            changed = conn.execute(
+                "DELETE FROM auto_review_leases WHERE review_id=? AND lease_token=?",
+                (int(review_id), lease_token),
+            ).rowcount
+            if changed == 1:
+                conn.execute(
+                    "UPDATE auto_reviews SET worker_state=?, updated_at=? "
+                    "WHERE id=? AND status=? AND worker_state IN (?, ?)",
+                    (
+                        AUTO_REVIEW_WORKER_RELEASED,
+                        stamp,
+                        int(review_id),
+                        AUTO_REVIEW_STATUS_RESERVED,
+                        AUTO_REVIEW_WORKER_CLAIMED,
+                        AUTO_REVIEW_WORKER_RUNNING,
+                    ),
+                )
+            conn.commit()
+            return changed == 1
+        except Exception:
+            conn.rollback()
+            raise
+
+    def begin_auto_review_stage(
+        self,
+        review_id: int,
+        stage: str,
+        lease_token: str,
+        lease_epoch: int,
+        *,
+        now: str | None = None,
+    ) -> None:
+        allowed = {
+            AUTO_REVIEW_STAGE_EVIDENCE: {
+                AUTO_REVIEW_STAGE_QUEUED,
+                AUTO_REVIEW_STAGE_RESERVED,
+                AUTO_REVIEW_STAGE_EVIDENCE,
+            },
+            AUTO_REVIEW_STAGE_BLIND: {
+                AUTO_REVIEW_STAGE_QUEUED,
+                AUTO_REVIEW_STAGE_RESERVED,
+                AUTO_REVIEW_STAGE_EVIDENCE,
+                AUTO_REVIEW_STAGE_BLIND,
+                AUTO_REVIEW_STAGE_BLIND_VALIDATED,
+                AUTO_REVIEW_STAGE_ADVERSARIAL,
+                AUTO_REVIEW_STAGE_ADVERSARIAL_VALIDATED,
+                AUTO_REVIEW_STAGE_VERDICT,
+            },
+            AUTO_REVIEW_STAGE_BLIND_VALIDATED: {
+                AUTO_REVIEW_STAGE_BLIND,
+                AUTO_REVIEW_STAGE_BLIND_VALIDATED,
+                AUTO_REVIEW_STAGE_ADVERSARIAL,
+                AUTO_REVIEW_STAGE_ADVERSARIAL_VALIDATED,
+                AUTO_REVIEW_STAGE_VERDICT,
+            },
+            AUTO_REVIEW_STAGE_ADVERSARIAL: {
+                AUTO_REVIEW_STAGE_BLIND_VALIDATED,
+                AUTO_REVIEW_STAGE_ADVERSARIAL,
+            },
+            AUTO_REVIEW_STAGE_ADVERSARIAL_VALIDATED: {
+                AUTO_REVIEW_STAGE_BLIND_VALIDATED,
+                AUTO_REVIEW_STAGE_ADVERSARIAL,
+                AUTO_REVIEW_STAGE_ADVERSARIAL_VALIDATED,
+            },
+            AUTO_REVIEW_STAGE_VERDICT: {
+                AUTO_REVIEW_STAGE_ADVERSARIAL_VALIDATED,
+                AUTO_REVIEW_STAGE_VERDICT,
+            },
+            AUTO_REVIEW_STAGE_DELIVERY: {
+                AUTO_REVIEW_STAGE_VERDICT,
+                AUTO_REVIEW_STAGE_DELIVERY,
+            },
+        }
+        if stage not in allowed:
+            raise AutoReviewConflict("unsupported stage")
+        stamp = now or datetime.now(timezone.utc).isoformat()
+        conn = self._conn
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if not self._auto_review_lease_owned(
+                conn, review_id, lease_token, lease_epoch, stamp
+            ):
+                conn.rollback()
+                raise AutoReviewLeaseLost("lease lost")
+            placeholders = ",".join("?" for _ in allowed[stage])
+            changed = conn.execute(
+                f"UPDATE auto_reviews SET stage=?, lifecycle_state=?, worker_state=?, "
+                f"updated_at=? WHERE id=? AND status=? AND stage IN ({placeholders})",
+                (
+                    stage,
+                    AUTO_REVIEW_LIFECYCLE_ACTIVE,
+                    AUTO_REVIEW_WORKER_RUNNING,
+                    stamp,
+                    int(review_id),
+                    AUTO_REVIEW_STATUS_RESERVED,
+                    *sorted(allowed[stage]),
+                ),
+            ).rowcount
+            if changed != 1:
+                conn.rollback()
+                raise AutoReviewConflict("illegal stage transition")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    def save_auto_review_stage(
+        self,
+        review_id: int,
+        repository_id: int,
+        pr_number: int,
+        stage: str,
+        status: str,
+        *,
+        lease_token: str,
+        lease_epoch: int,
+        evidence_sha256: str | None = None,
+        output_json: str | None = None,
+        validation_json: str | None = None,
+        error_class: str | None = None,
+        now: str | None = None,
+    ) -> None:
+        if stage not in ("blind", "adversarial"):
+            raise AutoReviewConflict("unsupported stage")
+        if status not in AUTO_REVIEW_STAGE_STATUSES:
+            raise AutoReviewConflict("unsupported stage status")
+        if output_json is not None and (
+            not isinstance(output_json, str) or len(output_json) > 400000
+        ):
+            raise AutoReviewConflict("invalid stage output")
+        if output_json is not None:
+            from .review.redact import redact_text
+
+            scan = redact_text(output_json, max_input_chars=400000)
+            if scan.status != "ok" or scan.redactions:
+                raise AutoReviewConflict("secret_in_stage_output")
+        if validation_json is not None and (
+            not isinstance(validation_json, str) or len(validation_json) > 20000
+        ):
+            raise AutoReviewConflict("invalid validation")
+        if evidence_sha256 is not None and (
+            not isinstance(evidence_sha256, str) or len(evidence_sha256) != 64
+        ):
+            raise AutoReviewConflict("invalid evidence hash")
+        if error_class is not None and (
+            not isinstance(error_class, str) or len(error_class) > 128
+        ):
+            raise AutoReviewConflict("invalid error class")
+        stamp = now or datetime.now(timezone.utc).isoformat()
+        output_sha = (
+            hashlib.sha256(output_json.encode("utf-8")).hexdigest()
+            if output_json is not None
+            else None
+        )
+        conn = self._conn
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if not self._auto_review_lease_owned(
+                conn, review_id, lease_token, lease_epoch, stamp
+            ):
+                conn.rollback()
+                raise AutoReviewLeaseLost("lease lost")
+            cycle = conn.execute(
+                "SELECT attempts FROM auto_reviews WHERE id=? AND status=?",
+                (int(review_id), AUTO_REVIEW_STATUS_RESERVED),
+            ).fetchone()
+            if cycle is None:
+                conn.rollback()
+                raise AutoReviewConflict("cycle is not active")
+            conn.execute(
+                "INSERT INTO auto_review_stages"
+                "(review_id, repository_id, pr_number, stage, status, attempt, "
+                " evidence_sha256, output_json, output_sha256, validation_json, error_class, "
+                " created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(review_id, repository_id, pr_number, stage) DO UPDATE SET "
+                "status=excluded.status, attempt=excluded.attempt, "
+                "evidence_sha256=excluded.evidence_sha256, output_json=excluded.output_json, "
+                "output_sha256=excluded.output_sha256, validation_json=excluded.validation_json, "
+                "error_class=excluded.error_class, updated_at=excluded.updated_at",
+                (
+                    int(review_id),
+                    int(repository_id),
+                    int(pr_number),
+                    stage,
+                    status,
+                    int(cycle["attempts"]),
+                    evidence_sha256,
+                    output_json,
+                    output_sha,
+                    validation_json,
+                    error_class,
+                    stamp,
+                    stamp,
+                ),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    def save_auto_review_evidence(
+        self,
+        review_id: int,
+        membership: AutoReviewMembership,
+        *,
+        lease_token: str,
+        lease_epoch: int,
+        evidence_sha256: str,
+        diff_sha256: str,
+        coverage_complete: bool,
+        ci_state: str,
+        evidence_json: str,
+        now: str | None = None,
+    ) -> None:
+        if not _valid_review_membership(membership):
+            raise AutoReviewConflict("invalid membership")
+        if not isinstance(evidence_sha256, str) or len(evidence_sha256) != 64:
+            raise AutoReviewConflict("invalid evidence hash")
+        if not isinstance(diff_sha256, str) or len(diff_sha256) != 64:
+            raise AutoReviewConflict("invalid diff hash")
+        if not isinstance(evidence_json, str) or len(evidence_json) > 100000:
+            raise AutoReviewConflict("invalid evidence json")
+        from .review.redact import redact_text
+
+        evidence_scan = redact_text(evidence_json, max_input_chars=100000)
+        if evidence_scan.status != "ok" or evidence_scan.redactions:
+            raise AutoReviewConflict("secret_in_evidence")
+        if not isinstance(ci_state, str) or len(ci_state) > 64:
+            raise AutoReviewConflict("invalid ci state")
+        stamp = now or datetime.now(timezone.utc).isoformat()
+        conn = self._conn
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if not self._auto_review_lease_owned(
+                conn, review_id, lease_token, lease_epoch, stamp
+            ):
+                conn.rollback()
+                raise AutoReviewLeaseLost("lease lost")
+            existing = conn.execute(
+                "SELECT * FROM auto_review_evidence WHERE review_id=? "
+                "AND repository_id=? AND pr_number=?",
+                (int(review_id), membership.repository_id, membership.pr_number),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["evidence_sha256"] == evidence_sha256
+                    and existing["diff_sha256"] == diff_sha256
+                ):
+                    conn.commit()
+                    return
+                conn.rollback()
+                raise AutoReviewConflict("evidence changed for active cycle")
+            conn.execute(
+                "INSERT INTO auto_review_evidence"
+                "(review_id, repository_id, pr_number, head_sha, base_sha, evidence_sha256, "
+                " diff_sha256, coverage_complete, ci_state, evidence_json, created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    int(review_id),
+                    membership.repository_id,
+                    membership.pr_number,
+                    membership.head_sha,
+                    membership.base_sha,
+                    evidence_sha256,
+                    diff_sha256,
+                    1 if coverage_complete else 0,
+                    ci_state,
+                    evidence_json,
+                    stamp,
+                ),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    def complete_auto_review(
+        self,
+        review_id: int,
+        *,
+        lease_token: str,
+        lease_epoch: int,
+        verdict: str,
+        report_ref: str,
+        delivery_text: str,
+        now: str | None = None,
+    ) -> None:
+        if not isinstance(verdict, str) or len(verdict) > 64:
+            raise AutoReviewConflict("invalid verdict")
+        if not isinstance(report_ref, str) or not 1 <= len(report_ref) <= 512:
+            raise AutoReviewConflict("invalid report_ref")
+        if not isinstance(delivery_text, str) or not 1 <= len(delivery_text) <= 10000:
+            raise AutoReviewConflict("invalid delivery_text")
+        from .review.redact import redact_text
+
+        delivery_scan = redact_text(
+            delivery_text, max_input_chars=10000, max_output_chars=10000
+        )
+        if delivery_scan.status != "ok":
+            raise AutoReviewConflict("invalid delivery_text")
+        delivery_text = delivery_scan.text
+        stamp = now or datetime.now(timezone.utc).isoformat()
+        conn = self._conn
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if not self._auto_review_lease_owned(
+                conn, review_id, lease_token, lease_epoch, stamp
+            ):
+                conn.rollback()
+                raise AutoReviewLeaseLost("lease lost")
+            changed = conn.execute(
+                "UPDATE auto_reviews SET verdict=?, report_ref=?, delivery_text=?, "
+                "stage=?, lifecycle_state=?, worker_state=?, next_attempt_at=NULL, "
+                "error_class=NULL, error_detail=NULL, updated_at=? "
+                "WHERE id=? AND status=? AND lifecycle_state IN (?, ?) "
+                "AND stage IN (?, ?)",
+                (
+                    verdict,
+                    report_ref,
+                    delivery_text,
+                    AUTO_REVIEW_STAGE_DELIVERY,
+                    AUTO_REVIEW_LIFECYCLE_DELIVERY_PENDING,
+                    AUTO_REVIEW_WORKER_IDLE,
+                    stamp,
+                    int(review_id),
+                    AUTO_REVIEW_STATUS_RESERVED,
+                    AUTO_REVIEW_LIFECYCLE_ACTIVE,
+                    AUTO_REVIEW_LIFECYCLE_RETRY_WAIT,
+                    AUTO_REVIEW_STAGE_ADVERSARIAL_VALIDATED,
+                    AUTO_REVIEW_STAGE_VERDICT,
+                ),
+            ).rowcount
+            if changed != 1:
+                conn.rollback()
+                raise AutoReviewConflict("illegal completion transition")
+            conn.execute(
+                "DELETE FROM auto_review_leases WHERE review_id=? AND lease_token=?",
+                (int(review_id), lease_token),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    def fail_auto_review(
+        self,
+        review_id: int,
+        *,
+        lease_token: str,
+        lease_epoch: int,
+        error_class: str,
+        retryable: bool,
+        delivery_text: str = "",
+        now: str | None = None,
+    ) -> str:
+        if not isinstance(error_class, str) or not 1 <= len(error_class) <= 128:
+            raise AutoReviewConflict("invalid error_class")
+        if delivery_text and len(delivery_text) > 10000:
+            raise AutoReviewConflict("invalid delivery_text")
+        stamp = now or datetime.now(timezone.utc).isoformat()
+        current = _parse_iso(stamp)
+        if current is None:
+            raise AutoReviewConflict("invalid now")
+        conn = self._conn
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if not self._auto_review_lease_owned(
+                conn, review_id, lease_token, lease_epoch, stamp
+            ):
+                conn.rollback()
+                raise AutoReviewLeaseLost("lease lost")
+            row = conn.execute(
+                "SELECT attempts, max_attempts FROM auto_reviews WHERE id=? AND status=?",
+                (int(review_id), AUTO_REVIEW_STATUS_RESERVED),
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                raise AutoReviewConflict("cycle is not active")
+            if retryable and int(row["attempts"]) < int(row["max_attempts"]):
+                delay = min(300, 2 ** min(int(row["attempts"]), 8))
+                next_at = (current + timedelta(seconds=delay)).isoformat()
+                conn.execute(
+                    "UPDATE auto_reviews SET lifecycle_state=?, worker_state=?, "
+                    "next_attempt_at=?, error_class=?, error_detail=?, updated_at=? "
+                    "WHERE id=? AND status=?",
+                    (
+                        AUTO_REVIEW_LIFECYCLE_RETRY_WAIT,
+                        AUTO_REVIEW_WORKER_RELEASED,
+                        next_at,
+                        error_class,
+                        error_class,
+                        stamp,
+                        int(review_id),
+                        AUTO_REVIEW_STATUS_RESERVED,
+                    ),
+                )
+                conn.execute(
+                    "DELETE FROM auto_review_leases WHERE review_id=? AND lease_token=?",
+                    (int(review_id), lease_token),
+                )
+                conn.commit()
+                return "retry_wait"
+            reason = "retry_exhausted" if retryable else error_class
+            text = delivery_text or f"تعذّر إكمال دورة المراجعة: {reason}"
+            conn.execute(
+                "UPDATE auto_reviews SET verdict=COALESCE(verdict, 'BLOCKED'), "
+                "stage=?, lifecycle_state=?, worker_state=?, delivery_text=?, "
+                "terminal_reason=?, error_class=?, error_detail=?, updated_at=? "
+                "WHERE id=? AND status=?",
+                (
+                    AUTO_REVIEW_STAGE_DELIVERY,
+                    AUTO_REVIEW_LIFECYCLE_DELIVERY_PENDING,
+                    AUTO_REVIEW_WORKER_IDLE,
+                    text,
+                    reason,
+                    error_class,
+                    error_class,
+                    stamp,
+                    int(review_id),
+                    AUTO_REVIEW_STATUS_RESERVED,
+                ),
+            )
+            conn.execute(
+                "DELETE FROM auto_review_leases WHERE review_id=? AND lease_token=?",
+                (int(review_id), lease_token),
+            )
+            conn.commit()
+            return "terminal_failed"
+        except Exception:
+            conn.rollback()
+            raise
+
+    def record_auto_review_owner_decision(
+        self,
+        review_id: int,
+        report_version: int,
+        owner_user_id: int,
+        action: str,
+        *,
+        now: str | None = None,
+    ) -> OwnerDecisionResult:
+        if isinstance(review_id, bool) or not isinstance(review_id, int) or review_id <= 0:
+            raise AutoReviewConflict("invalid review_id")
+        if (
+            isinstance(report_version, bool)
+            or not isinstance(report_version, int)
+            or report_version <= 0
+        ):
+            raise AutoReviewConflict("invalid report version")
+        if (
+            isinstance(owner_user_id, bool)
+            or not isinstance(owner_user_id, int)
+            or owner_user_id <= 0
+        ):
+            raise AutoReviewConflict("invalid owner")
+        if action not in OWNER_ACTIONS:
+            raise AutoReviewConflict("invalid owner action")
+        stamp = now or datetime.now(timezone.utc).isoformat()
+        key = f"review:{review_id}:v{report_version}:owner:{owner_user_id}:{action}"
+        conn = self._conn
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cycle = conn.execute(
+                "SELECT id, chat_id FROM auto_reviews WHERE id=?", (int(review_id),)
+            ).fetchone()
+            if cycle is None:
+                conn.rollback()
+                raise AutoReviewConflict("review cycle not found")
+            if int(cycle["chat_id"] or 0) != int(owner_user_id):
+                conn.rollback()
+                raise AutoReviewConflict("review owner mismatch")
+            report = conn.execute(
+                "SELECT 1 FROM auto_review_reports WHERE review_id=? AND version=?",
+                (int(review_id), int(report_version)),
+            ).fetchone()
+            if report is None:
+                conn.rollback()
+                raise AutoReviewConflict("review report not found")
+            existing = conn.execute(
+                "SELECT * FROM auto_review_owner_acceptance "
+                "WHERE review_id=? AND report_version=? AND owner_user_id=? "
+                "ORDER BY id LIMIT 1",
+                (int(review_id), int(report_version), int(owner_user_id)),
+            ).fetchone()
+            if existing is not None:
+                conn.commit()
+                return OwnerDecisionResult(
+                    OWNER_DECISION_DUPLICATE
+                    if existing["action"] == action
+                    else OWNER_DECISION_CONFLICT,
+                    int(existing["id"]),
+                    existing["action"],
+                )
+            cur = conn.execute(
+                "INSERT INTO auto_review_owner_acceptance"
+                "(review_id, report_version, owner_user_id, action, event_type, "
+                " idempotency_key, created_at) VALUES(?,?,?,?,?,?,?)",
+                (
+                    int(review_id),
+                    int(report_version),
+                    int(owner_user_id),
+                    action,
+                    AUTO_REVIEW_OWNER_ACCEPTANCE_EVENT,
+                    key,
+                    stamp,
+                ),
+            )
+            acceptance_id = int(cur.lastrowid)
+            conn.commit()
+            return OwnerDecisionResult(OWNER_DECISION_RECORDED, acceptance_id, action)
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            existing = conn.execute(
+                "SELECT * FROM auto_review_owner_acceptance "
+                "WHERE review_id=? AND report_version=? AND owner_user_id=? "
+                "ORDER BY id LIMIT 1",
+                (int(review_id), int(report_version), int(owner_user_id)),
+            ).fetchone()
+            if existing is None:
+                raise
+            return OwnerDecisionResult(
+                OWNER_DECISION_DUPLICATE
+                if existing["action"] == action
+                else OWNER_DECISION_CONFLICT,
+                int(existing["id"]),
+                existing["action"],
+            )
+        except Exception:
+            conn.rollback()
+            raise
+
+    def get_auto_review_owner_decision(
+        self, review_id: int, report_version: int, owner_user_id: int
+    ) -> AutoReviewOwnerDecision | None:
+        row = self._conn.execute(
+            "SELECT * FROM auto_review_owner_acceptance "
+            "WHERE review_id=? AND report_version=? AND owner_user_id=? "
+            "ORDER BY id LIMIT 1",
+            (int(review_id), int(report_version), int(owner_user_id)),
+        ).fetchone()
+        return self._row_to_auto_review_owner_decision(row) if row else None
+
+    def list_auto_review_owner_decisions(
+        self, review_id: int
+    ) -> tuple[AutoReviewOwnerDecision, ...]:
+        rows = self._conn.execute(
+            "SELECT * FROM auto_review_owner_acceptance WHERE review_id=? ORDER BY id",
+            (int(review_id),),
+        ).fetchall()
+        return tuple(self._row_to_auto_review_owner_decision(row) for row in rows)
+
+    def schedule_auto_review_report_delivery(
+        self,
+        review_id: int,
+        *,
+        report_id: int,
+        version: int,
+        filename: str,
+        summary: str,
+        now: str | None = None,
+    ) -> int:
+        """Attach the immutable report to the existing single review outbox intent."""
+        if isinstance(report_id, bool) or not isinstance(report_id, int) or report_id <= 0:
+            raise AutoReviewConflict("invalid report_id")
+        if isinstance(version, bool) or not isinstance(version, int) or version <= 0:
+            raise AutoReviewConflict("invalid report version")
+        if not isinstance(filename, str) or not _AUTO_REVIEW_REPORT_FILENAME_RE.match(filename):
+            raise AutoReviewConflict("invalid report filename")
+        if not isinstance(summary, str) or not 1 <= len(summary) <= 1024:
+            raise AutoReviewConflict("invalid report summary")
+        report_row = self._conn.execute(
+            "SELECT filename FROM auto_review_reports WHERE id=? AND review_id=? "
+            "AND version=?",
+            (int(report_id), int(review_id), int(version)),
+        ).fetchone()
+        if report_row is None or report_row["filename"] != filename:
+            raise AutoReviewConflict("report does not match delivery intent")
+        cycle = self.get_auto_review(review_id)
+        if cycle is None:
+            raise AutoReviewConflict("review cycle not found")
+        if not isinstance(cycle.chat_id, int) or cycle.chat_id <= 0:
+            raise AutoReviewConflict("chat_id is missing")
+        stamp = now or datetime.now(timezone.utc).isoformat()
+        key = f"review:{int(review_id)}:v{int(version)}"
+        conn = self._conn
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT id, status, updated_at FROM outbox WHERE review_delivery_key=?",
+                (key,),
+            ).fetchone()
+            if existing is not None:
+                status = existing["status"]
+                if status in (OUTBOX_PENDING, OUTBOX_CLAIMED):
+                    conn.execute(
+                        "UPDATE outbox SET text=?, review_kind=?, review_version=?, "
+                        "review_report_id=?, updated_at=? WHERE id=?",
+                        (
+                            summary,
+                            OUTBOX_REVIEW_KIND_SUMMARY_DOCUMENT,
+                            int(version),
+                            int(report_id),
+                            stamp,
+                            int(existing["id"]),
+                        ),
+                    )
+                    conn.execute(
+                        "UPDATE auto_reviews SET delivery_outbox_id=?, delivery_text=?, "
+                        "updated_at=? WHERE id=?",
+                        (int(existing["id"]), summary, stamp, int(review_id)),
+                    )
+                else:
+                    self._sync_auto_review_delivery_status(
+                        conn,
+                        int(review_id),
+                        status,
+                        existing["updated_at"] or stamp,
+                    )
+                    conn.execute(
+                        "UPDATE auto_reviews SET delivery_outbox_id=? WHERE id=?",
+                        (int(existing["id"]), int(review_id)),
+                    )
+                conn.commit()
+                return int(existing["id"])
+            cur = conn.execute(
+                "INSERT INTO outbox"
+                "(conversation_id, chat_id, text, status, created_at, updated_at, "
+                " review_id, review_delivery_key, review_kind, review_version, "
+                " review_report_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    cycle.conversation_id,
+                    cycle.chat_id,
+                    summary,
+                    OUTBOX_PENDING,
+                    stamp,
+                    stamp,
+                    int(review_id),
+                    key,
+                    OUTBOX_REVIEW_KIND_SUMMARY_DOCUMENT,
+                    int(version),
+                    int(report_id),
+                ),
+            )
+            outbox_id = int(cur.lastrowid)
+            conn.execute(
+                "UPDATE auto_reviews SET delivery_outbox_id=?, delivery_text=?, "
+                "delivery_state=?, updated_at=? WHERE id=?",
+                (outbox_id, summary, AUTO_REVIEW_DELIVERY_PENDING, stamp, int(review_id)),
+            )
+            conn.commit()
+            return outbox_id
+        except Exception:
+            conn.rollback()
+            raise
+
+    def schedule_auto_review_delivery(
+        self, review_id: int, *, now: str | None = None
+    ) -> int:
+        """Create exactly one durable outbox delivery for a completed review cycle."""
+        cycle = self.get_auto_review(review_id)
+        if cycle is None:
+            raise AutoReviewConflict("review cycle not found")
+        if cycle.lifecycle_state != AUTO_REVIEW_LIFECYCLE_DELIVERY_PENDING:
+            raise AutoReviewConflict("cycle is not ready for delivery")
+        if not isinstance(cycle.delivery_text, str) or not cycle.delivery_text:
+            raise AutoReviewConflict("delivery text is missing")
+        if not isinstance(cycle.chat_id, int) or cycle.chat_id <= 0:
+            raise AutoReviewConflict("chat_id is missing")
+        stamp = now or datetime.now(timezone.utc).isoformat()
+        key = f"review:{int(review_id)}:v1"
+        conn = self._conn
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT id, status, updated_at FROM outbox WHERE review_delivery_key=?",
+                (key,),
+            ).fetchone()
+            if existing is not None:
+                self._sync_auto_review_delivery_status(
+                    conn,
+                    int(review_id),
+                    existing["status"],
+                    existing["updated_at"] or stamp,
+                )
+                conn.execute(
+                    "UPDATE auto_reviews SET delivery_outbox_id=? WHERE id=?",
+                    (int(existing["id"]), int(review_id)),
+                )
+                conn.commit()
+                return int(existing["id"])
+            cur = conn.execute(
+                "INSERT INTO outbox"
+                "(conversation_id, chat_id, text, status, created_at, updated_at, "
+                " review_id, review_delivery_key) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    cycle.conversation_id,
+                    cycle.chat_id,
+                    cycle.delivery_text,
+                    OUTBOX_PENDING,
+                    stamp,
+                    stamp,
+                    int(review_id),
+                    key,
+                ),
+            )
+            outbox_id = int(cur.lastrowid)
+            conn.execute(
+                "UPDATE auto_reviews SET delivery_outbox_id=?, delivery_state=?, updated_at=? "
+                "WHERE id=?",
+                (outbox_id, AUTO_REVIEW_DELIVERY_PENDING, stamp, int(review_id)),
+            )
+            conn.commit()
+            return outbox_id
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            existing = self._conn.execute(
+                "SELECT id FROM outbox WHERE review_delivery_key=?", (key,)
+            ).fetchone()
+            if existing is None:
+                raise
+            self._conn.execute(
+                "UPDATE auto_reviews SET delivery_outbox_id=?, delivery_state=?, updated_at=? "
+                "WHERE id=?",
+                (
+                    int(existing["id"]),
+                    AUTO_REVIEW_DELIVERY_PENDING,
+                    stamp,
+                    int(review_id),
+                ),
+            )
+            self._conn.commit()
+            return int(existing["id"])
+        except Exception:
+            conn.rollback()
+            raise
+
+    @staticmethod
+    def _sync_auto_review_delivery_status(
+        conn: sqlite3.Connection, review_id: int, status: str, updated_at: str
+    ) -> None:
+        terminal = status in ("sent", "unknown", "failed", "discarded")
+        delivery_state = {
+            "sent": AUTO_REVIEW_DELIVERY_SENT,
+            "unknown": AUTO_REVIEW_DELIVERY_UNKNOWN,
+            "failed": AUTO_REVIEW_DELIVERY_FAILED,
+            "discarded": AUTO_REVIEW_DELIVERY_FAILED,
+            "claimed": AUTO_REVIEW_DELIVERY_CLAIMED,
+            "sending": AUTO_REVIEW_DELIVERY_SENDING,
+        }.get(status, AUTO_REVIEW_DELIVERY_PENDING)
+        reason = (
+            "delivered"
+            if status == "sent"
+            else "delivery_unknown"
+            if status == "unknown"
+            else "delivery_failed"
+            if status in ("failed", "discarded")
+            else None
+        )
+        conn.execute(
+            "UPDATE auto_reviews SET delivery_state=?, lifecycle_state=?, status=?, "
+            "stage=?, terminal_reason=?, updated_at=? WHERE id=?",
+            (
+                delivery_state,
+                AUTO_REVIEW_LIFECYCLE_TERMINAL
+                if terminal
+                else AUTO_REVIEW_LIFECYCLE_DELIVERY_PENDING,
+                AUTO_REVIEW_STATUS_TERMINAL if terminal else AUTO_REVIEW_STATUS_RESERVED,
+                AUTO_REVIEW_STAGE_DONE if terminal else AUTO_REVIEW_STAGE_DELIVERY,
+                reason,
+                updated_at,
+                int(review_id),
+            ),
+        )
+
+    def ensure_pending_auto_review_deliveries(self, *, now: str | None = None) -> int:
+        rows = self._conn.execute(
+            "SELECT id FROM auto_reviews WHERE status=? AND lifecycle_state=? "
+            "AND delivery_outbox_id IS NULL ORDER BY id",
+            (AUTO_REVIEW_STATUS_RESERVED, AUTO_REVIEW_LIFECYCLE_DELIVERY_PENDING),
+        ).fetchall()
+        created = 0
+        for row in rows:
+            self.schedule_auto_review_delivery(int(row["id"]), now=now)
+            created += 1
+        return created
+
+    def get_auto_review_outbox(self, review_id: int) -> tuple[OutboxItem, ...]:
+        rows = self._conn.execute(
+            "SELECT * FROM outbox WHERE review_id=? ORDER BY id", (int(review_id),)
+        ).fetchall()
+        return tuple(self._row_to_outbox(row) for row in rows)
 
     # -------------------------------------------------------- integrity / upkeep
     def quick_check(self) -> bool:

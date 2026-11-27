@@ -25,6 +25,8 @@ STATE_LABELS = {
     "finished": "منتهي",
     "error": "خطأ",
     "stuck": "متعلّق",
+    "cancelled": "اتلغى",
+    "canceled": "اتلغى",
     SANDBOX_ERROR: "خطأ بيئة",
     # OHB2-WP-06 (DEF-009): `get_status({})` بترجّع "unknown" (نص)، فالمفتاح ده لازم
     # يتضاف قبل ما نبدّل مواقع العرض لـ `get_status(conv)` عشان ما تظهرش كلمة إنجليزية.
@@ -32,9 +34,89 @@ STATE_LABELS = {
     None: "غير معروف",
 }
 
-DONE_STATES = {"finished", "error", "stuck", "waiting_for_confirmation"}
+# OHB2-OPENHANDS-WAIT-UNTIL-TERMINAL-STATUS: الحالات الدلالية المحلية. لا نعتبر
+# `waiting_for_confirmation` نجاحًا، ولا نعتبر `unknown` أو انتهاء مهلة محلية نجاحًا.
+TASK_RUNNING = "running"
+# حالة المزود وحدها (finished) لا تعني أن التقرير وصل أو اتسلّم.
+TASK_PROVIDER_FINISHED = "provider_finished"
+TASK_REPORT_PENDING = "report_pending"
+TASK_REPORT_AVAILABLE = "report_available"
+TASK_REPORT_UNCERTAIN = "report_uncertain"
+TASK_COMPLETED = "completed"
+TASK_FAILED = "failed"
+TASK_CANCELLED = "cancelled"
+TASK_UNKNOWN = "unknown"
+TASK_TIMED_OUT = "timed_out"
+
+TASK_STATE_LABELS = {
+    TASK_RUNNING: "شغال",
+    TASK_PROVIDER_FINISHED: "المزود أنهى التنفيذ",
+    TASK_REPORT_PENDING: "التقرير قيد الانتظار",
+    TASK_REPORT_AVAILABLE: "التقرير جاهز (قيد التسليم)",
+    TASK_REPORT_UNCERTAIN: "تسليم التقرير غير مؤكد",
+    TASK_COMPLETED: "مكتمل",
+    TASK_FAILED: "فشل",
+    TASK_CANCELLED: "اتلغى",
+    TASK_UNKNOWN: "غير معروف",
+    TASK_TIMED_OUT: "انتهت المهلة",
+}
+
+DONE_STATES = {"finished", "error", "stuck", "waiting_for_confirmation", "cancelled"}
 # الحالات النهائية المؤهّلة للإشعار: حالات الانتهاء + خطأ البيئة.
 TERMINAL_STATES = DONE_STATES | {SANDBOX_ERROR}
+
+_REPORT_PENDING_STATES = {"pending"}
+_REPORT_AVAILABLE_STATES = {"sending"}
+_REPORT_UNCERTAIN_STATES = {"uncertain"}
+_REPORT_DELIVERED_STATES = {"delivered", "not_required"}
+
+
+def task_state(status: str | None, report_state: str | None = None) -> str:
+    """يحوّل حالة المزود + حالة التقرير إلى حالة دلالية محلية.
+
+    `finished` وحدها لا تعني COMPLETED. التقرير يجب أن يكون مُسلَّمًا (أو غير مطلوب)
+    قبل اعتبار سير العمل مكتملًا. الحالات الأخرى:
+    - finished + pending ⇒ REPORT_PENDING
+    - finished + sending ⇒ REPORT_AVAILABLE
+    - finished + uncertain ⇒ REPORT_UNCERTAIN
+    - finished + timed_out ⇒ TIMED_OUT
+    - finished بدون report_state ⇒ PROVIDER_FINISHED (حقيقة المزود فقط)
+    - error/stuck/sandbox_error ⇒ FAILED
+    - cancelled/canceled ⇒ CANCELLED
+    - running/idle/paused ⇒ RUNNING
+    - أي قيمة غير معروفة ⇒ UNKNOWN، وليست COMPLETED.
+    """
+    if isinstance(status, str):
+        status = status.lower()
+        if status == "canceled":
+            status = "cancelled"
+    if status == "finished":
+        if report_state == "timed_out":
+            return TASK_TIMED_OUT
+        if report_state in _REPORT_PENDING_STATES:
+            return TASK_REPORT_PENDING
+        if report_state in _REPORT_AVAILABLE_STATES:
+            return TASK_REPORT_AVAILABLE
+        if report_state in _REPORT_UNCERTAIN_STATES:
+            return TASK_REPORT_UNCERTAIN
+        if report_state in _REPORT_DELIVERED_STATES:
+            return TASK_COMPLETED
+        return TASK_PROVIDER_FINISHED
+    if status in {"error", "stuck", SANDBOX_ERROR}:
+        return TASK_FAILED
+    if status == "cancelled":
+        return TASK_CANCELLED
+    if status in {"running", "idle", "paused"}:
+        return TASK_RUNNING
+    return TASK_UNKNOWN
+
+
+def task_state_label(state: str | None) -> str:
+    if state is None:
+        return TASK_STATE_LABELS[TASK_UNKNOWN]
+    if not isinstance(state, str):
+        return TASK_STATE_LABELS[TASK_UNKNOWN]
+    return TASK_STATE_LABELS.get(state, TASK_STATE_LABELS[TASK_UNKNOWN])
 
 
 def get_status(conversation: dict) -> str:
@@ -45,6 +127,9 @@ def get_status(conversation: dict) -> str:
     """
     execution = conversation.get("execution_status")
     status = str(execution).lower() if execution is not None else "unknown"
+    # OpenHands قد يستخدم التهجئة الأمريكية؛ نوحّدها إلى حالة واحدة.
+    if status == "canceled":
+        status = "cancelled"
     sandbox = str(conversation.get("sandbox_status") or "").upper()
     if sandbox in {"ERROR", "MISSING"}:
         return SANDBOX_ERROR

@@ -27,11 +27,19 @@ from telegram.error import RetryAfter, TelegramError
 
 from .db import (
     INBOX_CLAIM_LEASE,
+    INBOX_DELIVERY_DELIVERED,
     INBOX_DELIVERY_MAX_ATTEMPTS,
     INBOX_KIND_MISSING,
     INBOX_KIND_STALE_REPORT,
     INBOX_KIND_TERMINAL,
     INBOX_KIND_TIMEOUT,
+    REPORT_STATE_DELIVERED,
+    REPORT_STATE_NOT_REQUESTED,
+    REPORT_STATE_NOT_REQUIRED,
+    REPORT_STATE_PENDING,
+    REPORT_STATE_SENDING,
+    REPORT_STATE_TIMED_OUT,
+    REPORT_STATE_UNCERTAIN,
 )
 from .errors import ApiError
 from .messages import SANDBOX_ERROR, get_status, is_terminal, state_label
@@ -41,9 +49,8 @@ from .sender import send_long
 
 log = logging.getLogger(__name__)
 
-# U01: لو الشات وصل لحالة منتهية ومفيش تقرير أحدث من البرومبت بعد المهلة دي،
-# نبلّغ صراحةً (مش نسكت ولا نبعت تقرير قديم).
-START_TIMEOUT = timedelta(minutes=10)
+# U01: لا توجد مهلة محلية تحوّل انتظار التقرير إلى «مكتمل». بعد 24 ساعة نبلّغ
+# TIMED_OUT صراحةً ونوقف المتابعة، مع بقاء الحالة النهائية/provider كما هي.
 # مهلة المتابعة الكاملة: بعدها إشعار واضح بدل حذف صامت.
 FOLLOW_TIMEOUT = timedelta(hours=24)
 # عدد الدورات المتتالية اللي الشات فيها مش ظاهر قبل ما نعتبره اتمسح فعلاً.
@@ -52,8 +59,11 @@ MISSING_LIMIT = 3
 # العدّاد متخزّن في SQLite (watched.retry_count) فمابيتصفّرش بإعادة التشغيل، وبيرجع 0
 # لما تبدأ دورة إشعار جديدة (حالة غير منتهية جديدة / إضافة متابعة).
 MAX_WATCH_NOTIFY_RETRIES = 5
+# OHB2-OPENHANDS-WAIT-UNTIL-TERMINAL-STATUS: سقف backoff استطلاع المزود. الفاصل
+# الأساسي هو WATCHER_INTERVAL، ويتضاعف عند فشل الطلب حتى 15 دقيقة.
+MAX_POLL_BACKOFF_SECONDS = 15 * 60
 # حالات منتهية ممكن ما يطلعش فيها رد للـ agent، فانتقال حقيقي ليها كافي.
-_NO_REPORT_STATES = {"error", "stuck", "waiting_for_confirmation", SANDBOX_ERROR}
+_NO_REPORT_STATES = {"error", "stuck", "waiting_for_confirmation", "cancelled", SANDBOX_ERROR}
 
 
 class Watcher:
@@ -95,6 +105,10 @@ class Watcher:
         self._default_chat_id = chat_id
         self._interval = interval
         self._task: asyncio.Task | None = None
+        # OHB2-OPENHANDS-WAIT-UNTIL-TERMINAL-STATUS: تأخير الدورة القادمة في _run.
+        # tick نفسه لا ينام (الاختبارات والاستدعاء المباشر يفضلوا فوريين)، لكن _run
+        # يستخدمه لتنفيذ backoff حقيقي بعد فشل جلب الحالات.
+        self._next_delay = float(interval)
         # OHB2-LIFE-01: كنس انتهاكي اختياري من الـ tick **الموجود** (مفيش عامل/مجدول جديد).
         # None ⇒ السلوك السابق بالظبط (كنس الإقلاع فقط). الحرس/الخنق/الفشل داخل الغلاف.
         self._opportunistic_sweeper = opportunistic_sweeper
@@ -165,6 +179,7 @@ class Watcher:
                 pass
 
     async def _run(self) -> None:
+        await self._wait_for_initial_check()
         while True:
             try:
                 await self.tick()
@@ -172,7 +187,30 @@ class Watcher:
                 raise
             except Exception:  # noqa: BLE001
                 log.exception("خطأ في دورة المراقب")
-            await asyncio.sleep(self._interval)
+            await asyncio.sleep(self._next_delay)
+
+    async def _wait_for_initial_check(self) -> None:
+        """بعد restart: يحترم next_check_at المحفوظ بدل استطلاع فوري مكرر."""
+        try:
+            watched = self._db.list_watched()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("تعذّر قراءة مواعيد المتابعة عند الإقلاع (%s)", type(exc).__name__)
+            return
+        now = self._clock()
+        future = [
+            ts for w in watched
+            if (ts := parse_timestamp(w.next_check_at)) is not None and ts > now
+        ]
+        if not future:
+            return
+        delay = min((min(future) - now).total_seconds(), MAX_POLL_BACKOFF_SECONDS)
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+    def _backoff_delay(self, failures: int) -> float:
+        """تأخير محدود: interval، ثم يتضاعف لكل فشل متتالٍ حتى 15 دقيقة."""
+        exponent = min(max(int(failures), 1) - 1, 5)
+        return min(float(self._interval) * (2 ** exponent), float(MAX_POLL_BACKOFF_SECONDS))
 
     async def tick(self) -> None:
         # OHB2-LIFE-01: كنس انتهاكي **محدود/مخنوق** من الـ tick الموجود (لو مربوط). محلي
@@ -199,8 +237,24 @@ class Watcher:
         try:
             convs = {c["id"]: c for c in await self._client.get_conversations(ids)}
         except ApiError as exc:
+            # فشل شبكة/مزود: نثبت العدّاد والموعد القادم، ولا نغيّر حالة أي مهمة.
+            failures = 1
+            next_check = self._deadline_iso(self._backoff_delay(1))
+            try:
+                failures = self._db.mark_poll_failure(ids, next_check)
+                if failures > 1:
+                    next_check = self._deadline_iso(self._backoff_delay(failures))
+                    self._db.set_poll_next_check(ids, next_check)
+            except Exception as db_exc:  # noqa: BLE001
+                log.warning(
+                    "تعذّر تسجيل فشل الاستطلاع (%s)؛ هنسيب الموعد في الذاكرة",
+                    type(db_exc).__name__,
+                )
+            self._next_delay = self._backoff_delay(failures)
             log.warning("تعذّر جلب حالة الشاتات: %s", exc)
             return
+
+        self._next_delay = float(self._interval)
 
         for w in watched:
             # OHB2-08-02R: موعد إعادة محاولة **دائم** للمحادثة دي بعد RetryAfter. لو لسه
@@ -229,6 +283,18 @@ class Watcher:
                 continue
             self._misses.pop(w.conversation_id, None)
             self._refresh_title(w, conv)
+            # آخر استطلاع ناجح وموعد المحاولة القادمة. فشل كتابته لا يغيّر حالة المهمة
+            # ولا يسمح بإنهاء المتابعة؛ نتخطّى الدورة ونعيد المحاولة لاحقًا.
+            try:
+                self._db.mark_watched_verified(
+                    w.conversation_id, self._now_iso(), self._deadline_iso(self._interval)
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "تعذّر تسجيل آخر استطلاع ناجح للشات %s (%s)؛ هيتخطّى",
+                    w.conversation_id, type(exc).__name__,
+                )
+                continue
             state = get_status(conv)
             # NTF-15: عزل الأخطاء لكل شات (يشمل مسار الاسترجاع كمان). خطأ في محادثة واحدة
             # ما يوقفش باقي الدورة. بنسجّل النوع بس (مش النص، ممكن يحتوي أسرار).
@@ -387,10 +453,75 @@ class Watcher:
                 return
         self._db.advance_watched_state(w.conversation_id, state or "")
 
+    def _terminal_transition(self, w, state: str | None) -> bool:
+        """انتقال نهائي جديد: من غير نهائي إلى نهائي، أو بين نهايتين مختلفتين.
+
+        `finished` ثم `error`/`cancelled` حالة نهائية مختلفة، فلا يجوز أن تختفي
+        خلف `last_state=finished`. نفس الحالة المتكررة لا تُعدّ انتقالًا جديدًا.
+        """
+        return is_terminal(state) and (
+            not is_terminal(w.last_state) or w.last_state != state
+        )
+
+    async def _reconcile_report_delivery(self, w, state: str | None) -> bool:
+        """تسوية تسليم تقرير غير محسوم باستخدام هوية حدث الصندوق الدائمة.
+
+        - حدث التسليم الحالي `delivered` ⇒ التقرير وصل فعلًا: نثبّت الحالة ونشيل المتابعة.
+        - حدث `pending`/`failed` أو لا يوجد حدث ⇒ النتيجة غير مؤكدة؛ لا نرسل مرة أخرى
+          تلقائيًا ونترك `report_state=uncertain` للتوضيح/المهلة.
+        """
+        try:
+            snapshot = self._db.get_notification_state(w.conversation_id)
+            seq = snapshot.transition_seq if snapshot is not None else None
+            if seq is None:
+                return False
+            event = self._db.find_inbox_by_event_key(
+                self._inbox_event_key(w, INBOX_KIND_TERMINAL, seq)
+            )
+            if event is None:
+                return False
+            if event.transition_status and state and event.transition_status != state:
+                return False
+            if event.delivery_status == INBOX_DELIVERY_DELIVERED:
+                self._db.set_report_state(w.conversation_id, REPORT_STATE_DELIVERED)
+                self._db.remove_watched_if_seq(w.conversation_id, w.watch_seq)
+                return True
+            self._db.set_report_state(w.conversation_id, REPORT_STATE_UNCERTAIN)
+            log.warning(
+                "تسليم تقرير الشات %s غير مؤكد (حدث %s بحالة %s)؛ لن نعيد الإرسال تلقائيًا",
+                w.conversation_id, event.id, event.delivery_status,
+            )
+            return False
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "تعذّرت تسوية تسليم تقرير الشات %s (%s)؛ لن نعيد الإرسال تلقائيًا",
+                w.conversation_id, type(exc).__name__,
+            )
+            return False
+
     async def _process_submitted(self, w, conv: dict, state: str | None) -> None:
         """U01: الانتهاء لازم يتثبت بتقرير أحدث من وقت إرسال البرومبت."""
         submitted = parse_timestamp(w.submitted_at)
-        transition = is_terminal(state) and not is_terminal(w.last_state)
+        # حالة إرسال غير محسومة: لا نعيد الإرسال أعمى. نراجع حدث الصندوق أولًا.
+        if w.report_state in {REPORT_STATE_SENDING, REPORT_STATE_UNCERTAIN}:
+            if await self._reconcile_report_delivery(w, state):
+                return
+            if w.report_state == REPORT_STATE_SENDING:
+                try:
+                    self._db.set_report_state(w.conversation_id, REPORT_STATE_UNCERTAIN)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "تعذّر وسم تسليم تقرير الشات %s كغير مؤكد (%s)",
+                        w.conversation_id, type(exc).__name__,
+                    )
+            if self._expired(w.submitted_at, FOLLOW_TIMEOUT):
+                await self._notify_terminal_timeout(w, conv, state)
+            return
+        # إن كان التقرير اتسلّم بالفعل لكن حذف صف المتابعة فشل سابقًا، لا نعيد الإرسال.
+        if w.report_state == REPORT_STATE_DELIVERED:
+            self._db.remove_watched_if_seq(w.conversation_id, w.watch_seq)
+            return
+        transition = self._terminal_transition(w, state)
         if is_terminal(state):
             try:
                 report = await self._client.get_reply_since(w.conversation_id, submitted)
@@ -402,32 +533,66 @@ class Watcher:
                 return  # عطل مؤقت: ما نغيّرش الحالة المسجّلة ولا نشيل المتابعة
             if report is not None or (state in _NO_REPORT_STATES and transition):
                 try:
-                    delivered = await self._notify(w, conv, state, report=report, fresh_only=True)
+                    # علامة write-ahead دائمة قبل الإرسال: لو وقعت العملية بعد قبول
+                    # تيليجرام وقبل `delivered`، الدورة الجاية لا ترسل مرة أخرى أعمى.
+                    self._db.set_report_state(w.conversation_id, REPORT_STATE_SENDING)
+                    delivered = await self._notify(
+                        w, conv, state, report=report, fresh_only=True
+                    )
                 except TelegramError as exc:
+                    # رفض مؤكد قبل القبول: نرجع لـ pending حتى تُعاد المحاولة بأمان.
+                    try:
+                        self._db.set_report_state(w.conversation_id, REPORT_STATE_PENDING)
+                    except Exception as marker_exc:  # noqa: BLE001
+                        log.warning(
+                            "تعذّر إرجاع حالة تقرير الشات %s إلى pending (%s)",
+                            w.conversation_id, type(marker_exc).__name__,
+                        )
                     self._handle_notify_failure(w, exc)
                     return
                 if not delivered:
-                    return  # اتسلّم لتليجرام بس التسجيل فشل: هنسيبه متابَع ومانشيلوش
+                    # اتسلّم لتليجرام بس التسجيل فشل، أو عامل آخر يملك نفس الحدث.
+                    # `report_state=sending` تمنع أي إعادة إرسال أعمى في الدورة الجاية.
+                    return
+                self._db.set_report_state(
+                    w.conversation_id,
+                    REPORT_STATE_DELIVERED if report is not None else REPORT_STATE_NOT_REQUIRED,
+                )
                 self._db.remove_watched_if_seq(w.conversation_id, w.watch_seq)
                 return
-            if self._expired(w.submitted_at, START_TIMEOUT):
-                title = conv.get("title") or w.title or "بدون عنوان"
-                text = (
-                    f"الشات «{title}»: لم يظهر تقرير جديد بعد البرومبت الأخير "
-                    f"(مرّت أكثر من {int(START_TIMEOUT.total_seconds() // 60)} دقائق). "
-                    f"الحالة الحالية: {state_label(state)}. راجع الشات من الموقع."
-                )
-                if await self._deliver(w, text, kind=INBOX_KIND_STALE_REPORT, title=title):
-                    self._db.remove_watched_if_seq(w.conversation_id, w.watch_seq)
-                return
-            return  # بنستنى تقرير أحدث؛ الحالة المسجّلة تفضل زي ما هي
+            # OpenHands أكّد حالة نهائية، لكن التقرير النهائي لم يظهر بعد. هذه ليست
+            # «مكتملة»: نسجّل الحالة النهائية وحالة التقرير للاستعادة ونستمر في محاولة
+            # جلب التقرير حتى يظهر أو تنتهي مهلة الانتظار المحلية.
+            self._db.set_report_state(w.conversation_id, REPORT_STATE_PENDING)
+            self._db.advance_watched_state(w.conversation_id, state)
+            if self._expired(w.submitted_at, FOLLOW_TIMEOUT):
+                await self._notify_terminal_timeout(w, conv, state)
+            return
         if self._expired(w.submitted_at, FOLLOW_TIMEOUT):
             if await self._notify_timeout(w, conv, state):
                 return
+        if w.report_state == REPORT_STATE_PENDING:
+            # المزود رجع غير نهائي بعد terminal مؤقت؛ لا نترك حالة تقرير قديمة.
+            self._db.set_report_state(w.conversation_id, REPORT_STATE_NOT_REQUESTED)
         self._db.advance_watched_state(w.conversation_id, state or "")
+
+    async def _notify_terminal_timeout(self, w, conv: dict, state: str | None) -> bool:
+        """مهلة انتظار التقرير بعد تأكيد حالة نهائية (TIMED_OUT، ليست COMPLETED)."""
+        title = conv.get("title") or w.title or "بدون عنوان"
+        self._db.set_report_state(w.conversation_id, REPORT_STATE_TIMED_OUT)
+        text = (
+            f"انتهت مهلة انتظار التقرير النهائي للشات «{title}» (24 ساعة). "
+            f"OpenHands أكّد الحالة النهائية: {state_label(state)}، لكن التقرير لم يظهر. "
+            "لم يتم اعتبار المهمة مكتملة. راجع الشات من الموقع."
+        )
+        if await self._deliver(w, text, kind=INBOX_KIND_TIMEOUT, title=title):
+            self._db.remove_watched_if_seq(w.conversation_id, w.watch_seq)
+            return True
+        return False
 
     async def _notify_timeout(self, w, conv: dict, state: str | None) -> bool:
         title = conv.get("title") or w.title or "بدون عنوان"
+        self._db.set_report_state(w.conversation_id, REPORT_STATE_TIMED_OUT)
         text = (
             f"انتهت مهلة متابعة الشات «{title}» (24 ساعة) والشات لسه مش منتهي "
             f"(الحالة: {state_label(state)}). تم إيقاف المتابعة، راجعه من الموقع."

@@ -162,7 +162,10 @@ html, body {
 .pill { font-size: 12px; padding: 3px 8px; border-radius: 999px; background: #334155; color: #e2e8f0; white-space: nowrap; }
 .pill[data-status="running"] { background: #1d4ed8; }
 .pill[data-status="finished"] { background: #15803d; }
-.pill[data-status="error"], .pill[data-status="sandbox_error"] { background: #b91c1c; }
+.pill[data-status="completed"] { background: #15803d; }
+.pill[data-status="provider_finished"], .pill[data-status="report_pending"], .pill[data-status="report_available"], .pill[data-status="report_uncertain"] { background: #b45309; }
+.pill[data-status="timed_out"] { background: #7c3aed; }
+.pill[data-status="error"], .pill[data-status="sandbox_error"], .pill[data-status="failed"], .pill[data-status="cancelled"] { background: #b91c1c; }
 .pill[data-status="waiting_for_confirmation"] { background: #b45309; }
 /* OHB2-08-05 (Batch 3R): شارة حالة تسليم الإشعار (pending/failed). */
 .pill.delivery { background: #7c3aed; }

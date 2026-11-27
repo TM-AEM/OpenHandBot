@@ -36,7 +36,15 @@ from .attachment_text import validate_accompanying_text
 from .db import (
     DEDUPE_RETRY_DELAYS as _DEDUPE_RETRY_DELAYS,
     AttachmentRoutingState,
+    AutoReviewConflict,
     is_transient_sqlite_error as _is_transient_sqlite_error,
+)
+from .review.report import (
+    ACTION_ACCEPT,
+    ACTION_DETAILS,
+    ACTION_REJECT,
+    ReviewCallbackError,
+    parse_review_callback,
 )
 from .errors import ApiError, OperationalApiFailure, ResponseTooLargeError, error_text
 from .file_cache import FileCache
@@ -1461,6 +1469,93 @@ async def full_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         mark_display_failed(update, context, "full_reply_display_failed")
         return
     mark_explicitly_ignored(update, context)
+
+
+def _review_owner_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE, cycle) -> bool:
+    """Owner + private chat + exact review chat. Never trusts callback data."""
+    config = context.bot_data["config"]
+    user = update.effective_user
+    chat = getattr(update, "effective_chat", None)
+    q = update.callback_query
+    if not _allowed(update, config):
+        return False
+    if user is None or user.id != config.owner_id:
+        return False
+    if chat is None or getattr(chat, "id", None) != cycle.chat_id:
+        return False
+    message = getattr(q, "message", None) if q is not None else None
+    return message is not None and getattr(message, "chat_id", None) == cycle.chat_id
+
+
+async def review_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """R6 owner-only Details/Accept/Reject callback.
+
+    The callback contains only action/review id/version. Authorization and ownership
+    are re-checked from the configured owner and the persisted review row.
+    """
+    q = update.callback_query
+    if not _allowed(update, context.bot_data["config"]):
+        await _safe_answer(q)
+        _authorization_ignored(update, context)
+        return
+    try:
+        action, review_id, version = parse_review_callback(getattr(q, "data", None))
+    except ReviewCallbackError:
+        await _safe_answer(q, "طلب غير صالح.")
+        mark_explicitly_ignored(update, context)
+        return
+    db = context.bot_data["db"]
+    cycle = db.get_auto_review(review_id)
+    if cycle is None or not _review_owner_allowed(update, context, cycle):
+        await _safe_answer(q)
+        _authorization_ignored(update, context)
+        return
+    report = db.get_auto_review_report(review_id, version)
+    if report is None:
+        await _safe_answer(q, "التقرير غير متاح.")
+        mark_explicitly_ignored(update, context)
+        return
+    if action == ACTION_DETAILS:
+        service = context.bot_data.get("review_report_service")
+        if service is None:
+            await _safe_answer(q, "تعذّر إرسال التقرير.")
+            mark_display_failed(update, context, "review_details_service_missing")
+            return
+        sent = await service.send_details(context.bot, q.message.chat_id, report)
+        if not sent:
+            await _safe_answer(q, "تعذّر إرسال التقرير.")
+            mark_display_failed(update, context, "review_details_send_failed")
+            return
+        await _safe_answer(q, "تم إرسال التقرير.")
+        mark_explicitly_ignored(update, context)
+        return
+    if action == ACTION_ACCEPT:
+        owner_action = "ACCEPT"
+    elif action == ACTION_REJECT:
+        owner_action = "REJECT"
+    else:
+        await _safe_answer(q, "طلب غير صالح.")
+        mark_explicitly_ignored(update, context)
+        return
+    try:
+        result = db.record_auto_review_owner_decision(
+            review_id, version, update.effective_user.id, owner_action
+        )
+    except (sqlite3.Error, AutoReviewConflict) as exc:
+        record_update_failure(update, context, exc)
+        await _safe_answer(q, "تعذّر تسجيل قرارك؛ لم يتم حفظه.")
+        return
+    if result.outcome == "recorded":
+        await _safe_answer(
+            q, "تم تسجيل القبول." if owner_action == "ACCEPT" else "تم تسجيل الرفض."
+        )
+        mark_durable_completed(update, context)
+    elif result.outcome == "duplicate":
+        await _safe_answer(q, "تم تسجيل قرارك مسبقًا.")
+        mark_explicitly_ignored(update, context)
+    else:
+        await _safe_answer(q, "يوجد قرار سابق ولا يمكن تغييره.")
+        mark_explicitly_ignored(update, context)
 
 
 async def send_reply_txt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

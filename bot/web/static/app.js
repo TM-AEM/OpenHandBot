@@ -866,8 +866,9 @@
 
   // -------------------------------------------------------------- chats
   function statusPill(item) {
-    var pill = el("span", "pill", item.state_label || item.status || "");
-    pill.setAttribute("data-status", item.status || "");
+    var label = item.task_state_label || item.state_label || item.status || "";
+    var pill = el("span", "pill", label);
+    pill.setAttribute("data-status", item.task_state || item.status || "");
     return pill;
   }
 
@@ -941,7 +942,7 @@
 
       var card = el("div", "card");
       card.appendChild(el("p", "card-value", d.title || "بدون عنوان"));
-      card.appendChild(el("p", "card-label", (d.repository || "بدون مستودع") + " · " + (d.state_label || d.status || "")));
+      card.appendChild(el("p", "card-label", (d.repository || "بدون مستودع") + " · " + (d.task_state_label || d.state_label || d.status || "")));
       if (d.pr_url) {
         var a = el("a", "link", "افتح الـ PR");
         a.href = d.pr_url; a.target = "_blank"; a.rel = "noopener noreferrer";

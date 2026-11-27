@@ -65,6 +65,16 @@ python -m pytest -q
 | `MINI_APP_RATE_MAX_KEYS` | لا | `4096` | رقم صحيح موجب |
 | `MINI_APP_TRUSTED_PROXIES` | لا | — | IPs/CIDRs مفصولة بفواصل؛ قيمة غير صالحة ⇒ `ConfigError` |
 | `ATTACHMENT_DOCUMENT_INTAKE_ENABLED` | لا | `0` | `1`/`0` (مفتاح تخزين المستندات؛ `1` تفعيل صريح لمسار التخزين المحلي — راجع `OD-03`) |
+| `REVIEW_ENABLED` | لا | `0` | `1`/`0`؛ `1` يفعّل **التحقق من إعدادات المراجعة** ويجعل الدورة مؤهلة للإعداد فقط. **لا يفعّل worker المراجعة ولا يبدأ أي تنفيذ خارجي** (R2–R7) |
+| `REVIEW_REPOS` | عند التفعيل | — | قائمة `owner/repo` مفصولة بفواصل؛ مطلوبة عند `REVIEW_ENABLED=1` |
+| `REVIEWER_PROVIDER` | عند التفعيل | — | معرّف provider صالح (حروف صغيرة/أرقام/_/-)؛ مطلوب عند التفعيل |
+| `REVIEWER_API_BASE` | عند التفعيل | — | `http(s)://` بلا userinfo/fragment/query؛ `https` لمضيف خارجي؛ مطلوب عند التفعيل |
+| `REVIEWER_API_KEY` | عند التفعيل | — | سرّي؛ طوله ≥ 8 وبلا مسافات/محارف تحكّم؛ مطلوب عند التفعيل |
+| `REVIEWER_MODEL` | عند التفعيل | — | معرّف موديل صالح بلا مسافات/محارف تحكّم؛ مطلوب عند التفعيل |
+| `REVIEW_GITHUB_TOKEN` | عند التفعيل | — | سرّي؛ طوله ≥ 8 وبلا مسافات/محارف تحكّم؛ مطلوب عند التفعيل |
+| `REVIEW_MAX_INPUT_CHARS` | لا | `120000` | رقم صحيح بين `1000` و`1000000` |
+| `REVIEW_CI_TIMEOUT_MIN` | لا | `15` | رقم صحيح بين `1` و`120` دقيقة. **يُقرأ ويُتحقق منه فقط؛ لا يستهلكه collector أو worker حاليًا، فلا تفترض أنه حد CI حي.** |
+| `REVIEW_AUTOFIX_ROUNDS` | لا | `0` | لازم يكون `0` في R2؛ الإصلاح التلقائي غير منفّذ |
 
 ملاحظات:
 
@@ -83,17 +93,61 @@ python -m pytest -q
   - `PRAGMA journal_mode=WAL` — يسمح بالقراءة أثناء الكتابة (الـ handlers والمراقب
     بيكتبوا في وقت واحد).
   - `PRAGMA busy_timeout=5000` — بدل ما يرمي `database is locked`، بيستنى لحد 5 ثواني.
-  - `CREATE TABLE IF NOT EXISTS` للجداول (المصدر: `bot/db.py::_init_schema`؛ **17** جدول):
+  - `CREATE TABLE IF NOT EXISTS` للجداول (المصدر: `bot/db.py::_init_schema`؛ **26** جدول):
     `watched`, `user_state`, `outbox`, `creation_jobs`, `completion_pending`, `settings`,
     `notification_state`, `notifier_pending`, `notifier_retry_not_before`, `notification_inbox`,
     `deleted_conversations`, `web_sessions`, `processed_updates`, `update_failures`,
-    `attachment_batches`, `attachment_items`, `attachment_message_identity`
+    `attachment_batches`, `attachment_items`, `attachment_message_identity`,
+    `auto_review_provider_snapshots`, `auto_reviews`, `auto_review_memberships`,
+    `auto_review_pending_memberships`, `auto_review_stages`, `auto_review_evidence`,
+    `auto_review_leases`, `auto_review_reports`, `auto_review_owner_acceptance`
     (+ فهارس `idx_outbox_status`, `idx_creation_jobs_status`).
     اختبار تكافؤ (`NEW-DEF-08`) بيقارن العدد ده مع `bot/db.py` تلقائيًا.
+  - **جداول R2 (المراجعة):** `auto_review_provider_snapshots` لقطة غير سرية
+    (`provider`, `api_base`, `model`, `config_json`, `config_fingerprint`, `created_at`)،
+    وممنوع `UPDATE`/`DELETE` عليها بـ trigger. `auto_reviews` سجل حجز الدورة:
+    `reservation_key` فريد، و`provider_snapshot_id` FK، وpartial unique indexes بتفرض
+    دورة نشطة واحدة حسب `scope` الصريح (`conversation` أو `per_pr`). **مفيش أي
+    API key/token في الجدولين.**
+  - **جداول R5 (دورة المراجعة الدائمة):** `auto_review_memberships` لقطة PRs ثابتة،
+    `auto_review_pending_memberships` ملاحظات PRs جديدة أثناء دورة نشطة (تُستهلك في الدورة
+    التالية)، `auto_review_stages` نتائج blind/adversarial لكل PR بعد التحقق،
+    `auto_review_evidence` دليل SHA/CI/coverage لكل PR، و`auto_review_leases` lease/epoch
+    واحد لكل دورة. الدورة conversation-wide، والتسليم عبر `outbox` فقط (مفتاح
+    `review_delivery_key` فريد). **مفيش تخزين diff خام أو API key/token في الجداول دي.**
+- **جداول R6 (تقرير المراجعة وقرار المالك):** `auto_review_reports` نسخة تقرير ثابتة
+    (`version`, `filename`, `content`, `summary`, `report_sha256`, `verdict`) مع trigger
+    يمنع `UPDATE`/`DELETE`؛ و`auto_review_owner_acceptance` حدث `OWNER_ACCEPTANCE` منفصل
+    (`action` = `ACCEPT`/`REJECT`، مفتاح idempotency فريد) مع trigger يمنع التعديل.
+    التسليم يستخدم صف `outbox` واحدًا لكل دورة/نسخة (`review_kind=summary_document`،
+    `review_version`، `review_report_id`)، وقرار المالك لا يغيّر القرار التقني.
+- **تشغيل R6:** عند وجود دورة `delivery_pending`، `ReviewReportService` يبني تقريرًا
+    واحدًا لكل `(review_id, version)` ويحفظه في `auto_review_reports` قبل إنشاء/تحديث صف
+    `outbox` واحد بالمفتاح `review:<id>:v<version>`. الـ outbox worker يرسل مستند التقرير
+    مع ملخص كـ caption وأزرار `review:d|a|r:<id>:<version>` (كلها ≤64 بايت). فشل الإرسال
+    الغامض يُسجَّل `unknown` وليس `sent`؛ التقرير المفقود/نسخة غير موجودة تفشل مقفولة.
+    التفاصيل تعيد إرسال النسخة المحفوظة نفسها، وقبول/رفض المالك يُسجَّل في
+    `auto_review_owner_acceptance` بعد إعادة التحقق من المالك والمحادثة والنسخة.
+    **R6 لا يبدأ worker المراجعة تلقائيًا ولا يغيّر `REVIEW_ENABLED`.**
+- **حدود تفعيل المراجعة (R2–R7) — لا تخلط بينها:**
+  - **وجود الإعداد:** `REVIEW_ENABLED=1` يجعل `Settings` تتحقق من `REVIEW_REPOS`،
+    `REVIEWER_PROVIDER`، `REVIEWER_API_BASE`، و`REVIEWER_API_KEY`. غياب أي منها أو
+    قيمة غير صالحة ⇒ `ConfigError` عند التحميل، وليس بدء مراجعة.
+  - **أهلية الميزة:** وجود إعداد صالح يعني أن الميزة **مؤهلة للإعداد** فقط؛ لا يعني
+    أن worker المراجعة مفعّل ولا أن دورة بدأت.
+  - **تفعيل worker المراجعة:** `ReviewWorker` لا يبدأ من `main.py` في R2–R7. تشغيله
+    يحتاج مهمة تفعيل منفصلة معتمدة صراحةً (خارج نطاق هذه الدورة).
+  - **التنفيذ الخارجي:** حتى مع worker مشغّل، لا يبدأ أي تنفيذ خارجي إلا بعد حجز
+    دورة صريح (memberships/SHA) واجتياز تحقق الفرع/الـSHA والـCI. `REVIEW_ENABLED=1`
+    وحده **لا** يشغّل collector ولا provider ولا يرسل تقريرًا.
 - **الترحيلات (`_migrate`):** إضافية وغير مدمّرة فقط (`ALTER TABLE … ADD COLUMN`) —
   بتضيف أعمدة جديدة للقواعد القديمة من غير فقد بيانات. الأعمدة المُدارة:
   `watched.chat_id`, `user_state.awaiting_at`, `user_state.awaiting_title`,
-  `watched.submitted_at`, `watched.added_at`, `watched.retry_count`, `outbox.attempts`.
+  `watched.submitted_at`, `watched.added_at`, `watched.retry_count`, `outbox.attempts`,
+  `auto_reviews.chat_id/scope_policy/lifecycle_state/worker_state/delivery_state/attempts/
+  max_attempts/next_attempt_at/delivery_outbox_id/membership_count/implementation_report/
+  delivery_text`, و`outbox.review_id/review_delivery_key/review_kind/review_version/
+  review_report_id`.
   الجداول الجديدة بتتعمل بـ `IF NOT EXISTS`. **مفيش حذف ولا إعادة كتابة للبيانات.**
 - **الصيانة عند بدء التشغيل (`run_startup_maintenance`):** فحص سريع (`PRAGMA
   quick_check`) ثم `PRAGMA optimize` + `incremental_vacuum` (لو متاح) + `wal_checkpoint(TRUNCATE)`.
@@ -414,3 +468,65 @@ python -m pytest -q tests/test_watcher.py tests/test_u01_watcher.py
 - أوامر التشغيل: `bot/handlers.py` (`/outbox*`)
 - بوابة الانحدار: `docs/REGRESSION_GATE.md` · CI: `.github/workflows/ci.yml`
 - الـ API: `docs/API_NOTES.md` · حالة الاستضافة (Enzonic): `docs/DEPLOY_ENZONIC.md` *(تاريخيًا: `docs/DEPLOY_KATABUMP.md`)*
+
+## 11) حدود R7-B01: محلّل هوية المحادثة → PR → SHA (غير مفعّل)
+
+هذا القسم يوثّق طبقة التحقق المحلية فقط. **لا** يفعّل worker ولا يغيّر
+`REVIEW_ENABLED` ولا يثبت أن الربط التلقائي يعمل حيًا.
+
+### سلسلة الثقة
+
+```text
+Conversation ID (صيغة صارمة)
+  -> watched.chat_id (تفويض المحادثة القائم)
+  -> ConversationRepositoryLink (ادّعاء صريح من مصدر مُمرَّر؛ provenance للتدقيق فقط)
+  -> GitHub repository ID + full_name (تحقق read-only عبر allowlist)
+  -> أرقام PR صريحة (لا تخمين من اسم الفرع أو نص المستخدم)
+  -> GitHub PR base/head repository IDs + refs + state + head SHA
+  -> branch head == exact SHA (قبل وبعد القراءات)
+  -> compare/merge-base == exact base SHA
+  -> AutoReviewMembership غير قابلة للتغيير
+  -> R2/R5 reservation الذرّية
+```
+
+### الثوابت والافتراضات
+
+- **ثابت:** GitHub numeric `repository_id`؛ `repository_full_name` عرض قابل للتغيّر.
+- **ثابت:** `(repository_id, pr_number)` وهوية الـ PR؛ `head_sha` و`base_sha` بعد
+  التثبيت.
+- **غير موثوق:** نص المحادثة، وصف PR، اسم الفرع، وأي `source` يمرّره المستدعي.
+  الـ `source` للتدقيق فقط، وليس إثبات ملكية.
+- **غير مثبت بعد:** المصدر المعتمد لربط المحادثة بالمستودع، ومصدر أرقام PR. لا
+  يوجد resolver تلقائي مُفعّل؛ الطبقة الحالية تتحقق من ارتباط صريح يمرّره مستدعٍ
+  مفوّض.
+- **Fork/cross-repository:** مرفوض؛ يجب أن يساوي `head.repo.id` و`base.repo.id`
+  المستودع المتحقق منه.
+- **Rename/transfer:** إذا اختلف الاسم مع نفس ID أو اختلف ID، يفشل التحقق الآن
+  (`repository_rename_ambiguous` / `repository_id_mismatch`) حتى قرار مالك صريح.
+- **PR state:** يجب أن يكون `open` وغير `merged`.
+- **Branch movement:** أي `moved`/`missing`/`blocked` قبل أو بعد القراءات يفشل.
+- **CI:** التحقق الكامل للـ jobs يظل في R7 F-01؛ jobs ناقصة أو غير ناجحة لا تصل
+  إلى `PASS`.
+- **Membership:** لا تُعدّل snapshot لدورة نشطة؛ PR جديد يُسجّل `pending`
+  (`deferred_active_cycle`) ولا يدخل الدورة النشطة. تغيير `head_sha` يسبب conflict
+  ويحتاج مسار retry/recovery القائم.
+- **Retry/recovery:** أخطاء GitHub العابرة (`timeout`/`5xx`/rate limit) قابلة
+  لإعادة المحاولة؛ الرفض الدلالي (fork، PR مغلق، SHA غير مطابق) غير قابل
+  لإعادة المحاولة. لا يوجد partial insert: الحجز يتم عبر
+  `reserve_conversation_review` الذرّي.
+
+### ما لا يفعله هذا القسم
+
+- `REVIEW_ENABLED=1` يتحقق من الإعداد ويجعل الميزة مؤهلة للإعداد فقط؛ **لا**
+  يبدأ `ReviewWorker` ولا collector ولا provider ولا أي إرسال خارجي.
+- `REVIEW_REPOS` و`REVIEW_MAX_INPUT_CHARS` و`REVIEW_CI_TIMEOUT_MIN` إعدادات
+  مُتحقَّق منها، لكن **لا يوجد factory للـ worker في R2–R7 يستهلكها**؛ لا تفترض أن
+  ضبطها يفعّل حدودًا حيّة.
+- لا يوجد startup wiring لـ resolver أو worker.
+- `bot/review/canary_linkage.py` هو adapter canary فقط (D-01 B + D-02 explicit-list):
+  يقرأ `creation_jobs.repo` المرتبط بـ `conversation_id` الدقيق، ويتطلب قائمة PR صريحة
+  من المالك؛ **لا** يكتشف PRs ولا يُنشأ في `bot/app.py`.
+- التحقق المحلي بمocks ليس تحققًا حيًا؛ لا ادعاء بأن conversation → PR يعمل
+  ضد OpenHands/GitHub الحقيقيين.
+- القرارات المتبقية موثّقة في
+  `docs/reviews/OHB2-R7-B01-OWNER-DECISIONS-20261125.md`.

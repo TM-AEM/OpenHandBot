@@ -24,10 +24,18 @@ from .db import (
     OUTBOX_DISCARDED,
     OUTBOX_FAILED,
     OUTBOX_PENDING,
+    OUTBOX_REVIEW_KIND_SUMMARY_DOCUMENT,
     OUTBOX_SENDING,
+    OUTBOX_SENT,
     OUTBOX_UNKNOWN,
 )
 from .errors import ApiError, describe_status, error_text
+from .review.authorization import (
+    AUTHORIZATION_DATABASE_UNAVAILABLE,
+    DELIVERY_CONVERSATION_MISMATCH,
+    ReviewAuthorizationError,
+    revalidate_review_authorization,
+)
 
 log = logging.getLogger(__name__)
 
@@ -655,7 +663,151 @@ async def _retry_pre_cas(db, bot, item, reason: str, notice: str | None) -> None
         await safe_send(bot, item.chat_id, notice)
 
 
-async def _post_claimed(client, db, bot, item) -> None:
+def _handle_review_authorization_failure(db, item, exc: ReviewAuthorizationError) -> None:
+    """Fail closed without sending to an unauthorized target or losing recoverable work."""
+    if exc.retryable:
+        attempts = db.bump_outbox_attempt(item.id, now_iso(), exc.code)
+        if attempts == 0:
+            return
+        if attempts >= MAX_OUTBOX_ATTEMPTS:
+            db.set_outbox_status_if_in(
+                item.id, OUTBOX_FAILED, now_iso(), {OUTBOX_CLAIMED}, exc.code
+            )
+        else:
+            db.set_outbox_status_if_in(
+                item.id, OUTBOX_PENDING, now_iso(), {OUTBOX_CLAIMED}, exc.code
+            )
+        return
+    db.set_outbox_status_if_in(
+        item.id, OUTBOX_FAILED, now_iso(), {OUTBOX_CLAIMED}, exc.code
+    )
+    log.warning("review delivery denied (%s)", exc.code)
+
+
+def _review_authorization(db, item, review_owner_id) -> None:
+    try:
+        cycle = db.get_auto_review(item.review_id)
+    except Exception as exc:  # noqa: BLE001 - never authorize from a failed read
+        raise ReviewAuthorizationError(
+            AUTHORIZATION_DATABASE_UNAVAILABLE, retryable=True
+        ) from exc
+    if cycle is not None and item.conversation_id != cycle.conversation_id:
+        raise ReviewAuthorizationError(DELIVERY_CONVERSATION_MISMATCH)
+    revalidate_review_authorization(
+        db,
+        owner_id=review_owner_id,
+        cycle=cycle,
+        target_chat_id=item.chat_id,
+        phase="delivery",
+    )
+
+
+async def _post_claimed_review(db, bot, item, *, review_owner_id=None) -> None:
+    """Deliver one persisted R6 report through the existing outbox row.
+
+    The report is loaded from the immutable R6 table; the outbox row carries only
+    the summary/filename/version intent. The CAS to ``sending`` happens before the
+    Telegram call, so a duplicate completion cannot send the same report twice.
+    """
+    from telegram import InputFile
+    from telegram.constants import ParseMode
+    from telegram.error import BadRequest
+
+    from .messages import escape_html
+    from .review.report import review_actions_markup
+
+    current = db.get_outbox(item.id)
+    if current is None or current.status != OUTBOX_CLAIMED:
+        return
+    if item.review_kind not in (None, OUTBOX_REVIEW_KIND_SUMMARY_DOCUMENT):
+        db.set_outbox_status_if_in(
+            item.id, OUTBOX_FAILED, now_iso(), {OUTBOX_CLAIMED}, "unsupported_review_kind"
+        )
+        return
+    if item.review_version is None:
+        db.set_outbox_status_if_in(
+            item.id, OUTBOX_FAILED, now_iso(), {OUTBOX_CLAIMED}, "review_version_missing"
+        )
+        return
+    try:
+        _review_authorization(db, item, review_owner_id)
+    except ReviewAuthorizationError as exc:
+        _handle_review_authorization_failure(db, item, exc)
+        return
+    report = db.get_auto_review_report(item.review_id, item.review_version)
+    if (
+        report is None
+        or report.review_id != item.review_id
+        or (item.review_report_id is not None and report.id != item.review_report_id)
+    ):
+        db.set_outbox_status_if_in(
+            item.id, OUTBOX_FAILED, now_iso(), {OUTBOX_CLAIMED}, "review_report_missing"
+        )
+        log.warning("review delivery skipped: report missing for %s", item.review_id)
+        return
+    try:
+        _review_authorization(db, item, review_owner_id)
+    except ReviewAuthorizationError as exc:
+        _handle_review_authorization_failure(db, item, exc)
+        return
+    if not db.set_outbox_status_if_in(
+        item.id, OUTBOX_SENDING, now_iso(), {OUTBOX_CLAIMED}
+    ):
+        return
+    try:
+        _review_authorization(db, item, review_owner_id)
+    except ReviewAuthorizationError as exc:
+        db.set_outbox_status_if_in(
+            item.id, OUTBOX_UNKNOWN, now_iso(), {OUTBOX_SENDING}, exc.code
+        )
+        log.warning("review delivery authorization changed before send (%s)", exc.code)
+        return
+    try:
+        await bot.send_document(
+            chat_id=item.chat_id,
+            document=InputFile(report.content.encode("utf-8"), filename=report.filename),
+            caption=escape_html(report.summary),
+            parse_mode=ParseMode.HTML,
+            reply_markup=review_actions_markup(report.review_id, report.version),
+        )
+    except asyncio.CancelledError:
+        db.set_outbox_status_if_in(
+            item.id, OUTBOX_UNKNOWN, now_iso(), {OUTBOX_SENDING}, "cancelled"
+        )
+        raise
+    except BadRequest as exc:
+        db.set_outbox_status_if_in(
+            item.id, OUTBOX_FAILED, now_iso(), {OUTBOX_SENDING}, type(exc).__name__
+        )
+        log.warning("review delivery rejected (%s)", type(exc).__name__)
+        return
+    except TelegramError as exc:
+        # Telegram accepted no confirmed result; never retry automatically after
+        # the sending boundary. The cycle stays unknown, not sent.
+        db.set_outbox_status_if_in(
+            item.id, OUTBOX_UNKNOWN, now_iso(), {OUTBOX_SENDING}, type(exc).__name__
+        )
+        log.warning("review delivery ambiguous (%s)", type(exc).__name__)
+        return
+    except Exception as exc:  # noqa: BLE001 - after sending, at-most-once
+        db.set_outbox_status_if_in(
+            item.id, OUTBOX_UNKNOWN, now_iso(), {OUTBOX_SENDING}, type(exc).__name__
+        )
+        log.warning("review delivery unexpected failure (%s)", type(exc).__name__)
+        return
+    try:
+        _review_authorization(db, item, review_owner_id)
+    except ReviewAuthorizationError as exc:
+        db.set_outbox_status_if_in(
+            item.id, OUTBOX_UNKNOWN, now_iso(), {OUTBOX_SENDING}, exc.code
+        )
+        log.warning("review delivery authorization changed after send (%s)", exc.code)
+        return
+    db.set_outbox_status_if_in(item.id, OUTBOX_SENT, now_iso(), {OUTBOX_SENDING})
+    return
+
+
+async def _post_claimed(client, db, bot, item, *, review_owner_id=None) -> None:
     """يحاول الـ POST لعنصر محجوز (claimed) ولسه الإرسال مابدأش.
 
     at-most-once: بنسجّل 'sending' بـ **CAS ذرّي** (`claimed`⇒`sending`) فوراً قبل الـ POST
@@ -678,6 +830,13 @@ async def _post_claimed(client, db, bot, item) -> None:
     تلقائيًا (at-most-once: ممكن الـ POST يكون اتقبل) — أي استثناء هناك يتحسم داخليًا
     (ApiError ⇒ failed/unknown، CancelledError ⇒ unknown، عام ⇒ unknown) ومايتعادش أبدًا.
     """
+    if item.review_id is not None and (
+        item.review_kind == OUTBOX_REVIEW_KIND_SUMMARY_DOCUMENT
+        or item.review_report_id is not None
+    ):
+        await _post_claimed_review(db, bot, item, review_owner_id=review_owner_id)
+        return
+
     outbox_id = item.id
     conversation_id = item.conversation_id
     chat_id = item.chat_id
@@ -1025,6 +1184,19 @@ class OutboxWorker(_BaseWorker):
       بيستنى 3 ثوانٍ من آخر جزء قبل ما يبعت الدفعة كاملة مرة واحدة.
     """
 
+    def __init__(
+        self,
+        client,
+        db,
+        bot,
+        poll_interval: float = 2.0,
+        max_idle: float = 30.0,
+        *,
+        review_owner_id: int | None = None,
+    ) -> None:
+        super().__init__(client, db, bot, poll_interval=poll_interval, max_idle=max_idle)
+        self._review_owner_id = review_owner_id
+
     def _claim(self):
         # قراءة ساعة واحدة: نفس اللحظة بتحدّد حدّ النضج ووقت الحجز، فمفيش عدم اتّساق
         # بين حساب التأخير واللحظة اللي بنحجز فيها. حجز ذرّي للناضج (استوفى النافذة).
@@ -1032,7 +1204,13 @@ class OutboxWorker(_BaseWorker):
         return self._db.claim_outbox(_iso(now), mature_before=grouping_mature_before(now=now))
 
     async def _process(self, item) -> None:
-        await _post_claimed(self._client, self._db, self._bot, item)
+        await _post_claimed(
+            self._client,
+            self._db,
+            self._bot,
+            item,
+            review_owner_id=self._review_owner_id,
+        )
 
     def _is_retry_pending(self, item) -> bool:
         after = self._db.get_outbox(item.id)

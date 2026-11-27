@@ -1,3 +1,275 @@
+# PROGRESS — OHB2-AUTO-REVIEW-R7 — PHASE A (2026-11-25)
+
+## Goal
+Prepare and audit live end-to-end readiness for R7 without performing any live external operation.
+
+## Status
+`R7_PHASE_A_COMPLETE` — verdict `R7_READINESS_NEEDS_FIXES`. Phase B is NOT authorized and was NOT
+executed. No OpenHands/GitHub/provider/Telegram call, no worker activation, no commit/push/PR/deploy.
+
+## Baseline
+- Branch `agent/r6-review-delivery`; HEAD/main/origin/main
+  `01079676351aac869d09d4d1747661cd6f07d82b`; tree
+  `3ceb3580e3d0dfcebdd83ebbf9e285c6d4cc67bc`.
+- R1–R6 work remains uncommitted: 12 modified tracked files, 38 untracked files.
+- No `.env`; no `REVIEW_*`/`REVIEWER_*` environment values; no live credentials used.
+
+## Completed
+- Inspected R1–R6 source/tests/workflows/schema/runtime boundaries.
+- Built external dependency matrix (OpenHands, GitHub Actions, provider, Telegram, DB/runtime).
+- Designed two canary scenarios (known defect, corrected defect) and all 25 failure-injection cases.
+- Ran local verification: focused R1–R6 358 passed; full Python 4182 passed; Node 280 passed;
+  pyflakes 0; compileall 0; Bandit 0 High; pip-audit clean; `git diff --check` clean.
+- Wrote `docs/reviews/OHB2-AUTO-REVIEW-R7-READINESS-REPORT-20261125.md` and
+  `docs/reviews/OHB2-AUTO-REVIEW-R7-AUTHOR-SELF-REVIEW-20261125.md`.
+
+## Blockers / next
+- B-01 conversation→PR→SHA remains unresolved; no supported bot mapping.
+- Review worker is not started by `bot/app.py`; no live activation path.
+- Incomplete CI job evidence can currently reach PASS (needs a completeness assertion/test).
+- Provider snapshot binding is not enforced by `ReviewRunner`; live harness must enforce it.
+- No disposable repo/branch, provider credentials, or Phase B authorization.
+- Next: owner decision on B-01 + job-completeness fix, then request the five Phase B approvals
+  separately. Independent review remains deferred; R8 has not started.
+
+---
+
+# PROGRESS — OHB2-AUTO-REVIEW-R6 (2026-11-25)
+
+## Goal
+Telegram review delivery and owner interaction for completed R5 cycles: deterministic Markdown
+report, concise summary + document, Details/Accept/Reject buttons, owner-only authorization, and
+durable OWNER_ACCEPTANCE records separate from the R4 verdict.
+
+## Baseline
+- Branch `agent/r6-review-delivery` from `openhands-workspace-11liARbsA7OSSoFJOM2RDr`.
+- HEAD `01079676351aac869d09d4d1747661cd6f07d82b`; tree
+  `3ceb3580e3d0dfcebdd83ebbf9e285c6d4cc67bc`; main/origin/main equal HEAD.
+- R0–R5 work and reports are uncommitted; preserve them. No commit/push/PR/deploy.
+- Pre-R6 verified state: full Python 4151 passed; Node 280; pyflakes 0; Bandit High 0;
+  pip-audit clean; R5 focused 305 passed.
+
+## Acceptance criteria
+1. A deterministic Markdown report is generated only from persisted R5 cycle/stage/evidence data,
+   with validated SHA provenance, findings by severity, CI/evidence/limitations, BLOCKED preserved,
+   no secrets, safe escaping, bounded size, and a documented `review-<sha7>.md` filename rule.
+2. R5 outbox delivers one concise Telegram summary + full report document with Details/Accept/Reject
+   buttons, idempotently per cycle/report version, without false `sent` or a second sender.
+3. `^review:` is registered narrowly; payloads are strict, <=64 UTF-8 bytes, and contain no secrets.
+4. All actions re-check `config.is_allowed`, owner identity, chat ownership, review existence, and
+   report version; unauthorized/forged/cross-conversation callbacks mutate nothing and leak nothing.
+5. ACCEPT/REJECT create durable, unique OWNER_ACCEPTANCE events with stable duplicate/conflict
+   behavior; technical verdict, findings, SHAs, and R5 lifecycle remain unchanged.
+6. Details sends the exact persisted report version or fails closed; no fabrication/regeneration.
+
+## Plan
+1. Add minimal DB tables/columns and transactional APIs for reports, owner decisions, outbox kind.
+2. Implement `bot/review/report.py` (build, filename, escaping, summary, callbacks, delivery service).
+3. Extend existing outbox worker for review Telegram delivery; wire optional report service in R5.
+4. Register `^review:` in `bot/app.py`; add owner-authorized handler in `bot/handlers.py`.
+5. Add focused tests, negative controls, update schema docs/counts, run full verification.
+6. Write R6 implementation/self-review reports; R7 not started.
+
+## Completed
+- DB: two immutable R6 tables, outbox review metadata, report/owner-decision/recovery APIs.
+- Report: deterministic Markdown from persisted R5 data, filename/hash/escaping/size/secret rules.
+- Delivery: existing outbox sends summary caption + document + Details/Accept/Reject buttons.
+- Auth: `^review:` handler rechecks allowed user, owner, private chat, cycle chat, report version.
+- Decisions: durable unique `OWNER_ACCEPTANCE`; duplicate/conflict stable; verdict/findings untouched.
+- Tests/docs: R6 report/delivery/callback/worker tests, schema counts, README/runbook, R6 reports.
+
+## Verification
+- Focused R6/R5: 61 passed.
+- Full Python: 4182 passed, 0 failed (74 warnings; pre-existing PTB/Starlette deprecations).
+- Node: 280 pass, 0 fail.
+- pyflakes: 0; compileall: 0 errors; Bandit High: 0 (7 Low/20 Medium); pip-audit: no known vulns.
+- `git diff --check`: clean.
+
+## Status
+`R6_LOCAL_COMPLETE` — independent review not performed; no runtime activation; no R7.
+---
+
+# PROGRESS — OHB2-AUTO-REVIEW-R5 (2026-11-24)
+
+## Goal
+Durable conversation-wide review cycle: persisted membership/scope, leases/epochs, crash-safe
+resume, bounded retries, and outbox-backed delivery. R5 wires R4 only; it does not activate the
+runtime, change Telegram handlers, or perform real review/GitHub/Telegram calls.
+
+## Acceptance criteria
+1. A review cycle is persisted per conversation with explicit `conversation-wide` scope, a stable
+   identity, an immutable membership snapshot, and exactly one active cycle per conversation.
+2. Repeated/conflicting reservations are deterministic; a new PR observed while a cycle is active
+   is persisted as pending and included in a later cycle, never silently dropped or injected.
+3. Per-PR blind/adversarial stage results and SHA/CI-bound evidence survive restart; validated
+   stages resume, stale evidence is invalidated, and invalid blind output never reaches adversarial.
+4. Leases with tokens/epochs fence stale workers; expiry allows takeover; retryable failures are
+   bounded and terminal failures/unknown delivery are never reported as PASS/sent.
+5. Delivery uses the existing outbox, is created only after the verdict is durable, and has a
+   unique delivery key (at-most-once intent).
+6. No secrets/diff raw payloads are persisted; no runtime activation or handler changes.
+
+## Implementation
+- `bot/db.py`: R5 columns and five tables (`auto_review_memberships`,
+  `auto_review_pending_memberships`, `auto_review_stages`, `auto_review_evidence`,
+  `auto_review_leases`), partial unique indexes, immutable membership/evidence triggers, lease
+  token/epoch fencing, retry/exhaustion terminalization, outbox review linkage, and secret scans.
+- `bot/review/worker.py`: `ReviewRunner` (R4 stages persisted, resume, aggregate verdict, outbox
+  intent) and `ReviewWorker` (recovery, claim/lease, bounded retry, terminal delivery).
+- `bot/review/collector.py`: R3 compare/runs/jobs evidence collection bound to the exact PR
+  base/head SHAs; read-only and fail-closed.
+- `bot/review/evidence.py` / `schema.py`: deterministic evidence/stage fingerprints and canonical
+  output serialization.
+- `docs/OPERATIONS_RUNBOOK.md`: schema inventory and R5 lifecycle/lease/outbox notes.
+- `tests/test_auto_review_lifecycle.py`, `tests/test_review_collector.py`: R5 focused coverage.
+
+## Verification
+- R5 + review focused: **305 passed** (`pytest -q tests/test_auto_review_lifecycle.py
+  tests/test_review_collector.py tests/test_auto_reviews_db.py tests/test_review_*.py`).
+- Full Python: **4151 passed, 0 failed**, 74 warnings (278.04s).
+- Node: **280 pass / 0 fail**.
+- `pyflakes`: 0; Bandit High: **0**; pip-audit: no known vulnerabilities; compileall: 0;
+  `git diff --check`: 0.
+
+## Not verified / residual risks
+- **Independent review NOT performed.** This is author self-review + automated tests only; no
+  `INDEPENDENT_REVIEW_PASS` claim.
+- Python 3.11/GitHub Actions were not run locally; local runtime is Python 3.13.15.
+- R5 is not wired into `main.py`/Telegram; activation, handler integration, and Autopush remain
+  future work.
+- Redaction remains pattern-based; false negatives remain a residual risk inherited from R3/R4.
+
+## Status
+`R5_IMPLEMENTED_PENDING_INDEPENDENT_REVIEW` — local verification green; no commit/push/PR/deploy.
+
+---
+
+# PROGRESS — OHB2-AUTO-REVIEW-R4 (2026-11-24)
+
+## Goal
+Isolated review engine: blind review, adversarial review, strict schemas, evidence validation,
+and deterministic verdict. No worker/leases, no scope selection, no runtime activation, no R5.
+
+## Baseline (recorded before R4 edits)
+- Repo `/workspace/project/OpenHandBot`; branch `openhands-workspace-11liARbsA7OSSoFJOM2RDr`.
+- HEAD = `main` = `origin/main` = `01079676351aac869d09d4d1747661cd6f07d82b`; tree
+  `3ceb3580e3d0dfcebdd83ebbf9e285c6d4cc67bc`.
+- Working tree was not clean: R2 tracked modifications (config/db/docs/tests/env/README), R1
+  `verify.yml`, R0E/R0F/R1/R2/R3 reports, and R3 `bot/review/` + tests were present. All preserved.
+- Pre-R4 verified state: R3 focused 86 passed; R2/parity 101 passed; full suite 3995 passed;
+  Node 280; pyflakes 0; Bandit High 0; pip-audit clean.
+- R2 config: `reviewer_provider`, `reviewer_api_base`, `reviewer_api_key`, `reviewer_model`,
+  `review_max_input_chars`, immutable `AutoReviewProviderSnapshot`.
+- R3 interfaces: `bot/review/github.py` (read-only, SHA-bound) and `bot/review/redact.py`.
+- D1 preserved: one reviewer model, two calls, blind/adversarial separation, deterministic verdict,
+  provider-neutral adapter.
+- D2 unresolved: no conversation-wide/per_pr choice; R4 operates on explicit input only.
+- D3: R0E proposals are not approved architecture; implement only safe compatible subset.
+
+## Acceptance criteria
+1. Blind input contains only approved blind data; OpenHands report/verdict and adversarial output
+   are structurally absent.
+2. Adversarial input contains validated blind output, OpenHands report, diff/CI/architecture
+   evidence; it cannot rewrite blind output.
+3. Provider adapter binds the immutable snapshot, keeps credentials out of repr/errors/logs,
+   bounds timeouts/request/response, handles failures, and performs no real calls in tests.
+4. Strict versioned schemas reject malformed, incomplete, oversized, duplicate, contradictory, and
+   unknown/unsupported output; malformed output never becomes PASS.
+5. Evidence validation ties accepted findings to exact diff paths/lines/SHAs/CI IDs; stale SHA,
+   invalid paths/lines, or missing evidence blocks or rejects as specified.
+6. Deterministic verdict follows fixed precedence and ignores model-provided verdicts; oversized
+   diffs split only at file boundaries with deterministic coverage or BLOCKED.
+
+## Implementation
+- `bot/review/schema.py`: strict `r4.v1` blind/adversarial schemas, duplicate-key rejection,
+  bounded fields, typed findings/challenges, explicit stage/assessment consistency.
+- `bot/review/prompts.py`: separate immutable blind/adversarial inputs, injected build errors,
+  source manifests, content-derived fences, R3 redaction before egress, deterministic file-boundary
+  chunking and reconstruction checks.
+- `bot/review/llm.py`: provider-neutral `ReviewProvider` protocol, immutable R2 snapshot binding,
+  bounded OpenAI-compatible HTTP adapter, no retries, one bounded schema correction, secret-safe
+  errors/reprs.
+- `bot/review/evidence.py`: diff hunk/path coverage, quote/SHA/CI provenance checks, adversarial
+  blind-fingerprint binding, stale-SHA and incomplete-coverage blocking, R3 secret/path evidence.
+- `bot/review/verdict.py`: versioned deterministic precedence table (`R4-SHA-01`, `R4-CI-01`,
+  `R4-SEC-01`, `R4-FINDING-01`, `R4-BLOCK-01/02`, `R4-CI-02`, `R4-PASS-01`, `R4-NOTES-01`);
+  duplicate IDs keep the highest severity; model recommendation is never an input.
+- `bot/review/engine.py`: in-process blind-then-adversarial cycle with explicit evidence, stage
+  validation, deterministic combining, fail-closed errors, and no worker/lease/scope code.
+- `tests/test_review_schema.py`, `test_review_prompts.py`, `test_review_llm.py`,
+  `test_review_evidence.py`, `test_review_verdict.py`, `test_review_engine.py`: focused R4 coverage.
+
+## Verification (final)
+- R4 focused: 123 passed (`pytest -q tests/test_review_schema.py ... tests/test_review_engine.py`).
+- Full Python: 4118 passed, 0 failed, 74 warnings (213.52s).
+- Node: 280 pass / 0 fail.
+- pyflakes: 0; Bandit High: 0; pip-audit: no known vulnerabilities; compileall: 0;
+  `git diff --check`: 0.
+- Isolated negative controls (`/tmp/r4_negative_controls.py`, copy under `/tmp/r4-negative`):
+  10/10 caught (CI failure, blind report leak, missing blind result, invalid line, stale SHA,
+  malformed JSON, silent truncation, secret redaction bypass, provider failure, model verdict).
+
+## Not verified / residual risks
+- **Independent review NOT performed.** This is author self-review + automated/security tests only;
+  no `INDEPENDENT_REVIEW_PASS` claim.
+- Python 3.11 and GitHub Actions were not run locally; no push/PR/CI trigger. Local runtime is
+  Python 3.13.15.
+- R4 deliberately has no persistence, worker, leases, scope selection, Telegram delivery, or R5
+  integration; those remain future work.
+- Scope policy (conversation-wide vs per_pr) remains unresolved and not chosen by R4.
+- Redaction is pattern-based; false negatives remain a residual risk (inherited from R3).
+- Provider behavior is exercised with `httpx.MockTransport`; no real provider call was made.
+
+## Status
+`R4_IMPLEMENTED_PENDING_INDEPENDENT_REVIEW` — local verification green; no commit/push/PR/deploy.
+No independent review PASS is claimed.
+
+# PROGRESS — OHB2-AUTO-REVIEW-R3 (2026-11-24)
+
+## Goal
+Read-only GitHub primitives (`bot/review/github.py`) and deterministic redaction
+(`bot/review/redact.py`) for the automated review pipeline. No R4, no LLM, no runtime activation.
+
+## Baseline (recorded before edits)
+- Repo `/workspace/project/OpenHandBot`; branch `openhands-workspace-11liARbsA7OSSoFJOM2RDr`.
+- HEAD = `main` = `origin/main` = `01079676351aac869d09d4d1747661cd6f07d82b`; tree
+  `3ceb3580e3d0dfcebdd83ebbf9e285c6d4cc67bc`; no upstream.
+- Pre-R3 tracked modifications: 8 R2 files; untracked R0E/R0F/R1/R2 artifacts and R1 verify workflow.
+- `.openhands/` ignored and untouched. R1/R2 reports preserved.
+- Pre-R3 full suite: 3909 passed; Node 280; pyflakes 0; bandit High 0; pip-audit clean.
+- Scope policy remains unresolved: no owner decision for conversation-wide vs per_pr. R3 must not
+  choose either. GitHub/redaction primitives are independent of that decision.
+
+## Acceptance criteria
+1. Read-only GitHub client: agent/* branch discovery, branch SHA, explicit compare, Actions runs by
+   exact SHA, jobs, pagination, bounded timeout/size, safe errors, no token leakage.
+2. SHA provenance: strict lowercase 40-hex; compare and Actions evidence tied to requested SHAs;
+   branch movement explicit; no success from mere run existence.
+3. Redaction: common secrets/authorization headers masked; docs/**, *.patch, *.zip,
+   package-lock.json excluded; binary/traversal/malformed paths blocked; strict input bound;
+   explicit truncation; diff boundaries preserved; no secret in output.
+4. Tests use MockTransport/fake credentials only; full suite/static checks do not regress.
+5. No commit/push/PR/deploy, no R4, no provider/LLM calls, no external egress.
+
+## Plan
+1. Baseline + scope gate (done).
+2. Implement GitHub client + redaction (done).
+3. Focused tests, negative controls, full verification (done).
+4. Author self-review and R3 reports (done).
+
+## Verification (final)
+- R3 focused: `pytest -q tests/test_review_github.py tests/test_review_redact.py` -> 86 passed.
+- R1/R2/parity: 101 passed.
+- Full Python: 3995 passed (238.54s); Node: 280 pass.
+- pyflakes 0; Bandit High 0; pip-audit clean; compileall 0; `git diff --check` 0.
+- Negative controls in `/tmp/r3-negative`: compare SHA check, path exclusion, response cap,
+  secret redaction, and traversal rejection each produced expected failures.
+
+## Status
+R3 implemented and locally verified; reports written. No commit/push/PR/deploy. Independent
+review remains deferred; R4 not started. Scope policy (conversation-wide vs per_pr) still
+unresolved and not chosen by R3.
+
 # PROGRESS — OHB2-PLAN-01-APPROVE-DEFERRED-P0-AND-CONTINUE-STAGES-0-5
 
 ---
@@ -57,8 +329,6 @@
   ترسل `client_ref` دائمًا.
 - تم دمج NEW-04 في `main` ومزامنته مع GitHub `main` (exact sync)؛ لا PR/Autopush.
 
-
-
 ---
 
 # PROGRESS — OHB2-NEW02-TELEGRAM-PROMPT-GROUPING-IDENTITY-SAFETY (2026-11-22)
@@ -101,8 +371,6 @@
   بالوقت) لكن UX قد يحتاج تعليم المستخدم بالردّ على الجزء الأول لتجميع صريح.
 - NEW-01 + NEW-02 اتعملهم **commit محلي** على `agent/ohb2-new01-cancel-race`؛ مفيش push/PR.
 - تقرير NEW-02 مطلوب تحت `docs/reviews/` قبل الإغلاق.
-
-
 
 ## Goal
 تنفيذ قرار المستخدم الصريح (**Option D**): تأجيل ميزة تسليم المرفقات العامة (P0) **مؤقّتًا**،
@@ -1173,7 +1441,6 @@ unknown (غامض) · failed (فشل مؤكد) · discarded (اتلغى قبل �
 
 **حالة:** IN PROGRESS.
 
-
 **النتائج الكاملة + الإصلاحات (Phase B/C):**
 1. **كشف ميتاداتا شات محذوف (MEDIUM → مُصلَح):** `delete_conversation` بتسيّب صفوف
    `notification_inbox` أثر تدقيق (بعنوان + نص)، وقبل الإصلاح `list_inbox`/`count_inbox`
@@ -1992,7 +2259,6 @@ REQUIRED`، findings **F1–F4**). التمييز الدقيق بين **ما ه�
 ## Safety
 مفيش commit/push/PR/merge/نشر/نداء إنتاج/وصول أسرار/تعديل كود/تغيير سلوك. الشجرة الأساسية محفوظة.
 
-
 ---
 
 # PROGRESS — OHB2-P0-SECURE-UPLOAD-PROPOSAL-R2-INDEPENDENT-ADVERSARIAL-REVIEW (2026-11-11)
@@ -2779,7 +3045,6 @@ P0، مفيش تغيير سلوك، مفيش كود/اختبارات/مخطط.**
   البوابة نصّية؛ `xfail(strict=True)` عمدًا؛ لا commit (تعليمة صريحة).
 - **الحالة:** PARTIAL. **لا** commit/push/PR. تقرير: `docs/reviews/OHB2-P0-A3-TERMINAL-BATCH-ROUTING-REMEDIATION-REPORT.md`.
 - **الخطوة التالية:** قرار مالك على F1 (آلية هوية أو تنازل صريح)، ثم (بإذن) دفع `agent/*` ليتحقّق CI.
-
 
 ---
 
@@ -3974,7 +4239,6 @@ suites ⇒ **135 passed**؛ bandit (`-lll`) ⇒ **0 high** (نتيجة Low وا�
 
 **المرجع:** `docs/reviews/OHB2-MT2-IMPLEMENTATION-REPORT.md`.
 
-
 ---
 
 # جلسة 2026-11-14 — OHB2-COMPLETE-MT2: تحقّق عدائي مستقل + إصلاح
@@ -4118,7 +4382,6 @@ suites ⇒ **135 passed**؛ bandit (`-lll`) ⇒ **0 high** (نتيجة Low وا�
 - التحقّق من بقاء الثوابت محفوظة: `bot/db.py` غير ممسوس، `MINI_APP_ENABLED = False`، Autopush غير نشط، لا اعتماديات مضافة، لا رفع بعيد.
 - **حالة Plan 01:** **`PLAN01_IMPLEMENTATION_COMPLETE_PENDING_VERIFICATION`**.
 - **حالة Plan 02:** **`PLAN02_INVESTIGATION_AND_DESIGN_CLOSED_REMOTE_DELIVERY_BLOCKED`**.
-
 
 ---
 
@@ -4321,8 +4584,6 @@ pyflakes **0**؛ bandit **High 0**؛ مجموعة مركّزة (config/miniapp/b
   - لم يُنشأ أي مورد Canary ولم تُرفع أي ملفات؛ **`C1, C2, C4, C5, C6, C7, C8: NOT_RUN`**؛ **`C3: NOT_RUN — EXPLICITLY EXCLUDED BY OWNER`**؛ **`C9: PASS`** (شكليًا لعدم إنشاء أي مورد).
   - **`HOST-01`: `BLOCKED`** | **`HOST-02`: `BLOCKED`**.
 - **تأكيدات السلامة والتحقّق النهائي:** الخادم الحي القائم (`OpenHandBot` / `Brave Grove`) لم يُمسّ أو يُفتح أو يُختبَر؛ لا SQLite على Enzonic؛ لا كود/بيانات/أسرار مرفوعة؛ `MINI_APP_ENABLED=False`؛ Autopush معطّل؛ لا بطاقة/دفع/حساب جديد/مورد دائم؛ لا تعديل كود/مخطّط/تبعيات/إعدادات ولا أوامر Git كتابية.
-
-
 
 ---
 
@@ -4856,7 +5117,6 @@ verification are green; no commit/push/PR/merge/deploy/Autopush.
 - **INDEPENDENT REVIEW NOT PERFORMED** (لا توجد جلسة مراجع منفصلة متاحة).
 - تم دمج NEW-03 في `main` ومزامنته مع GitHub `main` (exact sync)؛ لا PR/merge/deploy/Autopush.
 
-
 ---
 
 # PROGRESS — OHB2-NEW03-PROGRESS-RECORD-UPDATE (2026-11-23)
@@ -4920,7 +5180,6 @@ final closure, or release approval.
 ## Safety
 - لا commit/push/PR/merge/deploy/Autopush في هذه المهمة.
 - لم يتم تعديل Notion.
-
 
 ---
 
@@ -5032,3 +5291,1078 @@ final closure, or release approval.
 ## Residual limitations
 - Mini App `bot/web/services.py` still uses `now > deadline`; FROZEN and outside this task.
 - No independent review was performed in this session; later review required.
+---
+
+# PROGRESS — OHB2-R7-REMEDIATION-AND-LOCAL-VERIFICATION (2026-11-25)
+
+## Status
+**`R7_REMEDIATION_VERIFIED_WITH_NOTES`** — local remediation and local verification only.
+Not live R7 validation, not independent review, not a live PASS.
+
+## Baseline / Git state
+- Branch `agent/r6-review-delivery`; HEAD/main/origin/main
+  `01079676351aac869d09d4d1747661cd6f07d82b`; HEAD tree
+  `3ceb3580e3d0dfcebdd83ebbf9e285c6d4cc67bc`.
+- 12 modified tracked files; R1–R7 implementation and review reports remain untracked.
+- Preserved `.openhands/`, historical reports, `bun.lock`, and unrelated files.
+- No commit/push/PR/merge/deploy/release; no destructive Git operation.
+
+## Implemented
+- **F-01 (FIXED_AND_TESTED):** `bot/review/ci_contract.py` derives expected jobs only
+  from `.github/workflows/ci.yml` and `.github/workflows/verify.yml`.
+  `ReviewEvidence.from_raw_diff` now defaults `ci_jobs_complete=False` unless the
+  collector supplies the contract result; `evaluate_verdict` blocks with
+  `R4-CI-03` (`ci_jobs_incomplete_or_unverified`). Unknown workflows, missing jobs,
+  empty jobs, failed/cancelled jobs, duplicate jobs, other-run jobs, other-SHA
+  evidence, and retrieval/pagination failures cannot reach PASS.
+- **F-02 (FIXED_AND_TESTED):** `ReviewRunner._verify_provider_binding` runs before
+  collection/provider calls and checks provider, API base, model, fingerprint, exact
+  snapshot id, and adapter binding. Missing/mismatched bindings fail closed without
+  exposing the API key; the immutable snapshot is never mutated.
+- **F-03 (FIXED_AND_TESTED):** `GitHubEvidenceCollector.collect` calls
+  `verify_branch_sha` before and after all reads; branch movement, missing SHA,
+  malformed SHA, compare/run mismatch, and GitHub verification failure are explicit.
+- **F-05 (FIXED_AND_TESTED):** `docs/OPERATIONS_RUNBOOK.md` distinguishes configuration
+  existence, feature eligibility, worker activation, and external execution; the R5
+  worker remains inactive.
+- **Missing coverage B–E:** `tests/test_review_recovery_failures.py` covers DB lock/write
+  failure, report generation/save failure, outbox insertion failure, and branch-movement
+  integration; incomplete-CI cases are in `tests/test_review_ci_jobs.py`.
+- **B01:** `docs/reviews/OHB2-R7-B01-CONVERSATION-PR-SHA-DECISION-20261125.md` —
+  `R7_B01_OWNER_DECISION_REQUIRED` (Option A verified resolver, Option B explicit
+  canary, Option C trailer convention not recommended).
+- **B02:** activation boundary documented; no startup wiring or worker activation added.
+- **B03:** blocked on external provider/disposable-repository/Telegram resources.
+
+## Verification
+- F-01: 15 passed; F-02: 11 passed; F-03: 8 passed; recovery coverage: 6 passed.
+- All review-focused tests: 398 passed.
+- Full Python suite: 4222 passed, 0 failed, 74 warnings.
+- Node suite: 280 pass, 0 fail.
+- pyflakes: 0; compileall: 0 errors.
+- Bandit (`-lll -s B613`): High 0 (Low 7, Medium 20).
+- pip-audit: no known vulnerabilities.
+- `git diff --check`: clean.
+- Python 3.13.15 / pytest 9.0.3 / Node 24.22.2. Python 3.11 and remote CI not verified.
+
+## Reports
+- `docs/reviews/OHB2-R7-REMEDIATION-REPORT-20261125.md`
+- `docs/reviews/OHB2-R7-AUTHOR-SELF-REVIEW-20261125.md`
+- `docs/reviews/OHB2-R7-B01-CONVERSATION-PR-SHA-DECISION-20261125.md`
+
+## Residual / safety
+- R7 live validation not complete; independent review deferred; R8 not started.
+- No OpenHands/GitHub/provider/Telegram call; no workflow dispatch; no worker activation;
+  no production DB access; no publication; no secrets in reports.
+- Autopush remains disabled/inactive.
+
+---
+
+# PROGRESS — OHB2-R7-B01-VERIFIED-RESOLVER-DESIGN-AND-LOCAL-IMPLEMENTATION (2026-11-25)
+
+## Status
+**`R7_B01_OWNER_DECISION_REQUIRED`** — safe local verifier components implemented and
+locally tested; the trusted conversation→repository and PR-candidate sources remain an
+owner decision. Not live conversation-to-PR resolution, not independent review, not a
+live PASS.
+
+## Baseline / Git state
+- Branch `agent/r6-review-delivery`; HEAD/main/origin/main
+  `01079676351aac869d09d4d1747661cd6f07d82b`; HEAD tree
+  `3ceb3580e3d0dfcebdd83ebbf9e285c6d4cc67bc`; 569 tracked files; 12 modified tracked;
+  52 untracked entries.
+- Preserved `.openhands/`, historical reports, `bun.lock`, unrelated files.
+- No commit/push/PR/merge/deploy/release; no destructive Git operation.
+
+## Implemented
+- `bot/review/github.py`: read-only `get_repository()` and `get_pull_request()`;
+  `RepositoryIdentity`/`PullRequestIdentity`; strict parsers for IDs, names, refs,
+  base/head repos, open/merged state, and exact SHAs.
+- `bot/review/resolver.py`: `ConversationMembershipResolver` verifies an explicit
+  `ConversationRepositoryLink` claim and explicit PR numbers through GitHub; checks
+  watched/chat authorization, immutable repository ID/name, PR base/head/no-fork,
+  open/non-merged, branch SHA before/after reads, PR re-read, and compare/merge-base.
+  `reserve_resolved_memberships` validates provenance then delegates to the existing
+  atomic `Database.reserve_conversation_review`.
+- No automatic conversation→repository source, no PR discovery, no worker activation,
+  no startup wiring, no schema change.
+- `docs/OPERATIONS_RUNBOOK.md` §11 documents the trust chain, untrusted metadata,
+  failure/retry behavior, fork/rename policy, membership immutability, and why
+  `REVIEW_ENABLED=1` does not activate the worker.
+- Reports added:
+  `docs/reviews/OHB2-R7-B01-VERIFIED-RESOLVER-REPORT-20261125.md`,
+  `docs/reviews/OHB2-R7-B01-AUTHOR-SELF-REVIEW-20261125.md`,
+  `docs/reviews/OHB2-R7-B01-OWNER-DECISIONS-20261125.md`.
+
+## Verification
+- Resolver: 32 passed.
+- Membership/immutability: 23 passed.
+- R5 lifecycle: 30 passed.
+- R3 branch/SHA: 8 passed.
+- F-01 CI completeness: 15 passed.
+- F-02 ProviderBinding: 11 passed.
+- Recovery: 6 passed.
+- Collector: 3 passed.
+- Worker integration: 1 passed.
+- R6 report: 11 passed.
+- R6 delivery: 8 passed.
+- All review-focused: 430 passed.
+- Full Python suite: 4254 passed, 0 failed, 74 warnings, 307.85s.
+- Node: 280 pass, 0 fail.
+- pyflakes: 0; compileall: 0 errors.
+- Bandit (`-lll -s B613`): High 0 (Low 7, Medium 20).
+- pip-audit: no known vulnerabilities.
+- `git diff --check`: clean.
+- Python 3.13.15 / pytest 9.0.3 / Node 24.22.2; Python 3.11 and remote CI not verified.
+
+## Owner decisions / blockers
+- Conversation→repository source, PR-candidate source, authorization source, provenance
+  persistence, rename/fork policy, worker activation, live validation resources, and
+  independent review remain explicit decisions in
+  `docs/reviews/OHB2-R7-B01-OWNER-DECISIONS-20261125.md`.
+- R7-B02 worker activation deferred; R7-B03 live resources blocked; independent review
+  deferred; R8 not started; R1–R7 changes uncommitted.
+
+## Safety
+- No OpenHands/GitHub/provider/Telegram call, workflow dispatch, external data
+  transmission, worker activation, production DB access, or publication.
+- Autopush remains disabled/inactive.
+
+---
+
+# PROGRESS — OHB2-R7-B01-OWNER-DECISION-ANALYSIS (2026-11-25)
+
+## Status
+**`D-01 = OWNER_DECISION_REQUIRED`; `D-02 = OWNER_DECISION_REQUIRED`.**
+Analysis-only. No implementation, no schema change, no resolver change, no live operation,
+no worker activation, no publication. R7 live validation and R8 not started.
+
+## Baseline / final Git state
+- Branch `agent/r6-review-delivery`; HEAD/main/origin/main
+  `01079676351aac869d09d4d1747661cd6f07d82b`; HEAD tree
+  `3ceb3580e3d0dfcebdd83ebbf9e285c6d4cc67bc`; 569 tracked files; 12 modified tracked;
+  52 untracked entries at analysis start.
+- Added `docs/reviews/OHB2-R7-B01-OWNER-DECISION-ANALYSIS-20261125.md`; appended this
+  entry. No source/schema/test/config changes. No commit/push/PR/merge/deploy/release.
+
+## Evidence-backed findings
+- D-01: no existing source is authenticated, immutable, and stable for all conversations.
+  OpenHands `selected_repository` is user-supplied/mutable; local `creation_jobs.repo` is
+  durable but owner-supplied, name-only, and only for bot-created chats; `watched.chat_id`
+  has no repository; prior review rows are historical. Explicit owner mapping is not
+  implemented. Recommended canary candidate only: local creation context (bot-created
+  chats) with GitHub numeric-ID verification; not an authority claim.
+- D-02: no automatic PR discovery exists. OpenHands `pr_number` is documented but
+  population is unverified (bot never sends it; all 20 observed org conversations had
+  `pr_number=[]`); display helper only. GitHub client has `get_pull_request` but no
+  PR list/search. No local table stores a conversation→PR candidate. Explicit owner list
+  is safe for a canary only, not discovery.
+- Schema: reading candidates needs no change; durable stable repository ID/provenance or
+  persisted PR candidates needs an additive migration. None was made.
+- Conversation-wide scope and immutable memberships unchanged.
+
+## Verification / scope
+- No code, schema, resolver, test, or config changes.
+- No tests run (analysis-only; no behavior changed).
+- No OpenHands/GitHub/provider/Telegram call, workflow dispatch, external transmission,
+  worker activation, commit, push, PR, merge, deployment, or release.
+- Report: `docs/reviews/OHB2-R7-B01-OWNER-DECISION-ANALYSIS-20261125.md`.
+
+---
+
+# PROGRESS — OHB2-R7-CANARY-LINKAGE-IMPLEMENTATION-AND-LOCAL-VERIFICATION (2026-11-25)
+
+## Status
+**`R7_CANARY_LINKAGE_OWNER_DECISION_REQUIRED`.**
+Owner-decision gate applied: no explicit D-01/D-02 approval found, so no linkage
+implementation, resolver change, schema change, test creation, worker activation, or
+live operation was performed. R7 live validation and R8 not started.
+
+## Baseline / final Git state
+- Branch `agent/r6-review-delivery`; HEAD/main/origin/main
+  `01079676351aac869d09d4d1747661cd6f07d82b`; HEAD tree
+  `3ceb3580e3d0dfcebdd83ebbf9e285c6d4cc67bc`; 569 tracked files; 12 modified tracked;
+  53 untracked entries at start.
+- Added:
+  `docs/reviews/OHB2-R7-CANARY-LINKAGE-IMPLEMENTATION-REPORT-20261125.md`,
+  `docs/reviews/OHB2-R7-CANARY-LINKAGE-AUTHOR-SELF-REVIEW-20261125.md`,
+  `docs/reviews/OHB2-R7-CANARY-LINKAGE-OWNER-DECISION-REQUEST-20261125.md`.
+- No source/schema/test/config changes. No commit/push/PR/merge/deploy/release.
+
+## Gate / design
+- Searched owner records: D-01 and D-02 remain `OWNER_DECISION_REQUIRED`; no
+  `D-01: B` / `D-02: explicit-list` approval exists.
+- Produced implementation-ready design for:
+  - D-01 B: `creation_jobs.repo` + exact `conversation_id`, one `done` owner row,
+    strict `owner/repo`, OpenHands `selected_repository` equality, GitHub numeric-ID/full-
+    name verification; bot-created conversations only; no fallback.
+  - D-02 B: explicit owner-supplied unique positive PR list, verified by existing
+    resolver; no OpenHands `pr_number`, no branch/URL inference, no GitHub discovery.
+- Documented same-name delete/recreate limitation: no stored numeric ID at creation;
+  durable identity would need a separate additive-schema decision.
+
+## R7 remediation verified
+- F-01 CI completeness: 15 tests pass.
+- F-02 ProviderBinding: 11 tests pass.
+- F-03 branch/SHA: 8 tests pass.
+- DB lock/write, report generation/save, outbox insertion, branch-movement recovery:
+  6 tests pass.
+- No locally actionable defect found within this no-implementation scope.
+
+## Verification / scope
+- Existing review-focused tests: **430 passed** (resolver 32, membership 23, lifecycle
+  30, branch/SHA 8, CI 15, provider 11, recovery 6, collector 3, report 11, delivery 8,
+  worker integration 1).
+- Full Python/Node/security suites not run: no implementation authorized.
+- No OpenHands/GitHub/provider/Telegram call, workflow dispatch, external transmission,
+  worker activation, commit, push, PR, merge, deployment, or release.
+- Reports: `docs/reviews/OHB2-R7-CANARY-LINKAGE-*-20261125.md`.
+
+---
+
+# PROGRESS — OHB2-R7-CANARY-LINKAGE-D01B-D02-EXPLICIT-LIST (2026-11-25)
+
+## Status
+**`R7_CANARY_LINKAGE_IMPLEMENTED_AND_VERIFIED_WITH_NOTES`.**
+D-01 B and D-02 Explicit-list implemented locally, canary-limited. No worker
+activation, live call, schema change, or publication.
+
+## Baseline / final Git state
+- Branch `agent/r6-review-delivery`; HEAD/main/origin/main
+  `01079676351aac869d09d4d1747661cd6f07d82b`; HEAD tree
+  `3ceb3580e3d0dfcebdd83ebbf9e285c6d4cc67bc`; 569 tracked; 12 modified tracked at
+  start. No commit/push/PR/merge/deploy/release.
+- Added `bot/review/canary_linkage.py`,
+  `tests/test_review_canary_linkage.py`.
+- Changed `bot/db.py` (read-only `list_done_creation_jobs_for_conversation`),
+  `bot/review/__init__.py` (docstring), `docs/OPERATIONS_RUNBOOK.md`.
+- No schema/migration/table/index/trigger change.
+
+## Implementation
+- D-01 B: exact `conversation_id` + one `done` `creation_jobs` row, owner `chat_id`,
+  strict `owner/repo`, OpenHands `selected_repository` equality check, GitHub numeric
+  ID + canonical full-name verification, no fallback. Same-name delete/recreate remains
+  indistinguishable without a stored numeric ID (D-04).
+- D-02 Explicit-list: owner-only `CanaryLinkageService`, non-empty unique positive
+  integer list, max 20, existing resolver verifies repository/PR/head/branch/SHA,
+  existing `reserve_resolved_memberships` persists one immutable conversation-wide
+  cycle. No PR discovery, no first-PR selection, no partial list.
+- No resolver change; no `bot/app.py` wiring; no ReviewWorker/Runner activation.
+
+## Verification
+- New canary suite: 42 passed.
+- Resolver + canary + lifecycle + membership: 124 passed.
+- Review-focused: 472 passed.
+- Full Python: 4296 passed, 74 warnings, 297.56s.
+- Node: 280 pass, 0 fail.
+- pyflakes: 0; compileall: 0 errors.
+- Bandit (`-lll -s B613`): High 0 (Low 7, Medium 20).
+- pip-audit: no known vulnerabilities.
+- `git diff --check`: clean.
+- Python 3.13.15 / pytest 9.0.3 / Node 24.22.2; Python 3.11 and remote CI not verified.
+
+## Remaining
+- D-03 broader authorization source, D-04 durable provenance, D-05 rename/transfer,
+  D-06 fork, D-07 worker activation, D-08 live resources, D-09 independent review/R8.
+- No live OpenHands/GitHub/provider/Telegram validation; no independent review.
+
+## Reports
+- `docs/reviews/OHB2-R7-CANARY-LINKAGE-IMPLEMENTATION-REPORT-20261125.md`
+- `docs/reviews/OHB2-R7-CANARY-LINKAGE-AUTHOR-SELF-REVIEW-20261125.md`
+- Prior owner-required reports archived with `OWNER-DECISION-REQUIRED` names.
+
+---
+
+# PROGRESS — OHB2-R7-PHASE-B-AUTHORIZATION-AND-ACTIVATION-READINESS (2026-11-25)
+
+## Status
+**`R7_PHASE_B_READINESS_PARTIALLY_VERIFIED`.**
+Preparation only. No live R7 validation, worker activation, external call, or publication.
+
+## Baseline / final Git
+- Branch `agent/r6-review-delivery`; HEAD/main/origin/main
+  `01079676351aac869d09d4d1747661cd6f07d82b`; tree
+  `3ceb3580e3d0dfcebdd83ebbf9e285c6d4cc67bc`; 569 tracked; 12 modified tracked;
+  untracked 59 -> 64. No commit/push/PR/merge/deploy/release.
+- No production code or test code changed. Runbook and README corrected; reports/progress added.
+
+## Findings
+- D-03: existing owner/private/cycle-chat callback checks are tested and fail closed;
+  D-02 has no live entrypoint/factory; exact Telegram message-id is not bound; D-03
+  broader authorization remains owner decision.
+- D-04: current name+numeric-ID verification cannot distinguish same-name
+  deletion/recreation; options A–D documented; no schema change.
+- D-05: rename/transfer reject-by-default; numeric ID alone is not authorization.
+- D-06: cross-repository/fork PR rejected by resolver; repository-is-fork/archived/private
+  eligibility remains an owner policy gap.
+- D-07: current `ReviewWorker` can claim any cycle, runs unbounded, and has no provider
+  call/chunk budget; not ready for activation. Bounded one-shot design documented.
+- D-08: reviewer key, review GitHub token, disposable resources, and Telegram target are
+  absent/unauthorized. OpenHands key exists but is not authorized for live use.
+- Provider: no entitlement/pricing/token/spend ceiling; theoretical upper bound up to
+  80 calls/PR and 1,600 calls/20 PRs (times attempts). Live inference blocked.
+- Config: `REVIEW_CI_TIMEOUT_MIN` parsed but unused; `REVIEW_MAX_INPUT_CHARS` and
+  `REVIEW_REPOS` not wired into an R2–R7 worker factory. Runbook corrected.
+
+## Verification
+- Focused Phase B selection: 192 passed.
+- Review-focused: 472 passed.
+- Full Python: 4296 passed, 74 warnings, 319.12s.
+- Node: 280 pass, 0 fail.
+- pyflakes 0; compileall 0; Bandit High 0; pip-audit clean; `git diff --check` clean.
+- Python 3.13.15 / pytest 9.0.3 / Node 24.22.2; Python 3.11 and remote CI not run.
+
+## Remaining
+- D-03 through D-09 owner decisions, bounded worker supervisor implementation, provider
+  entitlement/spend limit, disposable GitHub/OpenHands/Telegram resources, independent
+  review/R8. No live operation is authorized.
+
+## Reports
+- `docs/reviews/OHB2-R7-PHASE-B-READINESS-REPORT-20261125.md`
+- `docs/reviews/OHB2-R7-AUTHORIZATION-AND-RESOURCE-MATRIX-20261125.md`
+- `docs/reviews/OHB2-R7-TEMPORARY-WORKER-ACTIVATION-DESIGN-20261125.md`
+- `docs/reviews/OHB2-R7-PROVIDER-COST-AND-DATA-EGRESS-REPORT-20261125.md`
+- `docs/reviews/OHB2-R7-AUTHOR-SELF-REVIEW-20261125.md`
+- Prior Phase A self-review archived as
+  `docs/reviews/OHB2-R7-PHASE-A-AUTHOR-SELF-REVIEW-ARCHIVED-20261125.md`.
+
+---
+
+# PROGRESS — OHB2-R7-OWNER-DECISIONS-PACK (2026-11-25)
+
+## Status
+**`R7_OWNER_DECISIONS_PACK_READY_FOR_OWNER_REVIEW`.**
+Plan-only/documentation-only. D-03 through D-08 remain `OWNER_DECISION_REQUIRED`; no
+decision is approved. No live operation, worker activation, code/schema change, or Git
+publication.
+
+## Baseline
+- Branch `agent/r6-review-delivery`; HEAD/main/origin/main
+  `01079676351aac869d09d4d1747661cd6f07d82b`; tree
+  `3ceb3580e3d0dfcebdd83ebbf9e285c6d4cc67bc`; 569 tracked; 12 modified tracked;
+  64 untracked. Working tree preserved; no destructive Git.
+
+## Decisions prepared
+- D-03: recommend current-owner revalidation at execution/delivery; current code lacks it
+  and review delivery lacks the normal deletion-witness check.
+- D-04: recommend canary-only owner attestation now; future numeric repository ID
+  persistence as a separate schema decision. Existing records remain ineligible for
+  continuity claims.
+- D-05: recommend reject-rename-transfer; numeric ID is not authorization.
+- D-06: recommend private-allowlisted-only; reject fork PRs, cross-repo PRs, fork/
+  archived/deleted/recreated repositories, and visibility/ownership changes.
+- D-07: recommend bounded one-shot supervisor design only; exact claim, one PR, one
+  chunk/stage, four calls, one attempt, expiry, lease, explicit outbox delivery, audit;
+  implementation remains separate.
+- D-08: recommend keep-blocked until exact resources, least-privilege tokens, provider
+  entitlement/spend cap, Telegram target, isolated DB, and cleanup are supplied.
+
+## Gaps recorded
+- D-07 standalone supervisor has no outbox worker; needs one explicit delivery step.
+- One-PR canary must reject pending memberships to avoid multi-PR reservation.
+- Expiry must be checked before every provider call/renewal.
+- Four calls is valid only with one request/stage, one attempt, no retry/fallback.
+- D-03 revocation gap and D-08 cost/egress gaps remain.
+
+## Reports
+- `docs/reviews/OHB2-R7-OWNER-DECISIONS-PACK-20261125.md`
+- `docs/reviews/OHB2-R7-OWNER-DECISIONS-SELF-REVIEW-20261125.md`
+
+## Verification
+- Documentation-only checks: paths/references, recommendation-vs-approval, D-01/D-02
+  preservation, no live-readiness claim, `git diff --check`, secret scan, targeted doc
+  parity. No full test suite rerun; no executable change.
+- No code/tests/schema/migrations changed; no OpenHands/GitHub/provider/Telegram call; no
+  worker activation; no production DB; no commit/push/PR/merge/deploy/release.
+
+---
+
+# PROGRESS — OHB2-R7-OWNER-DECISIONS-PACK upgrade (2026-11-25)
+
+## Status
+**`R7_OWNER_DECISIONS_PACK_VERIFIED_WITH_NOTES`.** Documentation-only; D-03 through
+D-08 remain `OWNER_DECISION_REQUIRED`; no decision is approved; no live readiness claim.
+
+## What changed
+- Upgraded `docs/reviews/OHB2-R7-OWNER-DECISIONS-PACK-20261125.md` to the required
+  14-item format for each D-03..D-08, with decision summary + approval checklist first.
+- Added D-03 lifecycle authorization table, D-04 explicit provenance cases, D-05
+  per-event policy table, D-06 per-category eligibility table, D-07 14-issue analysis
+  and test plan, and D-08 resource matrix/staged approval.
+- Added provider cost/data-egress reconciliation and cross-decision consistency review.
+- Replaced the self-review with the upgraded verification and findings.
+- No production/test code, schema, migration, runtime wiring, worker, external call, or
+  Git publication.
+
+## Preserved decisions
+D-01 B, D-02 Explicit-list, conversation-wide scope, one active cycle per conversation,
+R1 exact-SHA, R3 read-only, R4 Blind/Adversarial + deterministic verdict, R5
+lease/outbox, R6 report/owner acceptance. `REVIEW_ENABLED=1` remains config validation
+only; R5 worker inactive; autopush disabled; independent review deferred; R8 not started.
+
+## Final verification
+- `git diff --check`: clean, exit 0.
+- `pytest -q tests/test_doc_code_parity.py`: 16 passed.
+- Report path/reference check: no missing references.
+- Secret-pattern scan: no matches.
+- Full test suite not rerun; no executable change.
+- Git: branch/HEAD/main/origin/main/tree unchanged; no commit/push/PR/merge/deploy/release.
+
+---
+
+# PROGRESS — OHB2-R7-OWNER-APPROVAL-RECORD-AND-IMPLEMENTATION-READINESS (2026-11-26)
+
+## Status
+**`R7_OWNER_APPROVALS_RECORDED_WITH_NOTES`.** Documentation-only. D-03–D-06 are
+`APPROVED` policies; D-04b is `DEFERRED`; D-07 is `APPROVED_DESIGN_ONLY`; D-08 is
+`APPROVED_BLOCKED`. No implementation or live operation is authorized.
+
+## Recorded approvals
+- D-03: `current-owner-revalidation`.
+- D-04: `canary-only-owner-attestation`.
+- D-04b: `persist-numeric-repository-id` — `DEFERRED`, no schema work.
+- D-05: `reject-rename-transfer`.
+- D-06: `private-allowlisted-only`.
+- D-07: `approve-bounded-canary-supervisor-design` — design only.
+- D-08: `keep-blocked`.
+
+## Artifacts
+- Updated `docs/reviews/OHB2-R7-OWNER-DECISIONS-PACK-20261125.md` §11 with the
+  authoritative owner approval record and extended status vocabulary.
+- Created `docs/reviews/OHB2-R7-APPROVED-DECISIONS-IMPLEMENTATION-PLAN-20261126.md`
+  with WP-01..WP-06 and the dependency/authorization matrix.
+- Added a post-approval addendum to
+  `docs/reviews/OHB2-R7-OWNER-DECISIONS-SELF-REVIEW-20261125.md`.
+
+## Preserved
+D-01 B, D-02 Explicit-list, conversation-wide scope, one active cycle, Blind/Adversarial
+separation, deterministic verdict, R1–R6, independent-review deferral, autopush disabled,
+`REVIEW_ENABLED=1` config-only, R5 worker inactive, R8 not started.
+
+## Verification
+- `git diff --check`: clean, exit 0.
+- `pytest -q tests/test_doc_code_parity.py`: 16 passed.
+- Approval statuses, D-04b deferred, D-07 design-only, D-08 blocked, references, and
+  secret scan checked.
+- No code/tests/schema/runtime/worker/credential/resource/external call/Git publication.
+
+---
+
+# PROGRESS — OHB2-R7-WP01-D03-AUTHORIZATION-REVALIDATION (2026-11-26)
+
+## Status
+**`WP01_LOCAL_IMPLEMENTATION_AND_VERIFICATION_COMPLETE`.** Local implementation and
+negative tests only. No WP-02..WP-06 work, no D-04b schema work, no live/provider/
+GitHub/Telegram call, no worker activation, no production DB, no deployment, no commit/
+push/PR/merge/release.
+
+## Acceptance criteria
+1. One read-only authorization helper returns allow/deny with safe reason codes.
+2. Current `Config.owner_id` is bound to execution, report generation, and delivery.
+3. Owner/deletion/watched checks run before each provider stage, before report
+   generation, before delivery claim/send, and before marking sent.
+4. Revocation/owner change/deletion/wrong chat/group/channel/DB-read failure fail closed.
+5. Lease/epoch fencing and R6 owner acceptance remain unchanged.
+6. Negative tests cover the required D-03 cases.
+
+## Implemented
+- `bot/review/authorization.py`: new `revalidate_review_authorization()` and
+  `ReviewAuthorizationError`; no provider/Telegram/DB mutation.
+- `bot/review/worker.py`: `ReviewRunner(owner_id=...)` and `_authorize()` calls at
+  execution start, before each membership collection, before Blind, before
+  Adversarial, before each provider request, and before cycle completion.
+- `bot/review/report.py`: `ReviewReportService(owner_id=...)` revalidates before
+  generating/scheduling a report.
+- `bot/outbox.py`: delivery revalidates before report claim, immediately before CAS,
+  immediately after CAS/before send, and after send before marking sent; retryable DB
+  read failures return the row to `pending`, explicit denial fails closed.
+- `bot/app.py`: passes `config.owner_id` to the report service and outbox worker.
+- Tests: `tests/test_review_authorization_revalidation.py` (39 focused tests), plus
+  owner/watched setup updates in existing review tests.
+
+## Verification
+- `pytest -q`: **4335 passed, 0 failed** (full suite, 328.54s).
+- Focused WP-01 tests: **39 passed**.
+- `node --test tests/frontend/*.test.js`: **280 pass, 0 fail**.
+- `pyflakes bot/ automation/ tools/ main.py tests/`: clean.
+- `compileall`: clean.
+- `bandit -r ... -lll -s B613`: **0 High** (7 Low, 20 Medium pre-existing).
+- `pip-audit -r requirements-dev.txt`: **no known vulnerabilities**.
+- `git diff --check`: clean.
+
+## Not implemented / not verified
+- No live Telegram send, no real provider call, no GitHub network call.
+- WP-02..WP-06 and D-04b remain out of scope.
+- No worker activation or production deployment.
+
+---
+
+# PROGRESS — OHB2-R7-WP02-D04-TEMPORARY-OWNER-ATTESTATION (2026-11-26)
+
+## Status
+**`WP02_D04_BLOCKED`.** The safe, durable, immutable attestation lifecycle cannot be
+implemented within the existing schema without a forbidden schema change. No
+implementation code, tests, schema, migration, worker, external call, or Git
+publication was performed.
+
+## Blocker
+No existing table can durably and atomically store the attestation ID, owner,
+conversation, exact creation-job linkage, repository identity commitment/full name,
+explicit PR selection, lifecycle transitions, expiry, fingerprint, and consumption
+binding. `settings` is mutable and not append-only; `auto_review_owner_acceptance` is
+R6 report acceptance and must not be reused for repository linkage; other immutable
+tables are domain-specific.
+
+A minimal separately reviewable design is documented in
+`docs/reviews/OHB2-R7-WP02-D04-TEMPORARY-OWNER-ATTESTATION-IMPLEMENTATION-REPORT-20261126.md`.
+D-04b numeric-ID persistence remains deferred and untouched.
+
+## Verification
+- Relevant existing tests: **235 passed, 0 failed**.
+- Full Python suite: **4335 passed, 0 failed** (323.24s).
+- Node: **280 pass, 0 fail**.
+- `pyflakes` exit 0; `compileall` exit 0; `git diff --check` exit 0.
+- `bandit`: **0 High** (7 Low, 20 Medium pre-existing); `pip-audit`: no known
+  vulnerabilities; doc parity: **16 passed**.
+- No D-04 tests added because no safe D-04 implementation exists; required D-04 cases
+  remain blocked.
+
+## Preserved
+D-01 B, D-02 explicit-list, conversation-wide scope, one active cycle, R1–R6, WP-01
+authorization, R5 worker inactive, autopush disabled, independent review deferred,
+R8 not started. D-04b deferred; WP-03..WP-06 not implemented.
+
+---
+
+# PROGRESS — OHB2-R7-WP03-D05-REJECT-RENAME-TRANSFER (2026-11-26)
+
+## Status
+**`WP03_D05_PASS_WITH_NOTES`.** D-05 is implemented for the authorized D-01 B/D-02
+linkage and review boundaries. D-04/WP-02 remains blocked and incomplete; D-04b is
+deferred and untouched.
+
+## Implemented
+- `GitHubClient` rejects every 3xx with `GitHubRedirectError`; redirects are never
+  followed (`follow_redirects=False`).
+- `get_repository` rejects a canonical full name different from the requested name.
+- `ConversationMembershipResolver` re-reads repository identity after all PR/branch
+  reads; rename, transfer, ID change, redirect, malformed response, and API failure
+  fail closed with explicit reason codes.
+- Existing D-01 B, D-02 explicit-list, WP-01 authorization, R5 lifecycle, and R6
+  acceptance/report/delivery behavior are unchanged.
+
+## Verification
+- New D-05 tests: **23 passed, 0 failed**.
+- Related D-05/resolver/canary/GitHub/authorization/lifecycle/report/delivery tests:
+  **302 passed, 0 failed**.
+- Full Python suite: **4358 passed, 0 failed** (318.70s).
+- Static/security/doc checks recorded in the WP-03 report.
+
+## Remaining limitations
+Same-name deletion/recreation cannot be distinguished without D-04b; the full name is
+not permanent identity. A residual TOCTOU window remains between the final identity
+re-read and reservation/execution. D-04/WP-02 remains blocked.
+
+## Preserved
+D-01 B, D-02 explicit-list, conversation-wide scope, one active cycle, R1–R6, WP-01
+authorization, R5 worker inactive, autopush disabled, independent review deferred,
+R8 not started. D-04b deferred; WP-04..WP-06 not implemented; no live Canary.
+
+---
+
+# PROGRESS — OHB2-R7-WP04-D06-PRIVATE-ALLOWLISTED-ONLY (2026-11-26)
+
+## Status
+**`WP04_D06_BLOCKED`.** Private/allowlisted/fork/archive/deletion/redirect/PR and
+revalidation controls are implemented and tested. The required same-name
+deletion/recreation rejection remains unprovable without D-04b, so WP-04 is not
+claimed complete.
+
+## Implemented
+- `bot/review/eligibility.py`: exact `private is True`, `fork is False`,
+  `archived is False`, and malformed-identity rejection.
+- `bot/review/resolver.py`: D-06 checks after D-01 B/D-02/D-05 identity checks and
+  after every PR/branch read.
+- `bot/review/collector.py`: D-06 revalidation before evidence and after all evidence
+  reads.
+- `bot/config.py` rejects duplicate normalized `REVIEW_REPOS` entries; the GitHub
+  client rejects duplicate normalized allowlist inputs.
+- Existing exact allowlist (`GitHubClient._repo`), D-05 redirects, WP-01 authorization,
+  exact-SHA checks, immutable memberships, R5 leases/fencing, and R6 report/delivery
+  remain unchanged.
+
+## Verification
+- New D-06 tests: **23 passed, 0 failed**.
+- Related D-06/GitHub/resolver/linkage/collector/authorization/lifecycle/report/
+  delivery tests: **400 passed, 0 failed**.
+- Full Python suite: **4383 passed, 0 failed** (329.37s).
+- Config tests: **42 passed**; node: **280 pass**; static/security/doc checks
+  recorded in the WP-04 report.
+
+## Blocker
+Same-name deletion/recreation before current resolution cannot be distinguished with
+the approved data model. D-04b is deferred and numeric-ID persistence is forbidden.
+No digest, fingerprint, identity token, or name heuristic was invented.
+
+## Preserved
+D-01 B, D-02 explicit-list, conversation-wide scope, one active cycle, R1–R6, WP-01
+authorization, R5 worker inactive, autopush disabled, independent review deferred,
+R8/R9 not started. D-04b deferred; WP-02 blocked; WP-05/WP-06 not started; no live
+Canary.
+
+---
+
+# PROGRESS — OHB2-R7-WP02-D04-ATTESTATION-STORAGE-BLOCKER-RESOLUTION (2026-11-26)
+
+## Status
+**`WP02_D04_OWNER_DECISION_REQUIRED`.** Investigation and design complete; no
+implementation, schema, migration, runtime, worker, or test change.
+
+## Findings
+- `settings` is mutable (`ON CONFLICT DO UPDATE`), has no immutability triggers, and
+  cannot be a durable attestation ledger.
+- `auto_review_owner_acceptance` is immutable but R6 report-bound
+  (`review_id`/`report_version`, `OWNER_ACCEPTANCE`, `ACCEPT|REJECT`); reuse is
+  forbidden and semantically wrong.
+- `auto_review_provider_snapshots`, `auto_review_memberships`,
+  `auto_review_evidence`, and `auto_review_reports` are immutable but domain-bound;
+  none can represent pre-cycle owner consent with expiry/consumption.
+- `auto_reviews` and `auto_review_pending_memberships` are mutable review state;
+  `creation_jobs` is the correct D-01 B context source but not an attestation store.
+- No existing non-database mechanism provides durable atomic append-only attestation.
+
+## Recommended design
+Dedicated additive immutable `canary_owner_attestations` header plus append-only
+`canary_owner_attestation_events`; exact owner/conversation/chat/creation-job/repository
+full name/PR-set binding; expiry, rejection, revocation, one-time consumption,
+transactional `BEGIN IMMEDIATE` confirmation/consumption, no R6 reuse, no numeric-ID
+persistence. This requires separate schema authorization.
+
+## D-04b / WP-04 conflict
+D-04 can be implemented name-bound with an explicit same-name recreation limitation,
+but D-06 cannot reject same-name recreated repositories without D-04b. The design does
+not invent a digest/identity substitute and does not claim permanence. WP-04 remains
+`WP04_D06_BLOCKED`.
+
+## Verification
+- Documentation/code parity: 16 passed.
+- `git diff --check`: clean.
+- Only this report and this additive PROGRESS entry were created by this task.
+- No schema/migration/runtime/config/test changes; no full suite claimed as D-04 proof.
+
+## Preserved
+D-01 B, D-02 explicit-list, conversation-wide scope, one active cycle, R1–R6, WP-01
+authorization, R5 worker inactive, autopush disabled, independent review deferred,
+R8/R9 not started, D-04b deferred, WP-02 blocked, WP-05/WP-06 not started, no live
+Canary.
+
+---
+
+# PROGRESS — OHB2-R7-WP02-D04-FINAL-OWNER-DECISION-PACK (2026-11-26)
+
+## Status
+**`WP02_D04_DECISION_PACK_READY_WITH_NOTES`.** Owner decision pack prepared; no
+implementation, schema, migration, runtime, worker, configuration, or test change.
+
+## Decisions prepared
+- `OD-R7-D04-SCHEMA-01`: approve dedicated `canary_owner_attestations` +
+  `canary_owner_attestation_events`, or reject and request an alternative.
+- `OD-R7-D04-SCOPE-02`: B1 name-bound without numeric ID and with same-name limitation,
+  or B2 request a separate D-04b decision.
+- `OD-R7-D04-AUTH-03`: A1 pre-cycle WP-01-equivalent helper, or A2 existing-cycle
+  authorization.
+- `OD-R7-D04-LIFECYCLE-04`: lifecycle package with one-time consumption, append-only
+  events, revocation, fixed TTL; exact TTL remains a separate pending parameter.
+- `OD-R7-D04-INTEGRATION-05`: I1 exact `creation_job_id` binding and atomic consumption
+  with reservation, or I2 reject/revise.
+
+## Approval state
+All five decisions are **PENDING / NOT APPROVED**. No owner selection was found in
+`docs/decisions/`, `docs/reviews/`, or `.agent/PROGRESS.md`. Inclusion in the pack and
+prior recommendations are not approvals.
+
+## Constraints preserved
+D-04b remains deferred and untouched; no numeric-ID persistence/backfill; B1 keeps
+WP-04 `WP04_D06_BLOCKED`. WP-02 remains blocked; WP-05/WP-06 not started; D-07
+design-only; D-08 blocked; no live Canary or worker.
+
+## Verification
+- Documentation/code parity: 16 passed.
+- `git diff --check`: clean.
+- Only this decision pack and this additive PROGRESS entry were created by this task.
+- No full suite claimed as D-04 verification.
+
+## Preserved
+D-01 B, D-02 explicit-list, conversation-wide scope, one active cycle, R1–R6, WP-01
+authorization, R5 worker inactive, autopush disabled, independent review deferred,
+R8/R9 not started, D-04b deferred, WP-02 blocked, WP-05/WP-06 not started, no live
+Canary.
+
+---
+
+# PROGRESS — OHB2-R7-WP02-D04-B1-OWNER-APPROVAL-AND-REMAINING-DECISIONS (2026-11-26)
+
+## Status
+**`WP02_D04_B1_RECORDED_AND_REMAINING_DECISIONS_READY`.** B1 recorded; four decisions
+remain pending; no D-04 implementation, schema, migration, runtime, config, or test
+change.
+
+## B1 approval
+- Decision: `OD-R7-D04-SCOPE-02`
+- Selected option: **B1**, status **APPROVED**
+- Date/source: 2026-11-26, explicit owner statement «موافق» in ChatGPT conversation
+- Scope: name-bound attestation without numeric repository ID; D-04b remains deferred;
+  same-name deletion/recreation limitation accepted; WP-04 remains blocked.
+- B1 does not authorize schema, authorization timing, lifecycle/TTL, integration,
+  implementation, migration, or numeric-ID work.
+
+## Remaining decisions (PENDING / NOT APPROVED)
+- `OD-R7-D04-SCHEMA-01`: APPROVE/REJECT dedicated `canary_owner_attestations` +
+  `canary_owner_attestation_events`.
+- `OD-R7-D04-AUTH-03`: A1 pre-cycle WP-01-equivalent helper or A2 existing-cycle
+  authorization.
+- `OD-R7-D04-LIFECYCLE-04`: lifecycle package with one-time consumption, append-only
+  events, revocation; exact TTL remains unselected and requires explicit owner choice.
+- `OD-R7-D04-INTEGRATION-05`: I1 exact `creation_job_id` binding and atomic consumption
+  with reservation, or I2 reject/revise.
+
+## Constraints
+D-04b remains deferred and untouched; no numeric-ID persistence/backfill. WP-04 remains
+`WP04_D06_BLOCKED`; WP-02 remains blocked; WP-05/WP-06 not started; D-07 design-only;
+D-08 blocked; no worker, Canary, or external operation.
+
+## Verification
+- Documentation/code parity: 16 passed.
+- `git diff --check`: clean.
+- Only this additive report and this PROGRESS entry were introduced by this task.
+- No full suite claimed as D-04 implementation verification.
+
+## Preserved
+D-01 B, D-02 explicit-list, conversation-wide scope, one active cycle, R1–R6, WP-01
+authorization, R5 worker inactive, autopush disabled, independent review deferred,
+R8/R9 not started, D-04b deferred, WP-02 blocked, WP-05/WP-06 not started, no live
+Canary.
+
+---
+
+# PROGRESS — OHB2-R7-WP02-D04-SCHEMA-TECHNICAL-VALIDATION (2026-11-26)
+
+## Status
+**`WP02_D04_SCHEMA_DESIGN_NEEDS_REVISION`.** Read-only validation complete; owner schema
+approval remains pending; no implementation, schema, migration, runtime, config, or test
+change.
+
+## Findings
+- Actual SQLite uses WAL, `busy_timeout=5000`, fail-closed `foreign_keys=ON`, and
+  `BEGIN IMMEDIATE` reservation transactions.
+- Existing immutable tables use only `BEFORE UPDATE`/`BEFORE DELETE` `RAISE(ABORT)`
+  triggers; no transition triggers or generic state table exists.
+- Proposed two-table schema lacks SQLite-level one-active-attestation uniqueness,
+  transition enforcement, `from_state`/`to_state`, `reason_code`, actor type, and
+  required consumption operation keys/review uniqueness.
+- A2 is not fully representable because the immutable header has no review-cycle
+  reference; A1 is compatible. I1 is compatible; I2 rejects integration.
+- B1 remains intact: no numeric repository ID or identity substitute; D-04b deferred;
+  same-name limitation unavoidable; WP-04 remains blocked.
+
+## Verification
+- Documentation/code parity: 16 passed.
+- `git diff --check`: clean.
+- Only this report and this additive PROGRESS entry were introduced.
+- Existing tests were inspected, not run as proof of unimplemented D-04 behavior.
+
+## Preserved
+D-01 B, D-02 explicit-list, conversation-wide scope, one active cycle, R1–R6, WP-01
+authorization, R5 worker inactive, autopush disabled, independent review deferred,
+R8/R9 not started, D-04b deferred, WP-02 blocked, WP-05/WP-06 not started, no live
+Canary. `OD-R7-D04-SCHEMA-01` remains pending.
+
+---
+
+# PROGRESS — OHB2-R7-WP02-D04-SCHEMA-DESIGN-REVISION-V2 (2026-11-26)
+
+## Status
+**`WP02_D04_SCHEMA_V2_READY_FOR_OWNER_REVIEW`.** Design revision complete; owner schema
+approval pending; no implementation, schema, migration, trigger, index, config, or test
+change.
+
+## Revision
+- Added stable semantic `binding_key` excluding generation.
+- Added `canary_owner_attestation_state` with partial unique active-binding index.
+- Added `from_state`/`to_state`, actor type/id, reason code, binding reference.
+- Added transition guards/projection triggers as unexecuted design.
+- Added required review/operation key, unique consumed review, atomic I1 reservation
+  design.
+- Added optional `authorization_mode`/`bound_review_id` to keep A1/A2 open.
+- Added creation-job revalidation at request, confirmation, and consumption.
+
+## Preserved
+B1 approved only for name-bound/no-numeric-ID scope; D-04b deferred; WP-04
+`WP04_D06_BLOCKED`; D-04 implementation not started; WP-02 blocked; WP-05/WP-06 not
+started; D-07 design-only; D-08 blocked; no worker/Canary; `OD-R7-D04-SCHEMA-01`,
+AUTH-03, LIFECYCLE-04, INTEGRATION-05 remain pending.
+
+## Verification
+- DDL reviewed logically only; **not executed**.
+- Documentation/code parity: 16 passed.
+- `git diff --check`: clean.
+- Only this report and this additive PROGRESS entry were introduced.
+- No tests added or modified; no runtime claim.
+
+## Preserved baseline
+D-01 B, D-02 explicit-list, conversation-wide scope, one active cycle, R1–R6, WP-01
+authorization, R5 worker inactive, autopush disabled, independent review deferred,
+R8/R9 not started, D-04b deferred, WP-02 blocked, WP-05/WP-06 not started, no live
+Canary.
+
+---
+
+# PROGRESS — OHB2-R7-WP02-D04-SCHEMA-V2-ISOLATED-SQLITE-VALIDATION (2026-11-26)
+
+## Status
+**`WP02_D04_SCHEMA_V2_NEEDS_REVISION`.** Isolated SQLite experiment complete; no
+application DB/schema/code/config/test change.
+
+## Experiment
+- SQLite **3.46.1**, disposable `/tmp/ohb2-d04-v2-*` file databases.
+- Exact v2 table/index/append-only trigger DDL from the v2 report executed.
+- WAL, `busy_timeout=5000`, `foreign_keys=ON`, `BEGIN IMMEDIATE`.
+- Transition/projection trigger SQL was **not present** in v2; those tests are
+  NOT_TESTED, not invented.
+
+## Findings
+- Tables, indexes, exact append-only triggers create; FK checks pass.
+- Partial active-binding index works when a state row exists; a header without state
+  can still be inserted (B6).
+- Exact v2 accepts invalid transitions, consumption without acceptance, revocation after
+  consumption, A2 bound-review mismatch, expiry after expiration, and arbitrary reason
+  codes.
+- Exact v2 accepts a second confirmation state update and concurrent expiry+acceptance
+  events; no state/event projection trigger.
+- Consumption CHECKs and unique review/operation indexes work; FK RESTRICT and
+  append-only triggers work; transaction rollback works.
+
+## Verification
+- No application DB opened.
+- Documentation/code parity: 16 passed.
+- `git diff --check`: clean.
+- Only this report and this additive PROGRESS entry were introduced.
+- No tests added/modified; no runtime claim for unimplemented D-04.
+
+## Preserved
+B1 name-bound approval only; D-04b deferred; WP-02 blocked; WP-04 `WP04_D06_BLOCKED`;
+WP-05/WP-06 not started; D-07 design-only; D-08 blocked; no worker/Canary; schema
+approval, AUTH, LIFECYCLE/TTL, and INTEGRATION remain pending.
+
+---
+
+# PROGRESS — OHB2-R7-WP02-D04-SCHEMA-DESIGN-REVISION-V3 (2026-11-26)
+
+## Status
+**`WP02_D04_SCHEMA_V3_DESIGN_READY_FOR_OWNER_REVIEW`.** Design-only; complete SQL
+proposal; no DDL executed.
+
+## Revision
+- Header `AFTER INSERT` bootstrap creates `REQUESTED` event then pending state.
+- State insert guard requires the initial request event; active partial unique index
+  prevents header-only orphan and generation bypass.
+- Table CHECKs + event transition guard enforce the exact lifecycle; state update guard
+  requires the latest matching event.
+- Event header/actor/reason guard enforces binding equality, owner ID, actor pairing, and
+  a finite reason-code lookup.
+- Time guard uses explicit caller timestamps and `julianday` for expiry.
+- A2 guard enforces exact `bound_review_id`; A1 binds review at consumption.
+- Append-only, FK RESTRICT, and no-cascade audit behavior retained.
+- Idempotency constraints: unique active state, event type, consumed review, and
+  `(attestation_id,operation_key)`.
+
+## Verification
+- DDL/triggers reviewed statically only; **not executed**.
+- No application DB, schema, migration, code, config, or test change.
+- Documentation/code parity: 16 passed.
+- `git diff --check`: clean.
+- Only this report and additive progress introduced.
+
+## Preserved
+B1 name-bound approval only; D-04b deferred; WP-02 blocked; WP-04
+`WP04_D06_BLOCKED`; WP-05/WP-06 not started; D-07 design-only; D-08 blocked; no
+worker/Canary; SCHEMA approval, AUTH, LIFECYCLE/TTL, and INTEGRATION remain pending.
+
+---
+
+# PROGRESS — OHB2-R7-WP02-D04-SCHEMA-V3-ISOLATED-SQLITE-VALIDATION (2026-11-26)
+
+## Status
+**`WP02_D04_SCHEMA_V3_SQLITE_VALIDATED_WITH_NOTES`.** Isolated only; no application
+DB/schema/code/config/test change.
+
+## Experiment
+- SQLite **3.46.1**, disposable `/tmp/ohb2-d04-v3-*` file databases.
+- Extracted 13 exact v3 SQL blocks (409 lines), SHA-256
+  `26e90800f29616cdd384ae4a09437a0e7da3c31cbca2e0d9b88ce551e9148902`; installed
+  exactly, with only parent fixture tables added.
+- 15 triggers, 4 tables, 3 reason seeds, FK check empty.
+
+## Results
+- PASS: header bootstrap (one REQUESTED + pending state); no header-only orphan; active
+  binding uniqueness; generation after terminal; all permitted transitions; invalid
+  transitions; event binding/actor/reason; A2 exact review; A1 review binding; expiry;
+  revocation; idempotency uniqueness; FKs; append-only; true concurrency races; rollback.
+- NOT_TESTED: atomic review reservation/membership (no app integration); failed
+  projection update (no safe fault path); repeat installation (not claimed idempotent).
+- No critical v3 SQL failure observed; no v4 required by this validation.
+
+## Verification
+- Only disposable DBs used; no application DB opened.
+- Documentation/code parity: 16 passed.
+- `git diff --check`: clean.
+- Only validation report + additive PROGRESS introduced.
+
+## Preserved
+B1 name-bound approval only; D-04b deferred; WP-02 blocked; WP-04
+`WP04_D06_BLOCKED`; WP-05/WP-06 not started; D-07 design-only; D-08 blocked; no
+worker/Canary; SCHEMA approval, AUTH, LIFECYCLE/TTL, and INTEGRATION remain pending.
+
+---
+
+# PROGRESS — OHB2-R7-WP02-D04-SCHEMA-V3-INDEPENDENT-REVIEW (2026-11-26)
+
+## Status
+**`WP02_D04_SCHEMA_V3_INDEPENDENT_REVIEW_NEEDS_REVISION`.** Review-only; no source,
+app DB, schema, migration, config, test, or runtime change.
+
+## Independent evidence
+- Exact v3 extraction: 13 blocks, 397 content / 409 joined lines, SQL hash
+  `26e90800f29616cdd384ae4a09437a0e7da3c31cbca2e0d9b88ce551e9148902`.
+- Fresh exact schema: 4 tables, 15 triggers, 5 named indexes, 3 seeds, FK empty.
+- **CRITICAL F01:** `INSERT OR IGNORE` header gen2 → header+REQUESTED, state NULL.
+- **CRITICAL F02:** `INSERT OR REPLACE` header gen2 → base state deleted, target
+  pending without terminal event.
+- **HIGH F03:** `CONSUMED` at 12:05 accepted after `ACCEPTED` at 12:10.
+- **HIGH F04:** v3 lacks v2 §8.1 canonical binding spec; identical B1 fields with
+  different keys produced 2 active states.
+- **HIGH F05:** A1/A2 accepted `auto_reviews` from another conversation/chat.
+- **HIGH F06:** v3 validation omitted conflict clauses/chronology/canonicalization.
+- Also recorded PR/digest shape-only, mutable parent linkage, system-invalidation gap,
+  one-time install, and idempotency ambiguity.
+- `NOT_TESTED`: I1 atomic reservation; failed projection update; full validation
+  concurrency matrix (partly `REPORT_ONLY`).
+
+## Verification
+- Independent concurrency: two requests → one OK/one state unique; two confirmations
+  → one OK/one transition error.
+- Documentation/code parity: 16 passed.
+- `git diff --check`: clean.
+- Only this review report and additive PROGRESS introduced.
+
+## Preserved
+B1 name-bound approval only; D-04b deferred; WP-02 blocked; WP-04
+`WP04_D06_BLOCKED`; WP-05/WP-06 not started; D-07 design-only; D-08 blocked; no
+worker/Canary; SCHEMA approval, AUTH, LIFECYCLE/TTL, and INTEGRATION remain pending.
+
+---
+
+# PROGRESS — OHB2-R7-WP02-D04-SCHEMA-V4-DESIGN-AND-ISOLATED-VALIDATION (2026-11-26)
+
+## Status
+**`WP02_D04_SCHEMA_V4_READY_FOR_OWNER_REVIEW`.** DESIGN_ONLY + SQL_VALIDATED;
+application not implemented/integrated. No source, app DB, schema, migration, config,
+test, runtime, provider, worker, or Canary change.
+
+## Deliverables
+- `docs/reviews/OHB2-R7-WP02-D04-SCHEMA-DESIGN-REVISION-V4-20261126.md`.
+- This additive PROGRESS section only.
+
+## v4 SQL validation
+- Exact SQL SHA-256 `d1731c077c72d022820a5fcfa331525cab3db399e8946a4074f9d3b70c8e75a4`.
+- 365 SQL lines; 7 canary tables; 27 triggers; 6 named indexes; 3 reason seeds.
+- Fresh DB: SQLite 3.46.1, FK ON (read-back 1), WAL, busy_timeout 5000,
+  `BEGIN IMMEDIATE`; FK check `[]`.
+- Exact SQL extracted from the report installs successfully.
+
+## F01–F06
+- F01/F02: header insert guard, semantic registry, state guard, and bootstrap checks
+  block `INSERT OR IGNORE`/`REPLACE`, `ON CONFLICT`, `UPDATE OR REPLACE` active-header
+  and state-deletion paths. Observed target `(0,0,0)`; base remains pending.
+- F03: fixed UTC microsecond format; nondecreasing chronology; earlier consumed
+  rejected; equal timestamp accepted; invalid rejected.
+- F04: canonical 13-field JSON/SHA helper, fixed vectors, semantic binding registry;
+  same fields/different key rejected; distinct semantic binding accepted.
+- F05: review-link trigger validates parent conversation/chat/repository/status/scope
+  and exact PR membership; A1/A2 modes supported without AUTH selection. Creation-job
+  and owner-current checks remain application-only.
+- F06: conflict, chronology, canonical, parent, I1, concurrency, install matrix in
+  the v4 report.
+
+## I1 and races
+- Fixture I1 exact: review=1, memberships=2, consumed=1, link=1.
+- Wrong-parent I1: review/membership/consumed=0; state unchanged; no link.
+- No-parent consumption: state remains accepted.
+- Concurrent requests/confirmations/consumption: one success, one guarded error;
+  expiry race ends expired; busy lock observed.
+- Actual application reservation/API integration remains
+  `APPLICATION_INTEGRATION_NOT_TESTED`.
+
+## Residual / limits
+- Install/repeat/partial recovery is one-shot: repeat fails `table ... already exists`;
+  partial prefix leaves 2 tables and full recovery fails. Future installer must use
+  `IF NOT EXISTS`/schema version or a transactional install.
+- One-PR/pending-membership merge, creation-job/owner/GitHub checks, and provider
+  authorization remain application/external and are not tested.
+- No separate system-invalidation event; LIFECYCLE/TTL pending.
+- D-04b remains deferred; B1 same-name limitation remains; WP-04 blocked.
+- No independent third-party review; author self-review only.
+- No owner approval, implementation authorization, commit, push, PR, merge, deploy,
+  fetch, pull, external API, worker, or Canary.
+
+## Preserved
+B1 name-bound approval only; D-04b deferred; WP-02 blocked; WP-04
+`WP04_D06_BLOCKED`; WP-05/WP-06 not started; D-07 design-only; D-08 blocked; no
+worker/Canary; SCHEMA approval, AUTH, LIFECYCLE/TTL, and INTEGRATION remain pending.
+
+---
+
+# PROGRESS — OHB2-R7-WP02-D04-SCHEMA-V4-OWNER-DECISION-PACK (2026-11-26)
+
+## Task and result
+- **Task ID:** `OHB2-R7-WP02-D04-SCHEMA-V4-OWNER-DECISION-PACK`.
+- **Result:** `READY_FOR_OWNER_DECISION`.
+- **Report:** `docs/reviews/OHB2-R7-WP02-D04-SCHEMA-V4-OWNER-DECISION-PACK-20261126.md`.
+- **Advisory recommendation:** **CONDITIONAL APPROVAL** of v4 design; owner decision not
+  made or recorded.
+
+## Evidence
+- Exact v4 SQL SHA-256 `d1731c077c72d022820a5fcfa331525cab3db399e8946a4074f9d3b70c8e75a4`,
+  365 lines; clean isolated install: 7 tables, 27 triggers, FK `[]`.
+- Independently re-executed from exact report SQL: clean install, normal boot,
+  F01/F02 active conflict, F03 earlier/tie, F04 binding twin, F05 wrong chat, I1 exact,
+  repeat/partial install failure.
+- Remaining v4 matrix entries are `REPORTED_ONLY`/`SOURCE_CONFIRMED`; application
+  integration is `APPLICATION_NOT_TESTED`; no third-party independent review.
+
+## Critical findings for decision
+- F01/F02/F03 schema bypasses are closed within the tested boundary.
+- F04/F05 are schema support plus mandatory application controls (canonical helper,
+  current owner, creation job, GitHub/D-05/D-06, PR source, one-PR/pending merge).
+- Repeat installation fails; partial installation leaves 2 objects and full rerun
+  fails. This is a HIGH implementation/migration prerequisite, not proof of a logical
+  schema bypass; `IF NOT EXISTS` alone is insufficient.
+- Actual reservation/I1 integration is fixture-only; no application implementation.
+- No CRITICAL/HIGH schema-logical bypass remains within the tested v4 boundary, but
+  HIGH implementation/migration/application risks remain (R-01–R-03 in report).
+
+## Outstanding owner decisions
+- `OD-R7-D04-SCHEMA-01`: `PENDING — NOT APPROVED`.
+- `OD-R7-D04-AUTH-03`: `PENDING`.
+- `OD-R7-D04-LIFECYCLE-04`: `PENDING`.
+- `OD-R7-D04-INTEGRATION-05`: `PENDING`.
+- D-04b `DEFERRED`; B1 name-bound; WP-02 blocked; WP-04 `WP04_D06_BLOCKED`;
+  WP-05/WP-06 not started; D-07 design-only; D-08 blocked.
+
+## Verification / scope
+- `tests/test_doc_code_parity.py`: 16 passed.
+- `git diff --check`: clean.
+- No application code/schema/migration/config/test/DB change.
+- No GitHub/OpenHands/Telegram/provider call; no worker/Canary.
+- No commit, push, PR, merge, deploy, fetch, pull.
+- Autopush disabled/inactive.

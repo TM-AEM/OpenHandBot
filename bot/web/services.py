@@ -17,7 +17,7 @@ import time
 from datetime import datetime, timezone
 
 from ..errors import ApiError, ResponseTooLargeError
-from ..messages import get_status, pr_url, state_label, truncate
+from ..messages import get_status, pr_url, state_label, task_state, task_state_label, truncate
 from ..openhands_client import collect_conversations
 from .. import features
 from .. import outbox
@@ -262,14 +262,17 @@ def _page_offset(page, size: int) -> int:
     return offset
 
 
-def _conversation_dto(conv: dict, watched: bool) -> dict:
+def _conversation_dto(conv: dict, watched: bool, report_state: str | None = None) -> dict:
     status = get_status(conv)
+    semantic = task_state(status, report_state if watched else None)
     return {
         "id": conv.get("id") or conv.get("conversation_id") or "",
         "title": conv.get("title") or "",
         "repository": conv.get("selected_repository") or "",
         "status": status,
         "state_label": state_label(status),
+        "task_state": semantic,
+        "task_state_label": task_state_label(semantic),
         "updated_at": conv.get("updated_at") or "",
         "watched": watched,
     }
@@ -637,7 +640,7 @@ class MiniAppService:
         chunk = items[start : start + PAGE_SIZE]
         if not chunk and page > 0:
             page, start, chunk = 0, 0, items[:PAGE_SIZE]
-        watched = self._watched_ids()
+        watched = self._watched_states()
         return {
             "page": page,
             "has_more": len(items) > start + PAGE_SIZE,
@@ -657,26 +660,25 @@ class MiniAppService:
             return items
         return [c for c in items if not self._db.is_deleted_with_retry(c.get("id") or "")]
 
-    def _list_item(self, conv: dict, watched: set[str]) -> dict:
-        status = get_status(conv)
+    def _list_item(self, conv: dict, watched: dict[str, str | None] | set[str]) -> dict:
         cid = conv.get("id") or ""
-        return {
-            "id": cid,
-            "title": conv.get("title") or "",
-            "repository": conv.get("selected_repository") or "",
-            "status": status,
-            "state_label": state_label(status),
-            "updated_at": conv.get("updated_at") or "",
-            "watched": cid in watched,
-        }
+        if isinstance(watched, dict):
+            return _conversation_dto(conv, cid in watched, watched.get(cid))
+        return _conversation_dto(conv, cid in watched)
+
+    def _watched_states(self) -> dict[str, str | None]:
+        if self._db is None:
+            return {}
+        try:
+            return {
+                w.conversation_id: w.report_state
+                for w in self._db.list_watched()
+            }
+        except Exception:  # noqa: BLE001
+            return {}
 
     def _watched_ids(self) -> set[str]:
-        if self._db is None:
-            return set()
-        try:
-            return {w.conversation_id for w in self._db.list_watched()}
-        except Exception:  # noqa: BLE001
-            return set()
+        return set(self._watched_states())
 
     async def get_conversation(self, conversation_id: str) -> dict:
         cid = _require_id(conversation_id)
@@ -685,8 +687,8 @@ class MiniAppService:
         conv = await self._authorize_conversation(cid)
         user_text, reply = await client.get_last_exchange(cid)
         reply_text, cut = truncate(reply, 4000)
-        watched = cid in self._watched_ids()
-        dto = _conversation_dto(conv, watched)
+        watched = self._watched_states()
+        dto = _conversation_dto(conv, cid in watched, watched.get(cid))
         dto.update(
             {
                 "sandbox_status": conv.get("sandbox_status") or "",
@@ -701,7 +703,8 @@ class MiniAppService:
     async def get_status(self, conversation_id: str) -> dict:
         cid = _require_id(conversation_id)
         conv = await self._authorize_conversation(cid)
-        return _conversation_dto(conv, cid in self._watched_ids())
+        watched = self._watched_states()
+        return _conversation_dto(conv, cid in watched, watched.get(cid))
 
     async def get_full_reply(self, conversation_id: str) -> dict:
         """OHB2-PHASE1B: الرد الكامل للـ assistant (مصدر زر «نسخ الرد الكامل»).
@@ -881,7 +884,8 @@ class MiniAppService:
         client = self._require_client()
         await client.update_conversation_repository(cid, repo)
         conv = await self._authorize_conversation(cid)
-        return _conversation_dto(conv, cid in self._watched_ids())
+        watched = self._watched_states()
+        return _conversation_dto(conv, cid in watched, watched.get(cid))
 
     async def delete_conversation(self, conversation_id: str) -> dict:
         """حذف الشات **من OpenHands نفسه** ثم تثبيت الحذف محليًا (OHB2-MINIAPP).

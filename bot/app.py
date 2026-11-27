@@ -20,6 +20,7 @@ from .db import Database
 from . import deletion
 from .notifier import Notifier
 from .openhands_client import OpenHandsClient
+from .review.report import ReviewReportService
 from .outbox import (
     CompletionWorker,
     CreationWorker,
@@ -103,6 +104,7 @@ def build_application(config: Config) -> Application:
     )
     client = OpenHandsClient(config.openhands_base_url, config.openhands_api_key)
     db = Database(config.db_path)
+    report_service = ReviewReportService(db, owner_id=config.owner_id)
 
     # OHB2-MANUAL-POLLING-OUTCOME: معالج أخطاء PTB يسجّل فشل التحديث **بثبات** (غير مؤهّل
     # للإقرار) بدل ما يُبتلع كنجاح. بدونه PTB بيسجّل الاستثناء ويرجّع عاديًّا ⇒ رجوع
@@ -112,6 +114,7 @@ def build_application(config: Config) -> Application:
     app.bot_data["config"] = config
     app.bot_data["client"] = client
     app.bot_data["db"] = db
+    app.bot_data["review_report_service"] = report_service
     # OHB2-POST-PUB-01/F06: سبب فشل الإقلاع الحاجز (أو None). بيتحدّد في _post_init؛
     # الـ readiness بيقراه عشان يعلن الحالة الحقيقية.
     app.bot_data["startup_failed"] = None
@@ -143,6 +146,8 @@ def build_application(config: Config) -> Application:
     app.add_handler(CallbackQueryHandler(handlers.open_conversation, pattern=r"^open:"))
     app.add_handler(CallbackQueryHandler(handlers.copy_reply, pattern=r"^copy:"))
     app.add_handler(CallbackQueryHandler(handlers.full_reply, pattern=r"^full:"))
+    # OHB2-AUTO-REVIEW-R6: owner-only Details/Accept/Reject for completed reviews.
+    app.add_handler(CallbackQueryHandler(handlers.review_action, pattern=r"^review:"))
     # OHB2-BOT-REPLY-TXT-FILE-BUTTON: تنزيل الرد الكامل كملف .txt (إجراء منفصل عن copy/full).
     app.add_handler(CallbackQueryHandler(handlers.send_reply_txt, pattern=r"^txt:"))
     app.add_handler(CallbackQueryHandler(handlers.show_status, pattern=r"^status:"))
@@ -275,7 +280,9 @@ def build_application(config: Config) -> Application:
         #    سجل 'sending'/'starting' قبل ما يتحوّل 'unknown'). الحرس ده يمنع worker
         #    تاني لو اتنادت _post_init تاني (إعادة تهيئة مكرّرة).
         if application.bot_data.get("outbox_worker") is None:
-            outbox_worker = OutboxWorker(client, db, application.bot)
+            outbox_worker = OutboxWorker(
+                client, db, application.bot, review_owner_id=config.owner_id
+            )
             application.bot_data["outbox_worker"] = outbox_worker
             outbox_worker.start()
         if application.bot_data.get("creation_worker") is None:

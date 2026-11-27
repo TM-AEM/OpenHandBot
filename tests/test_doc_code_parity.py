@@ -34,6 +34,7 @@ def _config_env_names() -> set[str]:
     names = set(re.findall(r'_clean\(\s*env,\s*"([A-Z_]+)"', CONFIG_SRC))
     names |= set(re.findall(r'_parse_bool\(\s*env,\s*"([A-Z_]+)"', CONFIG_SRC))
     names |= set(re.findall(r'_positive\(\s*"([A-Z_]+)"', CONFIG_SRC))
+    names |= set(re.findall(r'_parse_bounded_int\(\s*env,\s*"([A-Z_]+)"', CONFIG_SRC))
     return names
 
 

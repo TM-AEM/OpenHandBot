@@ -426,11 +426,21 @@ def test_orphan_file_counts_toward_limit_and_is_never_deleted(tmp_path):
 
 # ================================================ 9) بلا مخطّط/سجل حجز
 def test_no_schema_migration_or_reservation_ledger():
-    """17 جدولًا بلا تغيير، ومفيش أي سجل حجز/تحفّظ في وحدة المرفقات."""
+    """26 جدولًا (R2/R5/R6 أضافوا جداول المراجعة)، ومفيش سجل حجز في وحدة المرفقات."""
     source = pathlib.Path(attachments_mod.__file__).read_text(encoding="utf-8")
     for banned in ("reserve", "reservation", "release_reservation", "reserved_bytes"):
         assert banned not in source, f"ظهر عنصر سجل حجز ممنوع: {banned}"
 
     db_source = pathlib.Path(db_module.__file__).read_text(encoding="utf-8")
     tables = set(re.findall(r"CREATE TABLE IF NOT EXISTS ([a-z_]+)", db_source))
-    assert len(tables) == 17, f"عدد الجداول اتغيّر: {sorted(tables)}"
+    assert len(tables) == 26, f"عدد الجداول اتغيّر: {sorted(tables)}"
+    assert {
+        "auto_reviews",
+        "auto_review_provider_snapshots",
+        "auto_review_memberships",
+        "auto_review_stages",
+        "auto_review_evidence",
+        "auto_review_leases",
+        "auto_review_reports",
+        "auto_review_owner_acceptance",
+    } <= tables

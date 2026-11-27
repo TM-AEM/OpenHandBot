@@ -42,15 +42,35 @@ class Config:
     # مفيش get_file/تنزيل/صف/ملف/نداء OpenHands/سجل outbox، مع رسالة صادقة. ما بيعطّلش
     # النصوص/الأزرار/Mini App ولا مسار رفض الوسائط غير المدعومة (اللي يفضل شغّالًا).
     attachment_document_intake_enabled: bool = False
+    # OHB2-AUTO-REVIEW-R2: إعدادات المراجعة المستقلة (معطّلة افتراضيًا). لا تُطبع أي أسرار.
+    review_enabled: bool = False
+    review_repos: frozenset[str] = field(default_factory=frozenset)
+    reviewer_provider: str = ""
+    reviewer_api_base: str = ""
+    reviewer_api_key: str = ""
+    reviewer_model: str = ""
+    review_github_token: str = ""
+    review_max_input_chars: int = 120_000
+    review_ci_timeout_min: int = 15
+    review_autofix_rounds: int = 0
 
     @property
-    def secrets(self) -> tuple[str, str]:
-        return (self.telegram_bot_token, self.openhands_api_key)
+    def secrets(self) -> tuple[str, ...]:
+        extras: list[str] = []
+        for value in (self.reviewer_api_key, self.review_github_token):
+            if (
+                value
+                and value not in (self.telegram_bot_token, self.openhands_api_key)
+                and value not in extras
+            ):
+                extras.append(value)
+        return (self.telegram_bot_token, self.openhands_api_key, *extras)
 
     def __repr__(self) -> str:  # ما نطبعش الأسرار لو الـ Config اتسجّل بالغلط
         return (
             f"Config(owner_id={self.owner_id}, base_url={self.openhands_base_url!r}, "
-            f"interval={self.watcher_interval}, db_path={self.db_path!r})"
+            f"interval={self.watcher_interval}, db_path={self.db_path!r}, "
+            f"review_enabled={self.review_enabled})"
         )
 
     @property
@@ -71,6 +91,18 @@ MIN_INTERVAL = 5
 MAX_INTERVAL = 3600
 _LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 _LOOPBACK_HOSTS = {"localhost"}
+
+# OHB2-AUTO-REVIEW-R2: حدود إعدادات المراجعة. القيم الافتراضية محايدة (مفيش provider/model
+# حقيقي مثبّت)، والميزة نفسها معطّلة افتراضيًا.
+REVIEW_MAX_INPUT_CHARS_DEFAULT = 120_000
+REVIEW_MAX_INPUT_CHARS_MIN = 1_000
+REVIEW_MAX_INPUT_CHARS_MAX = 1_000_000
+REVIEW_CI_TIMEOUT_MIN_DEFAULT = 15
+REVIEW_CI_TIMEOUT_MIN_MIN = 1
+REVIEW_CI_TIMEOUT_MIN_MAX = 120
+_REVIEW_PROVIDER_RE = re.compile(r"^[a-z][a-z0-9_-]{1,31}$")
+_REVIEW_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+_REVIEW_REPO_PART_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -179,6 +211,104 @@ def _parse_ids(raw: str) -> list[int]:
             "شيل الزيادة وسيب ID واحد"
         )
     return ids
+
+
+def _parse_review_repos(raw: str) -> frozenset[str]:
+    """يطبّع REVIEW_REPOS إلى owner/repo صغير ومُتحقَّق منه (بدون طباعة القيم)."""
+    repos: set[str] = set()
+    for chunk in raw.replace(";", ",").split(","):
+        value = chunk.strip()
+        if not value:
+            continue
+        parts = value.split("/")
+        if len(parts) != 2:
+            raise ConfigError("REVIEW_REPOS: كل مستودع لازم يكون بالشكل owner/repo")
+        owner, repo = (part.strip().lower() for part in parts)
+        if not owner or not repo or owner in {".", ".."} or repo in {".", ".."}:
+            raise ConfigError("REVIEW_REPOS: كل مستودع لازم يكون بالشكل owner/repo")
+        if not _REVIEW_REPO_PART_RE.match(owner) or not _REVIEW_REPO_PART_RE.match(repo):
+            raise ConfigError("REVIEW_REPOS: اسم المالك/المستودع فيه محارف غير مسموحة")
+        normalized = f"{owner}/{repo}"
+        if normalized in repos:
+            raise ConfigError("REVIEW_REPOS: مستودع مكرر")
+        repos.add(normalized)
+    return frozenset(repos)
+
+
+def _parse_reviewer_provider(raw: str) -> str:
+    if not raw:
+        return ""
+    value = raw.lower()
+    if not _REVIEW_PROVIDER_RE.match(value):
+        raise ConfigError(
+            "REVIEWER_PROVIDER لازم يكون معرّف provider صالح (حروف صغيرة/أرقام/_/-)"
+        )
+    return value
+
+
+def _parse_reviewer_model(raw: str) -> str:
+    if not raw:
+        return ""
+    if not _REVIEW_MODEL_RE.match(raw):
+        raise ConfigError("REVIEWER_MODEL لازم يكون معرّف موديل صالح بدون مسافات/محارف تحكّم")
+    return raw
+
+
+def _parse_reviewer_api_base(raw: str) -> str:
+    if not raw:
+        return ""
+    if not _URL_RE.match(raw):
+        raise ConfigError("REVIEWER_API_BASE لازم يبدأ بـ http:// أو https://")
+    parts = urlsplit(raw)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        raise ConfigError("REVIEWER_API_BASE لازم يكون رابط صالح")
+    if parts.username or parts.password:
+        raise ConfigError("REVIEWER_API_BASE ما يحتويش على اسم مستخدم/كلمة سر")
+    if parts.fragment:
+        raise ConfigError("REVIEWER_API_BASE ما يحتويش على fragment (#...)")
+    if parts.query:
+        raise ConfigError("REVIEWER_API_BASE ما يحتويش على query (?...)")
+    if parts.scheme != "https" and not _is_loopback_host(parts.hostname or ""):
+        raise ConfigError("REVIEWER_API_BASE لازم يكون https:// لمضيف خارجي")
+    return raw.rstrip("/")
+
+
+def _parse_review_credential(raw: str, name: str) -> str:
+    if not raw:
+        return ""
+    if len(raw) < 8 or any(ch.isspace() or ord(ch) < 32 for ch in raw):
+        raise ConfigError(f"{name} شكله غلط (فيه مسافات أو قصير جداً)")
+    return raw
+
+
+def _parse_bounded_int(
+    env, name: str, default: int, min_value: int, max_value: int
+) -> int:
+    raw = _clean(env, name, str(default))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ConfigError(
+            f"{name} لازم يكون رقم صحيح بين {min_value} و{max_value}"
+        ) from exc
+    if not min_value <= value <= max_value:
+        raise ConfigError(f"{name} لازم يكون بين {min_value} و{max_value}")
+    return value
+
+
+def _parse_review_autofix_rounds(env) -> int:
+    raw = _clean(env, "REVIEW_AUTOFIX_ROUNDS", "0")
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ConfigError(
+            "REVIEW_AUTOFIX_ROUNDS لازم يكون 0 (الإصلاح التلقائي غير منفّذ في R2)"
+        ) from exc
+    if value != 0:
+        raise ConfigError(
+            "REVIEW_AUTOFIX_ROUNDS لازم يكون 0 (الإصلاح التلقائي غير منفّذ في R2)"
+        )
+    return value
 
 
 def load_config(env: dict | None = None) -> Config:
@@ -317,6 +447,53 @@ def load_config(env: dict | None = None) -> Config:
         env, "ATTACHMENT_DOCUMENT_INTAKE_ENABLED", False
     )
 
+    # OHB2-AUTO-REVIEW-R2: إعدادات المراجعة. الميزة معطّلة افتراضيًا، والتحقق من المطلوب
+    # بيحصل فقط عند REVIEW_ENABLED=1. أي قيمة غير صالحة ترفض بـ ConfigError بدون طبع القيمة.
+    review_enabled = _parse_bool(env, "REVIEW_ENABLED", False)
+    review_repos = _parse_review_repos(_clean(env, "REVIEW_REPOS"))
+    reviewer_provider = _parse_reviewer_provider(_clean(env, "REVIEWER_PROVIDER"))
+    reviewer_api_base = _parse_reviewer_api_base(_clean(env, "REVIEWER_API_BASE"))
+    reviewer_api_key = _parse_review_credential(
+        _clean(env, "REVIEWER_API_KEY"), "REVIEWER_API_KEY"
+    )
+    reviewer_model = _parse_reviewer_model(_clean(env, "REVIEWER_MODEL"))
+    review_github_token = _parse_review_credential(
+        _clean(env, "REVIEW_GITHUB_TOKEN"), "REVIEW_GITHUB_TOKEN"
+    )
+    review_max_input_chars = _parse_bounded_int(
+        env,
+        "REVIEW_MAX_INPUT_CHARS",
+        REVIEW_MAX_INPUT_CHARS_DEFAULT,
+        REVIEW_MAX_INPUT_CHARS_MIN,
+        REVIEW_MAX_INPUT_CHARS_MAX,
+    )
+    review_ci_timeout_min = _parse_bounded_int(
+        env,
+        "REVIEW_CI_TIMEOUT_MIN",
+        REVIEW_CI_TIMEOUT_MIN_DEFAULT,
+        REVIEW_CI_TIMEOUT_MIN_MIN,
+        REVIEW_CI_TIMEOUT_MIN_MAX,
+    )
+    review_autofix_rounds = _parse_review_autofix_rounds(env)
+
+    if review_enabled:
+        missing_review = [
+            name
+            for name, value in (
+                ("REVIEW_REPOS", review_repos),
+                ("REVIEWER_PROVIDER", reviewer_provider),
+                ("REVIEWER_API_BASE", reviewer_api_base),
+                ("REVIEWER_API_KEY", reviewer_api_key),
+                ("REVIEWER_MODEL", reviewer_model),
+                ("REVIEW_GITHUB_TOKEN", review_github_token),
+            )
+            if not value
+        ]
+        if missing_review:
+            raise ConfigError(
+                "متغيرات مراجعة ناقصة عند REVIEW_ENABLED=1: " + ", ".join(missing_review)
+            )
+
     return Config(
         telegram_bot_token=token,
         openhands_api_key=api_key,
@@ -339,4 +516,14 @@ def load_config(env: dict | None = None) -> Config:
         mini_app_rate_max_keys=mini_app_rate_max_keys,
         mini_app_trusted_proxies=mini_app_trusted_proxies,
         attachment_document_intake_enabled=attachment_document_intake_enabled,
+        review_enabled=review_enabled,
+        review_repos=review_repos,
+        reviewer_provider=reviewer_provider,
+        reviewer_api_base=reviewer_api_base,
+        reviewer_api_key=reviewer_api_key,
+        reviewer_model=reviewer_model,
+        review_github_token=review_github_token,
+        review_max_input_chars=review_max_input_chars,
+        review_ci_timeout_min=review_ci_timeout_min,
+        review_autofix_rounds=review_autofix_rounds,
     )

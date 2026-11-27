@@ -107,23 +107,24 @@ def test_event_exactly_at_submission_time_is_not_new(tmp_path):
     assert bot.sent == []
 
 
-def test_finished_without_new_report_reports_explicitly_after_timeout(tmp_path):
+def test_finished_without_new_report_remains_tracked_after_ten_minutes(tmp_path):
     db = setup(tmp_path, "finished")
     client = Client(conv("finished"), reports=[(T0 - timedelta(hours=1), "قديم")])
     bot = Bot()
 
     run(Watcher(client, db, bot, chat_id=1, clock=Clock(T0 + timedelta(minutes=11))))
 
-    assert len(bot.sent) == 1
-    assert "لم يظهر تقرير جديد" in bot.sent[0]
-    assert "قديم" not in bot.sent[0]
-    assert not db.is_watched("c1")  # إزالة بعد إشعار صريح، مش صامتة
+    # الحالة finished مؤكدة، لكن التقرير الجديد لم يظهر بعد. لا إشعار نجاح، ولا
+    # إزالة للمتابعة، ولا تحويل المهلة المحلية إلى اكتمال.
+    assert bot.sent == []
+    assert db.is_watched("c1")
+    assert db.list_watched()[0].last_state == "finished"
 
 
-def test_timeout_notice_failure_keeps_watch(tmp_path):
+def test_terminal_report_timeout_notice_failure_keeps_watch(tmp_path):
     db = setup(tmp_path, "finished")
     client = Client(conv("finished"))
-    run(Watcher(client, db, Bot(fail=True), chat_id=1, clock=Clock(T0 + timedelta(minutes=11))))
+    run(Watcher(client, db, Bot(fail=True), chat_id=1, clock=Clock(T0 + timedelta(hours=25))))
     assert db.is_watched("c1")
 
 
