@@ -36,6 +36,7 @@ from .attachment_text import validate_accompanying_text
 from .db import (
     DEDUPE_RETRY_DELAYS as _DEDUPE_RETRY_DELAYS,
     AttachmentRoutingState,
+    AttachmentSelectionPending,
     AutoReviewConflict,
     is_transient_sqlite_error as _is_transient_sqlite_error,
 )
@@ -2523,6 +2524,20 @@ ATTACHMENT_BATCH_CANCELLED_TEXT = (
     "الدفعة دي اتلغت أو اتغيّرت، فمش هينفع نضيف ليها الملف ده. "
     "استخدم /attachments أو ابدأ دفعة جديدة."
 )
+# R-01: اختيار شات جديد/بحث مستودعات معلّق. last_accessed السابق مش هدف صالح،
+# ولازم المستخدم يكمل/يعيد الاختيار قبل أي ملف أو نص مصاحب.
+ATTACHMENT_SELECTION_PENDING_TEXT = (
+    "اختار شات أول (أو كمّل اختيار الشات الجديد) وبعدين ابعت الملف. الملف مااتحفظش."
+)
+ATTACHMENT_SELECTION_EXPIRED_TEXT = (
+    "انتهت مهلة اختيار الشات. افتح الشات تاني وابعت الملف."
+)
+ATTACHMENT_TEXT_SELECTION_PENDING_TEXT = (
+    "اختار شات أول (أو كمّل اختيار الشات الجديد) وبعدين ابعت النص. النص مااتسجلش."
+)
+ATTACHMENT_TEXT_SELECTION_EXPIRED_TEXT = (
+    "انتهت مهلة اختيار الشات. افتح الشات تاني وابعت النص."
+)
 
 # OHB2-P0-A3/D-27..D-30: نصوص ردّ مسار النصّ المصاحب (محلي فقط — لا وعد بإرسال بعيد).
 ATTACHMENT_TEXT_RECORDED_TEXT = (
@@ -2778,6 +2793,54 @@ async def _download_attachment_chunks(context, file_id: str, max_bytes: int):
         return iter([bytes(buf)])
 
 
+def _pending_selection_state(db, telegram_id: int):
+    """R-01: حالة اختيار شات جديد/بحث مستودعات معلّقة، أو None.
+
+    `last_accessed` وحده لا يكفي: أثناء `newchat`/`reposearch` ممكن يكون لسه محفوظًا
+    من شات سابق، لكنه مش اختيار صالح للمرفقات أو النص المصاحب.
+    """
+    _pending, kind, _title, awaiting_at = db.awaiting_state(telegram_id)
+    if kind in ("newchat", "reposearch"):
+        return kind, awaiting_at
+    return None
+
+
+async def _reject_pending_selection(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *, for_attachment: bool
+) -> bool:
+    """R-01: يرفض العملية أثناء اختيار شات معلّق، برسالة واضحة وبلا fallback."""
+    db = context.bot_data["db"]
+    state = _pending_selection_state(db, update.effective_user.id)
+    if state is None:
+        return False
+    _kind, awaiting_at = state
+    if db.awaiting_is_expired(awaiting_at):
+        db.clear_awaiting_and_record_outcome(
+            update.effective_user.id,
+            _update_id(update),
+            outbox.now_iso(),
+            update_outcomes.EXPLICITLY_IGNORED,
+        )
+        reply = (
+            ATTACHMENT_SELECTION_EXPIRED_TEXT
+            if for_attachment
+            else ATTACHMENT_TEXT_SELECTION_EXPIRED_TEXT
+        )
+    else:
+        mark_explicitly_ignored(update, context)
+        reply = (
+            ATTACHMENT_SELECTION_PENDING_TEXT
+            if for_attachment
+            else ATTACHMENT_TEXT_SELECTION_PENDING_TEXT
+        )
+    try:
+        await update.message.reply_text(reply)
+    except Exception as exc:  # noqa: BLE001 — فشل الرد ⇒ فشل مُسجّل، مش نجاح صامت
+        record_update_failure(update, context, exc)
+        raise
+    return True
+
+
 async def handle_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """OHB2-P0-A2: قبول آمن لمرفق مدعوم — ربط بمستخدم+محادثة+دفعة، `T0` عند أول ملف.
 
@@ -2807,6 +2870,10 @@ async def handle_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     telegram_id = update.effective_user.id
     db = context.bot_data["db"]
     update_id = _update_id(update)
+
+    # R-01: اختيار شات جديد/بحث معلّق ⇒ last_accessed القديم مش هدف صالح.
+    if await _reject_pending_selection(update, context, for_attachment=True):
+        return
 
     # محادثة مفتوحة/مختارة آخر مرة: مفيش اختيار ⇒ رفض (مفيش fallback).
     conversation_id = db.get_last_accessed_conversation(telegram_id)
@@ -2877,6 +2944,8 @@ async def handle_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             reply = ATTACHMENT_TOO_LARGE_TEXT
         elif stage_value == "rejected_quota":
             reply = ATTACHMENT_QUOTA_TEXT
+        elif stage_value == "rejected_selection":
+            reply = ATTACHMENT_SELECTION_PENDING_TEXT
         elif stage_value == "rejected_batch":
             reply = ATTACHMENT_BATCH_CANCELLED_TEXT
         else:
@@ -3065,6 +3134,9 @@ async def _handle_accompanying_text(
 
     # state is AttachmentRoutingState.LIVE — دفعة حيّة واحدة بالضبط.
     batch = routing.live_batches[0]
+    # R-01: لو المستخدم بدأ اختيار شات جديد/بحث، النصّ ده مايتحولش لدفعة قديمة.
+    if await _reject_pending_selection(update, context, for_attachment=False):
+        return True
     selected_cid = db.get_last_accessed_conversation(telegram_id)
     if not selected_cid or selected_cid != batch.conversation_id:
         # لا هدف، أو هدف مختلف عن دفعة النصّ ⇒ لا ربط/لا استبدال (فشل مغلق).
@@ -3104,6 +3176,15 @@ async def _handle_accompanying_text(
             chat_id=getattr(update.effective_chat, "id", None),
             message_id=getattr(message, "message_id", None),
         )
+    except AttachmentSelectionPending:
+        # R-01: الاختيار اتغيّر بعد الفحص وقبل المعاملة ⇒ رفض واضح، بلا ربط بالدفعة القديمة.
+        await _reject_accompanying_text(
+            update,
+            context,
+            ATTACHMENT_TEXT_SELECTION_PENDING_TEXT,
+            reason="selection_pending",
+        )
+        return True
     except Exception as exc:  # noqa: BLE001 — عطل قاعدة ⇒ فشل تقني مُسجَّل (fail-closed)
         record_update_failure(update, context, exc)
         raise
@@ -3453,13 +3534,25 @@ async def _send_prompt(
         # consumed one-shot state, a deleted target, or (F-07) a routing target that
         # changed at the acceptance boundary. Never report acceptance for the latter.
         routing_changed = False
+        selection_cleared = False
         if routing_target_required:
             last = db.get_last_accessed_conversation(update.effective_user.id)
-            routing_changed = last is not None and last != conversation_id
+            if last is None:
+                # R-02: a concurrent clear-to-None is a real routing change, not a
+                # duplicate/no-op. It must not disappear into a silent ignore.
+                selection_cleared = True
+            else:
+                routing_changed = last != conversation_id
         uid = _update_id(update)
-        if uid is not None and db.update_outcome(uid) is None:
+        already_recorded = uid is not None and db.update_outcome(uid) is not None
+        if uid is not None and not already_recorded:
             mark_explicitly_ignored(update, context)
-        if routing_changed:
+        if not already_recorded and selection_cleared:
+            await update.message.reply_text(
+                "الشات المختار اتغيّر أو اتشال قبل حفظ رسالتك. "
+                "افتح الشات تاني وابعت رسالتك."
+            )
+        elif not already_recorded and routing_changed:
             await update.message.reply_text(
                 "تغيّر الشات المختار قبل حفظ رسالتك. ابعتها تاني للشات الجديد."
             )

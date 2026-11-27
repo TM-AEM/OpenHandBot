@@ -453,6 +453,14 @@ class AttachmentBatchStateChanged(RuntimeError):
     """
 
 
+class AttachmentSelectionPending(RuntimeError):
+    """R-01: اختيار `newchat`/`reposearch` معلّق؛ `last_accessed` القديم مش هدف صالح.
+
+    يُرفع داخل معاملة الكتابة لو الحالة اتغيّرت بعد الفحص في المعالج. المستدعي يحوّله
+    إلى رفض واضح للمستخدم بلا دفعة/عنصر جديد، ولا يرجع للهدف القديم.
+    """
+
+
 # OHB2-P0-A1: حالة عنصر مرفق **اتخزّن** بنجاح (بايتات كاملة + تحقّق). العنصر بيفضل
 # `pending` (نفس قيمة A0) قبل كده — بما فيها عند الفشل — عشان كنس A4 يلاقي المعلّق.
 ATTACHMENT_ITEM_STORED = "stored"
@@ -554,6 +562,10 @@ INBOX_CLAIM_LEASE = timedelta(minutes=5)
 # `route` (الشات المختار) **ما بتنتهيش** بالمهلة دي؛ التوجيه الافتراضي بيستمر لحد ما
 # المستخدم يفتح/يختار شات تاني أو الهدف يتأكد إنه غير متاح/محذوف.
 AWAITING_TTL = timedelta(minutes=10)
+
+# R-01: أثناء اختيار شات جديد/بحث مستودعات، last_accessed السابق مش هدف صالح للمرفقات.
+# الحالتان دول بيوقفوا قبول المرفقات/النص المصاحب لحد ما الاختيار يكتمل أو ينتهي.
+ATTACHMENT_BLOCKING_SELECTION_KINDS = frozenset({"newchat", "reposearch"})
 
 
 # OHB2-P0-A0: مهلة الدفعة الثابتة (15 دقيقة) من **أول** ملف في الدفعة المعلّقة. ثابت P0
@@ -2908,6 +2920,22 @@ class Database:
             return AttachmentRouting(AttachmentRoutingState.CANCELLED)
         return AttachmentRouting(AttachmentRoutingState.NONE)
 
+    def _attachment_blocking_selection_kind_nocommit(
+        self, conn, telegram_id: int
+    ) -> str | None:
+        """R-01: نوع اختيار شات جديد/بحث معلّق، للفحص داخل معاملة القبول.
+
+        لا يعتمد على `last_accessed`؛ الاختيار المعلّق نفسه هو الحاجز. الحالة المنتهية
+        تفضل حاجزة هنا كمان (fail-closed)؛ المعالج بيوضّح للمستخدم إن المهلة انتهت.
+        """
+        row = conn.execute(
+            "SELECT awaiting_kind FROM user_state WHERE telegram_id=?",
+            (int(telegram_id),),
+        ).fetchone()
+        if row is None or row["awaiting_kind"] not in ATTACHMENT_BLOCKING_SELECTION_KINDS:
+            return None
+        return row["awaiting_kind"]
+
     def record_attachment_intent(
         self,
         batch_id: str,
@@ -2945,6 +2973,12 @@ class Database:
                 )
                 conn.commit()
                 return None
+            selection_kind = self._attachment_blocking_selection_kind_nocommit(
+                conn, telegram_id
+            )
+            if selection_kind is not None:
+                conn.rollback()
+                raise AttachmentSelectionPending(selection_kind)
             row = conn.execute(
                 "SELECT * FROM attachment_batches WHERE batch_id=?", (batch_id,)
             ).fetchone()
@@ -3108,6 +3142,12 @@ class Database:
                 )
                 conn.commit()
                 return None
+            selection_kind = self._attachment_blocking_selection_kind_nocommit(
+                conn, batch.telegram_id
+            )
+            if selection_kind is not None:
+                conn.rollback()
+                raise AttachmentSelectionPending(selection_kind)
             # OHB2-WP01 Stage 1 + A4-F5: the batch may have been cancelled/expired/
             # intent-recorded after classification. Re-check ownership, conversation,
             # status, and the fixed deadline atomically before the INSERT.
@@ -3201,6 +3241,12 @@ class Database:
                 )
                 conn.commit()
                 return None
+            selection_kind = self._attachment_blocking_selection_kind_nocommit(
+                conn, telegram_id
+            )
+            if selection_kind is not None:
+                conn.rollback()
+                raise AttachmentSelectionPending(selection_kind)
             conn.execute(
                 "INSERT INTO attachment_batches"
                 "(batch_id, telegram_id, conversation_id, t0, status, created_at, updated_at) "

@@ -1,3 +1,43 @@
+# PROGRESS — OHB2-REMOVE-CHAT-FORWARDING-R01-R02-REMEDIATION (2026-11-27)
+
+## Goal
+Fix only the independent-review findings R-01 (stale last_accessed attachment/text routing while
+newchat/reposearch is pending) and R-02 (silent clear-to-None routing-CAS outcome). No general
+routing refactor, no commit/staging/push, no live integration.
+
+## Acceptance criteria
+1. With last_accessed=A and a pending newchat or reposearch selection, a document creates no
+   attachment batch/item for A and the user receives an actionable response.
+2. With the same pending selection, accompanying text records no intent against an old live batch.
+3. The pending-selection check is repeated inside the attachment acceptance transaction, so a
+   selection created after the handler precheck cannot accept a stale-target batch.
+4. Expired pending selection is cleared through the existing awaiting lifecycle, with no fallback
+   to the old last_accessed target.
+5. A clear-to-None CAS race sends an explicit user response, creates no outbox row, and does not
+   silently acknowledge/discard the prompt; A-to-B changes and CAS successes retain their behavior.
+6. Full local verification is green and no removed forwarding/cancel/pause symbol is reintroduced.
+
+## Baseline
+- Branch `main`; HEAD `12bd85291c02fcadb9203538f1b67fbd7498070a`; tree
+  `67aae5f0f1e2f9439b2c8dd5efc2ec0aee5c8f74`.
+- Pre-existing untracked independent-review report was preserved.
+- Implementation is local working-tree changes only; no commit/staging/push/PR/deploy.
+
+## Completed
+- `bot/handlers.py`: R-01 pending-selection prechecks for documents and accompanying text;
+  expired-state clearing; clear-to-None R-02 response.
+- `bot/db.py`: transaction-internal pending-selection guard for intent/append/new-batch writes.
+- `bot/attachments.py`: early service rejection plus `REJECTED_SELECTION` outcome mapping.
+- `tests/test_remove_chat_forwarding_r01_r02_remediation.py`: 13 deterministic regression tests.
+- Verification: new 13 passed; expanded focused 995 passed; full Python 4420 passed; Node 280;
+  pyflakes 0; Bandit High 0; pip-audit clean; docs parity 16 passed; `git diff --check` clean.
+
+## Status
+`DONE` — R-01/R-02 fixed locally; no commit/staging/push/PR/deploy; fresh independent review
+is the next step.
+
+---
+
 # PROGRESS — OHB2-AUTO-REVIEW-R7 — PHASE A (2026-11-25)
 
 ## Goal

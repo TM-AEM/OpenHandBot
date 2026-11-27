@@ -97,10 +97,12 @@ from .db import (
     ATTACHMENT_BATCH_REAPABLE_STATUSES,
     ATTACHMENT_BATCH_STATUSES,
     ATTACHMENT_BATCH_TTL,
+    ATTACHMENT_BLOCKING_SELECTION_KINDS,
     ATTACHMENT_ITEM_REAPED,
     ATTACHMENT_ITEM_STORED,
     AttachmentBatch,
     AttachmentBatchStateChanged,
+    AttachmentSelectionPending,
 )
 
 log = logging.getLogger(__name__)
@@ -180,6 +182,7 @@ class StageStatus(str, Enum):
     REJECTED_NAME = "rejected_name"      # اسم غير صالح
     REJECTED_EMPTY = "rejected_empty"    # صفر بايت
     REJECTED_BATCH = "rejected_batch"    # الدفعة الأب مش موجودة/مش مملوكة/محادثتها غير صالحة
+    REJECTED_SELECTION = "rejected_selection"  # R-01: اختيار شات جديد/بحث معلّق
     REJECTED_QUOTA = "rejected_quota"    # تجاوز سقف الدفعة (عدد) أو السقف الكلي (FIX-03)
     WRITE_FAILED = "write_failed"        # فشل كتابة/مسار
     DB_FAILED = "db_failed"              # فشل قاعدة بيانات (fail closed)
@@ -1097,6 +1100,14 @@ class AttachmentService:
         chunks_factory=None,
     ) -> AcceptResult:
         """يقبل/يرفض ملفًا واردًا. `chunks_factory()` بترجّع مُكرِّر بايتات عند الطلب."""
+        # R-01: don't even authorize/classify a stale target while a new selection is
+        # pending. The DB write guard below remains the atomic final check.
+        _pending, pending_kind, _title, _at = self._db.awaiting_state(int(telegram_id))
+        if pending_kind in ATTACHMENT_BLOCKING_SELECTION_KINDS:
+            return AcceptResult(
+                AcceptOutcome.REJECTED, stage=StageStatus.REJECTED_SELECTION
+            )
+
         # (1) تفويض المحادثة قبل أي قبول دائم (fail closed).
         try:
             conv, status = await self._authorized(conversation_id, db=self._db)
@@ -1177,6 +1188,12 @@ class AttachmentService:
                     update_id=update_id,
                     staging_token=staging_token,
                 )
+        except AttachmentSelectionPending:
+            # R-01: a newchat/reposearch selection became pending after the handler's
+            # precheck. No item/batch was written; never fall back to last_accessed.
+            return AcceptResult(
+                AcceptOutcome.REJECTED, stage=StageStatus.REJECTED_SELECTION
+            )
         except AttachmentBatchStateChanged:
             # Lost a race after classification (cancelled/expired/intent). No item was
             # inserted; do not create a new batch or download bytes for this file.
