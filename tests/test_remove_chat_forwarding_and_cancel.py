@@ -133,7 +133,7 @@ def test_manual_copy_buttons_remain(tmp_path):
     assert "copy:A" in callbacks
     assert "txt:A" in callbacks
     assert "reply:A" in callbacks
-    assert "open:A" in callbacks
+    assert "open:A" not in callbacks
     assert "cancelroute" not in callbacks
 
 

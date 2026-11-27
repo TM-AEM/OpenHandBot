@@ -381,8 +381,9 @@ def test_full_reply_behavior_unchanged(tmp_path):
 
 def test_existing_keyboard_buttons_preserved():
     cbs = [b.callback_data for row in kb.conversation_actions("A", has_reply=True, reply_cut=True).inline_keyboard for b in row]
-    for expected in ("copy:A", "full:A", "reply:A", "open:A", "status:A", "list:0", "delete:A"):
+    for expected in ("copy:A", "full:A", "reply:A", "status:A", "list:0", "delete:A"):
         assert expected in cbs
+    assert "open:A" not in cbs
     assert "cancelroute" not in cbs
 
 

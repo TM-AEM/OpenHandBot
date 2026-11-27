@@ -18,8 +18,11 @@ from . import features, handlers
 from .config import Config
 from .db import Database
 from . import deletion
+from .file_browser import BrowserCache
+from .files import IdentityCache
 from .notifier import Notifier
 from .openhands_client import OpenHandsClient
+from .refresh import ConversationRefreshService, ConversationRefreshWorker
 from .review.report import ReviewReportService
 from .outbox import (
     CompletionWorker,
@@ -104,6 +107,18 @@ def build_application(config: Config) -> Application:
     client = OpenHandsClient(config.openhands_base_url, config.openhands_api_key)
     db = Database(config.db_path)
     report_service = ReviewReportService(db, owner_id=config.owner_id)
+    identity = IdentityCache(client)
+    browser_cache = BrowserCache()
+    refresh_service = ConversationRefreshService(
+        client,
+        db,
+        app.bot,
+        identity=identity,
+        mini_app_url=(
+            config.mini_app_url if getattr(config, "mini_app_enabled", False) else ""
+        ),
+        files_cb_factory=lambda cid: f"fbo:{browser_cache.token_for(cid)}",
+    )
 
     # OHB2-MANUAL-POLLING-OUTCOME: معالج أخطاء PTB يسجّل فشل التحديث **بثبات** (غير مؤهّل
     # للإقرار) بدل ما يُبتلع كنجاح. بدونه PTB بيسجّل الاستثناء ويرجّع عاديًّا ⇒ رجوع
@@ -114,6 +129,9 @@ def build_application(config: Config) -> Application:
     app.bot_data["client"] = client
     app.bot_data["db"] = db
     app.bot_data["review_report_service"] = report_service
+    app.bot_data["identity_cache"] = (client, identity)
+    app.bot_data["file_browser_cache"] = browser_cache
+    app.bot_data["refresh_service"] = refresh_service
     # OHB2-POST-PUB-01/F06: سبب فشل الإقلاع الحاجز (أو None). بيتحدّد في _post_init؛
     # الـ readiness بيقراه عشان يعلن الحالة الحقيقية.
     app.bot_data["startup_failed"] = None
@@ -274,9 +292,19 @@ def build_application(config: Config) -> Application:
         # 2) worker واحد مالك لكل جدول — يبدأوا بعد ما التعافي يخلص (عشان مايعالجوش
         #    سجل 'sending'/'starting' قبل ما يتحوّل 'unknown'). الحرس ده يمنع worker
         #    تاني لو اتنادت _post_init تاني (إعادة تهيئة مكرّرة).
+        refresh_service = application.bot_data["refresh_service"]
+
+        def on_prompt_sent(conversation_id: str, chat_id: int) -> None:
+            refresh_service.request_immediate(conversation_id, chat_id)
+
+        if application.bot_data.get("refresh_worker") is None:
+            refresh_worker = ConversationRefreshWorker(refresh_service)
+            application.bot_data["refresh_worker"] = refresh_worker
+            refresh_worker.start()
         if application.bot_data.get("outbox_worker") is None:
             outbox_worker = OutboxWorker(
-                client, db, application.bot, review_owner_id=config.owner_id
+                client, db, application.bot, review_owner_id=config.owner_id,
+                on_sent=on_prompt_sent,
             )
             application.bot_data["outbox_worker"] = outbox_worker
             outbox_worker.start()
@@ -293,7 +321,8 @@ def build_application(config: Config) -> Application:
         # + تسجيل متابعة بس). يبدأ بعد التعافي عشان يكمل الآثار المعلّقة من إعادة تشغيل.
         if application.bot_data.get("completion_worker") is None:
             completion_worker = CompletionWorker(
-                client, db, application.bot, config.openhands_base_url
+                client, db, application.bot, config.openhands_base_url,
+                on_sent=on_prompt_sent,
             )
             application.bot_data["completion_worker"] = completion_worker
             completion_worker.start()
@@ -347,6 +376,9 @@ def build_application(config: Config) -> Application:
         completion_worker: CompletionWorker | None = application.bot_data.get("completion_worker")
         if completion_worker:
             await completion_worker.stop()
+        refresh_worker: ConversationRefreshWorker | None = application.bot_data.get("refresh_worker")
+        if refresh_worker:
+            await refresh_worker.stop()
         watcher: Watcher | None = application.bot_data.get("watcher")
         if watcher:
             await watcher.stop()

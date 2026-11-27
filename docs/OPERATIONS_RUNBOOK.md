@@ -93,16 +93,20 @@ python -m pytest -q
   - `PRAGMA journal_mode=WAL` — يسمح بالقراءة أثناء الكتابة (الـ handlers والمراقب
     بيكتبوا في وقت واحد).
   - `PRAGMA busy_timeout=5000` — بدل ما يرمي `database is locked`، بيستنى لحد 5 ثواني.
-  - `CREATE TABLE IF NOT EXISTS` للجداول (المصدر: `bot/db.py::_init_schema`؛ **26** جدول):
-    `watched`, `user_state`, `outbox`, `creation_jobs`, `completion_pending`, `settings`,
-    `notification_state`, `notifier_pending`, `notifier_retry_not_before`, `notification_inbox`,
-    `deleted_conversations`, `web_sessions`, `processed_updates`, `update_failures`,
-    `attachment_batches`, `attachment_items`, `attachment_message_identity`,
+  - `CREATE TABLE IF NOT EXISTS` للجداول (المصدر: `bot/db.py::_init_schema`؛ **27** جدول):
+    `watched`, `user_state`, `conversation_views`, `outbox`, `creation_jobs`, `completion_pending`,
+    `settings`, `notification_state`, `notifier_pending`, `notifier_retry_not_before`,
+    `notification_inbox`, `deleted_conversations`, `web_sessions`, `processed_updates`,
+    `update_failures`, `attachment_batches`, `attachment_items`, `attachment_message_identity`,
     `auto_review_provider_snapshots`, `auto_reviews`, `auto_review_memberships`,
     `auto_review_pending_memberships`, `auto_review_stages`, `auto_review_evidence`,
     `auto_review_leases`, `auto_review_reports`, `auto_review_owner_acceptance`
-    (+ فهارس `idx_outbox_status`, `idx_creation_jobs_status`).
+    (+ فهارس `idx_outbox_status`, `idx_creation_jobs_status`, `idx_conversation_views_due`).
     اختبار تكافؤ (`NEW-DEF-08`) بيقارن العدد ده مع `bot/db.py` تلقائيًا.
+  - **جدول التحديث التلقائي:** `conversation_views` بيحفظ رسالة العرض
+    (`telegram_id`, `chat_id`, `message_id`)، وبصمة المحتوى، وموعد الفحص التالي، وحالة
+    `active`. ده **جدول جدولة فقط** — ملكية الشات وحالته لسه من OpenHands والتفويض
+    الموجود، ومفيش تغيير في `last_accessed` أو المتابعات.
   - **جداول R2 (المراجعة):** `auto_review_provider_snapshots` لقطة غير سرية
     (`provider`, `api_base`, `model`, `config_json`, `config_fingerprint`, `created_at`)،
     وممنوع `UPDATE`/`DELETE` عليها بـ trigger. `auto_reviews` سجل حجز الدورة:

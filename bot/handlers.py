@@ -58,7 +58,15 @@ from .files import (
     authorize_conversation_detailed,
     file_status_message,
 )
-from .messages import escape_html, format_conversation_view, format_cost, get_status, pr_url, state_label
+from .messages import (
+    escape_html,
+    format_conversation_view,
+    format_cost,
+    get_status,
+    is_terminal,
+    pr_url,
+    state_label,
+)
 from .sender import TextDocumentTooLargeError, send_copyable, send_long, send_text_document
 
 log = logging.getLogger(__name__)
@@ -181,27 +189,36 @@ async def _display_conversation_view(
     *,
     q=None,
     reply_markup=None,
-) -> bool:
-    """يعرض عرض الشات في مسار الكولباك (تعديل) أو مسار الأمر (رسالة جديدة)."""
+    return_message: bool = False,
+):
+    """يعرض عرض الشات في مسار الكولباك (تعديل) أو مسار الأمر (رسالة جديدة).
+
+    `return_message=True` بيرجّع `(displayed, message_or_None)` بدل bool، عشان مسار
+    الفتح يسجّل معرّف الرسالة للتحديث التلقائي مع الحفاظ على دلالة نجاح العرض حتى لو
+    الإرسال البديل الطويل ما رجّعش كائن رسالة.
+    """
     if q is not None:
-        return await _edit_or_send(
+        displayed = await _edit_or_send(
             q, text, q.message.chat_id, context.bot, reply_markup=reply_markup
         )
+        if not return_message:
+            return displayed
+        return displayed, (q.message if displayed else None)
     try:
-        await update.message.reply_text(
+        message = await update.message.reply_text(
             escape_html(text), parse_mode=ParseMode.HTML, reply_markup=reply_markup
         )
-        return True
+        return (True, message) if return_message else True
     except Exception as exc:  # noqa: BLE001 — فشل العرض يُبلَّغ، لا يُخفى
         if "too long" in str(exc).lower():
             try:
                 await send_long(update.effective_chat.id, text, context.bot)
-                return True
+                return (True, None) if return_message else True
             except Exception as send_exc:  # noqa: BLE001 — فشل الإرسال البديل = فشل عرض
                 log.warning("فشل إرسال العرض البديل (%s)", type(send_exc).__name__)
-                return False
+                return (False, None) if return_message else False
         log.warning("فشل عرض الشات (%s)", type(exc).__name__)
-        return False
+        return (False, None) if return_message else False
 
 
 async def _safe_send_html(bot, chat_id: int, text: str) -> bool:
@@ -347,6 +364,37 @@ async def _authorized_conversation(
         client, context, conversation_id, allow_deleted=allow_deleted
     )
     return conv, message
+
+
+def _register_conversation_view(
+    context,
+    *,
+    telegram_id: int,
+    conversation_id: str,
+    message,
+    text: str,
+    markup,
+    conv: dict,
+) -> None:
+    """يسجّل رسالة العرض الحالية للتحديث التلقائي (لو الخدمة مربوطة).
+
+    فشل التسجيل لا يغيّر نجاح الفتح: العرض اتّم بالفعل، والتحديث التلقائي ميزة
+    مساعدة مش شرط للفتح. مفيش أي تغيير لـ `last_accessed` هنا.
+    """
+    service = context.bot_data.get("refresh_service")
+    if service is None or message is None:
+        return
+    chat_id = getattr(message, "chat_id", None)
+    message_id = getattr(message, "message_id", None)
+    service.record_view(
+        telegram_id=telegram_id,
+        conversation_id=conversation_id,
+        chat_id=chat_id,
+        message_id=message_id,
+        text=text,
+        markup=markup,
+        terminal=is_terminal(get_status(conv)),
+    )
 
 
 def _store_exchange(context, conversation_id, user_text, reply):
@@ -1304,13 +1352,23 @@ async def _open_conversation_view(
     # نحفظ آخر شات مفتوح/مختار بعد ما العرض يظهر فعلاً، عشان فشل العرض ما يغيّرش الهدف.
     # لا نُنشئ حالة `route` (توجيه تلقائي خاص بالشات) بعد إزالة هذه الميزة؛ نمسح أي
     # حالة انتظار مؤقتة ونحفظ `last_accessed` والنتيجة في معاملة واحدة.
-    if await _display_conversation_view(
-        update, context, text, q=q, reply_markup=markup
-    ):
+    displayed, view_message = await _display_conversation_view(
+        update, context, text, q=q, reply_markup=markup, return_message=True
+    )
+    if displayed:
         db.set_awaiting_and_record_outcome(
             update.effective_user.id, None, None,
             _update_id(update), outbox.now_iso(), update_outcomes.EXPLICITLY_IGNORED,
             last_accessed_conversation_id=conversation_id,
+        )
+        _register_conversation_view(
+            context,
+            telegram_id=update.effective_user.id,
+            conversation_id=conversation_id,
+            message=view_message,
+            text=text,
+            markup=markup,
+            conv=conv,
         )
         return True
     # OHB2-STAGE2-HIGH-ACK-BLOCKING-FIX: العرض هو المحتوى اللي المستخدم طلبه؛ فشل تسليمه

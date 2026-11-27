@@ -414,7 +414,7 @@ async def get_conversation(client, conversation_id: str) -> dict:
 
 
 # ------------------------------------------------------------- F02 completion
-async def _complete_outbox(db, bot, item, base_url: str = "") -> None:
+async def _complete_outbox(db, bot, item, base_url: str = "", on_sent=None) -> None:
     """إكمال الأثر المحلي للـ outbox (إشعار + تسجيل متابعة) — idempotent وقابل للتعافي.
 
     بيفترض إن صف `completion_pending` (kind=outbox) مسجّل بالفعل. الترتيب:
@@ -434,6 +434,14 @@ async def _complete_outbox(db, bot, item, base_url: str = "") -> None:
         return
     if db.is_deleted(item.conversation_id):
         return
+    if on_sent is not None:
+        try:
+            on_sent(item.conversation_id, item.chat_id)
+        except Exception as exc:  # noqa: BLE001 — refresh scheduling must not fail delivery
+            log.warning(
+                "تعذّر جدولة تحديث العرض بعد تسليم %s (%s)",
+                item.ref_id, type(exc).__name__,
+            )
     db.add_watched(item.conversation_id, item.title or "", item.chat_id)
     db.set_last_state(item.conversation_id, item.last_state or "")
     db.mark_submitted(item.conversation_id, item.submitted_at or now_iso())
@@ -519,7 +527,7 @@ async def wait_running(client, conversation_id: str, interval: float, timeout: f
     return "UNKNOWN"
 
 
-async def deliver_outbox(client, db, bot, outbox_id: int) -> None:
+async def deliver_outbox(client, db, bot, outbox_id: int, *, on_sent=None) -> None:
     """مسار مباشر: نحجز **السجل المطلوب نفسه** ذرّياً ثم نرسله عبر _post_claimed.
 
     OHB2-WP-05 (DEF-008): كان بيستدعي `claim_outbox` غير المُقيَّد بالمعرّف، فيمكن أن
@@ -533,7 +541,7 @@ async def deliver_outbox(client, db, bot, outbox_id: int) -> None:
     claimed = db.claim_outbox_by_id(outbox_id, now_iso())
     if claimed is None:
         return
-    await _post_claimed(client, db, bot, claimed)
+    await _post_claimed(client, db, bot, claimed, on_sent=on_sent)
 
 
 def _tombstoned(db, conversation_id: str) -> bool:
@@ -807,7 +815,7 @@ async def _post_claimed_review(db, bot, item, *, review_owner_id=None) -> None:
     return
 
 
-async def _post_claimed(client, db, bot, item, *, review_owner_id=None) -> None:
+async def _post_claimed(client, db, bot, item, *, review_owner_id=None, on_sent=None) -> None:
     """يحاول الـ POST لعنصر محجوز (claimed) ولسه الإرسال مابدأش.
 
     at-most-once: بنسجّل 'sending' بـ **CAS ذرّي** (`claimed`⇒`sending`) فوراً قبل الـ POST
@@ -1025,7 +1033,8 @@ async def _post_claimed(client, db, bot, item, *, review_owner_id=None) -> None:
     # "running" مفترضة (السبب في تقرير TASK 04A-3): الـ API مابيرجّعش معرّف run يربط
     # البرومت الجديد بالـ run بتاعه، فتسجيل "running" ممكن يدّي المراقب انتقال وهمي.
     await _complete_outbox(
-        db, bot, db.get_completion_pending(COMPLETION_KIND_OUTBOX, outbox_id)
+        db, bot, db.get_completion_pending(COMPLETION_KIND_OUTBOX, outbox_id),
+        on_sent=on_sent,
     )
 
 
@@ -1193,9 +1202,11 @@ class OutboxWorker(_BaseWorker):
         max_idle: float = 30.0,
         *,
         review_owner_id: int | None = None,
+        on_sent=None,
     ) -> None:
         super().__init__(client, db, bot, poll_interval=poll_interval, max_idle=max_idle)
         self._review_owner_id = review_owner_id
+        self._on_sent = on_sent
 
     def _claim(self):
         # قراءة ساعة واحدة: نفس اللحظة بتحدّد حدّ النضج ووقت الحجز، فمفيش عدم اتّساق
@@ -1210,6 +1221,7 @@ class OutboxWorker(_BaseWorker):
             self._bot,
             item,
             review_owner_id=self._review_owner_id,
+            on_sent=self._on_sent,
         )
 
     def _is_retry_pending(self, item) -> bool:
@@ -1528,10 +1540,11 @@ class CompletionWorker(_BaseWorker):
 
     def __init__(
         self, client, db, bot, base_url: str = "",
-        poll_interval: float = 2.0, max_idle: float = 30.0,
+        poll_interval: float = 2.0, max_idle: float = 30.0, on_sent=None,
     ) -> None:
         super().__init__(client, db, bot, poll_interval=poll_interval, max_idle=max_idle)
         self._base_url = base_url
+        self._on_sent = on_sent
         self._last_success_at: str | None = None
         self._last_failure_at: str | None = None
 
@@ -1546,7 +1559,9 @@ class CompletionWorker(_BaseWorker):
     async def _process(self, item) -> None:
         try:
             if item.ref_kind == COMPLETION_KIND_OUTBOX:
-                await _complete_outbox(self._db, self._bot, item, self._base_url)
+                await _complete_outbox(
+                    self._db, self._bot, item, self._base_url, on_sent=self._on_sent
+                )
             else:
                 await _complete_creation(self._db, self._bot, item, self._base_url)
         except Exception as exc:  # noqa: BLE001

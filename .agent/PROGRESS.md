@@ -1,3 +1,63 @@
+# PROGRESS — OHB2-AUTOMATIC-CONVERSATION-REFRESH-AND-REMOVE-REFRESH-BUTTON (2026-11-24)
+
+## Goal
+Replace the manual Telegram conversation «تحديث» button with a persisted automatic refresh
+that preserves the existing open/fetch/render behavior and polls every 35 seconds only while
+an OpenHands agent is actively working.
+
+## Acceptance criteria
+1. Opening a conversation records its rendered message and schedules the next refresh exactly
+   35 seconds later; the manual «تحديث» button and its callback wiring are removed.
+2. Automatic refresh uses the existing ownership/tombstone authorization, metadata, last-exchange,
+   rendering, and keyboard behavior; unchanged content causes no Telegram edit.
+3. A confirmed prompt submission triggers an immediate refresh; a failed prompt does not.
+4. Terminal conversations receive one final refresh and stop polling; deleted/inaccessible or
+   permanently rejected views stop safely; transient failures use bounded backoff and recover.
+5. Active schedules survive restart, one worker/lease prevents overlapping refreshes, and the
+   existing watcher, notifier, outbox, and `last_accessed` semantics are unchanged.
+6. New deterministic tests cover scheduling, changed/unchanged edits, terminal/deleted/permanent
+   stops, transient backoff, prompt success/failure, restart recovery, and button removal; full
+   local verification is green.
+
+## Baseline
+- Branch `main`; HEAD `857b8c3aa4ec98edba880bd4a39b8cb2f79e9717`; clean tree.
+- Python: 4343 passed, 0 failed. Node: 272 passed. pyflakes: 0.
+
+## Changes
+- `bot/db.py`: added `ConversationView` and the `conversation_views` scheduling table
+  (render target, content fingerprint, active flag, next check, lease, failures). Ownership
+  and conversation state remain OpenHands/authorization truth.
+- `bot/refresh.py`: automatic refresh service and single `ConversationRefreshWorker`. It reuses
+  `authorize_conversation_detailed`, `get_last_exchange`, `format_conversation_view`, and
+  `conversation_actions`; edits only when the rendered fingerprint changes; handles
+  `Message is not modified`, terminal stops, tombstones/permanent rejection, and bounded
+  transient/`RetryAfter` backoff.
+- `bot/handlers.py`: open/`/chat` now register the actually displayed message for refresh;
+  `_display_conversation_view` can return the Telegram message without changing existing
+  bool callers. `last_accessed` and awaiting/outcome behavior are unchanged.
+- `bot/outbox.py`: a successful prompt completion invokes an optional `on_sent` callback;
+  failed/unknown prompts do not.
+- `bot/app.py`: wires the refresh service, starts one refresh worker after recovery, and
+  stops it on shutdown.
+- `bot/keyboards.py`: removed the manual «تحديث» button and `REFRESH` constant; `open:` stays
+  for lists/deletion-cancel.
+- Tests/docs: added 18 deterministic refresh tests, updated button/schema-count expectations,
+  README, and runbook §4 (27 tables, scheduling-only semantics).
+
+## Verification
+- Focused refresh tests: **18 passed**.
+- Full Python: **4361 passed, 0 failed** (77 warnings; baseline 4343 + 18 new).
+- Node frontend: **272 pass / 0 fail**.
+- `pyflakes`: **0**; Bandit High: **0**; pip-audit: **no known vulnerabilities**;
+  `git diff --check`: clean.
+- Local Python 3.13.15 only; no live Telegram/OpenHands call, no CI run, no push/PR.
+
+## Status
+`DONE` — local implementation and verification green; independent review and live smoke test
+are the remaining external steps.
+
+---
+
 # PROGRESS — OHB2-REMOVE-EXPORT-BUTTON-AND-EXPLANATORY-TEXT (2026-11-27)
 
 ## Goal

@@ -28,7 +28,6 @@ def mini_app_launch(url: str) -> InlineKeyboardMarkup:
 
 BACK = "رجوع"
 REPLY = "رد"
-REFRESH = "تحديث"
 NEW_CHAT = "شات جديد"
 NO_REPO = "🚫 بدون مستودع"
 MY_CHATS = "شاتاتي"
@@ -131,7 +130,7 @@ def conversation_actions(
     files_cb: str | None = None,
 ) -> InlineKeyboardMarkup:
     # الميزات المؤجّلة (القرار 4): الملفات/التكلفة مخفية، وزر المتابعة اليدوية
-    # (تابع/إلغاء المتابعة) مخفي مع «متابعاتي». الأزرار الأساسية (رد/تحديث/رجوع) تفضل ظاهرة.
+    # (تابع/إلغاء المتابعة) مخفي مع «متابعاتي». الأزرار الأساسية (رد/رجوع) تفضل ظاهرة.
     toggle = (
         _btn("إلغاء المتابعة", callback_data=f"unwatch:{conversation_id}")
         if watched
@@ -151,12 +150,7 @@ def conversation_actions(
         if mini_app_url:
             txt_row.append(InlineKeyboardButton(COPY_MINI_APP, web_app={"url": mini_app_url}))
         rows.append(txt_row)
-    rows.append(
-        [
-            _btn(REPLY, callback_data=f"reply:{conversation_id}"),
-            _btn(REFRESH, callback_data=f"open:{conversation_id}"),
-        ],
-    )
+    rows.append([_btn(REPLY, callback_data=f"reply:{conversation_id}")])
     extra: list[InlineKeyboardButton] = []
     if not features.is_hidden("files"):
         extra.append(_btn(FILES, callback_data=files_cb or f"files:{conversation_id}:0"))

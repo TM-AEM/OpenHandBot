@@ -435,14 +435,14 @@ def test_T11b_no_reservation_ledger_introduced():
 
 
 def test_T12_schema_table_count_unchanged():
-    """T-12: عدد الجداول 26 — R2/R5/R6 أضافوا جداول المراجعة."""
+    """T-12: عدد الجداول 27 — R2/R5/R6 أضافوا جداول المراجعة، والتحديث التلقائي جدول عرض."""
     import bot.db as dbmod
 
     src = open(dbmod.__file__, encoding="utf-8").read()
     import re
 
     tables = set(re.findall(r"CREATE TABLE IF NOT EXISTS ([a-z_]+)", src))
-    assert len(tables) == 26, f"عدد الجداول اتغيّر: {sorted(tables)}"
+    assert len(tables) == 27, f"عدد الجداول اتغيّر: {sorted(tables)}"
     assert {"auto_reviews", "auto_review_provider_snapshots", "auto_review_memberships", "auto_review_stages", "auto_review_leases"} <= tables
 
 

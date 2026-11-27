@@ -730,6 +730,26 @@ class Watched:
 
 
 @dataclass
+class ConversationView:
+    """Target of the automatic Telegram conversation refresh.
+
+    One row per (user, conversation) view. `active` means the view is eligible for
+    periodic refresh; it is scheduling state only, never conversation ownership.
+    `last_fingerprint` is the rendered text+keyboard digest last shown, used to avoid
+    editing Telegram when nothing changed.
+    """
+
+    telegram_id: int
+    conversation_id: str
+    chat_id: int
+    message_id: int
+    last_fingerprint: str | None = None
+    failures: int = 0
+    next_check_at: str | None = None
+    active: bool = True
+
+
+@dataclass
 class NotificationState:
     conversation_id: str
     status: str | None = None
@@ -1208,6 +1228,24 @@ class Database:
                 awaiting_at              TEXT,
                 awaiting_title           TEXT
             );
+            -- Automatic Telegram conversation refresh targets. This is scheduling
+            -- state for a rendered view, not conversation ownership or lifecycle truth.
+            CREATE TABLE IF NOT EXISTS conversation_views (
+                telegram_id      INTEGER NOT NULL,
+                conversation_id  TEXT NOT NULL,
+                chat_id          INTEGER NOT NULL,
+                message_id       INTEGER NOT NULL,
+                last_fingerprint TEXT,
+                active           INTEGER NOT NULL DEFAULT 1,
+                failures         INTEGER NOT NULL DEFAULT 0,
+                next_check_at    TEXT,
+                lease_until      TEXT,
+                created_at       TEXT NOT NULL,
+                updated_at       TEXT NOT NULL,
+                PRIMARY KEY (telegram_id, conversation_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_conversation_views_due
+                ON conversation_views(active, next_check_at, lease_until);
             CREATE TABLE IF NOT EXISTS outbox (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 conversation_id TEXT NOT NULL,
@@ -4182,6 +4220,175 @@ class Database:
             r["watch_seq"], r["last_verified_at"], r["report_state"], r["poll_failures"],
             r["next_check_at"],
         )
+
+    # ------------------------------------------------------ conversation views
+    def upsert_conversation_view(
+        self,
+        *,
+        telegram_id: int,
+        conversation_id: str,
+        chat_id: int,
+        message_id: int,
+        last_fingerprint: str | None,
+        active: bool,
+        next_check_at: str | None,
+        now: str,
+    ) -> None:
+        """Record the rendered Telegram view and its refresh schedule.
+
+        A terminal conversation is stored inactive so a restart cannot resurrect polling
+        for it. The same row is reactivated only by an explicit successful prompt.
+        """
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO conversation_views "
+                "(telegram_id, conversation_id, chat_id, message_id, last_fingerprint, "
+                " active, failures, next_check_at, lease_until, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 0, ?, NULL, ?, ?) "
+                "ON CONFLICT(telegram_id, conversation_id) DO UPDATE SET "
+                "chat_id=excluded.chat_id, message_id=excluded.message_id, "
+                "last_fingerprint=excluded.last_fingerprint, active=excluded.active, "
+                "failures=0, next_check_at=excluded.next_check_at, lease_until=NULL, "
+                "updated_at=excluded.updated_at",
+                (
+                    int(telegram_id), conversation_id, int(chat_id), int(message_id),
+                    last_fingerprint, 1 if active else 0, next_check_at, now, now,
+                ),
+            )
+
+    def request_conversation_view_refresh(
+        self, conversation_id: str, *, chat_id: int | None, now: str
+    ) -> int:
+        """Make an existing view due immediately after a confirmed prompt submission."""
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE conversation_views SET active=1, failures=0, next_check_at=?, "
+                "lease_until=NULL, updated_at=? "
+                "WHERE conversation_id=? AND (? IS NULL OR chat_id=?)",
+                (now, now, conversation_id, chat_id, chat_id),
+            )
+            return int(cur.rowcount)
+
+    def claim_due_conversation_view(
+        self, now: str, lease_until: str
+    ) -> ConversationView | None:
+        """Atomically lease one due view so no two refresh cycles process it together."""
+        row = self._conn.execute(
+            "UPDATE conversation_views SET lease_until=?, updated_at=? "
+            "WHERE rowid = ("
+            "  SELECT rowid FROM conversation_views "
+            "  WHERE active=1 "
+            "    AND (next_check_at IS NULL OR next_check_at<=?) "
+            "    AND (lease_until IS NULL OR lease_until<=?) "
+            "  ORDER BY COALESCE(next_check_at, '') ASC, created_at ASC LIMIT 1"
+            ") "
+            "RETURNING telegram_id, conversation_id, chat_id, message_id, "
+            "last_fingerprint, failures, next_check_at, active",
+            (lease_until, now, now, now),
+        ).fetchone()
+        self._conn.commit()
+        if row is None:
+            return None
+        return ConversationView(
+            int(row["telegram_id"]), row["conversation_id"], int(row["chat_id"]),
+            int(row["message_id"]), row["last_fingerprint"], int(row["failures"]),
+            row["next_check_at"], bool(row["active"]),
+        )
+
+    def finish_conversation_view_refresh(
+        self,
+        *,
+        telegram_id: int,
+        conversation_id: str,
+        last_fingerprint: str | None,
+        active: bool,
+        next_check_at: str | None,
+        now: str,
+    ) -> None:
+        with self._conn:
+            self._conn.execute(
+                "UPDATE conversation_views SET last_fingerprint=?, active=?, "
+                "failures=0, next_check_at=?, lease_until=NULL, updated_at=? "
+                "WHERE telegram_id=? AND conversation_id=?",
+                (
+                    last_fingerprint, 1 if active else 0, next_check_at, now,
+                    int(telegram_id), conversation_id,
+                ),
+            )
+
+    def defer_conversation_view_refresh(
+        self,
+        *,
+        telegram_id: int,
+        conversation_id: str,
+        next_check_at: str,
+        now: str,
+    ) -> None:
+        with self._conn:
+            self._conn.execute(
+                "UPDATE conversation_views SET failures=failures+1, next_check_at=?, "
+                "lease_until=NULL, updated_at=? WHERE telegram_id=? AND conversation_id=?",
+                (next_check_at, now, int(telegram_id), conversation_id),
+            )
+
+    def deactivate_conversation_view(self, telegram_id: int, conversation_id: str, now: str) -> None:
+        with self._conn:
+            self._conn.execute(
+                "UPDATE conversation_views SET active=0, next_check_at=NULL, "
+                "lease_until=NULL, updated_at=? WHERE telegram_id=? AND conversation_id=?",
+                (now, int(telegram_id), conversation_id),
+            )
+
+    def get_conversation_view(
+        self, telegram_id: int, conversation_id: str
+    ) -> ConversationView | None:
+        row = self._conn.execute(
+            "SELECT telegram_id, conversation_id, chat_id, message_id, last_fingerprint, "
+            "failures, next_check_at, active FROM conversation_views "
+            "WHERE telegram_id=? AND conversation_id=?",
+            (int(telegram_id), conversation_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return ConversationView(
+            int(row["telegram_id"]), row["conversation_id"], int(row["chat_id"]),
+            int(row["message_id"]), row["last_fingerprint"], int(row["failures"]),
+            row["next_check_at"], bool(row["active"]),
+        )
+
+    def list_conversation_views(self) -> list[ConversationView]:
+        rows = self._conn.execute(
+            "SELECT telegram_id, conversation_id, chat_id, message_id, last_fingerprint, "
+            "failures, next_check_at, active FROM conversation_views "
+            "ORDER BY created_at, conversation_id"
+        ).fetchall()
+        return [
+            ConversationView(
+                int(r["telegram_id"]), r["conversation_id"], int(r["chat_id"]),
+                int(r["message_id"]), r["last_fingerprint"], int(r["failures"]),
+                r["next_check_at"], bool(r["active"]),
+            )
+            for r in rows
+        ]
+
+    def seconds_until_next_conversation_refresh(self, now: str) -> float | None:
+        """Seconds until the earliest active, unleased view is due; None if none."""
+        row = self._conn.execute(
+            "SELECT next_check_at FROM conversation_views "
+            "WHERE active=1 AND (lease_until IS NULL OR lease_until<=?) "
+            "ORDER BY CASE WHEN next_check_at IS NULL THEN 0 ELSE 1 END, "
+            "next_check_at ASC LIMIT 1",
+            (now,),
+        ).fetchone()
+        if row is None:
+            return None
+        if row["next_check_at"] is None:
+            return 0.0
+        now_dt = _parse_iso(now)
+        due = _parse_iso(row["next_check_at"])
+        if now_dt is None or due is None:
+            return 0.0
+        return max(0.0, (due - now_dt).total_seconds())
 
     def increment_watched_retry(self, conversation_id: str) -> int:
         """يزوّد عدّاد محاولات إشعار الانتهاء ذرّياً ويرجّع القيمة الجديدة (TASK 54).
