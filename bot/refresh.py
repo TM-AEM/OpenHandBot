@@ -31,10 +31,15 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 
 from . import keyboards as kb
-from .db import ConversationView
+from .db import (
+    DEDUPE_RETRY_DELAYS,
+    ConversationView,
+    is_transient_sqlite_error,
+)
 from .errors import ApiError
 from .files import FileStatus, IdentityCache, authorize_conversation_detailed
-from .messages import escape_html, format_conversation_view, get_status, is_terminal
+from .message_edit import MessageEditCoordinator, get_message_edit_coordinator
+from .messages import escape_html, format_conversation_view, get_status, is_terminal, split_message
 from .notifier import _retry_after_seconds
 from .outbox import _BaseWorker, is_permanent
 
@@ -48,6 +53,7 @@ REFRESH_LEASE_SECONDS = 120
 REFRESH_MAX_CONCURRENT = 1
 REFRESH_DISPATCH_GAP_SECONDS = 0.05
 EXCHANGE_CACHE_MAX = 20
+_REQUESTED_VIEW_PARTS = 1
 
 _PERMANENT_EDIT_MARKERS = (
     "message to edit not found",
@@ -79,6 +85,10 @@ def view_fingerprint(text: str, markup) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+class RefreshInvalidationError(RuntimeError):
+    """A screen replacement could not durably invalidate its old refresh target."""
+
+
 class ConversationRefreshService:
     def __init__(
         self,
@@ -92,6 +102,7 @@ class ConversationRefreshService:
         clock=None,
         exchange_cache: dict | None = None,
         exchange_cache_max: int = EXCHANGE_CACHE_MAX,
+        edit_coordinator: MessageEditCoordinator | None = None,
     ) -> None:
         self.client = client
         self.db = db
@@ -103,6 +114,7 @@ class ConversationRefreshService:
         self._worker: ConversationRefreshWorker | None = None
         self._exchange_cache = exchange_cache
         self._exchange_cache_max = max(1, int(exchange_cache_max))
+        self._edits = edit_coordinator or get_message_edit_coordinator()
 
     def attach_worker(self, worker: "ConversationRefreshWorker") -> None:
         self._worker = worker
@@ -140,6 +152,28 @@ class ConversationRefreshService:
         is superseded in the same transaction.
         """
         if not self._valid_target(telegram_id, chat_id, message_id):
+            return None
+        if len(split_message(text)) > _REQUESTED_VIEW_PARTS:
+            # A split view has no single Telegram message that can be atomically
+            # refreshed. Track nothing and retire any previous target for this
+            # message rather than leaving a stale screen refreshable.
+            try:
+                self.db.invalidate_conversation_views_for_message(
+                    telegram_id=telegram_id,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    now=self.now_iso(),
+                )
+            except Exception as exc:  # noqa: BLE001 — registration is best-effort
+                log.warning(
+                    "تعذّر إلغاء هدف قديم بعد عرض مقسّم للشات %s (%s)",
+                    conversation_id,
+                    type(exc).__name__,
+                )
+            log.warning(
+                "عرض الشات %s أطول من رسالة واحدة؛ لن يُسجَّل هدف تحديث تلقائي",
+                conversation_id,
+            )
             return None
         fingerprint = view_fingerprint(text, markup)
         next_check = None if terminal else self.deadline(REFRESH_INTERVAL_SECONDS)
@@ -179,20 +213,48 @@ class ConversationRefreshService:
         """
         if not self._valid_target(telegram_id, chat_id, message_id):
             return 0
-        try:
-            changed = self.db.invalidate_conversation_views_for_message(
-                telegram_id=telegram_id,
-                chat_id=chat_id,
-                message_id=message_id,
-                now=now or self.now_iso(),
-            )
-        except Exception as exc:  # noqa: BLE001 — navigation must not break
-            log.warning(
-                "تعذّر إلغاء عرض الرسالة %s/%s (%s)",
-                chat_id, message_id, type(exc).__name__,
-            )
-            return 0
-        return changed
+        return self.db.invalidate_conversation_views_for_message(
+            telegram_id=telegram_id,
+            chat_id=chat_id,
+            message_id=message_id,
+            now=now or self.now_iso(),
+        )
+
+    async def supersede_message_with_retry(
+        self,
+        *,
+        telegram_id: int,
+        chat_id: int,
+        message_id: int,
+        now: str | None = None,
+    ) -> int:
+        """Fail-closed invalidation with only bounded SQLite BUSY/LOCKED retries."""
+        attempt = 0
+        while True:
+            try:
+                return self.supersede_message(
+                    telegram_id=telegram_id,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    now=now,
+                )
+            except Exception as exc:  # noqa: BLE001 — classify before deciding
+                if not is_transient_sqlite_error(exc) or attempt >= len(DEDUPE_RETRY_DELAYS):
+                    raise RefreshInvalidationError(
+                        "تعذّر تثبيت إلغاء هدف تحديث الرسالة"
+                    ) from exc
+                delay = DEDUPE_RETRY_DELAYS[attempt]
+                attempt += 1
+                log.warning(
+                    "تعذّر إلغاء عرض الرسالة %s/%s (%s) — إعادة محاولة %d/%d بعد %.2fث",
+                    chat_id,
+                    message_id,
+                    type(exc).__name__,
+                    attempt,
+                    len(DEDUPE_RETRY_DELAYS),
+                    delay,
+                )
+                await asyncio.sleep(delay)
 
     def request_immediate(self, conversation_id: str, chat_id: int | None = None) -> None:
         """Mark existing, non-superseded view targets due after a confirmed prompt POST.
@@ -216,6 +278,9 @@ class ConversationRefreshService:
 
     async def refresh(self, target: ConversationView) -> None:
         """Fetch fresh data, edit only on change, and persist the next schedule."""
+        target = self._ensure_lease(target)
+        if target is None:
+            return
         target = self._current_target(target)
         if target is None:
             return
@@ -276,21 +341,31 @@ class ConversationRefreshService:
             terminal = is_terminal(get_status(conv))
 
             if fingerprint != target.last_fingerprint:
-                # Re-check immediately before the external edit. A navigation handler
-                # or a newer prompt may have superseded this target while we fetched.
-                if not self._is_current(target):
-                    self._release(target)
-                    return
-                outcome, retry_after = await self._edit(target, text, markup)
-                if outcome == "retry":
-                    self._defer(target, "Telegram RetryAfter", retry_after=retry_after)
-                    return
-                if outcome == "permanent":
-                    self._deactivate(target, superseded=True)
-                    return
-                if outcome == "transient":
-                    self._defer(target, "فشل مؤقت في تعديل رسالة تيليجرام")
-                    return
+                # The edit right is acquired before the final ownership check. A
+                # navigation replacement that already started waits for this edit;
+                # a navigation that wins first makes the target stale and prevents
+                # this edit from starting.
+                async with self._edits.lock(target.chat_id, target.message_id):
+                    if not self._is_current(target):
+                        self._release(target)
+                        return
+                    outcome, retry_after = await self._edit(target, text, markup)
+                    if outcome == "retry":
+                        self._defer(target, "Telegram RetryAfter", retry_after=retry_after)
+                        return
+                    if outcome == "oversized":
+                        log.warning(
+                            "عرض الشات %s تجاوز حد رسالة تيليجرام؛ إيقاف التحديث التلقائي",
+                            target.conversation_id,
+                        )
+                        self._deactivate(target, superseded=True)
+                        return
+                    if outcome == "permanent":
+                        self._deactivate(target, superseded=True)
+                        return
+                    if outcome == "transient":
+                        self._defer(target, "فشل مؤقت في تعديل رسالة تيليجرام")
+                        return
 
             # Re-check again before committing the result/cache. A superseded target
             # must never write its old fingerprint or exchange into the new target.
@@ -299,6 +374,10 @@ class ConversationRefreshService:
                 return
             if not self._finish(target, fingerprint, terminal):
                 self._release(target)
+                return
+            if not self._finished_target_still_current(target):
+                # A prompt-immediate/navigation/delete may have changed the row
+                # after our CAS finish but before the cache write.
                 return
             self._remember_exchange(target.conversation_id, user_text, reply)
         except asyncio.CancelledError:
@@ -310,54 +389,60 @@ class ConversationRefreshService:
             )
             self._defer(target, "خطأ غير متوقع")
 
-    def _current_target(self, target: ConversationView) -> ConversationView | None:
-        """Re-read the durable row and reject an inactive/superseded snapshot.
+    def _ensure_lease(self, target: ConversationView) -> ConversationView | None:
+        """Claim an unleased compatibility target before any refresh work.
 
-        An owned snapshot must match the exact lease/generation it claimed. It must
-        never adopt a newer worker's lease; only unleased compatibility callers may
-        use the freshly read row.
+        Production workers already pass a leased target. Direct compatibility
+        callers are upgraded to the same ownership model; if another holder owns
+        the row, or it is inactive/superseded/deleted, this returns None.
         """
         view_id = getattr(target, "view_id", None)
         if view_id is None:
-            row = self.db.get_conversation_view(target.telegram_id, target.conversation_id)
-        else:
-            row = self.db.get_conversation_view_by_id(view_id)
+            return None
+        if getattr(target, "claimed", False) and getattr(target, "lease_token", None):
+            return target
+        try:
+            return self.db.claim_conversation_view(
+                view_id=view_id,
+                now=self.now_iso(),
+                lease_until=self.deadline(REFRESH_LEASE_SECONDS),
+            )
+        except Exception as exc:  # noqa: BLE001 — a failed claim must not edit
+            log.warning(
+                "تعذّر حجز تحديث الشات %s (%s)",
+                target.conversation_id, type(exc).__name__,
+            )
+            return None
+
+    def _current_target(self, target: ConversationView) -> ConversationView | None:
+        """Re-read the durable row and reject an inactive/superseded snapshot.
+
+        Every refresh now carries an explicit lease. A target may only continue
+        when its exact lease, target token, and generation are still current.
+        """
+        view_id = getattr(target, "view_id", None)
+        lease_token = getattr(target, "lease_token", None)
+        if view_id is None or not lease_token:
+            return None
+        row = self.db.get_conversation_view_by_id(view_id)
         if row is None or not row.active or row.superseded:
             return None
-        if target.target_token and row.target_token != target.target_token:
+        if row.target_token != target.target_token:
             return None
-        lease_token = getattr(target, "lease_token", None)
-        if lease_token:
-            if (
-                row.lease_token != lease_token
-                or row.generation != getattr(target, "generation", None)
-            ):
-                return None
-            return target
-        if row.lease_token is not None:
+        if row.lease_token != lease_token or row.generation != target.generation:
             return None
-        return row
+        return target
 
     def _is_current(self, target: ConversationView) -> bool:
         view_id = getattr(target, "view_id", None)
-        if view_id is None:
-            return False
         lease_token = getattr(target, "lease_token", None)
-        if lease_token:
-            return self.db.is_conversation_view_current(
-                view_id=view_id,
-                target_token=target.target_token,
-                generation=target.generation,
-                lease_token=lease_token,
-            )
-        # Compatibility path for direct service tests/callers without a worker lease.
-        row = self.db.get_conversation_view_by_id(view_id)
-        return bool(
-            row is not None
-            and row.active
-            and not row.superseded
-            and row.lease_token is None
-            and row.target_token == target.target_token
+        if view_id is None or not lease_token:
+            return False
+        return self.db.is_conversation_view_current(
+            view_id=view_id,
+            target_token=target.target_token,
+            generation=target.generation,
+            lease_token=lease_token,
         )
 
     def _release(self, target: ConversationView) -> None:
@@ -377,27 +462,28 @@ class ConversationRefreshService:
 
     def _finish(self, target: ConversationView, fingerprint: str, terminal: bool) -> bool:
         lease_token = getattr(target, "lease_token", None)
+        if lease_token is None or target.view_id is None:
+            return False
         next_check = None if terminal else self.deadline(REFRESH_INTERVAL_SECONDS)
-        if lease_token and target.view_id is not None:
-            return self.db.finish_conversation_view_refresh_owned(
-                view_id=target.view_id,
-                target_token=target.target_token,
-                generation=target.generation,
-                lease_token=lease_token,
-                last_fingerprint=fingerprint,
-                active=not terminal,
-                next_check_at=next_check,
-                now=self.now_iso(),
-            )
-        self.db.finish_conversation_view_refresh(
-            telegram_id=target.telegram_id,
-            conversation_id=target.conversation_id,
+        return self.db.finish_conversation_view_refresh_owned(
+            view_id=target.view_id,
+            target_token=target.target_token,
+            generation=target.generation,
+            lease_token=lease_token,
             last_fingerprint=fingerprint,
             active=not terminal,
             next_check_at=next_check,
             now=self.now_iso(),
         )
-        return True
+
+    def _finished_target_still_current(self, target: ConversationView) -> bool:
+        row = self.db.get_conversation_view_by_id(target.view_id)
+        return bool(
+            row is not None
+            and row.target_token == target.target_token
+            and row.generation == target.generation + 1
+            and not row.superseded
+        )
 
     def _remember_exchange(self, conversation_id: str, user_text, reply) -> None:
         cache = self._exchange_cache
@@ -423,6 +509,8 @@ class ConversationRefreshService:
             message = str(exc).lower()
             if "not modified" in message:
                 return "ok", None
+            if "too long" in message:
+                return "oversized", None
             if any(marker in message for marker in _PERMANENT_EDIT_MARKERS):
                 return "permanent", None
             return "transient", None
@@ -444,25 +532,19 @@ class ConversationRefreshService:
         )
         next_check = self.deadline(delay)
         lease_token = getattr(target, "lease_token", None)
+        if lease_token is None or target.view_id is None:
+            return
         try:
-            if lease_token and target.view_id is not None:
-                changed = self.db.defer_conversation_view_refresh_owned(
-                    view_id=target.view_id,
-                    target_token=target.target_token,
-                    generation=target.generation,
-                    lease_token=lease_token,
-                    next_check_at=next_check,
-                    now=self.now_iso(),
-                )
-                if not changed:
-                    self._release(target)
-            else:
-                self.db.defer_conversation_view_refresh(
-                    telegram_id=target.telegram_id,
-                    conversation_id=target.conversation_id,
-                    next_check_at=next_check,
-                    now=self.now_iso(),
-                )
+            changed = self.db.defer_conversation_view_refresh_owned(
+                view_id=target.view_id,
+                target_token=target.target_token,
+                generation=target.generation,
+                lease_token=lease_token,
+                next_check_at=next_check,
+                now=self.now_iso(),
+            )
+            if not changed:
+                self._release(target)
         except Exception as exc:  # noqa: BLE001 — DB failure must not become success
             log.warning(
                 "تعذّر تأجيل تحديث الشات %s (%s) — %s",
@@ -473,25 +555,19 @@ class ConversationRefreshService:
         self, target: ConversationView, *, superseded: bool = False
     ) -> None:
         lease_token = getattr(target, "lease_token", None)
+        if lease_token is None or target.view_id is None:
+            return
         try:
-            if lease_token and target.view_id is not None:
-                changed = self.db.deactivate_conversation_view_owned(
-                    view_id=target.view_id,
-                    target_token=target.target_token,
-                    generation=target.generation,
-                    lease_token=lease_token,
-                    now=self.now_iso(),
-                    superseded=superseded,
-                )
-                if not changed:
-                    self._release(target)
-            else:
-                self.db.deactivate_conversation_view(
-                    target.telegram_id,
-                    target.conversation_id,
-                    self.now_iso(),
-                    superseded=superseded,
-                )
+            changed = self.db.deactivate_conversation_view_owned(
+                view_id=target.view_id,
+                target_token=target.target_token,
+                generation=target.generation,
+                lease_token=lease_token,
+                now=self.now_iso(),
+                superseded=superseded,
+            )
+            if not changed:
+                self._release(target)
         except Exception as exc:  # noqa: BLE001 — DB failure must not become success
             log.warning(
                 "تعذّر إيقاف تحديث الشات %s (%s)",

@@ -792,6 +792,10 @@ class ConversationView:
     generation: int = 0
     lease_token: str | None = None
     lease_until: str | None = None
+    # Transient: true only for a snapshot returned by an atomic claim. It is
+    # never persisted and prevents a fresh row read from being mistaken for
+    # ownership of someone else's live lease.
+    claimed: bool = False
 
 
 @dataclass
@@ -1796,38 +1800,52 @@ class Database:
         # durable per-message view_id and token/generation/lease columns.
         view_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(conversation_views)")}
         if view_cols and "view_id" not in view_cols:
-            self._conn.execute("DROP INDEX IF EXISTS idx_conversation_views_due")
-            self._conn.execute("DROP INDEX IF EXISTS idx_conversation_views_active_message")
-            self._conn.execute(
-                "ALTER TABLE conversation_views RENAME TO conversation_views_legacy"
-            )
-            self._conn.executescript(CONVERSATION_VIEWS_TABLE_SQL)
-            legacy_cols = {
-                r["name"]
-                for r in self._conn.execute("PRAGMA table_info(conversation_views_legacy)")
-            }
-            lease_expr = "lease_until" if "lease_until" in legacy_cols else "NULL"
-            self._conn.execute(
-                "INSERT INTO conversation_views "
-                "(telegram_id, conversation_id, chat_id, message_id, target_token, "
-                " last_fingerprint, active, superseded, failures, generation, next_check_at, "
-                " lease_token, lease_until, created_at, updated_at) "
-                "SELECT telegram_id, conversation_id, chat_id, message_id, "
-                "       lower(hex(randomblob(16))), last_fingerprint, active, 0, failures, "
-                f"       0, next_check_at, NULL, {lease_expr}, created_at, updated_at "
-                "FROM conversation_views_legacy"
-            )
-            # The old schema had no uniqueness on (chat_id, message_id). Keep only the
-            # newest row per message so the partial unique index can be built and an
-            # older inactive row can never be reactivated by a later prompt.
-            self._conn.execute(
-                "UPDATE conversation_views SET active=0, superseded=1, next_check_at=NULL "
-                "WHERE view_id NOT IN ("
-                "  SELECT MAX(view_id) FROM conversation_views "
-                "  GROUP BY chat_id, message_id"
-                ")"
-            )
-            self._conn.execute("DROP TABLE conversation_views_legacy")
+            # Keep the rename/copy/drop as one SQLite transaction. A crash must not
+            # leave a half-created new table beside an orphaned legacy table.
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute("DROP INDEX IF EXISTS idx_conversation_views_due")
+                self._conn.execute("DROP INDEX IF EXISTS idx_conversation_views_active_message")
+                self._conn.execute(
+                    "ALTER TABLE conversation_views RENAME TO conversation_views_legacy"
+                )
+                self._conn.execute(CONVERSATION_VIEWS_TABLE_SQL)
+                legacy_cols = {
+                    r["name"]
+                    for r in self._conn.execute("PRAGMA table_info(conversation_views_legacy)")
+                }
+                lease_expr = "lease_until" if "lease_until" in legacy_cols else "NULL"
+                self._conn.execute(
+                    "INSERT INTO conversation_views "
+                    "(telegram_id, conversation_id, chat_id, message_id, target_token, "
+                    " last_fingerprint, active, superseded, failures, generation, next_check_at, "
+                    " lease_token, lease_until, created_at, updated_at) "
+                    "SELECT telegram_id, conversation_id, chat_id, message_id, "
+                    "       lower(hex(randomblob(16))), last_fingerprint, active, 0, failures, "
+                    f"       0, next_check_at, NULL, {lease_expr}, created_at, updated_at "
+                    "FROM conversation_views_legacy"
+                )
+                # The old schema had no uniqueness on (chat_id, message_id). Keep the
+                # deterministically newest row per message (updated_at, then view_id)
+                # so the partial unique index can be built and an older inactive row
+                # can never be reactivated by a later prompt.
+                self._conn.execute(
+                    "UPDATE conversation_views SET active=0, superseded=1, next_check_at=NULL "
+                    "WHERE EXISTS ("
+                    "  SELECT 1 FROM conversation_views newer "
+                    "  WHERE newer.chat_id=conversation_views.chat_id "
+                    "    AND newer.message_id=conversation_views.message_id "
+                    "    AND (newer.updated_at>conversation_views.updated_at "
+                    "         OR (newer.updated_at=conversation_views.updated_at "
+                    "             AND newer.view_id>conversation_views.view_id))"
+                    ")"
+                )
+                self._conn.execute("DROP TABLE conversation_views_legacy")
+            except Exception:
+                self._conn.rollback()
+                raise
+            else:
+                self._conn.commit()
         columns = {r["name"] for r in self._conn.execute("PRAGMA table_info(watched)")}
         if "chat_id" not in columns:
             self._conn.execute("ALTER TABLE watched ADD COLUMN chat_id INTEGER")
@@ -4318,7 +4336,7 @@ class Database:
         "lease_token, lease_until"
     )
 
-    def _view_from_row(self, row) -> ConversationView:
+    def _view_from_row(self, row, *, claimed: bool = False) -> ConversationView:
         return ConversationView(
             int(row["telegram_id"]),
             row["conversation_id"],
@@ -4334,6 +4352,7 @@ class Database:
             generation=int(row["generation"]),
             lease_token=row["lease_token"],
             lease_until=row["lease_until"],
+            claimed=claimed,
         )
 
     def upsert_conversation_view(
@@ -4422,6 +4441,27 @@ class Database:
             )
             return int(cur.rowcount)
 
+    def claim_conversation_view(
+        self, *, view_id: int, now: str, lease_until: str
+    ) -> ConversationView | None:
+        """Lease one exact view for a direct/compatibility refresh caller.
+
+        The direct service path is upgraded to the same ownership model as the
+        worker. The CAS refuses an inactive/superseded view or a live lease held
+        by another caller; an expired lease may be replaced.
+        """
+        lease_token = secrets.token_hex(16)
+        row = self._conn.execute(
+            "UPDATE conversation_views SET lease_token=?, lease_until=?, "
+            "generation=generation+1, updated_at=? "
+            "WHERE view_id=? AND active=1 AND superseded=0 "
+            "  AND (lease_until IS NULL OR lease_until<=?) "
+            f"RETURNING {self._VIEW_COLUMNS}",
+            (lease_token, lease_until, now, int(view_id), now),
+        ).fetchone()
+        self._conn.commit()
+        return None if row is None else self._view_from_row(row, claimed=True)
+
     def claim_due_conversation_view(
         self, now: str, lease_until: str
     ) -> ConversationView | None:
@@ -4441,7 +4481,7 @@ class Database:
             (lease_token, lease_until, now, now, now),
         ).fetchone()
         self._conn.commit()
-        return None if row is None else self._view_from_row(row)
+        return None if row is None else self._view_from_row(row, claimed=True)
 
     def is_conversation_view_current(
         self,
@@ -4564,58 +4604,6 @@ class Database:
                 (now, int(chat_id), int(message_id)),
             )
             return int(cur.rowcount)
-
-    def finish_conversation_view_refresh(
-        self,
-        *,
-        telegram_id: int,
-        conversation_id: str,
-        last_fingerprint: str | None,
-        active: bool,
-        next_check_at: str | None,
-        now: str,
-    ) -> None:
-        """Compatibility wrapper for callers without a lease; worker uses *_owned."""
-        with self._conn:
-            self._conn.execute(
-                "UPDATE conversation_views SET last_fingerprint=?, active=?, "
-                "failures=0, next_check_at=?, lease_token=NULL, lease_until=NULL, "
-                "generation=generation+1, updated_at=? "
-                "WHERE telegram_id=? AND conversation_id=? AND active=1 AND superseded=0",
-                (
-                    last_fingerprint, 1 if active else 0, next_check_at, now,
-                    int(telegram_id), conversation_id,
-                ),
-            )
-
-    def defer_conversation_view_refresh(
-        self,
-        *,
-        telegram_id: int,
-        conversation_id: str,
-        next_check_at: str,
-        now: str,
-    ) -> None:
-        """Compatibility wrapper; worker uses defer_conversation_view_refresh_owned."""
-        with self._conn:
-            self._conn.execute(
-                "UPDATE conversation_views SET failures=failures+1, next_check_at=?, "
-                "lease_token=NULL, lease_until=NULL, generation=generation+1, updated_at=? "
-                "WHERE telegram_id=? AND conversation_id=? AND active=1 AND superseded=0",
-                (next_check_at, now, int(telegram_id), conversation_id),
-            )
-
-    def deactivate_conversation_view(
-        self, telegram_id: int, conversation_id: str, now: str, *, superseded: bool = False
-    ) -> None:
-        """Compatibility wrapper; worker uses deactivate_conversation_view_owned."""
-        with self._conn:
-            self._conn.execute(
-                "UPDATE conversation_views SET active=0, superseded=?, next_check_at=NULL, "
-                "lease_token=NULL, lease_until=NULL, generation=generation+1, updated_at=? "
-                "WHERE telegram_id=? AND conversation_id=? AND active=1",
-                (1 if superseded else 0, now, int(telegram_id), conversation_id),
-            )
 
     def get_conversation_view(
         self, telegram_id: int, conversation_id: str

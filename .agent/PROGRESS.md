@@ -6637,3 +6637,43 @@ worker/Canary; SCHEMA approval, AUTH, LIFECYCLE/TTL, and INTEGRATION remain pend
 - Terminal completion vs newer prompt-success: newer prompt immediacy wins because it
   clears the lease and bumps generation; stale terminal completion is rejected.
 - No live Telegram/OpenHands call, no Python 3.11 local run, no commit/push/PR/deploy.
+
+## OHB2-AUTOMATIC-REFRESH-R01-R04-REMEDIATION (2026-11-28)
+
+### Acceptance criteria
+1. Refresh and screen-replacement edits for one Telegram message are serialized by
+   `(chat_id, message_id)`; different messages remain independent.
+2. Navigation invalidates the old refresh target before replacing its screen; if
+   durable invalidation fails, the navigation fails closed (no new screen).
+3. A direct/unleased `ConversationRefreshService.refresh` acquires a real lease and
+   cannot edit or write schedule/cache after prompt-immediate, supersede, delete, or
+   a newer target generation.
+4. Long/split views are not tracked as refresh targets; a tracked view that grows
+   past Telegram limits stops refresh instead of retrying or truncating, and a long
+   replacement retires the old target.
+5. Legacy `conversation_views` migration is transactional and keeps the newest row
+   per message deterministically.
+
+### Implementation
+- `bot/message_edit.py`: per-message `asyncio.Lock` coordinator, reference-counted,
+  cancellation-safe cleanup; process-wide accessor.
+- `bot/refresh.py`: refresh edit under coordinator + final lease/generation check;
+  unleased callers claim exactly one view; cache write guarded after CAS finish;
+  long-view fail-closed behavior; bounded fail-closed invalidation retry.
+- `bot/handlers.py`: all callback edits go through the coordinator; all navigation
+  invalidation is awaited and locked before screen replacement.
+- `bot/db.py`: removed unleased view write wrappers; exact-view claim; transient
+  claimed marker; transactional legacy migration with newest-row winner.
+- `docs/OPERATIONS_RUNBOOK.md`: lock ordering, fail-closed rules, long-view policy,
+  migration and startup-only retention.
+- `tests/test_automatic_refresh_r01_r04_remediation.py`: 22 regression tests covering
+  races, failures, cancellation, unleased refresh, long views, cache guard and
+  migration ordering.
+
+### Verification
+- Full Python: **4407 passed, 0 failed** (77 warnings).
+- Focused refresh tests: **64 passed** (existing + new).
+- Frontend: **272 passed, 0 failed**; `npm run lint` and `npm run build` pass.
+- `pyflakes`: 0; Bandit High: 0; pip-audit: no known vulnerabilities;
+  `git diff --check`: clean.
+- No live Telegram/OpenHands calls, no push/PR/deploy.
