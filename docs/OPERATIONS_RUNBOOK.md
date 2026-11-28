@@ -167,15 +167,35 @@ python -m pytest -q
   - **التنفيذ الخارجي:** حتى مع worker مشغّل، لا يبدأ أي تنفيذ خارجي إلا بعد حجز
     دورة صريح (memberships/SHA) واجتياز تحقق الفرع/الـSHA والـCI. `REVIEW_ENABLED=1`
     وحده **لا** يشغّل collector ولا provider ولا يرسل تقريرًا.
-- **الترحيلات (`_migrate`):** إضافية وغير مدمّرة فقط (`ALTER TABLE … ADD COLUMN`) —
-  بتضيف أعمدة جديدة للقواعد القديمة من غير فقد بيانات. الأعمدة المُدارة:
-  `watched.chat_id`, `user_state.awaiting_at`, `user_state.awaiting_title`,
-  `watched.submitted_at`, `watched.added_at`, `watched.retry_count`, `outbox.attempts`,
-  `auto_reviews.chat_id/scope_policy/lifecycle_state/worker_state/delivery_state/attempts/
-  max_attempts/next_attempt_at/delivery_outbox_id/membership_count/implementation_report/
-  delivery_text`, و`outbox.review_id/review_delivery_key/review_kind/review_version/
-  review_report_id`.
-  الجداول الجديدة بتتعمل بـ `IF NOT EXISTS`. **مفيش حذف ولا إعادة كتابة للبيانات.**
+- **الترحيلات (`_migrate`):** ليست كلها إضافية. فيه نوعان:
+  - **ترحيلات إضافية:** `ALTER TABLE … ADD COLUMN` لأعمدة جديدة، و`CREATE TABLE
+    IF NOT EXISTS` للجداول الجديدة. الأعمدة المُدارة:
+    `watched.chat_id`, `user_state.awaiting_at`, `user_state.awaiting_title`,
+    `watched.submitted_at`, `watched.added_at`, `watched.retry_count`, `outbox.attempts`,
+    `auto_reviews.chat_id/scope_policy/lifecycle_state/worker_state/delivery_state/attempts/
+    max_attempts/next_attempt_at/delivery_outbox_id/membership_count/implementation_report/
+    delivery_text`, و`outbox.review_id/review_delivery_key/review_kind/review_version/
+    review_report_id`. دي بتضيف أعضاء/جداول من غير حذف صفوف.
+  - **إعادة بناء `conversation_views` القديمة:** لو الجدول القديم مش فيه `view_id`،
+    `bot/db.py::_migrate` مش بيضيف عمود؛ بيعمل **rebuild** للجدول كله:
+    يبدأ `BEGIN IMMEDIATE`، يشيل الفهارس القديمة، يعيد تسمية الجدول إلى
+    `conversation_views_legacy`، ينشئ `conversation_views` بالـ schema الجديدة، وينسخ
+    **كل** الصفوف القديمة (`INSERT … SELECT`) مع `view_id` جديد و`target_token` عشوائي،
+    و`lease_token=NULL`، ونسخ `lease_until` لو كان موجودًا. بعد النسخ، أي صف ليس الأحدث
+    لنفس `(chat_id, message_id)` بيتعلّم `active=0, superseded=1, next_check_at=NULL`
+    (الأحدث بـ `updated_at` ثم `view_id`)؛ الصفوف القديمة **لا تُحذف** في هذه الخطوة،
+    لكنها تبقى inactive/superseded. بعد ذلك يتم `DROP TABLE conversation_views_legacy`
+    بعد نجاح النسخ. العملية كلها داخل معاملة واحدة: أي exception ⇒ `rollback`، ونجاح
+    كل الخطوات ⇒ `commit`. لو العملية انقطعت قبل الـ commit، SQLite بترجع للجدول القديم؛
+    لو اكتمل الـ commit فالجدول الجديد هو المصدر. **مفيش ادعاء بأن crash بعد commit
+    يحتفظ بالجدول القديم**: الـ commit هو حدّ الانتقال. الصفوف inactive الأقدم من 30 يومًا
+    ممكن تتقلّم لاحقًا عند الإقلاع فقط حسب retention، وده ليس جزءًا من الترحيل.
+  - **التحقق:** الاختبارات `test_old_conversation_view_schema_is_migrated`،
+    `test_migration_keeps_newest_updated_at_not_insertion_order`، و
+    `test_deletion_removes_view_rows_and_retention_prunes_only_inactive` تغطي نسخ
+    الصفوف، اختيار الأحدث، وعدم تقليم target النشط. قبل أي تشغيل إنتاجي على قاعدة قديمة،
+    خُد نسخة احتياطية من ملف SQLite (أو استخدم `VACUUM INTO` على نسخة منفصلة) وافحص
+    `PRAGMA table_info(conversation_views)` بعد الإقلاع.
 - **الصيانة عند بدء التشغيل (`run_startup_maintenance`):** فحص سريع (`PRAGMA
   quick_check`) ثم `PRAGMA optimize` + `incremental_vacuum` (لو متاح) + `wal_checkpoint(TRUNCATE)`.
   - لو القاعدة سليمة: البوت يكمل.

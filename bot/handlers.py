@@ -782,6 +782,8 @@ def _classify_failure(exc: BaseException) -> str:
       أو **شبكي/تيليجرام عابر** (`RetryAfter`/`TimedOut`/`NetworkError`/`asyncio.TimeoutError`/
       `httpx.TransportError`/`OSError` شبكي مُقيَّد) ⇒ `FAILED_TRANSIENT` (إعادة محاولة الدفعة).
       `BadRequest` **مش** عابر (رفض نهائي)، حتى لو فرع من `NetworkError`.
+      `RefreshInvalidationError` بعد استنفاد ميزانية BUSY/LOCKED يحمل `transient=True`
+      ⇒ `FAILED_TRANSIENT`؛ الفشل الدائم في الإلغاء يظل `FAILED_PERMANENT`.
     - أي حاجة تانية (فشل دائم/برمجي/رفض غير متوقّع) ⇒ `FAILED_PERMANENT`.
 
     التفويض للسياسة المشتركة في `update_outcomes.classify_error_outcome` (مصدر واحد)
@@ -791,6 +793,7 @@ def _classify_failure(exc: BaseException) -> str:
         return update_outcomes.PARTIAL_OR_UNKNOWN
     transient = (
         (isinstance(exc, sqlite3.Error) and _is_transient_sqlite_error(exc))
+        or getattr(exc, "transient", False) is True
         or (isinstance(exc, ApiError) and not outbox.is_permanent(exc))
         or _is_transient_operational_error(exc)
     )

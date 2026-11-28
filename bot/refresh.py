@@ -86,7 +86,16 @@ def view_fingerprint(text: str, markup) -> str:
 
 
 class RefreshInvalidationError(RuntimeError):
-    """A screen replacement could not durably invalidate its old refresh target."""
+    """A screen replacement could not durably invalidate its old refresh target.
+
+    ``transient`` is set only when the bounded BUSY/LOCKED retry budget was
+    exhausted. Permanent and unexpected database failures keep it false so the
+    handler failure classifier does not turn them into retryable work.
+    """
+
+    def __init__(self, message: str, *, transient: bool = False) -> None:
+        super().__init__(message)
+        self.transient = bool(transient)
 
 
 class ConversationRefreshService:
@@ -239,9 +248,15 @@ class ConversationRefreshService:
                     now=now,
                 )
             except Exception as exc:  # noqa: BLE001 — classify before deciding
-                if not is_transient_sqlite_error(exc) or attempt >= len(DEDUPE_RETRY_DELAYS):
+                transient = is_transient_sqlite_error(exc)
+                if not transient:
                     raise RefreshInvalidationError(
                         "تعذّر تثبيت إلغاء هدف تحديث الرسالة"
+                    ) from exc
+                if attempt >= len(DEDUPE_RETRY_DELAYS):
+                    raise RefreshInvalidationError(
+                        "تعذّر تثبيت إلغاء هدف تحديث الرسالة بعد استنفاد ميزانية BUSY/LOCKED",
+                        transient=True,
                     ) from exc
                 delay = DEDUPE_RETRY_DELAYS[attempt]
                 attempt += 1
@@ -277,10 +292,24 @@ class ConversationRefreshService:
             self.wake()
 
     async def refresh(self, target: ConversationView) -> None:
-        """Fetch fresh data, edit only on change, and persist the next schedule."""
-        target = self._ensure_lease(target)
-        if target is None:
+        """Run one refresh while guaranteeing cleanup of the lease it owns.
+
+        ``_refresh_leased`` performs the existing fetch/edit/schedule flow. This
+        wrapper is the ownership boundary: whatever path exits the inner flow,
+        including cancellation, a database error before its own try block, or an
+        early validation return, the exact lease acquired here is released using
+        its token CAS. A newer lease or a cleared lease is never touched.
+        """
+        leased_target = self._ensure_lease(target)
+        if leased_target is None:
             return
+        try:
+            await self._refresh_leased(leased_target)
+        finally:
+            self._release(leased_target)
+
+    async def _refresh_leased(self, target: ConversationView) -> None:
+        """Fetch fresh data, edit only on change, and persist the next schedule."""
         target = self._current_target(target)
         if target is None:
             return
@@ -445,20 +474,34 @@ class ConversationRefreshService:
             lease_token=lease_token,
         )
 
-    def _release(self, target: ConversationView) -> None:
+    def _release(self, target: ConversationView) -> bool:
+        """Release this target's lease if it is still the current owner.
+
+        The database update matches the exact lease token, so a newer worker's
+        lease is never cleared. The return value is diagnostic only: a cleared
+        or replaced lease is an expected no-op, while a database failure is
+        logged and remains observable rather than being reported as success.
+        """
         view_id = getattr(target, "view_id", None)
         lease_token = getattr(target, "lease_token", None)
         if view_id is None or not lease_token:
-            return
+            return False
         try:
-            self.db.release_conversation_view_lease(
+            released = self.db.release_conversation_view_lease(
                 view_id=view_id, lease_token=lease_token, now=self.now_iso()
             )
         except Exception as exc:  # noqa: BLE001
             log.warning(
-                "تعذّر تحرير حجز تحديث الشات %s (%s)",
+                "تعذّر تحرير حجز تحديث الشات %s (%s) — الحجز لم يُؤكَّد تحريره",
                 target.conversation_id, type(exc).__name__,
             )
+            return False
+        if not released:
+            log.debug(
+                "حجز تحديث الشات %s لم يُحرَّر: انتهى/استُبدل بحجز أحدث",
+                target.conversation_id,
+            )
+        return bool(released)
 
     def _finish(self, target: ConversationView, fingerprint: str, terminal: bool) -> bool:
         lease_token = getattr(target, "lease_token", None)
