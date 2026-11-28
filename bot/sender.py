@@ -31,13 +31,18 @@ async def _send_report_file(chat_id: int, text: str, bot) -> None:
     await bot.send_document(chat_id=chat_id, document=InputFile(buffer, filename="report.md"))
 
 
-async def send_long(chat_id: int, text: str, bot) -> None:
+async def send_long(chat_id: int, text: str, bot):
+    """Send a long text; return the last actual text message (None for a file)."""
     parts = split_message(text)
     if len(parts) <= MAX_PARTS:
+        last = None
         for part in parts:
-            await bot.send_message(chat_id=chat_id, text=escape_html(part), parse_mode=ParseMode.HTML)
-        return
+            last = await bot.send_message(
+                chat_id=chat_id, text=escape_html(part), parse_mode=ParseMode.HTML
+            )
+        return last
     await _send_report_file(chat_id, text, bot)
+    return None
 
 
 async def send_copyable(chat_id: int, text: str, bot) -> None:

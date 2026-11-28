@@ -155,31 +155,31 @@ async def _safe_edit(query, text: str, **kwargs) -> bool:
         return False
 
 
-async def _edit_or_send(query, text: str, chat_id: int, bot, **kwargs) -> bool:
+async def _edit_or_send(
+    query, text: str, chat_id: int, bot, *, return_message: bool = False, **kwargs
+):
     """يعدّل الرسالة الحالية؛ ولو طويلة عليها يبعتها مقسّمة من جديد.
 
     بيرجّع True لو اتعرض العرض فعلاً (اتعدّلت الرسالة أو اتبعتت من جديد)، وFalse لو
-    فشل العرض (خطأ تيليجرام زي رسالة قديمة/مش قابلة للتعديل، أو فشل الإرسال البديل عند
-    الطول). الفشل بيتسجّل بنوعه بس (من غير نص الاستثناء، ممكن يحتوي أسرار) عشان ما يتخفيش
-    — بس ما يوقّفش معالج الـ callback (مفيش استثناء بيطلع للمستدعي). اللي بينده لازم ياخد
-    باله من القيمة الراجعة قبل أي تغيير في الحالة.
+    فشل العرض. مع `return_message=True` بيرجّع `(displayed, actual_message_or_None)`
+    عشان الـ target يسجّل الرسالة الفعلية، لا رسالة الكولباك القديمة، في مسار الطول.
     """
     try:
         await query.edit_message_text(escape_html(text), parse_mode=ParseMode.HTML, **kwargs)
-        return True
+        return (True, getattr(query, "message", None)) if return_message else True
     except Exception as exc:  # noqa: BLE001
         message = str(exc).lower()
         if "not modified" in message:
-            return True  # العرض نفسه موجود بالفعل — مش فشل
+            return (True, getattr(query, "message", None)) if return_message else True
         if "too long" in message:
             try:
-                await send_long(chat_id, text, bot)
-                return True
+                sent = await send_long(chat_id, text, bot)
+                return (True, sent) if return_message else True
             except Exception as send_exc:  # noqa: BLE001 — فشل الإرسال البديل = فشل عرض
                 log.warning("فشل إرسال العرض البديل (%s)", type(send_exc).__name__)
-                return False
+                return (False, None) if return_message else False
         log.warning("فشل عرض الشات (%s)", type(exc).__name__)
-        return False
+        return (False, None) if return_message else False
 
 
 async def _display_conversation_view(
@@ -198,12 +198,13 @@ async def _display_conversation_view(
     الإرسال البديل الطويل ما رجّعش كائن رسالة.
     """
     if q is not None:
-        displayed = await _edit_or_send(
-            q, text, q.message.chat_id, context.bot, reply_markup=reply_markup
+        displayed, message = await _edit_or_send(
+            q, text, q.message.chat_id, context.bot,
+            return_message=True, reply_markup=reply_markup,
         )
         if not return_message:
             return displayed
-        return displayed, (q.message if displayed else None)
+        return displayed, (message if displayed else None)
     try:
         message = await update.message.reply_text(
             escape_html(text), parse_mode=ParseMode.HTML, reply_markup=reply_markup
@@ -212,8 +213,8 @@ async def _display_conversation_view(
     except Exception as exc:  # noqa: BLE001 — فشل العرض يُبلَّغ، لا يُخفى
         if "too long" in str(exc).lower():
             try:
-                await send_long(update.effective_chat.id, text, context.bot)
-                return (True, None) if return_message else True
+                sent = await send_long(update.effective_chat.id, text, context.bot)
+                return (True, sent) if return_message else True
             except Exception as send_exc:  # noqa: BLE001 — فشل الإرسال البديل = فشل عرض
                 log.warning("فشل إرسال العرض البديل (%s)", type(send_exc).__name__)
                 return (False, None) if return_message else False
@@ -364,6 +365,26 @@ async def _authorized_conversation(
         client, context, conversation_id, allow_deleted=allow_deleted
     )
     return conv, message
+
+
+def _invalidate_refresh_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Stop tracking a conversation view before its message is reused.
+
+    Every handler that edits/replaces the callback message with another screen must
+    call this first. The refresh worker then cannot edit that message after the
+    navigation, and a later prompt cannot reactivate the superseded target.
+    """
+    q = getattr(update, "callback_query", None)
+    message = getattr(q, "message", None) if q is not None else None
+    user = getattr(update, "effective_user", None)
+    service = context.bot_data.get("refresh_service")
+    if service is None or message is None or user is None:
+        return
+    service.supersede_message(
+        telegram_id=getattr(user, "id", None),
+        chat_id=getattr(message, "chat_id", None),
+        message_id=getattr(message, "message_id", None),
+    )
 
 
 def _register_conversation_view(
@@ -1047,6 +1068,7 @@ async def app_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def app_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
+    _invalidate_refresh_target(update, context)
     await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
@@ -1067,6 +1089,7 @@ async def app_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
+    _invalidate_refresh_target(update, context)
     await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
@@ -1107,6 +1130,7 @@ async def notifications_command(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def notifications_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
+    _invalidate_refresh_target(update, context)
     await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
@@ -1122,6 +1146,7 @@ async def notifications_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def notifications_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
+    _invalidate_refresh_target(update, context)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
         _authorization_ignored(update, context)
@@ -1167,6 +1192,7 @@ def _without_deleted(db, items: list[dict]) -> list[dict]:
 
 async def list_conversations(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
+    _invalidate_refresh_target(update, context)
     await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
@@ -1397,6 +1423,7 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def open_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
+    _invalidate_refresh_target(update, context)
     await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
@@ -1680,6 +1707,7 @@ async def send_reply_txt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def list_watches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
+    _invalidate_refresh_target(update, context)
     await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
@@ -1717,6 +1745,7 @@ async def list_watches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def watch_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
+    _invalidate_refresh_target(update, context)
     await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
@@ -1762,6 +1791,7 @@ async def watch_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def unwatch_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
+    _invalidate_refresh_target(update, context)
     await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
@@ -1804,6 +1834,7 @@ async def unwatch_conversation(update: Update, context: ContextTypes.DEFAULT_TYP
 async def delete_conversation_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """OHB2-MINIAPP: يعرض تأكيد حذف الشات **من OpenHands**. تفويض الملكية قبل أي حذف."""
     q = update.callback_query
+    _invalidate_refresh_target(update, context)
     await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
@@ -1839,6 +1870,7 @@ async def delete_conversation_prompt(update: Update, context: ContextTypes.DEFAU
 async def delete_conversation_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """OHB2-MINIAPP: تأكيد حذف الشات **من OpenHands** ثم محليًا. تفويض الملكية إلزامي."""
     q = update.callback_query
+    _invalidate_refresh_target(update, context)
     await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
@@ -1899,6 +1931,7 @@ async def delete_conversation_confirm(update: Update, context: ContextTypes.DEFA
 
 async def show_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
+    _invalidate_refresh_target(update, context)
     await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
@@ -1952,6 +1985,7 @@ async def show_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def show_cost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
+    _invalidate_refresh_target(update, context)
     await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
@@ -1989,6 +2023,7 @@ async def show_cost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
+    _invalidate_refresh_target(update, context)
     await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
@@ -2044,6 +2079,7 @@ async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def show_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
+    _invalidate_refresh_target(update, context)
     await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
@@ -2169,6 +2205,7 @@ async def _render_browser(q, state, dir_index: int, page: int) -> None:
 async def browse_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """فتح متصفح الملفات من زر «الملفات» برمز شات قصير (DEF-010-safe)."""
     q = update.callback_query
+    _invalidate_refresh_target(update, context)
     await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         _authorization_ignored(update, context)
@@ -2217,6 +2254,7 @@ async def browse_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def browse_dir(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
+    _invalidate_refresh_target(update, context)
     await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         _authorization_ignored(update, context)
@@ -2239,6 +2277,7 @@ async def browse_dir(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def browse_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
+    _invalidate_refresh_target(update, context)
     await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         _authorization_ignored(update, context)
@@ -2261,6 +2300,7 @@ async def browse_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def browse_up(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
+    _invalidate_refresh_target(update, context)
     await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         _authorization_ignored(update, context)
@@ -2286,6 +2326,7 @@ async def browse_up(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def browse_root(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
+    _invalidate_refresh_target(update, context)
     await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         _authorization_ignored(update, context)
@@ -2308,6 +2349,7 @@ async def browse_root(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def browse_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """تحديث اللقطة (ملفات اتضافت/اتشالت) مع البقاء في نفس المجلد إن أمكن."""
     q = update.callback_query
+    _invalidate_refresh_target(update, context)
     await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         _authorization_ignored(update, context)
@@ -2359,6 +2401,7 @@ async def browse_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def browse_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
+    _invalidate_refresh_target(update, context)
     await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         _authorization_ignored(update, context)
@@ -2407,6 +2450,7 @@ async def browse_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def browse_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
+    _invalidate_refresh_target(update, context)
     await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         _authorization_ignored(update, context)
@@ -2435,6 +2479,7 @@ async def browse_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def reply_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
+    _invalidate_refresh_target(update, context)
     await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
@@ -3590,6 +3635,7 @@ async def creation_recover(app) -> None:
 
 async def start_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
+    _invalidate_refresh_target(update, context)
     await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
@@ -3619,6 +3665,7 @@ def _repo_nav(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> dict:
 
 async def repos_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
+    _invalidate_refresh_target(update, context)
     await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
@@ -3642,6 +3689,7 @@ async def repos_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def repo_search_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
+    _invalidate_refresh_target(update, context)
     await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
@@ -3701,6 +3749,7 @@ async def _show_repos(
 
 async def pick_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
+    _invalidate_refresh_target(update, context)
     await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.
@@ -3730,6 +3779,7 @@ async def pick_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def new_chat_no_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """شات جديد من غير مستودع (المهمة OHB2: إنشاء شات بمستودع أو بدونه)."""
     q = update.callback_query
+    _invalidate_refresh_target(update, context)
     await _safe_answer(q)
     if not _allowed(update, context.bot_data["config"]):
         # OHB2-MANUAL-POLLING-HANDLER-OUTCOME: رفض تفويض مقصود ⇒ نتيجة صريحة.

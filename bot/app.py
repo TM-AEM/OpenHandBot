@@ -109,6 +109,7 @@ def build_application(config: Config) -> Application:
     report_service = ReviewReportService(db, owner_id=config.owner_id)
     identity = IdentityCache(client)
     browser_cache = BrowserCache()
+    exchange_cache: dict = {}
     refresh_service = ConversationRefreshService(
         client,
         db,
@@ -118,6 +119,8 @@ def build_application(config: Config) -> Application:
             config.mini_app_url if getattr(config, "mini_app_enabled", False) else ""
         ),
         files_cb_factory=lambda cid: f"fbo:{browser_cache.token_for(cid)}",
+        exchange_cache=exchange_cache,
+        exchange_cache_max=handlers.EXCHANGE_CACHE_MAX,
     )
 
     # OHB2-MANUAL-POLLING-OUTCOME: معالج أخطاء PTB يسجّل فشل التحديث **بثبات** (غير مؤهّل
@@ -131,6 +134,7 @@ def build_application(config: Config) -> Application:
     app.bot_data["review_report_service"] = report_service
     app.bot_data["identity_cache"] = (client, identity)
     app.bot_data["file_browser_cache"] = browser_cache
+    app.bot_data["exchange_cache"] = exchange_cache
     app.bot_data["refresh_service"] = refresh_service
     # OHB2-POST-PUB-01/F06: سبب فشل الإقلاع الحاجز (أو None). بيتحدّد في _post_init؛
     # الـ readiness بيقراه عشان يعلن الحالة الحقيقية.
@@ -274,6 +278,18 @@ def build_application(config: Config) -> Application:
             await deletion.reconcile_pending_deletions(client, db)
         except Exception as exc:  # noqa: BLE001 — التسوية ما تمنعش الإقلاع
             log.warning("تسوية الحذف البعيد المعلّق اتخطّت (%s)", type(exc).__name__)
+        # 1.2a) Bounded retention for inactive/superseded conversation-view targets.
+        # Active targets are never touched; deletion removes rows atomically in DB.
+        try:
+            from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+            before = (
+                _dt.now(_tz.utc) - _td(days=db.CONVERSATION_VIEW_RETENTION_DAYS)
+            ).isoformat()
+            removed = db.prune_inactive_conversation_views(before)
+            if removed:
+                log.info("تقليم عروض الشات غير النشطة: اتشال %s صف", removed)
+        except Exception as exc:  # noqa: BLE001 — التقليم غير حرج
+            log.warning("تقليم عروض الشات غير النشطة اتخطّى (%s)", type(exc).__name__)
         # 1.3) OHB2-P0-A4: كنس الـ staging المحلي للدفعات النهائية/المنتهية + رصد منظّم.
         #      يُستدعى من hook الإقلاع **الموجود** (مفيش worker/مجدول/عملية/مالك قاعدة جديد).
         #      محلي فقط (بلا نداء بعيد)؛ idempotent (إعادة الكنس آمنة عند إعادة التشغيل)؛

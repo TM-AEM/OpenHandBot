@@ -6570,3 +6570,70 @@ worker/Canary; SCHEMA approval, AUTH, LIFECYCLE/TTL, and INTEGRATION remain pend
   3.13.15); no live Telegram/OpenHands call. No commit/push/PR/deploy performed.
 - **Status:** `OHB2_REMOVE_CHAT_FORWARDING_AND_CANCEL_COMPLETE` — local verification
   green; independent review not performed.
+
+---
+
+# PROGRESS — OHB2-AUTOMATIC-CONVERSATION-REFRESH-REMEDIATION (2026-11-24)
+
+## Task and provenance
+- **Task ID:** `OHB2-AUTOMATIC-CONVERSATION-REFRESH-REMEDIATION`.
+- **Branch:** `agent/automatic-conversation-refresh`.
+- **Reviewed commit:** `5e893c68eef8935c45f8510cbc65857b966edfc5`; parent
+  `857b8c3aa4ec98edba880bd4a39b8cb2f79e9717` (`feat: auto-refresh active conversation views`).
+- **Goal:** remediate the prior independent review's HIGH display/scheduling failures
+  (F1/F2) and the medium ambiguity/cache/multi-message/load/lifecycle risks without
+  changing unrelated behavior.
+
+## Acceptance criteria
+1. A refresh target is unique per rendered Telegram message; only one active target per
+   `(chat_id, message_id)`; another conversation on the same message supersedes the old
+   target. Same conversation on two messages remains two independent targets.
+2. Every navigation/action that reuses the message supersedes the target before editing;
+   an in-flight or stale worker cannot edit, finish, defer, reactivate, or cache after
+   losing ownership.
+3. Leases use a unique token plus target token/generation; finish/defer/deactivate are
+   CAS against the exact claimed ownership. Prompt-success immediacy cannot be overwritten
+   by an older terminal completion.
+4. Empty metadata is retryable, not deletion proof; confirmed 404/tombstone/unauthorized
+   stop polling; 5xx/429/empty retry with bounded backoff; invalid identifiers stop safely.
+5. Exchange cache stays current for copy/full, never poisons on failure/supersede, and is
+   bounded/isolated per conversation.
+6. Long-message fallback tracks the actual replacement message (not the old callback
+   message); deletion/retention cleanup is bounded; old `(telegram_id, conversation_id)`
+   schema migrates non-destructively.
+7. Full Python/frontend/static/doc-parity/security checks pass; no commit/push/PR unless
+   separately directed.
+
+## Implementation
+- `bot/db.py`: per-message `view_id`/`target_token`/`superseded`/`generation`/lease
+  columns; partial unique active-message index; non-destructive legacy migration; CAS
+  finish/defer/deactivate; message invalidation; deletion-row cleanup; bounded inactive
+  retention; current-target/count helpers.
+- `bot/refresh.py`: re-read target, reject inactive/superseded/stale lease, re-check before
+  edit and before finish; CAS worker writes; `superseded` terminal/retryable classification;
+  exchange cache; explicit `REFRESH_MAX_CONCURRENT=1`.
+- `bot/handlers.py`: `_invalidate_refresh_target` before navigation edits; actual message
+  returned from long fallback; same-message identity preserved.
+- `bot/files.py`: `AMBIGUOUS` status + opt-in `empty_is_ambiguous` for refresh.
+- `bot/app.py`: shared exchange cache; startup retention prune.
+- `bot/sender.py`: return last actual long message.
+- `docs/OPERATIONS_RUNBOOK.md`: target identity/lease/retention semantics.
+- `tests/test_automatic_conversation_refresh_remediation.py`: 21 focused test functions
+  (24 cases including parametrization).
+
+## Verification
+- Full Python: **4385 passed, 0 failed** (77 warnings; 323.00s); focused refresh/
+  navigation/schema/app suite after final polish: **170 passed**.
+- Node frontend: **272 pass / 0 fail**; npm lint and build pass.
+- `pyflakes`: 0; Bandit High: 0; pip-audit: no known vulnerabilities; `git diff --check`
+  clean.
+- Migration verified against a real old schema (one row and duplicate-message cases).
+- In-flight barrier test: supersede while `get_last_exchange` is awaiting ⇒ no edit.
+
+## Decisions / not verified
+- `idle`/`paused` remain non-terminal (existing approved policy in
+  `OHB2-OPENHANDS-WAIT-UNTIL-TERMINAL-STATUS-IMPLEMENTATION-REPORT-20261127`: continue
+  polling); no provider semantics invented. This is documented, not silently changed.
+- Terminal completion vs newer prompt-success: newer prompt immediacy wins because it
+  clears the lease and bumps generation; stale terminal completion is rejected.
+- No live Telegram/OpenHands call, no Python 3.11 local run, no commit/push/PR/deploy.

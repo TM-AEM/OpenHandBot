@@ -101,12 +101,22 @@ python -m pytest -q
     `auto_review_provider_snapshots`, `auto_reviews`, `auto_review_memberships`,
     `auto_review_pending_memberships`, `auto_review_stages`, `auto_review_evidence`,
     `auto_review_leases`, `auto_review_reports`, `auto_review_owner_acceptance`
-    (+ فهارس `idx_outbox_status`, `idx_creation_jobs_status`, `idx_conversation_views_due`).
+    (+ فهارس `idx_outbox_status`, `idx_creation_jobs_status`,
+    `idx_conversation_views_active_message`, `idx_conversation_views_due`).
     اختبار تكافؤ (`NEW-DEF-08`) بيقارن العدد ده مع `bot/db.py` تلقائيًا.
-  - **جدول التحديث التلقائي:** `conversation_views` بيحفظ رسالة العرض
-    (`telegram_id`, `chat_id`, `message_id`)، وبصمة المحتوى، وموعد الفحص التالي، وحالة
-    `active`. ده **جدول جدولة فقط** — ملكية الشات وحالته لسه من OpenHands والتفويض
-    الموجود، ومفيش تغيير في `last_accessed` أو المتابعات.
+  - **جدول التحديث التلقائي:** `conversation_views` بيحفظ **رسالة العرض الواحدة**
+    (`view_id`, `target_token`, `telegram_id`, `chat_id`, `message_id`)، وبصمة المحتوى،
+    و`generation`، و`lease_token`/`lease_until`، وموعد الفحص التالي، وحالة `active`،
+    و`superseded`. فيه **هدف نشط واحد كحد أقصى لكل `(chat_id, message_id)`** (partial
+    unique index)، بينما نفس الشات على رسائل مختلفة يفضل له أهداف مستقلة. أي شاشة/إجراء
+    تاني يعيد استخدام الرسالة بيلغي الهدف (`superseded=1` + generation bump)، وكل كتابة
+    من الـ worker مقيدة بـ CAS على الـ lease/generation. الـ 35 ثانية هي الفاصل الطبيعي،
+    والـ worker واحد بياخد صفًا واحدًا في المرة (توازي فعلي = 1). ده **جدول جدولة فقط** —
+    ملكية الشات وحالته لسه من OpenHands والتفويض الموجود، ومفيش تغيير في `last_accessed`
+    أو المتابعات. `idle` و`paused` مش حالات نهائية حسب سياسة الانتظار المعتمدة (نفس
+    `OHB2-OPENHANDS-WAIT-UNTIL-TERMINAL-STATUS-IMPLEMENTATION-REPORT-20261127`)، فالعرض
+    بيفضل يتفحص؛ مفيش دلالة provider جديدة مخترعة. الصفوف غير النشطة الأقدم من 30 يومًا
+    بتتقلم عند الإقلاع؛ الحذف المؤكد بيشيل صفوف الشات في نفس معاملة الحذف.
   - **جداول R2 (المراجعة):** `auto_review_provider_snapshots` لقطة غير سرية
     (`provider`, `api_base`, `model`, `config_json`, `config_fingerprint`, `created_at`)،
     وممنوع `UPDATE`/`DELETE` عليها بـ trigger. `auto_reviews` سجل حجز الدورة:

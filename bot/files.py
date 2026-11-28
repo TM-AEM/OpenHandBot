@@ -43,6 +43,7 @@ class FileStatus(str, Enum):
     UNAUTHORIZED = "unauthorized"      # الملكية مش مثبتة (fail closed)
     NOT_FOUND = "not_found"            # الشات أو الملف مش موجود
     DELETED = "deleted"                # الشات عليه شاهد حذف (F-1) — يُعرَض كـ not_found
+    AMBIGUOUS = "ambiguous"            # رد metadata فاضي/ناقص — مش دليل حذف (retryable)
     INVALID_PATH = "invalid_path"      # مسار مرفوض محليًا (مطلق/اجتياز/غير صالح)
     BINARY = "binary"                  # محتوى ثنائي (مش نص)
     NOT_UTF8 = "not_utf8"              # ترميز غير صالح
@@ -108,6 +109,9 @@ CONVERSATION_ERRORS: dict["FileStatus", tuple[str, int, str]] = {
     # F-1: شات عليه شاهد حذف يُعرَض **بنفس** رد «مش موجود» (404) عشان ما نكشفش وجود
     # شات محذوف ولا أي تفاصيل عنه. الرد آمن ومتسق مع عرف الـ API.
     FileStatus.DELETED: ("not_found", 404, "الشات مش موجود."),
+    # Empty/incomplete metadata is not deletion proof; callers that opt into this
+    # status must retry rather than tell the user the conversation is gone.
+    FileStatus.AMBIGUOUS: ("ambiguous", 502, "تعذّر الوصول للشات دلوقتي، جرّب تاني."),
     FileStatus.UPSTREAM_ERROR: ("upstream_error", 502, "تعذّر الوصول للشات دلوقتي، جرّب تاني."),
 }
 
@@ -117,6 +121,7 @@ FILE_STATUS_ERRORS: dict["FileStatus", tuple[str, int]] = {
     FileStatus.UNAUTHORIZED: ("unauthorized", 403),
     FileStatus.NOT_FOUND: ("not_found", 404),
     FileStatus.DELETED: ("not_found", 404),
+    FileStatus.AMBIGUOUS: ("ambiguous", 502),
     FileStatus.INVALID_PATH: ("invalid_path", 400),
     FileStatus.TOO_LARGE: ("too_large", 413),
     FileStatus.UPSTREAM_ERROR: ("upstream_error", 502),
@@ -125,6 +130,7 @@ FILE_STATUS_MESSAGES: dict["FileStatus", str] = {
     FileStatus.UNAUTHORIZED: "مش مسموح لك بالوصول لملفات الشات ده.",
     FileStatus.NOT_FOUND: "الشات أو الملف مش موجود.",
     FileStatus.DELETED: "الشات أو الملف مش موجود.",
+    FileStatus.AMBIGUOUS: "تعذّر الوصول لبيانات الشات دلوقتي، جرّب تاني.",
     FileStatus.INVALID_PATH: "مسار الملف غير صالح.",
     FileStatus.BINARY: "الملف مش نص (مش قابل للعرض).",
     FileStatus.NOT_UTF8: "الملف بترميز مش مدعوم (مش قابل للعرض).",
@@ -218,7 +224,13 @@ async def authorize_conversation(
 
 
 async def authorize_conversation_detailed(
-    client, identity: IdentityCache, conversation_id: str, db=None, *, allow_deleted: bool = False
+    client,
+    identity: IdentityCache,
+    conversation_id: str,
+    db=None,
+    *,
+    allow_deleted: bool = False,
+    empty_is_ambiguous: bool = False,
 ) -> tuple[dict | None, FileStatus, str | None, ApiError | None]:
     """نفس تفويض `authorize_conversation` لكن بترجّع كمان رسالة خطأ upstream الآمنة
     **والاستثناء الأصلي** (أو None).
@@ -254,6 +266,11 @@ async def authorize_conversation_detailed(
     except ApiError as exc:
         return None, FileStatus.UPSTREAM_ERROR, error_text(exc), exc
     if not convs:
+        # An empty list is ambiguous: it can be an eventually-consistent replica or an
+        # incomplete response, not proof of deletion. Existing callers keep the legacy
+        # NOT_FOUND mapping; background refresh opts into AMBIGUOUS so it can retry.
+        if empty_is_ambiguous:
+            return None, FileStatus.AMBIGUOUS, None, None
         return None, FileStatus.NOT_FOUND, None, None
     # OHB2-SW-04: نحافظ على التفصيل — فشل upstream في `/users/me` يفضل UPSTREAM_ERROR
     # (مش UNAUTHORIZED)، وغياب الهوية يفضل UNAUTHORIZED. الاتنين رفض مغلق (مش نجاح).

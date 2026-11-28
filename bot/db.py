@@ -122,6 +122,43 @@ CREATION_NOTIFY_NONE = ""
 CREATION_NOTIFY_PENDING = "pending"
 CREATION_NOTIFY_SENT = "sent"
 
+# Automatic Telegram conversation refresh targets. `view_id` is the durable identity
+# of one rendered message; the unique partial index allows at most one *active* target
+# per Telegram message while retaining multiple messages for the same conversation.
+# `target_token`/`generation` invalidate in-flight workers, and `lease_token` is the
+# ownership token every worker mutation must present.
+CONVERSATION_VIEWS_TABLE_SQL = """
+CREATE TABLE conversation_views (
+    view_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    telegram_id      INTEGER NOT NULL,
+    conversation_id  TEXT NOT NULL,
+    chat_id          INTEGER NOT NULL,
+    message_id       INTEGER NOT NULL,
+    target_token     TEXT NOT NULL,
+    last_fingerprint TEXT,
+    active           INTEGER NOT NULL DEFAULT 1,
+    superseded       INTEGER NOT NULL DEFAULT 0,
+    failures         INTEGER NOT NULL DEFAULT 0,
+    generation       INTEGER NOT NULL DEFAULT 0,
+    next_check_at    TEXT,
+    lease_token      TEXT,
+    lease_until      TEXT,
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL
+);
+"""
+
+CONVERSATION_VIEWS_INDEX_SQL = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_conversation_views_active_message
+    ON conversation_views(chat_id, message_id) WHERE active=1;
+CREATE INDEX IF NOT EXISTS idx_conversation_views_due
+    ON conversation_views(active, next_check_at, lease_until);
+"""
+
+# Inactive/superseded targets are retained only long enough for diagnostics/restart
+# inspection; active targets are never pruned by retention.
+CONVERSATION_VIEW_RETENTION_DAYS = 30
+
 # OHB2-AUTO-REVIEW-R2: حجز دورة مراجعة. الـscope صريح من المستدعي (مش اختيار صامت):
 # - conversation: دورة نشطة واحدة لكل محادثة.
 # - per_pr: دورة نشطة واحدة لكل (محادثة، repository_id، pr_number).
@@ -733,10 +770,12 @@ class Watched:
 class ConversationView:
     """Target of the automatic Telegram conversation refresh.
 
-    One row per (user, conversation) view. `active` means the view is eligible for
-    periodic refresh; it is scheduling state only, never conversation ownership.
-    `last_fingerprint` is the rendered text+keyboard digest last shown, used to avoid
-    editing Telegram when nothing changed.
+    One row per rendered Telegram message. `active` means the view is eligible for
+    periodic refresh; `superseded` means the message now represents another screen and
+    must never be reactivated by a stale prompt/worker. `target_token` and `generation`
+    invalidate in-flight workers, and `lease_token` is the ownership token required by
+    every worker mutation. This is scheduling/presentation state only, never
+    conversation ownership or lifecycle truth.
     """
 
     telegram_id: int
@@ -747,6 +786,12 @@ class ConversationView:
     failures: int = 0
     next_check_at: str | None = None
     active: bool = True
+    view_id: int | None = None
+    target_token: str | None = None
+    superseded: bool = False
+    generation: int = 0
+    lease_token: str | None = None
+    lease_until: str | None = None
 
 
 @dataclass
@@ -1228,24 +1273,26 @@ class Database:
                 awaiting_at              TEXT,
                 awaiting_title           TEXT
             );
-            -- Automatic Telegram conversation refresh targets. This is scheduling
-            -- state for a rendered view, not conversation ownership or lifecycle truth.
+            -- Automatic Telegram conversation refresh targets. One row per rendered
+            -- message; the unique index is created after the old-schema migration.
             CREATE TABLE IF NOT EXISTS conversation_views (
+                view_id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 telegram_id      INTEGER NOT NULL,
                 conversation_id  TEXT NOT NULL,
                 chat_id          INTEGER NOT NULL,
                 message_id       INTEGER NOT NULL,
+                target_token     TEXT NOT NULL,
                 last_fingerprint TEXT,
                 active           INTEGER NOT NULL DEFAULT 1,
+                superseded       INTEGER NOT NULL DEFAULT 0,
                 failures         INTEGER NOT NULL DEFAULT 0,
+                generation       INTEGER NOT NULL DEFAULT 0,
                 next_check_at    TEXT,
+                lease_token      TEXT,
                 lease_until      TEXT,
                 created_at       TEXT NOT NULL,
-                updated_at       TEXT NOT NULL,
-                PRIMARY KEY (telegram_id, conversation_id)
+                updated_at       TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_conversation_views_due
-                ON conversation_views(active, next_check_at, lease_until);
             CREATE TABLE IF NOT EXISTS outbox (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 conversation_id TEXT NOT NULL,
@@ -1738,10 +1785,49 @@ class Database:
             """
         )
         self._migrate()
+        self._conn.executescript(CONVERSATION_VIEWS_INDEX_SQL)
         self._conn.commit()
 
     def _migrate(self) -> None:
         """يضيف الأعمدة/الجداول الجديدة لقواعد موجودة من نسخ أقدم (غير مدمّر)."""
+        # The first conversation_views schema used (telegram_id, conversation_id) as
+        # its primary key, which could not represent two messages for one conversation
+        # and allowed two conversations to share one message. Rebuild it once with a
+        # durable per-message view_id and token/generation/lease columns.
+        view_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(conversation_views)")}
+        if view_cols and "view_id" not in view_cols:
+            self._conn.execute("DROP INDEX IF EXISTS idx_conversation_views_due")
+            self._conn.execute("DROP INDEX IF EXISTS idx_conversation_views_active_message")
+            self._conn.execute(
+                "ALTER TABLE conversation_views RENAME TO conversation_views_legacy"
+            )
+            self._conn.executescript(CONVERSATION_VIEWS_TABLE_SQL)
+            legacy_cols = {
+                r["name"]
+                for r in self._conn.execute("PRAGMA table_info(conversation_views_legacy)")
+            }
+            lease_expr = "lease_until" if "lease_until" in legacy_cols else "NULL"
+            self._conn.execute(
+                "INSERT INTO conversation_views "
+                "(telegram_id, conversation_id, chat_id, message_id, target_token, "
+                " last_fingerprint, active, superseded, failures, generation, next_check_at, "
+                " lease_token, lease_until, created_at, updated_at) "
+                "SELECT telegram_id, conversation_id, chat_id, message_id, "
+                "       lower(hex(randomblob(16))), last_fingerprint, active, 0, failures, "
+                f"       0, next_check_at, NULL, {lease_expr}, created_at, updated_at "
+                "FROM conversation_views_legacy"
+            )
+            # The old schema had no uniqueness on (chat_id, message_id). Keep only the
+            # newest row per message so the partial unique index can be built and an
+            # older inactive row can never be reactivated by a later prompt.
+            self._conn.execute(
+                "UPDATE conversation_views SET active=0, superseded=1, next_check_at=NULL "
+                "WHERE view_id NOT IN ("
+                "  SELECT MAX(view_id) FROM conversation_views "
+                "  GROUP BY chat_id, message_id"
+                ")"
+            )
+            self._conn.execute("DROP TABLE conversation_views_legacy")
         columns = {r["name"] for r in self._conn.execute("PRAGMA table_info(watched)")}
         if "chat_id" not in columns:
             self._conn.execute("ALTER TABLE watched ADD COLUMN chat_id INTEGER")
@@ -4101,6 +4187,9 @@ class Database:
                 "AND delivery_status IN ('pending', 'failed')",
                 (conversation_id,),
             ).rowcount
+            views_deleted = conn.execute(
+                "DELETE FROM conversation_views WHERE conversation_id=?", (conversation_id,)
+            ).rowcount
             conn.execute(
                 "UPDATE user_state SET awaiting_conversation_id=NULL, awaiting_kind=NULL, "
                 "awaiting_at=NULL, awaiting_title=NULL WHERE awaiting_conversation_id=?",
@@ -4131,6 +4220,7 @@ class Database:
             "completion_deleted": int(completion_deleted),
             "notif_state_deleted": int(notif_state_deleted),
             "inbox_superseded": int(inbox_superseded),
+            "views_deleted": int(views_deleted),
         }
 
     # ------------------------------------------------------ Mini App sessions
@@ -4222,6 +4312,30 @@ class Database:
         )
 
     # ------------------------------------------------------ conversation views
+    _VIEW_COLUMNS = (
+        "view_id, telegram_id, conversation_id, chat_id, message_id, target_token, "
+        "last_fingerprint, failures, next_check_at, active, superseded, generation, "
+        "lease_token, lease_until"
+    )
+
+    def _view_from_row(self, row) -> ConversationView:
+        return ConversationView(
+            int(row["telegram_id"]),
+            row["conversation_id"],
+            int(row["chat_id"]),
+            int(row["message_id"]),
+            row["last_fingerprint"],
+            int(row["failures"]),
+            row["next_check_at"],
+            bool(row["active"]),
+            view_id=int(row["view_id"]),
+            target_token=row["target_token"],
+            superseded=bool(row["superseded"]),
+            generation=int(row["generation"]),
+            lease_token=row["lease_token"],
+            lease_until=row["lease_until"],
+        )
+
     def upsert_conversation_view(
         self,
         *,
@@ -4233,38 +4347,77 @@ class Database:
         active: bool,
         next_check_at: str | None,
         now: str,
-    ) -> None:
+    ) -> int:
         """Record the rendered Telegram view and its refresh schedule.
 
         A terminal conversation is stored inactive so a restart cannot resurrect polling
-        for it. The same row is reactivated only by an explicit successful prompt.
+        for it. Any other active target for the same Telegram message is superseded in
+        the same transaction, so two conversation views can never share one message.
+        The new target token/generation invalidates any worker that claimed the old row.
         """
+        target_token = secrets.token_hex(16)
+        active_int = 1 if active else 0
         with self._conn:
+            existing = self._conn.execute(
+                "SELECT view_id FROM conversation_views "
+                "WHERE telegram_id=? AND conversation_id=? AND chat_id=? AND message_id=? "
+                "ORDER BY view_id DESC LIMIT 1",
+                (int(telegram_id), conversation_id, int(chat_id), int(message_id)),
+            ).fetchone()
+            if existing is None:
+                self._conn.execute(
+                    "UPDATE conversation_views SET active=0, superseded=1, "
+                    "next_check_at=NULL, lease_token=NULL, lease_until=NULL, "
+                    "generation=generation+1, updated_at=? "
+                    "WHERE chat_id=? AND message_id=?",
+                    (now, int(chat_id), int(message_id)),
+                )
+                cur = self._conn.execute(
+                    "INSERT INTO conversation_views "
+                    "(telegram_id, conversation_id, chat_id, message_id, target_token, "
+                    " last_fingerprint, active, superseded, failures, generation, "
+                    " next_check_at, lease_token, lease_until, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, NULL, NULL, ?, ?)",
+                    (
+                        int(telegram_id), conversation_id, int(chat_id), int(message_id),
+                        target_token, last_fingerprint, active_int, next_check_at, now, now,
+                    ),
+                )
+                return int(cur.lastrowid)
+            view_id = int(existing["view_id"])
             self._conn.execute(
-                "INSERT INTO conversation_views "
-                "(telegram_id, conversation_id, chat_id, message_id, last_fingerprint, "
-                " active, failures, next_check_at, lease_until, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, 0, ?, NULL, ?, ?) "
-                "ON CONFLICT(telegram_id, conversation_id) DO UPDATE SET "
-                "chat_id=excluded.chat_id, message_id=excluded.message_id, "
-                "last_fingerprint=excluded.last_fingerprint, active=excluded.active, "
-                "failures=0, next_check_at=excluded.next_check_at, lease_until=NULL, "
-                "updated_at=excluded.updated_at",
+                "UPDATE conversation_views SET active=0, superseded=1, "
+                "next_check_at=NULL, lease_token=NULL, lease_until=NULL, "
+                "generation=generation+1, updated_at=? "
+                "WHERE chat_id=? AND message_id=? AND view_id<>?",
+                (now, int(chat_id), int(message_id), view_id),
+            )
+            self._conn.execute(
+                "UPDATE conversation_views SET target_token=?, last_fingerprint=?, "
+                "active=?, superseded=0, failures=0, next_check_at=?, "
+                "lease_token=NULL, lease_until=NULL, generation=generation+1, "
+                "updated_at=? WHERE view_id=?",
                 (
-                    int(telegram_id), conversation_id, int(chat_id), int(message_id),
-                    last_fingerprint, 1 if active else 0, next_check_at, now, now,
+                    target_token, last_fingerprint, active_int, next_check_at, now, view_id,
                 ),
             )
+            return view_id
 
     def request_conversation_view_refresh(
         self, conversation_id: str, *, chat_id: int | None, now: str
     ) -> int:
-        """Make an existing view due immediately after a confirmed prompt submission."""
+        """Make an existing view due immediately after a confirmed prompt submission.
+
+        Only targets that have not been superseded are eligible. Terminal (inactive but
+        not superseded) targets may be reactivated by a new prompt. The generation bump
+        invalidates an older worker and the cleared lease lets the new schedule be
+        claimed immediately instead of waiting for the old worker to finish.
+        """
         with self._conn:
             cur = self._conn.execute(
                 "UPDATE conversation_views SET active=1, failures=0, next_check_at=?, "
-                "lease_until=NULL, updated_at=? "
-                "WHERE conversation_id=? AND (? IS NULL OR chat_id=?)",
+                "lease_token=NULL, lease_until=NULL, generation=generation+1, updated_at=? "
+                "WHERE conversation_id=? AND (? IS NULL OR chat_id=?) AND superseded=0",
                 (now, now, conversation_id, chat_id, chat_id),
             )
             return int(cur.rowcount)
@@ -4272,28 +4425,145 @@ class Database:
     def claim_due_conversation_view(
         self, now: str, lease_until: str
     ) -> ConversationView | None:
-        """Atomically lease one due view so no two refresh cycles process it together."""
+        """Atomically lease one due view and return its ownership token."""
+        lease_token = secrets.token_hex(16)
         row = self._conn.execute(
-            "UPDATE conversation_views SET lease_until=?, updated_at=? "
-            "WHERE rowid = ("
-            "  SELECT rowid FROM conversation_views "
-            "  WHERE active=1 "
+            "UPDATE conversation_views SET lease_token=?, lease_until=?, "
+            "generation=generation+1, updated_at=? "
+            "WHERE view_id = ("
+            "  SELECT view_id FROM conversation_views "
+            "  WHERE active=1 AND superseded=0 "
             "    AND (next_check_at IS NULL OR next_check_at<=?) "
             "    AND (lease_until IS NULL OR lease_until<=?) "
-            "  ORDER BY COALESCE(next_check_at, '') ASC, created_at ASC LIMIT 1"
+            "  ORDER BY COALESCE(next_check_at, '') ASC, created_at ASC, view_id ASC LIMIT 1"
             ") "
-            "RETURNING telegram_id, conversation_id, chat_id, message_id, "
-            "last_fingerprint, failures, next_check_at, active",
-            (lease_until, now, now, now),
+            f"RETURNING {self._VIEW_COLUMNS}",
+            (lease_token, lease_until, now, now, now),
         ).fetchone()
         self._conn.commit()
-        if row is None:
-            return None
-        return ConversationView(
-            int(row["telegram_id"]), row["conversation_id"], int(row["chat_id"]),
-            int(row["message_id"]), row["last_fingerprint"], int(row["failures"]),
-            row["next_check_at"], bool(row["active"]),
-        )
+        return None if row is None else self._view_from_row(row)
+
+    def is_conversation_view_current(
+        self,
+        *,
+        view_id: int,
+        target_token: str,
+        generation: int,
+        lease_token: str,
+    ) -> bool:
+        """Is this exact target/lease/generation still the active owner?"""
+        row = self._conn.execute(
+            "SELECT 1 FROM conversation_views WHERE view_id=? AND target_token=? "
+            "AND generation=? AND lease_token=? AND active=1 AND superseded=0",
+            (int(view_id), target_token, int(generation), lease_token),
+        ).fetchone()
+        return row is not None
+
+    def release_conversation_view_lease(
+        self, *, view_id: int, lease_token: str, now: str
+    ) -> bool:
+        """Release our own lease even if the target was superseded; never touch schedule."""
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE conversation_views SET lease_token=NULL, lease_until=NULL, "
+                "updated_at=? WHERE view_id=? AND lease_token=?",
+                (now, int(view_id), lease_token),
+            )
+            return int(cur.rowcount) == 1
+
+    def finish_conversation_view_refresh_owned(
+        self,
+        *,
+        view_id: int,
+        target_token: str,
+        generation: int,
+        lease_token: str,
+        last_fingerprint: str | None,
+        active: bool,
+        next_check_at: str | None,
+        now: str,
+    ) -> bool:
+        """CAS finish: reject a stale worker after supersede/lease replacement."""
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE conversation_views SET last_fingerprint=?, active=?, "
+                "failures=0, next_check_at=?, lease_token=NULL, lease_until=NULL, "
+                "generation=generation+1, updated_at=? "
+                "WHERE view_id=? AND target_token=? AND generation=? AND lease_token=? "
+                "AND active=1 AND superseded=0",
+                (
+                    last_fingerprint, 1 if active else 0, next_check_at, now,
+                    int(view_id), target_token, int(generation), lease_token,
+                ),
+            )
+            return int(cur.rowcount) == 1
+
+    def defer_conversation_view_refresh_owned(
+        self,
+        *,
+        view_id: int,
+        target_token: str,
+        generation: int,
+        lease_token: str,
+        next_check_at: str,
+        now: str,
+    ) -> bool:
+        """CAS defer/retry: stale failure cannot overwrite a newer target/schedule."""
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE conversation_views SET failures=failures+1, next_check_at=?, "
+                "lease_token=NULL, lease_until=NULL, generation=generation+1, updated_at=? "
+                "WHERE view_id=? AND target_token=? AND generation=? AND lease_token=? "
+                "AND active=1 AND superseded=0",
+                (
+                    next_check_at, now, int(view_id), target_token, int(generation),
+                    lease_token,
+                ),
+            )
+            return int(cur.rowcount) == 1
+
+    def deactivate_conversation_view_owned(
+        self,
+        *,
+        view_id: int,
+        target_token: str,
+        generation: int,
+        lease_token: str,
+        now: str,
+        superseded: bool = False,
+    ) -> bool:
+        """CAS deactivate: terminal completion or permanent rejection by the owner."""
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE conversation_views SET active=0, superseded=?, "
+                "next_check_at=NULL, lease_token=NULL, lease_until=NULL, "
+                "generation=generation+1, updated_at=? "
+                "WHERE view_id=? AND target_token=? AND generation=? AND lease_token=? "
+                "AND active=1 AND superseded=0",
+                (
+                    1 if superseded else 0, now, int(view_id), target_token,
+                    int(generation), lease_token,
+                ),
+            )
+            return int(cur.rowcount) == 1
+
+    def invalidate_conversation_views_for_message(
+        self, *, telegram_id: int, chat_id: int, message_id: int, now: str
+    ) -> int:
+        """Supersede every target for a message reused by another screen/action.
+
+        The generation bump and lease clear invalidate any in-flight worker; a stale
+        finish/defer/deactivate CAS will be rejected.
+        """
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE conversation_views SET active=0, superseded=1, "
+                "next_check_at=NULL, lease_token=NULL, lease_until=NULL, "
+                "generation=generation+1, updated_at=? "
+                "WHERE chat_id=? AND message_id=?",
+                (now, int(chat_id), int(message_id)),
+            )
+            return int(cur.rowcount)
 
     def finish_conversation_view_refresh(
         self,
@@ -4305,11 +4575,13 @@ class Database:
         next_check_at: str | None,
         now: str,
     ) -> None:
+        """Compatibility wrapper for callers without a lease; worker uses *_owned."""
         with self._conn:
             self._conn.execute(
                 "UPDATE conversation_views SET last_fingerprint=?, active=?, "
-                "failures=0, next_check_at=?, lease_until=NULL, updated_at=? "
-                "WHERE telegram_id=? AND conversation_id=?",
+                "failures=0, next_check_at=?, lease_token=NULL, lease_until=NULL, "
+                "generation=generation+1, updated_at=? "
+                "WHERE telegram_id=? AND conversation_id=? AND active=1 AND superseded=0",
                 (
                     last_fingerprint, 1 if active else 0, next_check_at, now,
                     int(telegram_id), conversation_id,
@@ -4324,58 +4596,72 @@ class Database:
         next_check_at: str,
         now: str,
     ) -> None:
+        """Compatibility wrapper; worker uses defer_conversation_view_refresh_owned."""
         with self._conn:
             self._conn.execute(
                 "UPDATE conversation_views SET failures=failures+1, next_check_at=?, "
-                "lease_until=NULL, updated_at=? WHERE telegram_id=? AND conversation_id=?",
+                "lease_token=NULL, lease_until=NULL, generation=generation+1, updated_at=? "
+                "WHERE telegram_id=? AND conversation_id=? AND active=1 AND superseded=0",
                 (next_check_at, now, int(telegram_id), conversation_id),
             )
 
-    def deactivate_conversation_view(self, telegram_id: int, conversation_id: str, now: str) -> None:
+    def deactivate_conversation_view(
+        self, telegram_id: int, conversation_id: str, now: str, *, superseded: bool = False
+    ) -> None:
+        """Compatibility wrapper; worker uses deactivate_conversation_view_owned."""
         with self._conn:
             self._conn.execute(
-                "UPDATE conversation_views SET active=0, next_check_at=NULL, "
-                "lease_until=NULL, updated_at=? WHERE telegram_id=? AND conversation_id=?",
-                (now, int(telegram_id), conversation_id),
+                "UPDATE conversation_views SET active=0, superseded=?, next_check_at=NULL, "
+                "lease_token=NULL, lease_until=NULL, generation=generation+1, updated_at=? "
+                "WHERE telegram_id=? AND conversation_id=? AND active=1",
+                (1 if superseded else 0, now, int(telegram_id), conversation_id),
             )
 
     def get_conversation_view(
         self, telegram_id: int, conversation_id: str
     ) -> ConversationView | None:
         row = self._conn.execute(
-            "SELECT telegram_id, conversation_id, chat_id, message_id, last_fingerprint, "
-            "failures, next_check_at, active FROM conversation_views "
-            "WHERE telegram_id=? AND conversation_id=?",
+            f"SELECT {self._VIEW_COLUMNS} FROM conversation_views "
+            "WHERE telegram_id=? AND conversation_id=? "
+            "ORDER BY active DESC, updated_at DESC, view_id DESC LIMIT 1",
             (int(telegram_id), conversation_id),
         ).fetchone()
-        if row is None:
-            return None
-        return ConversationView(
-            int(row["telegram_id"]), row["conversation_id"], int(row["chat_id"]),
-            int(row["message_id"]), row["last_fingerprint"], int(row["failures"]),
-            row["next_check_at"], bool(row["active"]),
-        )
+        return None if row is None else self._view_from_row(row)
+
+    def get_conversation_view_by_id(self, view_id: int) -> ConversationView | None:
+        row = self._conn.execute(
+            f"SELECT {self._VIEW_COLUMNS} FROM conversation_views WHERE view_id=?",
+            (int(view_id),),
+        ).fetchone()
+        return None if row is None else self._view_from_row(row)
 
     def list_conversation_views(self) -> list[ConversationView]:
         rows = self._conn.execute(
-            "SELECT telegram_id, conversation_id, chat_id, message_id, last_fingerprint, "
-            "failures, next_check_at, active FROM conversation_views "
-            "ORDER BY created_at, conversation_id"
+            f"SELECT {self._VIEW_COLUMNS} FROM conversation_views "
+            "ORDER BY created_at, view_id"
         ).fetchall()
-        return [
-            ConversationView(
-                int(r["telegram_id"]), r["conversation_id"], int(r["chat_id"]),
-                int(r["message_id"]), r["last_fingerprint"], int(r["failures"]),
-                r["next_check_at"], bool(r["active"]),
+        return [self._view_from_row(r) for r in rows]
+
+    def count_active_conversation_views(self) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM conversation_views WHERE active=1 AND superseded=0"
+        ).fetchone()
+        return int(row["n"]) if row else 0
+
+    def prune_inactive_conversation_views(self, before: str) -> int:
+        """Bounded retention for inactive/superseded targets older than `before`."""
+        with self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM conversation_views WHERE active=0 AND updated_at < ?", (before,)
             )
-            for r in rows
-        ]
+            return int(cur.rowcount)
 
     def seconds_until_next_conversation_refresh(self, now: str) -> float | None:
-        """Seconds until the earliest active, unleased view is due; None if none."""
+        """Seconds until the earliest active, unleased, non-superseded view is due."""
         row = self._conn.execute(
             "SELECT next_check_at FROM conversation_views "
-            "WHERE active=1 AND (lease_until IS NULL OR lease_until<=?) "
+            "WHERE active=1 AND superseded=0 "
+            "AND (lease_until IS NULL OR lease_until<=?) "
             "ORDER BY CASE WHEN next_check_at IS NULL THEN 0 ELSE 1 END, "
             "next_check_at ASC LIMIT 1",
             (now,),
